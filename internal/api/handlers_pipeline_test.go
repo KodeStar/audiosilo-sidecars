@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -270,6 +271,57 @@ func TestBookControlEndpoints(t *testing.T) {
 		r.Body.Close()
 	} else {
 		r.Body.Close()
+	}
+}
+
+// TestPurgeScratchEndpoint covers the HTTP contract: 409 for a book in a
+// non-purgeable state, 204 once it is paused, and 404 for an unknown book. (The
+// actual chapters/ deletion + confinement guard are covered in
+// internal/scheduler and internal/scratch.)
+func TestPurgeScratchEndpoint(t *testing.T) {
+	env := newPipelineEnv(t, nil)
+	token := env.login(t)
+	resp := env.do(t, http.MethodPost, "/api/v1/books", token, `{"candidates":[{"source_path":"/b/purge","title":"Purge Me"}]}`)
+	var cr createBooksResponse
+	_ = json.NewDecoder(resp.Body).Decode(&cr)
+	resp.Body.Close()
+	// The create result carries the disk gauge field.
+	if cr.Results[0].Book == nil {
+		t.Fatal("no book in create result")
+	}
+	id := strconv.FormatInt(cr.Results[0].Book.ID, 10)
+
+	// A queued book (running, non-terminal) is not purgeable -> 409.
+	if r := env.do(t, http.MethodPost, "/api/v1/books/"+id+"/purge-scratch", token, ""); r.StatusCode != http.StatusConflict {
+		t.Errorf("purge queued = %d, want 409", r.StatusCode)
+		r.Body.Close()
+	} else {
+		r.Body.Close()
+	}
+
+	// Pause it, then purge is allowed -> 204.
+	env.do(t, http.MethodPost, "/api/v1/books/"+id+"/pause", token, "").Body.Close()
+	if r := env.do(t, http.MethodPost, "/api/v1/books/"+id+"/purge-scratch", token, ""); r.StatusCode != http.StatusNoContent {
+		t.Errorf("purge paused = %d, want 204", r.StatusCode)
+		r.Body.Close()
+	} else {
+		r.Body.Close()
+	}
+
+	// Unknown book -> 404.
+	if r := env.do(t, http.MethodPost, "/api/v1/books/99999/purge-scratch", token, ""); r.StatusCode != http.StatusNotFound {
+		t.Errorf("purge missing = %d, want 404", r.StatusCode)
+		r.Body.Close()
+	} else {
+		r.Body.Close()
+	}
+
+	// The book view exposes scratch_bytes.
+	list := env.do(t, http.MethodGet, "/api/v1/books", token, "")
+	body, _ := io.ReadAll(list.Body)
+	list.Body.Close()
+	if !strings.Contains(string(body), `"scratch_bytes"`) {
+		t.Error("book view is missing scratch_bytes")
 	}
 }
 

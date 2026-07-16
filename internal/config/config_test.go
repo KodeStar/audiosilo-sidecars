@@ -124,8 +124,11 @@ func TestDefaultsForNewFields(t *testing.T) {
 	if cfg.Metadata.BaseURL != DefaultMetadataBaseURL {
 		t.Errorf("metadata base_url = %q, want %q", cfg.Metadata.BaseURL, DefaultMetadataBaseURL)
 	}
-	if cfg.Scan.FFprobePath != DefaultFFprobePath {
-		t.Errorf("ffprobe = %q, want %q", cfg.Scan.FFprobePath, DefaultFFprobePath)
+	if !cfg.Tools.AutoDownload {
+		t.Error("tools.auto_download should default to true")
+	}
+	if cfg.Tools.FFmpegPath != "" || cfg.Tools.FFprobePath != "" {
+		t.Errorf("tool paths default = %q,%q, want empty (auto-resolve)", cfg.Tools.FFmpegPath, cfg.Tools.FFprobePath)
 	}
 	if cfg.LibraryRoots == nil {
 		t.Error("library_roots should be non-nil empty slice")
@@ -137,7 +140,8 @@ func TestNewFieldsRoundTripAndEnv(t *testing.T) {
 	in := Default()
 	in.LibraryRoots = []string{"/srv/audiobooks"}
 	in.Metadata.BaseURL = "http://localhost:9999"
-	in.Scan.FFprobePath = ""
+	in.Tools.FFmpegPath = "/opt/ffmpeg"
+	in.Tools.AutoDownload = false
 	if err := Save(dir, in); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -148,14 +152,15 @@ func TestNewFieldsRoundTripAndEnv(t *testing.T) {
 	if len(out.LibraryRoots) != 1 || out.LibraryRoots[0] != "/srv/audiobooks" {
 		t.Errorf("library_roots = %v", out.LibraryRoots)
 	}
-	if out.Metadata.BaseURL != "http://localhost:9999" || out.Scan.FFprobePath != "" {
-		t.Errorf("metadata/scan round-trip: %+v %+v", out.Metadata, out.Scan)
+	if out.Metadata.BaseURL != "http://localhost:9999" || out.Tools.FFmpegPath != "/opt/ffmpeg" || out.Tools.AutoDownload {
+		t.Errorf("metadata/tools round-trip: %+v %+v", out.Metadata, out.Tools)
 	}
 
 	// Env overrides.
 	t.Setenv("AUDIOSILO_SIDECARS_LIBRARY_ROOTS", "/a, /b ")
 	t.Setenv("AUDIOSILO_SIDECARS_METADATA_BASE_URL", "https://meta.example")
-	t.Setenv("AUDIOSILO_SIDECARS_SCAN_FFPROBE_PATH", "/usr/bin/ffprobe")
+	t.Setenv("AUDIOSILO_SIDECARS_TOOLS_FFPROBE_PATH", "/usr/bin/ffprobe")
+	t.Setenv("AUDIOSILO_SIDECARS_TOOLS_AUTO_DOWNLOAD", "true")
 	env, err := Load(dir)
 	if err != nil {
 		t.Fatalf("Load env: %v", err)
@@ -163,8 +168,25 @@ func TestNewFieldsRoundTripAndEnv(t *testing.T) {
 	if len(env.LibraryRoots) != 2 || env.LibraryRoots[1] != "/b" {
 		t.Errorf("env library_roots = %v", env.LibraryRoots)
 	}
-	if env.Metadata.BaseURL != "https://meta.example" || env.Scan.FFprobePath != "/usr/bin/ffprobe" {
-		t.Errorf("env metadata/scan: %+v %+v", env.Metadata, env.Scan)
+	if env.Metadata.BaseURL != "https://meta.example" || env.Tools.FFprobePath != "/usr/bin/ffprobe" || !env.Tools.AutoDownload {
+		t.Errorf("env metadata/tools: %+v %+v", env.Metadata, env.Tools)
+	}
+}
+
+// TestMigrateLegacyFFprobe proves a pre-Tools config's scan.ffprobe_path is
+// adopted into the canonical tools.ffprobe_path on load.
+func TestMigrateLegacyFFprobe(t *testing.T) {
+	dir := t.TempDir()
+	legacy := "metadata:\n  base_url: https://meta.audiosilo.app\nscan:\n  ffprobe_path: /legacy/ffprobe\n"
+	if err := os.WriteFile(filepath.Join(dir, FileName), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Tools.FFprobePath != "/legacy/ffprobe" {
+		t.Errorf("legacy scan.ffprobe_path not migrated: tools.ffprobe_path = %q", cfg.Tools.FFprobePath)
 	}
 }
 

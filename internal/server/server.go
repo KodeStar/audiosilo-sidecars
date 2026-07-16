@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -20,9 +21,11 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/config"
 	"github.com/kodestar/audiosilo-sidecars/internal/events"
 	"github.com/kodestar/audiosilo-sidecars/internal/metaops"
+	"github.com/kodestar/audiosilo-sidecars/internal/pipeline"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/secrets"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
+	"github.com/kodestar/audiosilo-sidecars/internal/toolfetch"
 	"github.com/kodestar/audiosilo-sidecars/internal/web"
 )
 
@@ -100,14 +103,30 @@ func Run(ctx context.Context, opts Options) error {
 	hub.SetPersister(persister.enqueue)
 	go hub.RunHeartbeat(ctx, heartbeatInterval)
 
-	// Pipeline wiring (M1): the metadata client, the async scan manager, and the
-	// three-lane scheduler over stub executors. The scheduler runs its own
-	// goroutine (under a child context so it can be stopped independently) and
-	// reconciles crash state on start.
+	// Resolve the media tools once at startup (explicit path -> next to the binary
+	// -> $PATH -> on-demand download into <data>/tools). The resolved ffprobe feeds
+	// both the audio inspect stage and the folder scan (one source of truth); ffmpeg
+	// drives the chapter split. A missing tool degrades gracefully: the affected
+	// stage fails its book with a clear error while the rest of the daemon works.
+	toolLog := slog.New(slog.NewTextHandler(opts.Out, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	tools := toolfetch.Resolve(ctx, toolfetch.ResolveConfig{
+		FFmpegPath:   cfg.Tools.FFmpegPath,
+		FFprobePath:  cfg.Tools.FFprobePath,
+		AutoDownload: cfg.Tools.AutoDownload,
+	}, filepath.Join(opts.DataDir, "tools"), toolLog)
+	fmt.Fprintf(opts.Out, "[info] media tools: ffmpeg=%s ffprobe=%s\n",
+		toolDisplay(tools.FFmpeg), toolDisplay(tools.FFprobe))
+
+	// Pipeline wiring: the metadata client, the async scan manager (using the
+	// resolved ffprobe), and the three-lane scheduler over the composite executor
+	// (real inspect/split from internal/pipeline, stubs beyond). The scheduler runs
+	// its own goroutine (under a child context so it can be stopped independently)
+	// and reconciles crash state on start.
 	metaClient := metaops.NewClient(cfg.Metadata.BaseURL)
-	scanMgr := metaops.NewScanManager(ctx, metaClient, cfg.Scan.FFprobePath)
+	scanMgr := metaops.NewScanManager(ctx, metaClient, tools.FFprobe)
 	workRoot := filepath.Join(opts.DataDir, "work")
-	sched := scheduler.New(db, hub, scheduler.NewStubExecutor(0, 0), cfg.Agent.Concurrency, workRoot)
+	exec := pipeline.NewExecutor(tools.FFmpeg, tools.FFprobe, scheduler.NewStubExecutor(0, 0))
+	sched := scheduler.New(db, hub, exec, cfg.Agent.Concurrency, workRoot)
 	schedCtx, cancelSched := context.WithCancel(ctx)
 	defer cancelSched()
 	schedDone := make(chan struct{})
@@ -119,17 +138,19 @@ func Run(ctx context.Context, opts Options) error {
 	}()
 
 	apiHandler := api.New(api.Deps{
-		Auth:      mgr,
-		Limiter:   auth.NewRateLimiter(10, 0.5), // burst 10, refill 1 per 2s
-		Secrets:   sec,
-		Events:    hub,
-		Version:   opts.Version,
-		DataDir:   opts.DataDir,
-		Store:     db,
-		Scheduler: sched,
-		Scans:     scanMgr,
-		Config:    cfg,
-		Save:      func(c config.Config) error { return config.Save(opts.DataDir, c) },
+		Auth:        mgr,
+		Limiter:     auth.NewRateLimiter(10, 0.5), // burst 10, refill 1 per 2s
+		Secrets:     sec,
+		Events:      hub,
+		Version:     opts.Version,
+		DataDir:     opts.DataDir,
+		Store:       db,
+		Scheduler:   sched,
+		Scans:       scanMgr,
+		Config:      cfg,
+		Save:        func(c config.Config) error { return config.Save(opts.DataDir, c) },
+		FFmpegPath:  tools.FFmpeg,
+		FFprobePath: tools.FFprobe,
 	}).Handler()
 
 	root := http.NewServeMux()
@@ -273,6 +294,15 @@ func shutdown(srv *http.Server) error {
 // dataFile returns the config file path used to detect a first run.
 func dataFile(dir string) string {
 	return dir + string(os.PathSeparator) + config.FileName
+}
+
+// toolDisplay renders a resolved tool path for the startup log, marking an
+// unresolved tool clearly rather than printing an empty string.
+func toolDisplay(path string) string {
+	if path == "" {
+		return "(not found)"
+	}
+	return path
 }
 
 // printBanner writes the startup banner. The one-time password is printed only

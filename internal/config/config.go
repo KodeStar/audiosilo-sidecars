@@ -35,9 +35,10 @@ const DefaultConcurrency = 2
 // queries. Overridable (env / config) so tests can point at a local httptest.
 const DefaultMetadataBaseURL = "https://meta.audiosilo.app"
 
-// DefaultFFprobePath is the ffprobe binary the folder scan uses for
-// runtime/chapter enrichment. "" disables enrichment; "ffprobe" resolves on PATH.
-const DefaultFFprobePath = "ffprobe"
+// DefaultAutoDownload is the tools.auto_download default: when a tool is not found
+// locally (explicit path -> next to the binary -> $PATH), fetch a checksummed
+// static build into <data>/tools rather than failing.
+const DefaultAutoDownload = true
 
 // ASRConfig holds automatic-speech-recognition settings. It is a typed stub for
 // M0: the fields are wired through so the Settings UI and later milestones share
@@ -65,11 +66,24 @@ type MetadataConfig struct {
 	BaseURL string `yaml:"base_url"`
 }
 
-// ScanConfig tunes the folder scan.
-type ScanConfig struct {
-	// FFprobePath is the ffprobe binary for runtime/chapter enrichment. ""
-	// disables it; "ffprobe" resolves on PATH.
+// ToolsConfig locates the external media tools (ffmpeg + ffprobe) the audio
+// stages and the folder scan use. An empty path means "resolve automatically":
+// next to the daemon binary, then $PATH, and finally (when AutoDownload) an
+// on-demand checksummed download into <data>/tools. This is the SINGLE source of
+// truth for tool locations - the folder scan consumes the RESOLVED ffprobe path,
+// not a separate knob. The legacy scan.ffprobe_path config/env key is migrated
+// into FFprobePath on load for backward compatibility.
+type ToolsConfig struct {
+	// FFmpegPath is an explicit ffmpeg binary (path or PATH-resolvable name). ""
+	// resolves automatically. ffmpeg drives the chapter FLAC split.
+	FFmpegPath string `yaml:"ffmpeg_path"`
+	// FFprobePath is an explicit ffprobe binary. "" resolves automatically.
+	// ffprobe drives inspect (format + chapter markers) and scan enrichment.
 	FFprobePath string `yaml:"ffprobe_path"`
+	// AutoDownload, when true (the default), fetches a static build into
+	// <data>/tools when neither an explicit path, a copy next to the binary, nor
+	// $PATH turns up the tool. Set false for an air-gapped/managed environment.
+	AutoDownload bool `yaml:"auto_download"`
 }
 
 // Config is the daemon configuration.
@@ -87,8 +101,10 @@ type Config struct {
 	LibraryRoots []string `yaml:"library_roots"`
 	// Metadata configures the community metadata API client.
 	Metadata MetadataConfig `yaml:"metadata"`
-	// Scan tunes the folder scan.
-	Scan ScanConfig `yaml:"scan"`
+	// Tools locates ffmpeg/ffprobe (resolved at startup, see internal/toolfetch).
+	// It is the single source of truth for tool paths; the folder scan uses the
+	// resolved ffprobe.
+	Tools ToolsConfig `yaml:"tools"`
 	// ASR and Agent are typed stubs consumed by later milestones (Agent.Concurrency
 	// is live in M1).
 	ASR   ASRConfig   `yaml:"asr"`
@@ -102,7 +118,7 @@ func Default() Config {
 		CORSOrigins:  []string{},
 		LibraryRoots: []string{},
 		Metadata:     MetadataConfig{BaseURL: DefaultMetadataBaseURL},
-		Scan:         ScanConfig{FFprobePath: DefaultFFprobePath},
+		Tools:        ToolsConfig{AutoDownload: DefaultAutoDownload},
 		ASR:          ASRConfig{},
 		Agent:        AgentConfig{Concurrency: DefaultConcurrency},
 	}
@@ -119,6 +135,7 @@ func Load(dataDir string) (Config, error) {
 		if uerr := yaml.Unmarshal(raw, &cfg); uerr != nil {
 			return Config{}, fmt.Errorf("parse %s: %w", path, uerr)
 		}
+		migrateLegacyFFprobe(&cfg, raw)
 	case errors.Is(err, os.ErrNotExist):
 		// First run: keep defaults.
 	default:
@@ -140,6 +157,23 @@ func Load(dataDir string) (Config, error) {
 	return cfg, nil
 }
 
+// migrateLegacyFFprobe adopts a pre-Tools config's scan.ffprobe_path into
+// tools.ffprobe_path when the canonical key is unset, so an existing config file
+// keeps working after the knob moved from scan to tools (one source of truth).
+func migrateLegacyFFprobe(cfg *Config, raw []byte) {
+	if cfg.Tools.FFprobePath != "" {
+		return
+	}
+	var legacy struct {
+		Scan struct {
+			FFprobePath string `yaml:"ffprobe_path"`
+		} `yaml:"scan"`
+	}
+	if yaml.Unmarshal(raw, &legacy) == nil && legacy.Scan.FFprobePath != "" {
+		cfg.Tools.FFprobePath = legacy.Scan.FFprobePath
+	}
+}
+
 // applyEnv overlays AUDIOSILO_SIDECARS_* environment variables onto cfg.
 func applyEnv(cfg *Config) {
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_LISTEN"); ok {
@@ -154,8 +188,21 @@ func applyEnv(cfg *Config) {
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_METADATA_BASE_URL"); ok {
 		cfg.Metadata.BaseURL = strings.TrimSpace(v)
 	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_TOOLS_FFMPEG_PATH"); ok {
+		cfg.Tools.FFmpegPath = v
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_TOOLS_FFPROBE_PATH"); ok {
+		cfg.Tools.FFprobePath = v
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_TOOLS_AUTO_DOWNLOAD"); ok {
+		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			cfg.Tools.AutoDownload = b
+		}
+	}
+	// Legacy: the ffprobe path moved from scan.* to tools.*; keep the old env key
+	// working (it feeds the canonical tools.ffprobe_path).
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_SCAN_FFPROBE_PATH"); ok {
-		cfg.Scan.FFprobePath = v
+		cfg.Tools.FFprobePath = v
 	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_ASR_BACKEND"); ok {
 		cfg.ASR.Backend = v

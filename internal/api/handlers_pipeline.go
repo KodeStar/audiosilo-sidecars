@@ -11,6 +11,7 @@ import (
 
 	"github.com/kodestar/audiosilo-sidecars/internal/metaops"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
+	"github.com/kodestar/audiosilo-sidecars/internal/scratch"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
@@ -203,8 +204,12 @@ type bookView struct {
 	Error           string            `json:"error,omitempty"`
 	Coverage        json.RawMessage   `json:"coverage,omitempty"`
 	Progress        []store.Progress  `json:"progress"`
-	CreatedAt       string            `json:"created_at"`
-	UpdatedAt       string            `json:"updated_at"`
+	// ScratchBytes is the current on-disk size of the book's work dir (chapters +
+	// durables), so the UI can show disk usage and offer a purge. 0 when the work
+	// dir does not exist yet (or was purged).
+	ScratchBytes int64  `json:"scratch_bytes"`
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
 }
 
 // bookDetail adds the per-execution stage-run ledger.
@@ -217,7 +222,16 @@ type bookDetail struct {
 // endpoint uses buildBookView with a pre-fetched progress slice to avoid an N+1.
 func (a *API) bookToView(ctx context.Context, b store.Book) bookView {
 	progress, _ := a.store.ListProgress(ctx, b.ID)
-	return buildBookView(b, progress)
+	v := buildBookView(b, progress)
+	v.ScratchBytes = scratchBytes(b.WorkDir)
+	return v
+}
+
+// scratchBytes reports a work dir's on-disk size, tolerating any walk error (a
+// gauge must never fail a book view).
+func scratchBytes(workDir string) int64 {
+	n, _ := scratch.DirSize(workDir)
+	return n
 }
 
 // buildBookView assembles a bookView from a book and its (possibly nil) progress
@@ -263,7 +277,9 @@ func (a *API) handleListBooks(w http.ResponseWriter, r *http.Request) {
 	}
 	views := make([]bookView, 0, len(books))
 	for _, b := range books {
-		views = append(views, buildBookView(b, progressByBook[b.ID]))
+		v := buildBookView(b, progressByBook[b.ID])
+		v.ScratchBytes = scratchBytes(b.WorkDir)
+		views = append(views, v)
 	}
 	writeJSON(w, http.StatusOK, listBooksResponse{Books: views})
 }
@@ -313,6 +329,17 @@ func (a *API) handleDeleteBook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeControlResult(w, a.sched.Delete(r.Context(), id))
+}
+
+// handlePurgeScratch reclaims a book's split chapters (the M2 heavy scratch). The
+// scheduler enforces the allowed states (done/paused/failed) and the not-busy
+// guard, mapped to 409 by writeControlResult.
+func (a *API) handlePurgeScratch(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	writeControlResult(w, a.sched.PurgeScratch(r.Context(), id))
 }
 
 // writeControlResult maps a scheduler control error to an HTTP status.

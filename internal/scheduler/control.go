@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/kodestar/audiosilo-sidecars/internal/scratch"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
+	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
 
 // ErrInvalidOp is returned when a control action does not apply to a book's
@@ -136,6 +138,44 @@ func (s *Scheduler) Delete(ctx context.Context, id int64) error {
 	}
 	s.removeWorkDir(b.WorkDir)
 	return nil
+}
+
+// PurgeScratch reclaims a book's split chapters/ (the M2 heavy scratch) while
+// keeping its durables (probe.json/manifest.json/transcripts). It is a manual,
+// user-initiated reclaim: allowed only when the book is done, paused, or
+// failed/cancelled - never mid-run (a running book still needs its chapters). It
+// refuses an in-flight book (ErrBusy) so a worker never races the delete, and the
+// removal is confined to the work root by scratch.Purge.
+func (s *Scheduler) PurgeScratch(ctx context.Context, id int64) error {
+	b, err := s.db.GetBook(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !purgeAllowed(b) {
+		return ErrInvalidOp
+	}
+	s.mu.Lock()
+	_, busy := s.inflight[id]
+	s.mu.Unlock()
+	if busy {
+		return ErrBusy
+	}
+	return scratch.Purge(s.workRoot, b.WorkDir)
+}
+
+// purgeAllowed reports whether a book is in a state where reclaiming its chapters
+// is safe: terminal (done), or parked paused/failed (cancel marks a book failed).
+// A running book (status none, non-terminal) still needs its chapters.
+func purgeAllowed(b store.Book) bool {
+	if state.IsTerminal(state.State(b.State)) {
+		return true
+	}
+	switch state.Status(b.Status) {
+	case state.StatusPaused, state.StatusFailed:
+		return true
+	default:
+		return false
+	}
 }
 
 // removeWorkDir deletes a removed book's scratch dir, but ONLY when it resolves to

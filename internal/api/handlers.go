@@ -81,11 +81,22 @@ type tabInfo struct {
 	Status string `json:"status"` // "ready" | "planned"
 }
 
+// toolsInfo surfaces the media-tool paths resolved at startup (empty when a tool
+// could not be located). It is read-only diagnostic info, not a secret.
+type toolsInfo struct {
+	FFmpeg  string `json:"ffmpeg"`
+	FFprobe string `json:"ffprobe"`
+}
+
 type systemResponse struct {
 	Version string    `json:"version"`
 	DataDir string    `json:"data_dir"`
 	Listen  string    `json:"listen"`
 	Tabs    []tabInfo `json:"tabs"`
+	Tools   toolsInfo `json:"tools"`
+	// ScratchBytes is the daemon-total on-disk scratch (the sum of every book's
+	// work dir under <data>/work), the disk gauge the UI shows.
+	ScratchBytes int64 `json:"scratch_bytes"`
 }
 
 // tabs is the static tab list. Library/Running/Settings are functional as of
@@ -100,10 +111,12 @@ var tabs = []tabInfo{
 func (a *API) handleSystem(w http.ResponseWriter, _ *http.Request) {
 	cfg := a.snapshot()
 	writeJSON(w, http.StatusOK, systemResponse{
-		Version: a.version,
-		DataDir: a.dataDir,
-		Listen:  cfg.Listen,
-		Tabs:    tabs,
+		Version:      a.version,
+		DataDir:      a.dataDir,
+		Listen:       cfg.Listen,
+		Tabs:         tabs,
+		Tools:        toolsInfo{FFmpeg: a.ffmpeg, FFprobe: a.ffprobe},
+		ScratchBytes: scratchBytes(a.workRoot()),
 	})
 }
 

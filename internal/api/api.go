@@ -37,6 +37,11 @@ type Deps struct {
 	// config.yaml.
 	Config config.Config
 	Save   func(config.Config) error
+	// FFmpegPath and FFprobePath are the tool paths resolved at startup (empty when
+	// a tool could not be located). Surfaced read-only on /system so the UI/operator
+	// can see which media tools the audio stages will use.
+	FFmpegPath  string
+	FFprobePath string
 }
 
 // API is the HTTP transport.
@@ -50,6 +55,8 @@ type API struct {
 	store   *store.DB
 	sched   *scheduler.Scheduler
 	scans   *metaops.ScanManager
+	ffmpeg  string
+	ffprobe string
 
 	mu   sync.Mutex // guards cfg
 	cfg  config.Config
@@ -72,6 +79,8 @@ func New(d Deps) *API {
 		store:   d.Store,
 		sched:   d.Scheduler,
 		scans:   d.Scans,
+		ffmpeg:  d.FFmpegPath,
+		ffprobe: d.FFprobePath,
 		cfg:     d.Config,
 		save:    save,
 	}
@@ -103,6 +112,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/books/{id}/resume", a.requireAuth(a.requirePipeline(a.bookAction((*scheduler.Scheduler).Resume))))
 	mux.HandleFunc("POST /api/v1/books/{id}/retry", a.requireAuth(a.requirePipeline(a.bookAction((*scheduler.Scheduler).Retry))))
 	mux.HandleFunc("POST /api/v1/books/{id}/cancel", a.requireAuth(a.requirePipeline(a.bookAction((*scheduler.Scheduler).Cancel))))
+	mux.HandleFunc("POST /api/v1/books/{id}/purge-scratch", a.requireAuth(a.requirePipeline(a.handlePurgeScratch)))
 	mux.HandleFunc("DELETE /api/v1/books/{id}", a.requireAuth(a.requirePipeline(a.handleDeleteBook)))
 
 	// SSE authenticates itself (token in the query, since EventSource cannot set
