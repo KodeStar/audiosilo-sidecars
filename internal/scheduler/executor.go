@@ -2,7 +2,7 @@ package scheduler
 
 import (
 	"context"
-	"math/rand"
+	"math/rand/v2"
 	"time"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
@@ -46,7 +46,6 @@ type StubExecutor struct {
 	// Decide, when set, returns the branch decision for a (book, stage). When nil
 	// the happy-path defaults apply.
 	Decide func(book store.Book, stage state.State) StageResult
-	rng    *rand.Rand
 }
 
 // NewStubExecutor returns a stub with the given per-stage delay bounds. Zero
@@ -61,7 +60,6 @@ func NewStubExecutor(minDelay, maxDelay time.Duration) *StubExecutor {
 	return &StubExecutor{
 		MinDelay: minDelay,
 		MaxDelay: maxDelay,
-		rng:      rand.New(rand.NewSource(1)), //nolint:gosec // not security-sensitive
 	}
 }
 
@@ -78,7 +76,9 @@ func (e *StubExecutor) Execute(ctx context.Context, book store.Book, stage state
 	span := e.MaxDelay - e.MinDelay
 	total := e.MinDelay
 	if span > 0 {
-		total += time.Duration(e.rng.Int63n(int64(span)))
+		// rand/v2's top-level functions are safe for concurrent use - lane
+		// workers share this executor, so a per-struct rand.Rand would race.
+		total += time.Duration(rand.Int64N(int64(span))) //nolint:gosec // stub delay jitter, not security-sensitive
 	}
 	const ticks = 2
 	if report != nil {

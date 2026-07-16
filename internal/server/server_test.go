@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -42,6 +44,12 @@ func TestPrintBannerKeychainFallbackWarning(t *testing.T) {
 
 func TestRunBootsAndServesThenShutsDown(t *testing.T) {
 	dir := t.TempDir()
+	// Keep the boot hermetic: never let toolfetch reach the network from a test
+	// runner without local ffmpeg (auto_download defaults to true).
+	cfgYAML := "tools:\n  auto_download: false\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -55,7 +63,7 @@ func TestRunBootsAndServesThenShutsDown(t *testing.T) {
 
 	// Poll until the server answers.
 	base := "http://127.0.0.1:8137"
-	if !waitReady(base+"/api/v1/system", 3*time.Second) {
+	if !waitReady(base+"/api/v1/system", 10*time.Second) {
 		cancel()
 		<-done
 		t.Fatal("server never became ready")
