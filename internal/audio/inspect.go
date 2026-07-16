@@ -59,15 +59,9 @@ func ResolveSource(sourcePath string) (Source, error) {
 // audioFilesIn lists the audio files directly in dir (non-recursive), in
 // numeric-aware ("natural") name order so multi-file chapter order is stable and
 // intuitive: "Chapter 2" sorts before "Chapter 10", which a plain byte sort gets
-// wrong for unpadded names.
-//
-// NOTE (deliberate divergence): audiosilo-meta's pkg/scan orders multi-file books
-// with a plain lexical sort and has the same unpadded-number bug. It is NOT fixed
-// here (that would silently diverge one repo's ordering from the shared scanner's
-// for the same folder); an upstream fix in audiosilo-meta is filed as a follow-up.
-// Until it lands, a book split here can order chapters differently from how the
-// meta scanner enumerated them - acceptable because the split order only drives
-// this tool's own ASR sequencing.
+// wrong for unpadded names. audiosilo-meta's pkg/scan orders a folder book's
+// files the same way (its natural sort landed in meta PR #32), so the split
+// order here matches how the shared scanner enumerates the same folder.
 func audioFilesIn(dir string) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
