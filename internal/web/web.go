@@ -25,12 +25,13 @@ import (
 
 // The CSP for the embedded UI. Strict same-origin: scripts only from self,
 // styles allow inline (React sets style attributes; the CSS is a self-hosted
-// bundle), images allow data: URIs, and the app talks only to its own origin.
+// bundle), images and fonts allow data: URIs (Vite inlines small Roboto
+// subsets as data: fonts), and the app talks only to its own origin.
 const contentSecurityPolicy = "default-src 'self'; " +
 	"script-src 'self'; " +
 	"style-src 'self' 'unsafe-inline'; " +
 	"img-src 'self' data:; " +
-	"font-src 'self'; " +
+	"font-src 'self' data:; " +
 	"connect-src 'self'; " +
 	"base-uri 'self'; " +
 	"form-action 'self'; " +

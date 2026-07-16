@@ -88,11 +88,11 @@ type systemResponse struct {
 	Tabs    []tabInfo `json:"tabs"`
 }
 
-// tabs is the static M0 tab list. Only Settings is functional; the rest are
-// placeholders whose real content lands in later milestones.
+// tabs is the static tab list. Library/Running/Settings are functional as of
+// M1 (Running in its minimal live-list form); Done lands with the M6 board.
 var tabs = []tabInfo{
 	{ID: "library", Label: "Library", Status: "ready"},
-	{ID: "running", Label: "Running", Status: "planned"},
+	{ID: "running", Label: "Running", Status: "ready"},
 	{ID: "done", Label: "Done", Status: "planned"},
 	{ID: "settings", Label: "Settings", Status: "ready"},
 }
