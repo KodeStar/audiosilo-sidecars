@@ -297,11 +297,19 @@ Milestones from the workspace plan; each is shippable.
   and a live daemon smoke (real 3-chapter m4b through inspect -> split -> asr(real
   mlx) -> sanitizing -> done, transcripts-raw `0444`, text non-empty, kill -9
   mid-asr on a second book resumes without re-transcribing the completed chapter).
-- **M3b, M4-M8 (planned):** the whisper.cpp CI-built binary matrix + auto-download
-  (M3b), QA/spelling ports (M4), the agent runner (claude + codex) with staged
-  context dirs enforcing the invariants, the fact-pass + synthesis + audit loop,
-  contribution (intake/PR/local), and packaging (GoReleaser + Docker matrix). See
-  the plan for the full table.
+- **M3b (in progress):** whisper.cpp binaries for non-Apple hardware. The
+  **CI build matrix has landed** (`.github/workflows/whisper-binaries.yml`,
+  manually dispatched: macOS Metal w/ embedded metallib + a real tiny-model
+  transcription smoke, Linux CUDA w/ bundled cudart/cublas + `$ORIGIN` RPATH,
+  Linux Vulkan, Linux amd64/arm64 + Windows CPU; ldd allow-list gates; flat
+  archives + checksums.txt published as a `whisper-cpp-<ref>-<rev>` GitHub
+  release - the asset names + tag are the distribution contract
+  `toolfetch.WhisperCLIReleaseTag` consumes, publish-then-bump-const on
+  upgrades). The toolfetch auto-download client is in flight.
+- **M4-M8 (planned):** QA/spelling ports (M4), the agent runner (claude +
+  codex) with staged context dirs enforcing the invariants, the fact-pass +
+  synthesis + audit loop, contribution (intake/PR/local), and packaging
+  (GoReleaser + Docker matrix). See the plan for the full table.
 
 Still **not built**: the **Done** tab (full board is M6), the Running tab's richer
 board (stage timeline / ETA / cost, M6), and the pipeline stages beyond sanitizing

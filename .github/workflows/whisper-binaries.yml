@@ -44,6 +44,10 @@ name: whisper-binaries
 on:
   workflow_dispatch:
     inputs:
+      # The defaults define the published tag whisper-cpp-<upstream_ref>-<build_rev>.
+      # Keep them in sync with the Go client's pinned toolfetch.WhisperCLIReleaseTag
+      # (internal/toolfetch/whisper.go): a release the const does not name is one no
+      # shipped daemon will ever fetch. The flow is publish first, then bump the const.
       upstream_ref:
         description: "ggml-org/whisper.cpp tag to build (e.g. v1.9.1)"
         type: string
@@ -68,12 +72,6 @@ concurrency:
 env:
   UPSTREAM_REF: ${{ inputs.upstream_ref }}
   BUILD_REV: ${{ inputs.build_rev }}
-  # Cover common consumer + datacenter arches so one CUDA binary runs broadly.
-  # We MUST pin this: whisper.cpp/ggml defaults CMAKE_CUDA_ARCHITECTURES to
-  # "native", which would target only the (absent) GPU of the build runner.
-  # 61 Pascal, 70 Volta, 75 Turing, 80 Ampere(A100), 86 Ampere(30xx),
-  # 89 Ada(40xx), 90 Hopper.
-  CUDA_ARCHS: "61;70;75;80;86;89;90"
 
 jobs:
   # ------------------------------------------------------------------------
@@ -88,6 +86,14 @@ jobs:
   build-linux:
     name: build ${{ matrix.leg }}
     runs-on: ${{ matrix.runner }}
+    env:
+      # CUDA-leg-only tuning (applied conditionally in Configure). Cover common
+      # consumer + datacenter arches so one CUDA binary runs broadly. We MUST pin
+      # this: whisper.cpp/ggml defaults CMAKE_CUDA_ARCHITECTURES to "native",
+      # which would target only the (absent) GPU of the build runner.
+      # 61 Pascal, 70 Volta, 75 Turing, 80 Ampere(A100), 86 Ampere(30xx),
+      # 89 Ada(40xx), 90 Hopper.
+      CUDA_ARCHS: "61;70;75;80;86;89;90"
     strategy:
       fail-fast: false
       matrix:
@@ -180,6 +186,16 @@ jobs:
           # or bundle). GGML_OPENMP=OFF keeps the dependency set to exactly the
           # ldd allow-list (an OpenMP build would pull in libgomp.so.1); ggml's
           # own pthread threadpool handles multi-threading without it.
+          # CMAKE_CUDA_ARCHITECTURES only exists on the CUDA leg (the CUDA
+          # language is never enabled elsewhere; passing it there would only
+          # emit an unused-variable warning). Word-splitting on the unquoted
+          # $CUDA_ARCH_FLAG is safe: the value contains no spaces, and the
+          # semicolons inside a shell variable are never re-parsed as command
+          # separators.
+          CUDA_ARCH_FLAG=""
+          if [ "${{ matrix.leg }}" = "linux-amd64-cuda" ]; then
+            CUDA_ARCH_FLAG="-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHS"
+          fi
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
@@ -187,7 +203,7 @@ jobs:
             -DGGML_NATIVE=OFF \
             -DWHISPER_BUILD_TESTS=OFF \
             -DWHISPER_BUILD_EXAMPLES=ON \
-            -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
+            $CUDA_ARCH_FLAG \
             ${{ matrix.cmake_flags }}
 
       - name: Build whisper-cli
@@ -315,9 +331,22 @@ jobs:
           # Log the linkage for auditing; only system frameworks/dylibs expected.
           otool -L pkg/whisper-cli
 
-      - name: Smoke test (--help)
+      # A --help smoke never exercises Metal (device init is lazy), so a silently
+      # broken GGML_METAL_EMBED_LIBRARY would ship a binary whose first real
+      # transcription fails on user machines. Run an actual tiny-model
+      # transcription of the repo's own jfk.wav (the same smoke upstream's ctest
+      # "gh" label runs) and require the canonical word to appear.
+      - name: Smoke test (real Metal transcription)
         working-directory: whisper.cpp
-        run: ./pkg/whisper-cli --help
+        run: |
+          set -euo pipefail
+          ./pkg/whisper-cli --help
+          curl -fsSL -o ggml-tiny.en.bin \
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin
+          out=$(./pkg/whisper-cli -m ggml-tiny.en.bin -f samples/jfk.wav)
+          echo "$out"
+          echo "$out" | grep -qi "americans" \
+            || { echo "transcription smoke failed: expected 'americans' in output"; exit 1; }
 
       - name: Package (flat tar.gz)
         working-directory: whisper.cpp
