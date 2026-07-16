@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -32,6 +33,10 @@ type fakeBackend struct {
 	before        func(chapter int)
 	block         chan struct{} // when non-nil, Transcribe waits on it (or ctx)
 	transcribeErr error         // when non-nil, Transcribe returns it (a real failure)
+	// emptyMode scripts per-chapter empty output across attempts: "" normal (always
+	// non-empty), "once" empty on the first attempt then non-empty, "always" empty on
+	// every attempt. An empty attempt writes a valid-but-segmentless raw transcript.
+	emptyMode string
 }
 
 func newFakeBackend() *fakeBackend { return &fakeBackend{transcribed: map[int]int{}} }
@@ -60,8 +65,19 @@ func (f *fakeBackend) Transcribe(ctx context.Context, job asr.Job) error {
 	}
 	f.mu.Lock()
 	f.transcribed[job.Chapter]++
+	attempt := f.transcribed[job.Chapter] // 1-based attempt count for this chapter
+	mode := f.emptyMode
 	f.mu.Unlock()
-	raw := fmt.Sprintf(`{"text":" fake chapter %d","language":"en","segments":[{"id":0,"start":0,"end":1,"text":" fake chapter %d","avg_logprob":NaN,"words":[{"word":" fake","start":0,"end":0.5,"probability":0.9}]}]}`, job.Chapter, job.Chapter)
+
+	empty := mode == "always" || (mode == "once" && attempt == 1)
+	var raw string
+	if empty {
+		// Structurally complete (passes transcript.Complete) but segmentless - the
+		// empty-transcript failure mode the asr stage must double-check.
+		raw = `{"text":"","language":"en","segments":[]}`
+	} else {
+		raw = fmt.Sprintf(`{"text":" fake chapter %d","language":"en","segments":[{"id":0,"start":0,"end":1,"text":" fake chapter %d","avg_logprob":NaN,"words":[{"word":" fake","start":0,"end":0.5,"probability":0.9}]}]}`, job.Chapter, job.Chapter)
+	}
 	return os.WriteFile(filepath.Join(job.OutDir, transcript.RawName(job.Chapter)), []byte(raw+"\n"), 0o644) //nolint:gosec // test artifact
 }
 
@@ -128,7 +144,7 @@ func TestPipelineInspectSplitToDone(t *testing.T) {
 	hub := events.NewHub(1024)
 
 	fake := newFakeBackend()
-	exe := NewExecutor(db, ffmpeg, ffprobe, dir, fakeASR(fake), scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond))
+	exe := NewExecutor(Config{DB: db, FFmpeg: ffmpeg, FFprobe: ffprobe, DataDir: dir, ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond)})
 	sched := scheduler.New(db, hub, exe, 2, workRoot)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -294,7 +310,7 @@ func TestPipelineParksUnnormalizableMarkers(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = db.Close() })
 			hub := events.NewHub(1024)
-			exe := NewExecutor(db, ffmpeg, ffprobe, dir, fakeASR(newFakeBackend()), scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond))
+			exe := NewExecutor(Config{DB: db, FFmpeg: ffmpeg, FFprobe: ffprobe, DataDir: dir, ASR: fakeASR(newFakeBackend()), Fallback: scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond)})
 			sched := scheduler.New(db, hub, exe, 2, workRoot)
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan struct{})
@@ -385,7 +401,7 @@ func TestASRStageResumesSkippingCompleted(t *testing.T) {
 	seedRawTranscript(t, work, 2)
 
 	fake := newFakeBackend()
-	exe := NewExecutor(nil, "", "", t.TempDir(), fakeASR(fake), scheduler.NewStubExecutor(0, 0))
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
 	book := store.Book{ID: 1, WorkDir: work}
 
 	var lastDone, lastTotal int
@@ -434,7 +450,12 @@ func TestASRStageUnavailableParks(t *testing.T) {
 	work := t.TempDir()
 	writeManifest(t, work, 1)
 	seedFLACs(t, work, 1)
-	exe := NewExecutor(nil, "", "", t.TempDir(), ASRSetup{Backend: nil, Cap: asr.Capability{Available: false, Detail: "no python3"}}, scheduler.NewStubExecutor(0, 0))
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: ASRSetup{Backend: nil, Cap: asr.Capability{Available: false, Detail: "no python3"}}, Fallback: scheduler.NewStubExecutor(0, 0)})
+	// Re-detection also finds nothing (this machine may have a real backend, which is
+	// not what this test is about), so the stage parks on the unavailable capability.
+	exe.redetectASR = func(context.Context) (asr.Backend, asr.Capability, string) {
+		return nil, asr.Capability{}, ""
+	}
 	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil)
 	var pe *scheduler.ParkError
 	if !errors.As(err, &pe) {
@@ -454,7 +475,7 @@ func TestASRStageTranscribeFailureFails(t *testing.T) {
 	seedFLACs(t, work, 1)
 	fake := newFakeBackend()
 	fake.transcribeErr = errors.New("model exploded")
-	exe := NewExecutor(nil, "", "", t.TempDir(), fakeASR(fake), scheduler.NewStubExecutor(0, 0))
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
 	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil)
 	if err == nil {
 		t.Fatal("a transcription failure should fail the stage")
@@ -470,8 +491,17 @@ func TestASRStageTranscribeFailureFails(t *testing.T) {
 // hard-failing, since a missing tool is a human-fixable startup precondition.
 func TestStagesParkWhenMediaToolsMissing(t *testing.T) {
 	work := t.TempDir()
-	// Empty ffmpeg/ffprobe paths => unresolved tools.
-	exe := NewExecutor(nil, "", "", t.TempDir(), fakeASR(newFakeBackend()), scheduler.NewStubExecutor(0, 0))
+	// Unresolved tools: unset resolved paths AND explicit config paths that point at
+	// nonexistent binaries, so the local re-resolution (which honors an explicit path
+	// exactly, never falling back to $PATH) still finds nothing on a machine that has
+	// ffmpeg/ffprobe installed.
+	nope := t.TempDir()
+	exe := NewExecutor(Config{
+		DataDir:  t.TempDir(),
+		Tools:    ToolConfig{FFmpegPath: filepath.Join(nope, "no-ffmpeg"), FFprobePath: filepath.Join(nope, "no-ffprobe")},
+		ASR:      fakeASR(newFakeBackend()),
+		Fallback: scheduler.NewStubExecutor(0, 0),
+	})
 	book := store.Book{ID: 1, WorkDir: work, SourcePath: filepath.Join(work, "book.m4b")}
 	for _, stage := range []state.State{state.Inspecting, state.Splitting} {
 		_, err := exe.Execute(context.Background(), book, stage, nil)
@@ -495,7 +525,7 @@ func TestSanitizeStageDerivesLayers(t *testing.T) {
 	if err := writeASRProvenance(work, asrProvenance{Backend: "fake", Model: "m", Language: "en"}); err != nil {
 		t.Fatal(err)
 	}
-	exe := NewExecutor(nil, "", "", t.TempDir(), ASRSetup{}, scheduler.NewStubExecutor(0, 0))
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: ASRSetup{}, Fallback: scheduler.NewStubExecutor(0, 0)})
 	book := store.Book{ID: 1, WorkDir: work}
 	for pass := 0; pass < 2; pass++ { // idempotent: run twice
 		if _, err := exe.Execute(context.Background(), book, state.Sanitizing, nil); err != nil {
@@ -551,7 +581,7 @@ func TestPipelineCancelMidASRResumes(t *testing.T) {
 		default:
 		}
 	}
-	exe1 := NewExecutor(db, ffmpeg, ffprobe, dir, fakeASR(blocking), scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond))
+	exe1 := NewExecutor(Config{DB: db, FFmpeg: ffmpeg, FFprobe: ffprobe, DataDir: dir, ASR: fakeASR(blocking), Fallback: scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond)})
 	sched1 := scheduler.New(db, hub, exe1, 2, workRoot)
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	done1 := make(chan struct{})
@@ -579,7 +609,7 @@ func TestPipelineCancelMidASRResumes(t *testing.T) {
 
 	// Second run: a fresh, unblocked backend resumes the book to done.
 	resume := newFakeBackend()
-	exe2 := NewExecutor(db, ffmpeg, ffprobe, dir, fakeASR(resume), scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond))
+	exe2 := NewExecutor(Config{DB: db, FFmpeg: ffmpeg, FFprobe: ffprobe, DataDir: dir, ASR: fakeASR(resume), Fallback: scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond)})
 	sched2 := scheduler.New(db, hub, exe2, 2, workRoot)
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	done2 := make(chan struct{})
@@ -599,5 +629,236 @@ func TestPipelineCancelMidASRResumes(t *testing.T) {
 		if resume.count(i) != 1 {
 			t.Errorf("chapter %d transcribed %d times on resume, want 1", i, resume.count(i))
 		}
+	}
+}
+
+// TestASRReDetectsBackendOnRetry asserts the asr stage re-selects an ASR backend at
+// stage entry: a book parks when none is available, then the SAME executor resumes
+// (no daemon restart) once a backend appears - the retry-after-install path.
+func TestASRReDetectsBackendOnRetry(t *testing.T) {
+	work := t.TempDir()
+	writeManifest(t, work, 1)
+	seedFLACs(t, work, 1)
+
+	fake := newFakeBackend()
+	var available bool
+	exe := NewExecutor(Config{
+		DataDir:  t.TempDir(),
+		ASR:      ASRSetup{Backend: nil, Cap: asr.Capability{Available: false, Detail: "no backend"}},
+		Fallback: scheduler.NewStubExecutor(0, 0),
+	})
+	exe.redetectASR = func(context.Context) (asr.Backend, asr.Capability, string) {
+		if !available {
+			return nil, asr.Capability{}, ""
+		}
+		return fake, asr.Capability{Backend: "fake", Available: true, Device: "cpu"}, "fake-model"
+	}
+	book := store.Book{ID: 1, WorkDir: work}
+
+	// No backend yet -> park, and nothing transcribed.
+	_, err := exe.Execute(context.Background(), book, state.ASR, nil)
+	var pe *scheduler.ParkError
+	if !errors.As(err, &pe) {
+		t.Fatalf("first run error = %v, want a ParkError", err)
+	}
+	if fake.count(1) != 0 {
+		t.Fatalf("chapter transcribed %d times before a backend was available", fake.count(1))
+	}
+
+	// A backend appears; the same executor now runs to completion without a restart.
+	available = true
+	if _, err := exe.Execute(context.Background(), book, state.ASR, nil); err != nil {
+		t.Fatalf("second run after backend appeared: %v", err)
+	}
+	if fake.count(1) != 1 {
+		t.Errorf("chapter transcribed %d times after backend appeared, want 1", fake.count(1))
+	}
+}
+
+// TestEnsureToolsAdoptsAppearingTool asserts ensureTools re-resolves a media tool
+// that only appears after startup (explicit config path honored), and that
+// ToolPaths reflects the adoption - without driving a real stage.
+func TestEnsureToolsAdoptsAppearingTool(t *testing.T) {
+	dir := t.TempDir()
+	toolPath := filepath.Join(dir, "ffprobe-fake")
+	exe := NewExecutor(Config{
+		FFprobe:  "",
+		Tools:    ToolConfig{FFprobePath: toolPath},
+		Fallback: scheduler.NewStubExecutor(0, 0),
+	})
+	if _, fp := exe.ToolPaths(); fp != "" {
+		t.Fatalf("ffprobe path = %q before the tool exists, want empty", fp)
+	}
+	if _, fp := exe.ensureTools(); fp != "" {
+		t.Fatalf("ensureTools resolved %q before the tool exists, want empty", fp)
+	}
+	// The operator installs the binary (executable).
+	if err := os.WriteFile(toolPath, []byte("#!/bin/sh\n"), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+		t.Fatal(err)
+	}
+	if _, fp := exe.ensureTools(); fp != toolPath {
+		t.Errorf("ensureTools resolved %q after creation, want %q", fp, toolPath)
+	}
+	if _, fp := exe.ToolPaths(); fp != toolPath {
+		t.Errorf("ToolPaths = %q after adoption, want %q", fp, toolPath)
+	}
+}
+
+// TestASRResumesOnMatchingFingerprint asserts a resume whose recorded manifest
+// fingerprint still matches proceeds normally (skips completed chapters), NOT parks.
+func TestASRResumesOnMatchingFingerprint(t *testing.T) {
+	work := t.TempDir()
+	writeManifest(t, work, 3)
+	seedFLACs(t, work, 3)
+	seedRawTranscript(t, work, 1)
+	seedRawTranscript(t, work, 2)
+	fp, err := manifestFingerprint(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeASRProvenance(work, asrProvenance{Backend: "fake", Model: "m", Language: "en", ManifestSHA: fp}); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := newFakeBackend()
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil); err != nil {
+		t.Fatalf("asr stage: %v", err)
+	}
+	if fake.count(1) != 0 || fake.count(2) != 0 {
+		t.Errorf("pre-completed chapters re-transcribed: c1=%d c2=%d", fake.count(1), fake.count(2))
+	}
+	if fake.count(3) != 1 {
+		t.Errorf("chapter 3 transcribed %d times, want 1", fake.count(3))
+	}
+}
+
+// TestASRParksOnManifestMismatch asserts a resume whose recorded fingerprint no
+// longer matches the manifest PARKS (a different edition) and does NOT delete the
+// existing raw evidence.
+func TestASRParksOnManifestMismatch(t *testing.T) {
+	work := t.TempDir()
+	writeManifest(t, work, 3)
+	seedFLACs(t, work, 3)
+	seedRawTranscript(t, work, 1)
+	if err := writeASRProvenance(work, asrProvenance{Backend: "fake", Model: "m", Language: "en", ManifestSHA: "deadbeef"}); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := newFakeBackend()
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil)
+	var pe *scheduler.ParkError
+	if !errors.As(err, &pe) {
+		t.Fatalf("error = %v, want a ParkError", err)
+	}
+	if pe.Reason != ManifestChangedMsg {
+		t.Errorf("park reason = %q, want %q", pe.Reason, ManifestChangedMsg)
+	}
+	// The pre-seeded raw must survive - it is 0444 evidence, never silently deleted.
+	if _, serr := os.Stat(filepath.Join(work, transcript.RawDir, transcript.RawName(1))); serr != nil {
+		t.Errorf("pre-seeded raw was removed on park: %v", serr)
+	}
+}
+
+// TestASRResumeReFreezesRaw asserts a completed raw left at 0644 (a crash between
+// write and chmod) is re-frozen to 0444 on resume and NOT re-transcribed.
+func TestASRResumeReFreezesRaw(t *testing.T) {
+	work := t.TempDir()
+	writeManifest(t, work, 1)
+	seedFLACs(t, work, 1)
+	rawDir := filepath.Join(work, transcript.RawDir)
+	if err := os.MkdirAll(rawDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	raw := `{"text":" hi","language":"en","segments":[{"id":0,"start":0,"end":1,"text":" hi","words":[]}]}`
+	rawPath := filepath.Join(rawDir, transcript.RawName(1))
+	if err := os.WriteFile(rawPath, []byte(raw), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+
+	fake := newFakeBackend()
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil); err != nil {
+		t.Fatalf("asr stage: %v", err)
+	}
+	if fake.count(1) != 0 {
+		t.Errorf("completed chapter re-transcribed %d times, want 0 (skipped)", fake.count(1))
+	}
+	info, err := os.Stat(rawPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o444 {
+		t.Errorf("raw perm = %o after resume, want 444 (re-frozen)", perm)
+	}
+}
+
+// TestASREmptyThenNonEmptyRetried asserts an empty transcript is deleted and
+// retried once, the retry's non-empty result is adopted, and no chapter is recorded
+// as accepted-empty.
+func TestASREmptyThenNonEmptyRetried(t *testing.T) {
+	work := t.TempDir()
+	writeManifest(t, work, 1)
+	seedFLACs(t, work, 1)
+
+	fake := newFakeBackend()
+	fake.emptyMode = "once"
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil); err != nil {
+		t.Fatalf("asr stage: %v", err)
+	}
+	if fake.count(1) != 2 {
+		t.Errorf("chapter transcribed %d times, want 2 (empty then retry)", fake.count(1))
+	}
+	empty, err := rawIsEmpty(filepath.Join(work, transcript.RawDir, transcript.RawName(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty {
+		t.Error("final raw is empty; want the retried non-empty transcript")
+	}
+	if prov := readASRProvenance(work); len(prov.EmptyChapters) != 0 {
+		t.Errorf("empty_chapters = %v, want none", prov.EmptyChapters)
+	}
+}
+
+// TestASREmptyTwiceAccepted asserts an empty transcript that stays empty across the
+// retry is accepted (no park/error), frozen 0444, and recorded in asr.json's
+// empty_chapters.
+func TestASREmptyTwiceAccepted(t *testing.T) {
+	work := t.TempDir()
+	writeManifest(t, work, 1)
+	seedFLACs(t, work, 1)
+
+	fake := newFakeBackend()
+	fake.emptyMode = "always"
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil); err != nil {
+		t.Fatalf("asr stage (empty accepted): %v", err)
+	}
+	if fake.count(1) != 2 {
+		t.Errorf("chapter transcribed %d times, want 2 (one retry then accept)", fake.count(1))
+	}
+	rawPath := filepath.Join(work, transcript.RawDir, transcript.RawName(1))
+	info, err := os.Stat(rawPath)
+	if err != nil {
+		t.Fatalf("accepted raw missing: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o444 {
+		t.Errorf("accepted empty raw perm = %o, want 444", perm)
+	}
+	data, err := os.ReadFile(filepath.Join(work, "asr.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prov struct {
+		EmptyChapters []int `json:"empty_chapters"`
+	}
+	if err := json.Unmarshal(data, &prov); err != nil {
+		t.Fatal(err)
+	}
+	if len(prov.EmptyChapters) != 1 || prov.EmptyChapters[0] != 1 {
+		t.Errorf("empty_chapters = %v, want [1]", prov.EmptyChapters)
 	}
 }

@@ -161,6 +161,26 @@ func (db *DB) SucceededStagesAll(ctx context.Context) (map[int64]map[string]bool
 	return out, rows.Err()
 }
 
+// SucceededStages returns one book's set of stages with at least one ok=1 run - the
+// single-book form of SucceededStagesAll, used by a mid-run reconcile (a scratch
+// purge) that must recover just the purged book without a whole-catalogue scan.
+func (db *DB) SucceededStages(ctx context.Context, bookID int64) (map[string]bool, error) {
+	rows, err := db.sql.QueryContext(ctx, `SELECT DISTINCT stage FROM stage_runs WHERE book_id=? AND ok=1`, bookID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]bool{}
+	for rows.Next() {
+		var stage string
+		if err := rows.Scan(&stage); err != nil {
+			return nil, err
+		}
+		out[stage] = true
+	}
+	return out, rows.Err()
+}
+
 // DeleteStageSuccess removes ok=1 runs of a stage for a book, used by reconcile
 // when a completed stage's sentinel is missing and the stage must re-run.
 func (db *DB) DeleteStageSuccess(ctx context.Context, bookID int64, stage string) error {

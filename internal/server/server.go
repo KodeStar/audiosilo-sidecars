@@ -149,12 +149,29 @@ func Run(ctx context.Context, opts Options) error {
 	metaClient := metaops.NewClient(cfg.Metadata.BaseURL)
 	scanMgr := metaops.NewScanManager(ctx, metaClient, tools.FFprobe)
 	workRoot := filepath.Join(opts.DataDir, "work")
-	exec := pipeline.NewExecutor(db, tools.FFmpeg, tools.FFprobe, opts.DataDir, pipeline.ASRSetup{
-		Backend:  asrBackend,
-		Cap:      asrCap,
-		Model:    asrModel,
-		Language: cfg.ASR.Language,
-	}, scheduler.NewStubExecutor(0, 0))
+	exec := pipeline.NewExecutor(pipeline.Config{
+		DB:      db,
+		FFmpeg:  tools.FFmpeg,
+		FFprobe: tools.FFprobe,
+		Tools:   pipeline.ToolConfig{FFmpegPath: cfg.Tools.FFmpegPath, FFprobePath: cfg.Tools.FFprobePath},
+		DataDir: opts.DataDir,
+		ASR: pipeline.ASRSetup{
+			Backend:  asrBackend,
+			Cap:      asrCap,
+			Model:    asrModel,
+			Language: cfg.ASR.Language,
+		},
+		ASRSelect: asr.SelectConfig{
+			Backend:        cfg.ASR.Backend,
+			Model:          cfg.ASR.Model,
+			Language:       cfg.ASR.Language,
+			WhisperCLIPath: cfg.ASR.WhisperCLIPath,
+			DataDir:        opts.DataDir,
+			Log:            toolLog,
+		},
+		Log:      toolLog,
+		Fallback: scheduler.NewStubExecutor(0, 0),
+	})
 	sched := scheduler.New(db, hub, exec, cfg.Agent.Concurrency, workRoot)
 	schedCtx, cancelSched := context.WithCancel(ctx)
 	defer cancelSched()
@@ -186,6 +203,21 @@ func Run(ctx context.Context, opts Options) error {
 			Device:    asrCap.Device,
 			Version:   asrCap.Version,
 			Detail:    asrCap.Detail,
+		},
+		// LiveStatus reports the executor's CURRENT ASR capability + resolved tool
+		// paths, which a stage may have re-detected after a retry (an operator
+		// installing a tool/backend post-startup), so /system reflects them without a
+		// daemon restart.
+		LiveStatus: func() (api.ASRInfo, string, string) {
+			cap := exec.ASRCapability()
+			ff, fp := exec.ToolPaths()
+			return api.ASRInfo{
+				Backend:   cap.Backend,
+				Available: cap.Available,
+				Device:    cap.Device,
+				Version:   cap.Version,
+				Detail:    cap.Detail,
+			}, ff, fp
 		},
 	}).Handler()
 

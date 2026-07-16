@@ -167,34 +167,46 @@ func (s *Scheduler) Reconcile(ctx context.Context) error {
 		if state.IsTerminal(state.State(b.State)) {
 			continue
 		}
-		succeeded := succeededByBook[b.ID]
-		var rewind string
-		haveRewind := false
-		for stage := range succeeded {
-			if SentinelExists(b.WorkDir, stage) {
-				continue
-			}
-			if !haveRewind || state.Order(state.State(stage)) < state.Order(state.State(rewind)) {
-				rewind, haveRewind = stage, true
-			}
-		}
-		if !haveRewind {
-			continue
-		}
-		// Drop the DB success of the rewind stage and every later completed stage
-		// so their counts stay honest when the book re-advances.
-		for stage := range succeeded {
-			if state.Order(state.State(stage)) >= state.Order(state.State(rewind)) {
-				if err := s.db.DeleteStageSuccess(ctx, b.ID, stage); err != nil {
-					return err
-				}
-			}
-		}
-		if err := s.db.SetBookState(ctx, b.ID, rewind, b.Status, b.Error); err != nil {
+		if err := s.reconcileBook(ctx, b, succeededByBook[b.ID]); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// reconcileBook rewinds one active book to the earliest completed stage whose
+// sentinel is missing (a purged/lost work dir), dropping the DB success of that
+// stage and every later one so the counts stay honest and the stage re-runs. It is
+// the per-book half of Reconcile, shared with PurgeScratch so a purge that
+// invalidates a stage recovers WITHOUT waiting for a restart. Terminal books are a
+// no-op. succeeded is the book's DB-succeeded stage set.
+func (s *Scheduler) reconcileBook(ctx context.Context, b store.Book, succeeded map[string]bool) error {
+	if state.IsTerminal(state.State(b.State)) {
+		return nil
+	}
+	var rewind string
+	haveRewind := false
+	for stage := range succeeded {
+		if SentinelExists(b.WorkDir, stage) {
+			continue
+		}
+		if !haveRewind || state.Order(state.State(stage)) < state.Order(state.State(rewind)) {
+			rewind, haveRewind = stage, true
+		}
+	}
+	if !haveRewind {
+		return nil
+	}
+	// Drop the DB success of the rewind stage and every later completed stage
+	// so their counts stay honest when the book re-advances.
+	for stage := range succeeded {
+		if state.Order(state.State(stage)) >= state.Order(state.State(rewind)) {
+			if err := s.db.DeleteStageSuccess(ctx, b.ID, stage); err != nil {
+				return err
+			}
+		}
+	}
+	return s.db.SetBookState(ctx, b.ID, rewind, b.Status, b.Error)
 }
 
 // --- dispatch ---

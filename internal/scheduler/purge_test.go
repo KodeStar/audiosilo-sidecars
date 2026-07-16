@@ -291,6 +291,133 @@ func TestPurgeInvalidatesSplitSentinel(t *testing.T) {
 	}
 }
 
+// recordSuccess opens and closes an ok=1 stage run for a book, mirroring a stage
+// that completed - so SucceededStages/reconcileBook see it as DB-succeeded.
+func recordSuccess(t *testing.T, db *store.DB, bookID int64, stage state.State) {
+	t.Helper()
+	ctx := context.Background()
+	runID, err := db.StartStageRun(ctx, bookID, string(stage), 1)
+	if err != nil {
+		t.Fatalf("StartStageRun(%s): %v", stage, err)
+	}
+	if err := db.FinishStageRun(ctx, runID, true, nil); err != nil {
+		t.Fatalf("FinishStageRun(%s): %v", stage, err)
+	}
+}
+
+// TestPurgeThenRetryReSplitsWithoutRestart is the core regression: a book that
+// failed PAST splitting (at asr) must, after a purge, be rewound to splitting by
+// PurgeScratch itself - so a following Retry re-splits WITHOUT a daemon restart
+// (previously only startup Reconcile recovered it, leaving Retry to run asr against
+// an empty chapters/).
+func TestPurgeThenRetryReSplitsWithoutRestart(t *testing.T) {
+	h := newHarness(t)
+	db := h.openDB(t)
+	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, h.workRoot)
+	ctx := context.Background()
+	b := h.addBook(t, db, "failed-at-asr", "", "")
+
+	// The book completed splitting and asr (both have ok=1 DB rows + sentinels +
+	// chapters on disk), then failed at asr.
+	seedChapters(t, b.WorkDir)
+	recordSuccess(t, db, b.ID, state.Splitting)
+	recordSuccess(t, db, b.ID, state.ASR)
+	if err := WriteSentinel(b.WorkDir, string(state.Splitting), happyPath()); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteSentinel(b.WorkDir, string(state.ASR), happyPath()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetBookState(ctx, b.ID, string(state.ASR), string(state.StatusFailed), "boom"); err != nil {
+		t.Fatal(err)
+	}
+
+	chapters := filepath.Join(b.WorkDir, "chapters")
+	if err := s.PurgeScratch(ctx, b.ID); err != nil {
+		t.Fatalf("PurgeScratch: %v", err)
+	}
+	if _, err := os.Stat(chapters); !os.IsNotExist(err) {
+		t.Fatal("purge did not remove chapters/")
+	}
+	if SentinelExists(b.WorkDir, string(state.Splitting)) {
+		t.Fatal("purge did not remove the split sentinel")
+	}
+	// The book was rewound to splitting mid-run (no restart), preserving failed.
+	got, err := db.GetBook(ctx, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != string(state.Splitting) {
+		t.Fatalf("after purge State = %q, want %q", got.State, state.Splitting)
+	}
+	if got.Status != string(state.StatusFailed) {
+		t.Errorf("after purge Status = %q, want %q (reconcile must preserve status)", got.Status, state.StatusFailed)
+	}
+	succeeded, err := db.SucceededStages(ctx, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if succeeded[string(state.Splitting)] {
+		t.Error("purge+reconcile did not drop the splitting DB success")
+	}
+
+	// Drive to completion to prove no restart is needed: Retry -> Start re-splits.
+	exec := &splitReExecExecutor{stub: NewStubExecutor(time.Millisecond, 2*time.Millisecond)}
+	rs := New(db, h.hub, exec, 2, h.workRoot)
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { _ = rs.Start(runCtx); close(done) }()
+	if err := rs.Retry(ctx, b.ID); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	books := waitBooks(t, db, allDone, 15*time.Second)
+	cancel()
+	<-done
+	if !allDone(books) {
+		t.Fatal("book did not complete after purge+retry")
+	}
+	exec.mu.Lock()
+	splits := exec.splits
+	exec.mu.Unlock()
+	if splits < 1 {
+		t.Errorf("splitting re-executed %d times, want >= 1", splits)
+	}
+	if _, err := os.Stat(chapters); err != nil {
+		t.Errorf("chapters/ was not recreated by the re-split: %v", err)
+	}
+}
+
+// TestPurgeDoneBookNotReconciled proves a terminal (done) book is never rewound by
+// the purge reconcile: even with a DB-succeeded stage whose sentinel is absent, a
+// done book stays done (chapters are still reclaimed).
+func TestPurgeDoneBookNotReconciled(t *testing.T) {
+	h := newHarness(t)
+	db := h.openDB(t)
+	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, h.workRoot)
+	ctx := context.Background()
+	b := h.addBook(t, db, "done-book", "", "")
+
+	chapters := seedChapters(t, b.WorkDir)
+	recordSuccess(t, db, b.ID, state.Splitting) // ok=1 but no sentinel written
+	if err := db.SetBookState(ctx, b.ID, string(state.Done), "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.PurgeScratch(ctx, b.ID); err != nil {
+		t.Fatalf("PurgeScratch(done): %v", err)
+	}
+	if _, err := os.Stat(chapters); !os.IsNotExist(err) {
+		t.Error("PurgeScratch(done) did not remove chapters/")
+	}
+	got, err := db.GetBook(ctx, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != string(state.Done) {
+		t.Errorf("done book State = %q after purge, want %q (must not be reconciled)", got.State, state.Done)
+	}
+}
+
 // waitBooks polls until pred holds over the book list or the deadline passes.
 func waitBooks(t *testing.T, db *store.DB, pred func([]store.Book) bool, timeout time.Duration) []store.Book {
 	t.Helper()

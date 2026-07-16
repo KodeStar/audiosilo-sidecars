@@ -216,16 +216,12 @@ func adaptOpenAI(sanitized []byte, meta Meta) (Transcript, error) {
 		return Transcript{}, fmt.Errorf("parse openai-whisper transcript: %w", err)
 	}
 	segs := make([]Segment, 0, len(d.Segments))
-	for i, s := range d.Segments {
+	for _, s := range d.Segments {
 		words := make([]Word, 0, len(s.Words))
 		for _, w := range s.Words {
 			words = append(words, Word{W: w.Word, Start: w.Start, End: w.End, P: finite(w.Probability)})
 		}
-		id := s.ID
-		if id == 0 && i != 0 {
-			id = i
-		}
-		segs = append(segs, Segment{ID: id, Start: s.Start, End: s.End, Text: s.Text, Words: words})
+		segs = append(segs, Segment{ID: s.ID, Start: s.Start, End: s.End, Text: s.Text, Words: words})
 	}
 	return Transcript{
 		Schema:   Schema,

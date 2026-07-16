@@ -91,6 +91,33 @@ func TestNormalizeOpenAIFixture(t *testing.T) {
 	}
 }
 
+func TestAdaptOpenAIPreservesSegmentIDs(t *testing.T) {
+	// Both segments report id 0 - the second at loop index 1. The reported id must
+	// pass through verbatim; the old loop-index fabrication would have rewritten the
+	// second segment's id to 1, corrupting a genuinely id-0 segment.
+	raw := []byte(`{
+		"text": "one two",
+		"language": "en",
+		"segments": [
+			{"id": 0, "start": 0.0, "end": 1.0, "text": " one", "words": []},
+			{"id": 0, "start": 1.0, "end": 2.0, "text": " two", "words": []}
+		]
+	}`)
+	tr, err := Normalize(raw, Meta{Chapter: 1, Backend: "mlx-whisper", Model: "large-v3-turbo", Language: "en"})
+	if err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	if len(tr.Segments) != 2 {
+		t.Fatalf("segments = %d, want 2", len(tr.Segments))
+	}
+	if tr.Segments[0].ID != 0 {
+		t.Errorf("segment 0 id = %d, want 0", tr.Segments[0].ID)
+	}
+	if tr.Segments[1].ID != 0 {
+		t.Errorf("segment 1 id = %d, want 0 (loop-index fabrication should be gone)", tr.Segments[1].ID)
+	}
+}
+
 func TestNormalizeWhisperCppFixture(t *testing.T) {
 	raw := readFixture(t, "whispercpp-ch001.raw.json")
 	if !Complete(raw) {

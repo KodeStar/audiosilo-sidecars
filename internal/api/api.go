@@ -45,6 +45,10 @@ type Deps struct {
 	// ASR is the speech-recognition backend resolved at startup, surfaced read-only
 	// on /system so the UI/operator can see whether ASR will run and on what device.
 	ASR ASRInfo
+	// LiveStatus, when set, supplies the CURRENT ASR capability and resolved media-tool
+	// paths (which a stage may have re-detected after a retry), so /system reflects them
+	// without a restart. nil falls back to the boot-time ASR/FFmpegPath/FFprobePath.
+	LiveStatus func() (ASRInfo, string, string)
 }
 
 // ASRInfo is the resolved ASR backend capability shown on /system.
@@ -58,18 +62,19 @@ type ASRInfo struct {
 
 // API is the HTTP transport.
 type API struct {
-	auth    *auth.Manager
-	limiter *auth.RateLimiter
-	secrets secrets.Store
-	events  *events.Hub
-	version string
-	dataDir string
-	store   *store.DB
-	sched   *scheduler.Scheduler
-	scans   *metaops.ScanManager
-	ffmpeg  string
-	ffprobe string
-	asr     ASRInfo
+	auth       *auth.Manager
+	limiter    *auth.RateLimiter
+	secrets    secrets.Store
+	events     *events.Hub
+	version    string
+	dataDir    string
+	store      *store.DB
+	sched      *scheduler.Scheduler
+	scans      *metaops.ScanManager
+	ffmpeg     string
+	ffprobe    string
+	asr        ASRInfo
+	liveStatus func() (ASRInfo, string, string)
 
 	mu   sync.Mutex // guards cfg
 	cfg  config.Config
@@ -83,20 +88,21 @@ func New(d Deps) *API {
 		save = func(config.Config) error { return nil }
 	}
 	return &API{
-		auth:    d.Auth,
-		limiter: d.Limiter,
-		secrets: d.Secrets,
-		events:  d.Events,
-		version: d.Version,
-		dataDir: d.DataDir,
-		store:   d.Store,
-		sched:   d.Scheduler,
-		scans:   d.Scans,
-		ffmpeg:  d.FFmpegPath,
-		ffprobe: d.FFprobePath,
-		asr:     d.ASR,
-		cfg:     d.Config,
-		save:    save,
+		auth:       d.Auth,
+		limiter:    d.Limiter,
+		secrets:    d.Secrets,
+		events:     d.Events,
+		version:    d.Version,
+		dataDir:    d.DataDir,
+		store:      d.Store,
+		sched:      d.Scheduler,
+		scans:      d.Scans,
+		ffmpeg:     d.FFmpegPath,
+		ffprobe:    d.FFprobePath,
+		asr:        d.ASR,
+		liveStatus: d.LiveStatus,
+		cfg:        d.Config,
+		save:       save,
 	}
 }
 

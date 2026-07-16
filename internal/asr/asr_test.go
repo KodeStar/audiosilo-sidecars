@@ -27,42 +27,61 @@ func writeScript(t *testing.T, path, content string) string {
 	return path
 }
 
-// fakeMLXChain writes a fake python3 that, on `-m venv DIR`, installs a fake pip
-// that installs a fake mlx_whisper that emits an openai-format raw JSON (with a
-// NaN, exercising the downstream sanitize). It prepends the python3's dir to PATH.
-func fakeMLXChain(t *testing.T) {
-	t.Helper()
-	base := t.TempDir()
-	mlxSrc := writeScript(t, filepath.Join(base, "mlx_whisper.src"), `#!/bin/sh
-OUTDIR=""
-AUDIO=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --output-dir) OUTDIR="$2"; shift 2;;
-    --model|--language|--output-format|--word-timestamps|--verbose|--initial-prompt) shift 2;;
-    -*) shift;;
-    *) AUDIO="$1"; shift;;
-  esac
-done
-STEM=$(basename "$AUDIO"); STEM=${STEM%.*}
-mkdir -p "$OUTDIR"
-printf '{"text":" fake","language":"en","segments":[{"id":0,"start":0,"end":1,"text":" fake","avg_logprob":NaN,"words":[]}]}\n' > "$OUTDIR/$STEM.json"
-`)
-	pipSrc := writeScript(t, filepath.Join(base, "pip.src"), fmt.Sprintf(`#!/bin/sh
-cp %q "$(dirname "$0")/mlx_whisper"
-chmod +x "$(dirname "$0")/mlx_whisper"
-`, mlxSrc))
-	pathDir := filepath.Join(base, "bin")
-	writeScript(t, filepath.Join(pathDir, "python3"), fmt.Sprintf(`#!/bin/sh
+// fakePython is a single fake python interpreter used for the whole mlx chain. It
+// handles the exact invocations the backend now makes THROUGH the python binary
+// (never a console script - see mlxwhisper.go): `--version`; `-m venv DIR` (copies
+// itself to DIR/bin/python so the venv's python is this same fake); `-m pip install
+// ...` (creates a stub mlx_whisper console script beside itself so EnsureReady's
+// presence check passes); and `-m mlx_whisper.cli ...` (emits an openai-format raw
+// JSON with a NaN, exercising the downstream sanitize, at --output-dir). The venv
+// lives under a data dir whose path may contain a space, so this must never rely on
+// an unquoted shebang.
+const fakePython = `#!/bin/sh
 if [ "$1" = "--version" ]; then echo "Python 3.99.0 (fake)"; exit 0; fi
-if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
-  mkdir -p "$3/bin"
-  cp %q "$3/bin/pip"
-  chmod +x "$3/bin/pip"
-  exit 0
+if [ "$1" = "-m" ]; then
+  MOD="$2"; shift 2
+  case "$MOD" in
+    venv)
+      DIR="$1"
+      mkdir -p "$DIR/bin"
+      cp "$0" "$DIR/bin/python"
+      chmod +x "$DIR/bin/python"
+      exit 0
+      ;;
+    pip)
+      SELFDIR=$(dirname "$0")
+      printf '#!/bin/sh\nexit 0\n' > "$SELFDIR/mlx_whisper"
+      chmod +x "$SELFDIR/mlx_whisper"
+      exit 0
+      ;;
+    mlx_whisper.cli)
+      OUTDIR=""
+      AUDIO=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --output-dir) OUTDIR="$2"; shift 2;;
+          --model|--language|--output-format|--word-timestamps|--verbose|--initial-prompt) shift 2;;
+          -*) shift;;
+          *) AUDIO="$1"; shift;;
+        esac
+      done
+      STEM=$(basename "$AUDIO"); STEM=${STEM%.*}
+      mkdir -p "$OUTDIR"
+      printf '{"text":" fake","language":"en","segments":[{"id":0,"start":0,"end":1,"text":" fake","avg_logprob":NaN,"words":[]}]}\n' > "$OUTDIR/$STEM.json"
+      exit 0
+      ;;
+  esac
 fi
 exit 1
-`, pipSrc))
+`
+
+// fakeMLXChain puts the fakePython interpreter on PATH as python3, so EnsureReady
+// builds a venv (whose bin/python is this same fake) and Transcribe drives it via
+// `python -m mlx_whisper.cli`.
+func fakeMLXChain(t *testing.T) {
+	t.Helper()
+	pathDir := filepath.Join(t.TempDir(), "bin")
+	writeScript(t, filepath.Join(pathDir, "python3"), fakePython)
 	t.Setenv("PATH", pathDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
@@ -134,6 +153,41 @@ func TestMLXEnsureReadyRequiresPython(t *testing.T) {
 	}
 }
 
+// TestMLXVenvInvocationWithSpaceInPath proves the whole venv flow survives a <data>
+// dir whose path contains a space - the reason the backend invokes python directly
+// instead of the console scripts (an unquoted console-script shebang breaks on a
+// spaced interpreter path). It runs EnsureReady then Transcribe under such a path
+// and asserts the raw output lands. darwin/arm64-gated like the other mlx tests
+// (EnsureReady guards on the platform); the exec chain itself is the fakePython.
+func TestMLXVenvInvocationWithSpaceInPath(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("mlx-whisper backend is gated to darwin/arm64")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fakes are unix-only")
+	}
+	fakeMLXChain(t)
+	dataDir := filepath.Join(t.TempDir(), "data dir with space")
+	if err := os.MkdirAll(dataDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	b := newMLXWhisper(SelectConfig{DataDir: dataDir, Log: discardLogger()})
+	if err := b.EnsureReady(context.Background(), dataDir); err != nil {
+		t.Fatalf("EnsureReady under spaced path: %v", err)
+	}
+	outDir := filepath.Join(dataDir, "raw")
+	audio := filepath.Join(dataDir, "ch003.flac")
+	if err := os.WriteFile(audio, []byte("flac"), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+	if err := b.Transcribe(context.Background(), Job{Audio: audio, OutDir: outDir, Chapter: 3, Language: "en"}); err != nil {
+		t.Fatalf("Transcribe under spaced path: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outDir, "ch003.json")); err != nil {
+		t.Errorf("raw output ch003.json missing under spaced path: %v", err)
+	}
+}
+
 // fakeWhisperCLI writes a fake whisper-cli that emits a whisper.cpp -ojf raw JSON
 // at the -of prefix, and returns its path.
 func fakeWhisperCLI(t *testing.T) string {
@@ -166,9 +220,16 @@ func TestMLXEnsurePinnedVersion(t *testing.T) {
 		dataDir := t.TempDir()
 		b := newMLXWhisper(SelectConfig{DataDir: dataDir, Log: discardLogger()})
 		invocations := filepath.Join(dataDir, "pip-invocations")
-		// A fake pip that records that it ran (and its args) into a sentinel file.
-		writeScript(t, b.venvBin(dataDir, "pip"), fmt.Sprintf(`#!/bin/sh
-echo "$@" >> %q
+		// A fake venv python that records a `-m pip install ...` invocation (and its
+		// args) into a sentinel file - reinstall now runs `python -m pip`, not the
+		// pip console script.
+		writeScript(t, b.venvBin(dataDir, "python"), fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then
+  shift 2
+  echo "$@" >> %q
+  exit 0
+fi
+exit 1
 `, invocations))
 		return b, dataDir, invocations
 	}

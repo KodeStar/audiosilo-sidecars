@@ -24,12 +24,23 @@ export interface ToolsInfo {
   ffprobe: string;
 }
 
+// Resolved speech-recognition backend capability (mirrors the Go /system `asr`
+// block). Read-only diagnostic info: whether ASR will run and on what device.
+export interface AsrInfo {
+  backend: string;
+  available: boolean;
+  device: string;
+  version: string;
+  detail: string;
+}
+
 export interface SystemInfo {
   version: string;
   data_dir: string;
   listen: string;
   tabs: SystemTab[];
   tools: ToolsInfo;
+  asr: AsrInfo;
   // Daemon-total on-disk scratch (sum of every book's work dir), the disk gauge.
   scratch_bytes: number;
 }

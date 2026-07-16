@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { ApiClient } from '@/lib/apiClient';
 import { ApiError } from '@/lib/apiClient';
-import type { SecretsPresence, Settings, ToolsInfo } from '@/api/types';
+import type { AsrInfo, SecretsPresence, Settings, ToolsInfo } from '@/api/types';
 import { ChangePasswordForm } from './settings/ChangePasswordForm';
 import { SecretRow } from './settings/SecretRow';
 
@@ -18,6 +18,7 @@ const SECRET_FIELDS: { key: keyof SecretsPresence; label: string }[] = [
 export function SettingsPanel({ client }: SettingsPanelProps) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [tools, setTools] = useState<ToolsInfo | null>(null);
+  const [asr, setAsr] = useState<AsrInfo | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -33,14 +34,17 @@ export function SettingsPanel({ client }: SettingsPanelProps) {
     }
   }, [client]);
 
-  // The resolved media-tool paths live on /system (read-only diagnostics), so
-  // fetch them once on mount alongside the settings load.
+  // The resolved media-tool paths and ASR capability live on /system (read-only
+  // diagnostics), so fetch them once on mount alongside the settings load.
   useEffect(() => {
     let cancelled = false;
     client
       .system()
       .then((info) => {
-        if (!cancelled) setTools(info.tools);
+        if (!cancelled) {
+          setTools(info.tools);
+          setAsr(info.asr);
+        }
       })
       .catch(() => {
         // A tools read failure is non-fatal; the block simply shows nothing.
@@ -96,6 +100,7 @@ export function SettingsPanel({ client }: SettingsPanelProps) {
         <dl className="grid grid-cols-[max-content_1fr] items-center gap-x-6 gap-y-2 text-sm">
           <ToolRow label="ffmpeg" path={tools?.ffmpeg} />
           <ToolRow label="ffprobe" path={tools?.ffprobe} />
+          {asr && <AsrRow asr={asr} />}
         </dl>
       </Card>
 
@@ -150,6 +155,23 @@ function ToolRow({ label, path }: { label: string; path?: string }) {
       <dd className={path ? 'break-all font-mono text-body' : 'text-sm text-dim'}>
         {path ? path : 'Not found'}
       </dd>
+    </>
+  );
+}
+
+// AsrRow shows the resolved speech-recognition backend and, when it will run,
+// the detected device; when unavailable it shows the muted reason detail.
+function AsrRow({ asr }: { asr: AsrInfo }) {
+  return (
+    <>
+      <dt className="text-dim">ASR</dt>
+      {asr.available ? (
+        <dd className="break-all font-mono text-body">
+          {asr.device ? `${asr.backend} (${asr.device})` : asr.backend}
+        </dd>
+      ) : (
+        <dd className="text-sm text-dim">{asr.detail || 'Not available'}</dd>
+      )}
     </>
   );
 }

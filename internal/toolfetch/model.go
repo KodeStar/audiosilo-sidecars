@@ -2,6 +2,7 @@ package toolfetch
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,6 +18,17 @@ import (
 // var so tests can shrink it. Model files are far larger than the tool binaries,
 // so they use their own cap rather than maxToolBytes.
 var maxModelBytes int64 = 5 << 30 // 5 GiB
+
+// modelMeta is the <model>.meta sidecar written after a completed download. It lets
+// a cache-hit check verify the cached file is byte-for-byte the size we fetched,
+// catching a truncated/corrupted cache that a bare floor check would trust forever.
+type modelMeta struct {
+	Size int64  `json:"size"`
+	URL  string `json:"url"`
+}
+
+// metaPath returns the sidecar path for a given model destination.
+func metaPath(destPath string) string { return destPath + ".meta" }
 
 // LocateBinary resolves an external binary WITHOUT downloading it, using the same
 // order as the ffmpeg/ffprobe resolution: an explicit path/name (honored exactly),
@@ -43,8 +55,20 @@ func EnsureModel(ctx context.Context, url, destPath string, minBytes int64, log 
 	if !strings.HasPrefix(strings.ToLower(url), "https://") {
 		return "", fmt.Errorf("model url must be https: %q", url)
 	}
-	if info, err := os.Stat(destPath); err == nil && !info.IsDir() && info.Size() >= minBytes {
-		return destPath, nil // already cached and plausibly whole
+	if info, err := os.Stat(destPath); err == nil && !info.IsDir() {
+		if meta, ok := readMeta(metaPath(destPath)); ok {
+			// A sidecar exists: require an exact size match. A truncated/corrupted
+			// cache fails here and re-downloads rather than being trusted forever.
+			if info.Size() == meta.Size {
+				return destPath, nil // cached and byte-for-byte the size we fetched
+			}
+			log.Warn("cached ASR model size mismatch; re-downloading",
+				"path", destPath, "have", info.Size(), "want", meta.Size)
+		} else if info.Size() >= minBytes {
+			// Legacy fallback: no sidecar (downloaded before this change), so trust
+			// the size floor as before.
+			return destPath, nil
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(destPath), 0o750); err != nil {
 		return "", err
@@ -53,8 +77,53 @@ func EnsureModel(ctx context.Context, url, destPath string, minBytes int64, log 
 	if err := downloadModel(ctx, url, destPath, minBytes, log); err != nil {
 		return "", err
 	}
+	if err := writeMeta(metaPath(destPath), destPath, url); err != nil {
+		return "", err
+	}
 	log.Info("ASR model ready", "path", destPath)
 	return destPath, nil
+}
+
+// readMeta reads and parses a model sidecar. It returns ok=false when the sidecar
+// is absent or unparseable, so the caller falls back to the legacy floor check.
+func readMeta(path string) (modelMeta, bool) {
+	data, err := os.ReadFile(path) //nolint:gosec // path is the caller's model dest + ".meta", not user input
+	if err != nil {
+		return modelMeta{}, false
+	}
+	var m modelMeta
+	if err := json.Unmarshal(data, &m); err != nil {
+		return modelMeta{}, false
+	}
+	return m, true
+}
+
+// writeMeta stats the freshly-downloaded destPath for its true byte count and writes
+// the sidecar (temp + rename for cleanliness). A partial/corrupt sidecar only fails a
+// later equality check and forces a safe re-download, so it is not correctness-critical.
+func writeMeta(path, destPath, url string) error {
+	info, err := os.Stat(destPath)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(modelMeta{Size: info.Size(), URL: url})
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".meta-"+filepath.Base(path)+"-")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }() // no-op once renamed
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // progressStep is how much must download between progress log lines (~100 MiB), so

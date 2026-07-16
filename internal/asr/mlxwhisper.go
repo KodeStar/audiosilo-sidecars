@@ -22,14 +22,30 @@ const mlxVenvDir = "mlx-venv"
 // mlxWhisperVersion is the pinned mlx-whisper release (the validated version).
 const mlxWhisperVersion = "0.4.3"
 
+// mlxWhisperModule is the module the venv's python runs to drive the mlx-whisper
+// CLI (`python -m mlxWhisperModule ...`). It is the module half of the
+// `mlx_whisper` console-script entry point (`mlx_whisper.cli:main`, verified for
+// mlx-whisper==0.4.3); `python -m mlx_whisper` alone does not work because the
+// package ships no __main__. Running via python avoids the console script's
+// unquoted-shebang breakage when <data> holds a space.
+const mlxWhisperModule = "mlx_whisper.cli"
+
 // versionMarkerName is the file inside the venv recording which mlxWhisperVersion
 // was installed, so a later run can detect a pin change and reinstall in place.
 const versionMarkerName = ".asr-version"
 
 // mlxWhisper is the Apple-Silicon ASR backend. It manages a pinned Python venv and
-// invokes the venv's mlx_whisper console script; the model downloads itself from
-// Hugging Face on first transcription (mlx-whisper handles that), so EnsureReady
-// only has to build the venv.
+// invokes mlx-whisper through the venv's python BINARY (never the generated console
+// scripts): a console script's shebang embeds the interpreter path unquoted, so it
+// fails when <data> contains a space, whereas invoking python directly with
+// `-m pip` / `-m mlx_whisper.cli` dereferences no shebang. The model downloads
+// itself from Hugging Face on first transcription (mlx-whisper handles that), so
+// EnsureReady only has to build the venv.
+//
+// Verified empirically on darwin/arm64 with mlx-whisper==0.4.3: the `mlx_whisper`
+// console-script entry point is `mlx_whisper.cli:main`; `python -m mlx_whisper`
+// fails (the package ships no __main__), while `python -m mlx_whisper.cli` runs the
+// CLI - hence mlxWhisperModule below.
 type mlxWhisper struct {
 	model    string
 	language string
@@ -104,9 +120,9 @@ func (m *mlxWhisper) EnsureReady(ctx context.Context, dataDir string) error {
 	if out, err := runTool(ctx, 5*time.Minute, py, "-m", "venv", venv); err != nil {
 		return fmt.Errorf("create venv: %w: %s", err, out)
 	}
-	pip := m.venvBin(dataDir, "pip")
+	python := m.venvBin(dataDir, "python")
 	m.log.Info("mlx-whisper: installing mlx-whisper into the venv (one time)", "version", mlxWhisperVersion)
-	if out, err := runTool(ctx, 15*time.Minute, pip, "install", "mlx-whisper=="+mlxWhisperVersion); err != nil {
+	if out, err := runTool(ctx, 15*time.Minute, python, "-m", "pip", "install", "mlx-whisper=="+mlxWhisperVersion); err != nil {
 		return fmt.Errorf("pip install mlx-whisper: %w: %s", err, out)
 	}
 	if !fsutil.IsFile(whisper) {
@@ -128,9 +144,9 @@ func (m *mlxWhisper) ensurePinnedVersion(ctx context.Context, dataDir string) er
 	if m.readVersionMarker(dataDir) == mlxWhisperVersion {
 		return nil
 	}
-	pip := m.venvBin(dataDir, "pip")
+	python := m.venvBin(dataDir, "python")
 	m.log.Info("mlx-whisper: pinned version changed; reinstalling in venv", "version", mlxWhisperVersion)
-	if out, err := runTool(ctx, 15*time.Minute, pip, "install", "mlx-whisper=="+mlxWhisperVersion); err != nil {
+	if out, err := runTool(ctx, 15*time.Minute, python, "-m", "pip", "install", "mlx-whisper=="+mlxWhisperVersion); err != nil {
 		return fmt.Errorf("pip install mlx-whisper: %w: %s", err, out)
 	}
 	return m.writeVersionMarker(dataDir)
@@ -156,14 +172,16 @@ func (m *mlxWhisper) writeVersionMarker(dataDir string) error {
 	return fsutil.WriteFileAtomic(m.versionMarkerPath(dataDir), []byte(mlxWhisperVersion+"\n"), 0o644)
 }
 
-// Transcribe runs one chapter FLAC through the venv's mlx_whisper, writing raw
-// JSON (with word timestamps) into job.OutDir as <flac-stem>.json. The initial
-// prompt is passed only when non-empty (verified spellings), matching
-// audio_extract.py - a seeded guess makes a wrong spelling recur.
+// Transcribe runs one chapter FLAC through mlx-whisper via the venv's python
+// binary (`python -m mlx_whisper.cli ...`, not the console script - see the type
+// doc), writing raw JSON (with word timestamps) into job.OutDir as
+// <flac-stem>.json. The initial prompt is passed only when non-empty (verified
+// spellings), matching audio_extract.py - a seeded guess makes a wrong spelling
+// recur.
 func (m *mlxWhisper) Transcribe(ctx context.Context, job Job) error {
-	whisper := m.venvBin(m.dataDir, "mlx_whisper")
-	if !fsutil.IsFile(whisper) {
-		return fmt.Errorf("mlx-whisper venv not provisioned (%s missing); run EnsureReady", whisper)
+	python := m.venvBin(m.dataDir, "python")
+	if !fsutil.IsFile(python) {
+		return fmt.Errorf("mlx-whisper venv not provisioned (%s missing); run EnsureReady", python)
 	}
 	lang := job.Language
 	if lang == "" {
@@ -173,6 +191,7 @@ func (m *mlxWhisper) Transcribe(ctx context.Context, job Job) error {
 		return err
 	}
 	args := []string{
+		"-m", mlxWhisperModule,
 		job.Audio,
 		"--model", m.model,
 		"--language", lang,
@@ -184,7 +203,7 @@ func (m *mlxWhisper) Transcribe(ctx context.Context, job Job) error {
 	if strings.TrimSpace(job.InitialPrompt) != "" {
 		args = append(args, "--initial-prompt", job.InitialPrompt)
 	}
-	if out, err := runTool(ctx, 2*time.Hour, whisper, args...); err != nil {
+	if out, err := runTool(ctx, 2*time.Hour, python, args...); err != nil {
 		return fmt.Errorf("mlx_whisper chapter %d: %w: %s", job.Chapter, err, out)
 	}
 	return nil
@@ -207,8 +226,8 @@ func pythonVersion(py string) string {
 func runTool(ctx context.Context, timeout time.Duration, name string, args ...string) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	// name is a resolved tool path (the venv's mlx_whisper or whisper-cli) and args
-	// are argv-only (no shell), so there is no injection surface here.
+	// name is a resolved tool path (the venv's python or whisper-cli) and args are
+	// argv-only (no shell), so there is no injection surface here.
 	cmd := exec.CommandContext(cctx, name, args...) //nolint:gosec // resolved tool path + argv-only
 	var buf bytes.Buffer
 	cmd.Stdout = &buf

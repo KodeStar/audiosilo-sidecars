@@ -15,11 +15,16 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/asr"
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
@@ -28,6 +33,7 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/scratch"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
+	"github.com/kodestar/audiosilo-sidecars/internal/toolfetch"
 	"github.com/kodestar/audiosilo-sidecars/internal/transcript"
 )
 
@@ -41,28 +47,143 @@ type ASRSetup struct {
 	Language string
 }
 
+// ToolConfig carries the explicit ffmpeg/ffprobe config paths so the executor can
+// re-resolve a tool LOCALLY after startup (an operator who named a binary meant
+// that one). Empty fields fall back to the beside-the-binary / $PATH lookup.
+type ToolConfig struct {
+	FFmpegPath  string
+	FFprobePath string
+}
+
+// Config configures a composite Executor. FFmpeg/FFprobe are the tool paths
+// resolved at startup ("" when unresolved); Tools carries the explicit config
+// paths honored on a later re-resolution. ASR is the backend chosen at startup and
+// ASRSelect lets a stage re-run asr.Select when that backend was unavailable.
+type Config struct {
+	DB        *store.DB
+	FFmpeg    string
+	FFprobe   string
+	Tools     ToolConfig
+	DataDir   string
+	ASR       ASRSetup
+	ASRSelect asr.SelectConfig
+	Log       *slog.Logger
+	Fallback  scheduler.Executor
+}
+
 // Executor is the composite stage executor. ffmpeg/ffprobe are the resolved tool
 // paths ("" when unavailable, in which case the audio stages PARK their book
 // needs_attention with a clear, human-fixable message while the rest of the daemon
 // keeps working - a missing tool is a startup precondition a person can fix and
-// retry, not a hard failure). dataDir is the daemon
-// data dir the ASR backend derives its venv/model cache from. fallback runs every
-// stage the real executors don't yet implement. db is used to account a book's
-// scratch size once a stage has written durable artifacts.
+// retry, not a hard failure). Because a tool or ASR backend can appear AFTER
+// startup (the operator installs it, then hits Retry), the asr/inspect/split stages
+// lazily re-detect on entry under mu; Lane A (cap 1) makes ASR contention trivial,
+// but Lane C (cap 2) can re-resolve tools concurrently, so mu guards the mutable
+// ffmpeg/ffprobe/asr fields. dataDir is the daemon data dir the ASR backend derives
+// its venv/model cache from. fallback runs every stage the real executors don't yet
+// implement. db is used to account a book's scratch size once a stage has written
+// durable artifacts.
 type Executor struct {
-	db       *store.DB
-	ffmpeg   string
-	ffprobe  string
-	dataDir  string
-	asr      ASRSetup
-	fallback scheduler.Executor
+	db *store.DB
+
+	mu      sync.Mutex // guards ffmpeg, ffprobe, asr
+	ffmpeg  string
+	ffprobe string
+	asr     ASRSetup
+
+	ffmpegCfg  string
+	ffprobeCfg string
+	dataDir    string
+	asrSelect  asr.SelectConfig
+	log        *slog.Logger
+	fallback   scheduler.Executor
+
+	// redetectASR re-selects an ASR backend when the frozen one is unavailable. It is
+	// a field so a test can inject a scripted result; NewExecutor sets it to
+	// defaultRedetectASR (a real asr.Select).
+	redetectASR func(context.Context) (asr.Backend, asr.Capability, string)
 }
 
-// NewExecutor builds a composite executor over the resolved tool paths and ASR
-// backend, delegating unimplemented stages to fallback (the stub executor). db may
-// be nil in tests that don't assert scratch accounting.
-func NewExecutor(db *store.DB, ffmpeg, ffprobe, dataDir string, asrSetup ASRSetup, fallback scheduler.Executor) *Executor {
-	return &Executor{db: db, ffmpeg: ffmpeg, ffprobe: ffprobe, dataDir: dataDir, asr: asrSetup, fallback: fallback}
+// NewExecutor builds a composite executor from cfg, delegating unimplemented stages
+// to cfg.Fallback (the stub executor). cfg.DB may be nil in tests that don't assert
+// scratch accounting; cfg.Log nil discards warnings.
+func NewExecutor(cfg Config) *Executor {
+	log := cfg.Log
+	if log == nil {
+		log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	e := &Executor{
+		db:         cfg.DB,
+		ffmpeg:     cfg.FFmpeg,
+		ffprobe:    cfg.FFprobe,
+		asr:        cfg.ASR,
+		ffmpegCfg:  cfg.Tools.FFmpegPath,
+		ffprobeCfg: cfg.Tools.FFprobePath,
+		dataDir:    cfg.DataDir,
+		asrSelect:  cfg.ASRSelect,
+		log:        log,
+		fallback:   cfg.Fallback,
+	}
+	e.redetectASR = e.defaultRedetectASR
+	return e
+}
+
+// ASRCapability returns the executor's current ASR capability (which a stage may
+// have re-detected after a retry). Safe for concurrent use.
+func (e *Executor) ASRCapability() asr.Capability {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.asr.Cap
+}
+
+// ToolPaths returns the executor's current resolved media-tool paths (which a stage
+// may have re-detected after a retry). Safe for concurrent use.
+func (e *Executor) ToolPaths() (ffmpeg, ffprobe string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.ffmpeg, e.ffprobe
+}
+
+// ensureASR re-selects a backend when the frozen one is unavailable, adopting a
+// now-available result for this and future runs. Detect is cheap (PATH/stat).
+func (e *Executor) ensureASR(ctx context.Context) ASRSetup {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.asr.Backend != nil && e.asr.Cap.Available {
+		return e.asr
+	}
+	if b, cap, model := e.redetectASR(ctx); b != nil && cap.Available {
+		e.asr.Backend, e.asr.Cap, e.asr.Model = b, cap, model
+	}
+	return e.asr
+}
+
+// defaultRedetectASR re-runs asr.Select and reports a usable backend, or nil when
+// none is available. It is the production redetectASR.
+func (e *Executor) defaultRedetectASR(ctx context.Context) (asr.Backend, asr.Capability, string) {
+	b, cap, err := asr.Select(ctx, e.asrSelect)
+	if err != nil || b == nil {
+		return nil, asr.Capability{}, ""
+	}
+	model := e.asrSelect.Model
+	if model == "" {
+		model = asr.DefaultModelFor(cap.Backend)
+	}
+	return b, cap, model
+}
+
+// ensureTools re-resolves any unresolved media tool LOCALLY (explicit config path
+// -> beside the binary -> PATH; no auto-download), adopting a now-present tool.
+func (e *Executor) ensureTools() (ffmpeg, ffprobe string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.ffmpeg == "" {
+		e.ffmpeg = toolfetch.LocateBinary("ffmpeg", e.ffmpegCfg)
+	}
+	if e.ffprobe == "" {
+		e.ffprobe = toolfetch.LocateBinary("ffprobe", e.ffprobeCfg)
+	}
+	return e.ffmpeg, e.ffprobe
 }
 
 // Execute routes a stage to its implementation. Inspecting, splitting, asr, and
@@ -100,25 +221,36 @@ const MarkersNormalizingMsg = "chapter markers need manual mapping - automatic n
 // failure. Exported so a test (and the UI) can assert/label it exactly.
 const MediaToolsUnavailableMsg = "media tools unavailable: ffmpeg/ffprobe not found - install them or enable auto-download, then retry"
 
+// ManifestChangedMsg parks a book whose manifest fingerprint no longer matches the
+// one recorded when transcription began - the existing raw transcripts belong to a
+// different edition and must not be silently reused. Exported so tests/UI can assert it.
+const ManifestChangedMsg = "source audio or chapter layout changed since transcription - the existing transcripts belong to a different edition; delete this book and re-enqueue to re-transcribe"
+
 // asrInfoName is the provenance sidecar the asr stage writes (backend/model/
-// language) and the sanitize stage reads to stamp normalized transcripts.
+// language + the manifest fingerprint and any accepted-empty chapters) and the
+// sanitize stage reads to stamp normalized transcripts.
 const asrInfoName = "asr.json"
 
-// asrProvenance is the persisted backend/model/language the asr stage used.
+// asrProvenance is the persisted backend/model/language the asr stage used, plus
+// the manifest fingerprint that gates a resume against a changed edition and the
+// chapters an ASR run accepted as legitimately empty.
 type asrProvenance struct {
-	Backend  string `json:"backend"`
-	Model    string `json:"model"`
-	Language string `json:"language"`
+	Backend       string `json:"backend"`
+	Model         string `json:"model"`
+	Language      string `json:"language"`
+	ManifestSHA   string `json:"manifest_sha,omitempty"`
+	EmptyChapters []int  `json:"empty_chapters,omitempty"`
 }
 
 // inspect probes the book's source audio, writes probe.json + manifest.json, and
 // records whether the chapter markers are contiguous (drives the
 // markers_normalizing skip). It writes the stage sentinel as its final action.
 func (e *Executor) inspect(ctx context.Context, book store.Book) (scheduler.StageResult, error) {
-	if e.ffprobe == "" {
+	_, ffprobe := e.ensureTools()
+	if ffprobe == "" {
 		return scheduler.StageResult{}, scheduler.Park(MediaToolsUnavailableMsg)
 	}
-	manifest, contiguous, err := audio.Inspect(ctx, book.SourcePath, book.WorkDir, e.ffprobe)
+	manifest, contiguous, err := audio.Inspect(ctx, book.SourcePath, book.WorkDir, ffprobe)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("inspect: %w", err)
 	}
@@ -140,14 +272,15 @@ func (e *Executor) inspect(ctx context.Context, book store.Book) (scheduler.Stag
 // split converts each manifest chapter into a mono/16 kHz FLAC, reporting progress
 // per chapter, then writes the stage sentinel.
 func (e *Executor) split(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
-	if e.ffmpeg == "" {
+	ffmpeg, _ := e.ensureTools()
+	if ffmpeg == "" {
 		return scheduler.StageResult{}, scheduler.Park(MediaToolsUnavailableMsg)
 	}
 	manifest, err := audio.ReadManifest(book.WorkDir)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("split: read manifest (inspect must run first): %w", err)
 	}
-	if err := audio.Split(ctx, manifest, book.WorkDir, e.ffmpeg, func(done, total int) {
+	if err := audio.Split(ctx, manifest, book.WorkDir, ffmpeg, func(done, total int) {
 		if report != nil {
 			report(done, total)
 		}
@@ -175,12 +308,19 @@ func (e *Executor) split(ctx context.Context, book store.Book, report scheduler.
 // chapter at a time here, and the scheduler's capacity-1 ASR lane guarantees only
 // one book transcribes at a time (Metal-contention constraint). Normalization is a
 // separate stage (sanitizing) so the raw layer stays untouched.
+//
+// It re-detects the ASR backend on entry (ensureASR) so an operator who installs a
+// backend after startup can Retry into it, and it fingerprints the manifest: if the
+// recorded fingerprint no longer matches (the source/chapter layout changed since
+// transcription began) it parks rather than silently reusing raws for a different
+// edition.
 func (e *Executor) asrStage(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
-	if e.asr.Backend == nil || !e.asr.Cap.Available {
-		// A missing ASR backend is a known-at-startup, human-fixable precondition
-		// (install python3+mlx-whisper or a whisper-cli binary), so park the book
+	setup := e.ensureASR(ctx)
+	if setup.Backend == nil || !setup.Cap.Available {
+		// A missing ASR backend is a known, human-fixable precondition (install
+		// python3+mlx-whisper or a whisper-cli binary), so park the book
 		// needs_attention - which Retry re-admits - rather than hard-fail it.
-		return scheduler.StageResult{}, scheduler.Park("ASR unavailable: " + asrUnavailableDetail(e.asr.Cap) + " - fix this, then retry")
+		return scheduler.StageResult{}, scheduler.Park("ASR unavailable: " + asrUnavailableDetail(setup.Cap) + " - fix this, then retry")
 	}
 	manifest, err := audio.ReadManifest(book.WorkDir)
 	if err != nil {
@@ -189,62 +329,88 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, report schedul
 	if len(manifest.Chapters) == 0 {
 		return scheduler.StageResult{}, fmt.Errorf("asr: manifest has no chapters")
 	}
+	// Guard against reusing raws that belong to a different edition: if the manifest
+	// fingerprint changed since transcription began, park (do NOT delete the raws -
+	// they are 0444 evidence). An empty prior fingerprint (a work dir from before
+	// this guard existed) is treated as unknown, not a mismatch.
+	fp, err := manifestFingerprint(book.WorkDir)
+	if err != nil {
+		return scheduler.StageResult{}, fmt.Errorf("asr: fingerprint manifest: %w", err)
+	}
+	prior := readASRProvenance(book.WorkDir)
+	if prior.ManifestSHA != "" && prior.ManifestSHA != fp {
+		return scheduler.StageResult{}, scheduler.Park(ManifestChangedMsg)
+	}
 	rawDir := filepath.Join(book.WorkDir, transcript.RawDir)
 	if err := os.MkdirAll(rawDir, 0o750); err != nil {
 		return scheduler.StageResult{}, err
 	}
+	// Record the fingerprint at stage START so a crash mid-loop still lets a later
+	// resume detect a subsequent manifest change.
+	if err := writeASRProvenance(book.WorkDir, asrProvenance{
+		Backend: setup.Backend.ID(), Model: setup.Model, Language: setup.Language, ManifestSHA: fp,
+	}); err != nil {
+		return scheduler.StageResult{}, fmt.Errorf("asr: write provenance: %w", err)
+	}
 	// Prepare the backend once per book run (build the venv / fetch the model).
 	// Idempotent + logged inside the backend.
-	if err := e.asr.Backend.EnsureReady(ctx, e.dataDir); err != nil {
+	if err := setup.Backend.EnsureReady(ctx, e.dataDir); err != nil {
 		if ctx.Err() != nil {
 			return scheduler.StageResult{}, ctx.Err()
 		}
-		return scheduler.StageResult{}, fmt.Errorf("asr: prepare %s: %w", e.asr.Backend.ID(), err)
+		return scheduler.StageResult{}, fmt.Errorf("asr: prepare %s: %w", setup.Backend.ID(), err)
 	}
 
 	total := len(manifest.Chapters)
 	if report != nil {
 		report(0, total)
 	}
+	var emptyChapters []int
 	for i, ch := range manifest.Chapters {
 		if err := ctx.Err(); err != nil {
 			return scheduler.StageResult{}, err // clean pause/cancel/shutdown; completed chapters remain
 		}
 		rawPath := filepath.Join(rawDir, transcript.RawName(ch.Chapter))
 		if rawComplete(rawPath) {
+			// Resume: this chapter is already done. Re-freeze it if a crash landed
+			// between the write and the chmod, so the immutability guard always holds.
+			if info, serr := os.Stat(rawPath); serr == nil && info.Mode().Perm() != 0o444 {
+				if err := os.Chmod(rawPath, 0o444); err != nil { //nolint:gosec // immutability guard on a non-secret artifact
+					e.log.Warn("asr: could not re-freeze completed raw", "path", rawPath, "err", err)
+				}
+			}
 			if report != nil {
 				report(i+1, total)
 			}
-			continue // resume: this chapter is already done
+			continue
 		}
 		_ = os.Remove(rawPath) // clear any malformed/partial output before retrying
 		flac := filepath.Join(book.WorkDir, audio.ChaptersDir, audio.ChapterFileName(ch.Chapter))
 		if !fsutil.IsFile(flac) {
 			return scheduler.StageResult{}, fmt.Errorf("asr: chapter %d FLAC missing (%s); split must run first", ch.Chapter, flac)
 		}
-		// InitialPrompt is intentionally empty in M3a: verified spellings come from the
-		// spelling stage (M4). Seeding a guess would make a wrong spelling recur.
-		job := asr.Job{Audio: flac, OutDir: rawDir, Chapter: ch.Chapter, Language: e.asr.Language}
-		if err := e.asr.Backend.Transcribe(ctx, job); err != nil {
-			if ctx.Err() != nil {
-				return scheduler.StageResult{}, ctx.Err() // killed by cancellation, not a real failure
-			}
-			return scheduler.StageResult{}, fmt.Errorf("asr: transcribe chapter %d: %w", ch.Chapter, err)
+		empty, err := e.transcribeChapter(ctx, setup, flac, rawDir, rawPath, ch.Chapter)
+		if err != nil {
+			return scheduler.StageResult{}, err
 		}
-		if !rawComplete(rawPath) {
-			return scheduler.StageResult{}, fmt.Errorf("asr: chapter %d produced an incomplete transcript", ch.Chapter)
+		if empty {
+			emptyChapters = append(emptyChapters, ch.Chapter)
 		}
 		// Freeze the raw output: it is durable audit evidence the sanitize stage only
 		// reads, so make it read-only (immutability guard). It is a non-secret
-		// transcript, so a world-readable read-only mode is intended.
-		_ = os.Chmod(rawPath, 0o444) //nolint:gosec // immutability guard on a non-secret artifact
+		// transcript, so a world-readable read-only mode is intended. A chmod failure
+		// is logged, not fatal - the transcript itself is complete.
+		if err := os.Chmod(rawPath, 0o444); err != nil { //nolint:gosec // immutability guard on a non-secret artifact
+			e.log.Warn("asr: could not freeze raw transcript", "path", rawPath, "err", err)
+		}
 		if report != nil {
 			report(i+1, total)
 		}
 	}
 
 	if err := writeASRProvenance(book.WorkDir, asrProvenance{
-		Backend: e.asr.Backend.ID(), Model: e.asr.Model, Language: e.asr.Language,
+		Backend: setup.Backend.ID(), Model: setup.Model, Language: setup.Language,
+		ManifestSHA: fp, EmptyChapters: emptyChapters,
 	}); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("asr: write provenance: %w", err)
 	}
@@ -252,8 +418,8 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, report schedul
 
 	result := scheduler.StageResult{
 		Metrics: metrics(map[string]any{
-			"backend":       e.asr.Backend.ID(),
-			"model":         e.asr.Model,
+			"backend":       setup.Backend.ID(),
+			"model":         setup.Model,
 			"chapter_count": total,
 		}),
 	}
@@ -261,6 +427,42 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, report schedul
 		return scheduler.StageResult{}, err
 	}
 	return result, nil
+}
+
+// transcribeChapter runs the backend for one chapter and guards against an empty
+// transcript - a known ASR failure mode (a silent/near-silent decode) that still
+// passes the structural Complete check. If the normalized transcript has zero
+// segments it deletes the raw and retries ONCE; if it is still empty it accepts it
+// (returning empty=true so the caller records the chapter in provenance) rather than
+// looping forever. A genuine transcription/completeness error is returned as-is.
+func (e *Executor) transcribeChapter(ctx context.Context, setup ASRSetup, flac, rawDir, rawPath string, chapter int) (empty bool, err error) {
+	// InitialPrompt is intentionally empty in M3a: verified spellings come from the
+	// spelling stage (M4). Seeding a guess would make a wrong spelling recur.
+	for attempt := 0; attempt < 2; attempt++ {
+		job := asr.Job{Audio: flac, OutDir: rawDir, Chapter: chapter, Language: setup.Language}
+		if terr := setup.Backend.Transcribe(ctx, job); terr != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err() // killed by cancellation, not a real failure
+			}
+			return false, fmt.Errorf("asr: transcribe chapter %d: %w", chapter, terr)
+		}
+		if !rawComplete(rawPath) {
+			return false, fmt.Errorf("asr: chapter %d produced an incomplete transcript", chapter)
+		}
+		isEmpty, cerr := rawIsEmpty(rawPath)
+		if cerr != nil {
+			return false, fmt.Errorf("asr: chapter %d check empty transcript: %w", chapter, cerr)
+		}
+		if !isEmpty {
+			return false, nil
+		}
+		if attempt == 0 {
+			_ = os.Remove(rawPath) // one retry - a transient empty decode
+			continue
+		}
+	}
+	e.log.Warn("asr: chapter produced an empty transcript; accepting", "chapter", chapter)
+	return true, nil
 }
 
 // sanitize derives transcripts-json/ (normalized audiosilo-transcript/v1, NaN->null)
@@ -358,7 +560,36 @@ func rawComplete(path string) bool {
 	return transcript.Complete(data)
 }
 
-// writeASRProvenance records the backend/model/language for the sanitize stage.
+// rawIsEmpty reports whether a raw transcript normalizes to zero segments - an empty
+// transcription that still passes the structural Complete check. A normalize error
+// is NOT treated as empty (it is a different, non-empty failure); the caller only
+// uses this to trigger the empty-retry path.
+func rawIsEmpty(path string) (bool, error) {
+	raw, err := os.ReadFile(path) //nolint:gosec // path derives from the book's work dir
+	if err != nil {
+		return false, err
+	}
+	tr, nerr := transcript.Normalize(raw, transcript.Meta{})
+	if nerr != nil {
+		return false, nil
+	}
+	return len(tr.Segments) == 0, nil
+}
+
+// manifestFingerprint returns the hex sha256 of the book's manifest.json bytes. The
+// manifest is written canonically by audio.WriteManifest, so the digest is stable
+// across reads and changes exactly when the inspected source/chapter layout changes.
+func manifestFingerprint(workDir string) (string, error) {
+	raw, err := os.ReadFile(filepath.Join(workDir, audio.ManifestName)) //nolint:gosec // path derives from the book's work dir
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// writeASRProvenance records the backend/model/language (plus fingerprint + empty
+// chapters) for the sanitize stage and the resume guard.
 func writeASRProvenance(workDir string, p asrProvenance) error {
 	out, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {

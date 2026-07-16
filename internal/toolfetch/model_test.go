@@ -54,6 +54,125 @@ func TestEnsureModelDownloadsAndCaches(t *testing.T) {
 	}
 }
 
+func TestEnsureModelSidecarMatchSkipsNetwork(t *testing.T) {
+	body := strings.Repeat("M", 4096)
+	var hits int
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	restore := http.DefaultTransport
+	http.DefaultTransport = srv.Client().Transport
+	defer func() { http.DefaultTransport = restore }()
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "models", "ggml-test.bin")
+	url := srv.URL + "/ggml-test.bin"
+
+	// First call downloads and writes the sidecar.
+	if _, err := EnsureModel(context.Background(), url, dest, int64(len(body)), discard()); err != nil {
+		t.Fatalf("EnsureModel: %v", err)
+	}
+	if _, err := os.Stat(dest + ".meta"); err != nil {
+		t.Fatalf("expected a .meta sidecar after download: %v", err)
+	}
+	// Second call short-circuits on the sidecar's exact-size match: no network.
+	if _, err := EnsureModel(context.Background(), url, dest, int64(len(body)), discard()); err != nil {
+		t.Fatalf("EnsureModel cached: %v", err)
+	}
+	if hits != 1 {
+		t.Errorf("server hits = %d, want 1 (sidecar match should short-circuit)", hits)
+	}
+}
+
+func TestEnsureModelReDownloadsOnSidecarSizeMismatch(t *testing.T) {
+	body := strings.Repeat("M", 4096)
+	var hits int
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	restore := http.DefaultTransport
+	http.DefaultTransport = srv.Client().Transport
+	defer func() { http.DefaultTransport = restore }()
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "models", "ggml-test.bin")
+	url := srv.URL + "/ggml-test.bin"
+
+	if _, err := EnsureModel(context.Background(), url, dest, int64(len(body)), discard()); err != nil {
+		t.Fatalf("EnsureModel: %v", err)
+	}
+	if hits != 1 {
+		t.Fatalf("first call hits = %d, want 1", hits)
+	}
+
+	// Corrupt the cache to a DIFFERENT size than the sidecar records, but still above
+	// the floor - so only the sidecar equality check can catch it.
+	corrupt := strings.Repeat("X", 2048)
+	if len(corrupt) == len(body) {
+		t.Fatal("corrupt body must differ in size from the original")
+	}
+	if err := os.WriteFile(dest, []byte(corrupt), 0o600); err != nil {
+		t.Fatalf("corrupt cache: %v", err)
+	}
+
+	// The sidecar size no longer matches, so EnsureModel re-downloads.
+	if _, err := EnsureModel(context.Background(), url, dest, int64(len(body)), discard()); err != nil {
+		t.Fatalf("EnsureModel re-download: %v", err)
+	}
+	if hits != 2 {
+		t.Errorf("server hits = %d, want 2 (size mismatch should re-download)", hits)
+	}
+	data, err := os.ReadFile(dest)
+	if err != nil || string(data) != body {
+		t.Fatalf("cache not restored: err=%v len=%d", err, len(data))
+	}
+	// And the sidecar again matches the restored file.
+	if _, err := EnsureModel(context.Background(), url, dest, int64(len(body)), discard()); err != nil {
+		t.Fatalf("EnsureModel post-restore: %v", err)
+	}
+	if hits != 2 {
+		t.Errorf("server hits = %d, want 2 (restored cache should match sidecar)", hits)
+	}
+}
+
+func TestEnsureModelLegacyNoSidecarUsesFloor(t *testing.T) {
+	body := strings.Repeat("M", 4096)
+	var hits int
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	restore := http.DefaultTransport
+	http.DefaultTransport = srv.Client().Transport
+	defer func() { http.DefaultTransport = restore }()
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "models", "ggml-legacy.bin")
+	if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Pre-create a big-enough file with NO sidecar (as if downloaded before this change).
+	if err := os.WriteFile(dest, []byte(body), 0o600); err != nil {
+		t.Fatalf("seed legacy cache: %v", err)
+	}
+
+	// Floor is satisfied and no sidecar exists, so it's a cache hit with no network.
+	if _, err := EnsureModel(context.Background(), srv.URL+"/x", dest, int64(len(body)), discard()); err != nil {
+		t.Fatalf("EnsureModel legacy: %v", err)
+	}
+	if hits != 0 {
+		t.Errorf("server hits = %d, want 0 (legacy floor hit should not download)", hits)
+	}
+}
+
 func TestEnsureModelLogsCompletion(t *testing.T) {
 	body := strings.Repeat("M", 8192)
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

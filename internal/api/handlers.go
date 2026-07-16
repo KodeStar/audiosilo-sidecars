@@ -119,13 +119,19 @@ func (a *API) handleSystem(w http.ResponseWriter, r *http.Request) {
 	if a.store != nil {
 		scratchTotal, _ = a.store.SumScratchBytes(r.Context())
 	}
+	// Prefer the executor's live values (a stage may have re-detected an ASR backend
+	// or a media tool after startup); fall back to the boot-time snapshot.
+	asrInfo, ffmpeg, ffprobe := a.asr, a.ffmpeg, a.ffprobe
+	if a.liveStatus != nil {
+		asrInfo, ffmpeg, ffprobe = a.liveStatus()
+	}
 	writeJSON(w, http.StatusOK, systemResponse{
 		Version:      a.version,
 		DataDir:      a.dataDir,
 		Listen:       cfg.Listen,
 		Tabs:         tabs,
-		Tools:        toolsInfo{FFmpeg: a.ffmpeg, FFprobe: a.ffprobe},
-		ASR:          a.asr,
+		Tools:        toolsInfo{FFmpeg: ffmpeg, FFprobe: ffprobe},
+		ASR:          asrInfo,
 		ScratchBytes: scratchTotal,
 	})
 }

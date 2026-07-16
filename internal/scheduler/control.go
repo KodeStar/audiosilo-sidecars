@@ -193,6 +193,21 @@ func (s *Scheduler) PurgeScratch(ctx context.Context, id int64) error {
 			"book_id", id, "work_dir", b.WorkDir, "err", derr)
 		_ = s.db.UpdateScratchBytes(ctx, id, 0)
 	}
+	// Reconcile the purged book WITHOUT waiting for a restart: dropping the split
+	// sentinel above only re-runs the book if it is still AT splitting. A book past
+	// splitting (e.g. failed at asr) would otherwise retry into an empty chapters/
+	// and fail. reconcileBook rewinds it to the earliest completed stage whose
+	// sentinel we just invalidated, so a following Retry re-splits. Terminal (done)
+	// books are left untouched. It runs while the id is still reserved.
+	if !state.IsTerminal(state.State(b.State)) {
+		succeeded, serr := s.db.SucceededStages(ctx, id)
+		if serr != nil {
+			return serr
+		}
+		if rerr := s.reconcileBook(ctx, b, succeeded); rerr != nil {
+			return rerr
+		}
+	}
 	return nil
 }
 

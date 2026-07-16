@@ -416,6 +416,64 @@ func TestEventsReplaysPublished(t *testing.T) {
 	}
 }
 
+// TestSystemUsesLiveStatus asserts that when Deps.LiveStatus is set, /system reports
+// the executor's LIVE ASR capability and resolved tool paths (which a stage may have
+// re-detected after a retry) rather than the boot-time static values.
+func TestSystemUsesLiveStatus(t *testing.T) {
+	mem := auth.NewMemStore()
+	mgr := auth.New(mem)
+	pw, err := mgr.EnsureAdmin()
+	if err != nil {
+		t.Fatalf("EnsureAdmin: %v", err)
+	}
+	a := New(Deps{
+		Auth:    mgr,
+		Limiter: auth.NewRateLimiter(100, 100),
+		Secrets: secrets.NewMemStore(),
+		Events:  events.NewHub(0),
+		Version: "test",
+		DataDir: "/tmp/data",
+		Config:  config.Default(),
+		// Boot-time (static) values the live callback must override.
+		ASR:         ASRInfo{Backend: "boot", Available: false, Device: "cpu"},
+		FFmpegPath:  "/boot/ffmpeg",
+		FFprobePath: "/boot/ffprobe",
+		LiveStatus: func() (ASRInfo, string, string) {
+			return ASRInfo{Backend: "live", Available: true, Device: "metal"}, "/live/ffmpeg", "/live/ffprobe"
+		},
+	})
+	srv := httptest.NewServer(a.Handler())
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Post(srv.URL+"/api/v1/auth/login", "application/json", strings.NewReader(`{"password":"`+pw+`"}`))
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	var lr loginResponse
+	if err := json.NewDecoder(resp.Body).Decode(&lr); err != nil {
+		t.Fatalf("decode login: %v", err)
+	}
+	resp.Body.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/system", nil)
+	req.Header.Set("Authorization", "Bearer "+lr.Token)
+	sysResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("system: %v", err)
+	}
+	defer sysResp.Body.Close()
+	var sys systemResponse
+	if err := json.NewDecoder(sysResp.Body).Decode(&sys); err != nil {
+		t.Fatalf("decode system: %v", err)
+	}
+	if sys.ASR.Backend != "live" || !sys.ASR.Available || sys.ASR.Device != "metal" {
+		t.Errorf("asr = %+v, want the live values (live/available/metal)", sys.ASR)
+	}
+	if sys.Tools.FFmpeg != "/live/ffmpeg" || sys.Tools.FFprobe != "/live/ffprobe" {
+		t.Errorf("tools = %+v, want the live paths", sys.Tools)
+	}
+}
+
 func readAll(t *testing.T, resp *http.Response) string {
 	t.Helper()
 	defer resp.Body.Close()

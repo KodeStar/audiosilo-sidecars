@@ -27,6 +27,13 @@ function system(scratchBytes: number): SystemInfo {
     listen: '127.0.0.1:8090',
     tabs: [],
     tools: { ffmpeg: '/usr/bin/ffmpeg', ffprobe: '/usr/bin/ffprobe' },
+    asr: {
+      backend: 'mlx-whisper',
+      available: true,
+      device: 'metal',
+      version: 'Python 3.12',
+      detail: '',
+    },
     scratch_bytes: scratchBytes,
   };
 }
