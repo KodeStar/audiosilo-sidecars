@@ -57,6 +57,14 @@ on:
 permissions:
   contents: read
 
+# Serialize same-tag dispatches before any runner starts: a duplicate dispatch
+# queues (cancel-in-progress: false - never kill an in-flight release build)
+# instead of paying for the full matrix and only failing at the release job's
+# tag-exists guard, which stays as belt-and-braces.
+concurrency:
+  group: whisper-binaries-${{ inputs.upstream_ref }}-${{ inputs.build_rev }}
+  cancel-in-progress: false
+
 env:
   UPSTREAM_REF: ${{ inputs.upstream_ref }}
   BUILD_REV: ${{ inputs.build_rev }}
@@ -131,11 +139,17 @@ jobs:
         if: matrix.leg == 'linux-amd64-cuda'
         run: |
           # NVIDIA's own apt repo - transparent and pin-free (no third-party
-          # action). cuda-toolkit-12-6 pulls nvcc + cublas/cudart dev packages.
+          # action). Install only what the build needs: nvcc, the cudart/cublas
+          # dev headers+libs, and the tiny profiler-api headers ggml includes.
+          # The cuda-toolkit-12-6 umbrella meta-package would pull nsight, docs
+          # and samples (several GB) for nothing. patchelf lives here because
+          # only this leg uses it (the $ORIGIN RPATH in the bundle step).
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cuda-toolkit-12-6
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-12-6 cuda-cudart-dev-12-6 libcublas-dev-12-6 \
+            cuda-profiler-api-12-6 patchelf
           echo "CUDA_PATH=/usr/local/cuda-12.6" >> "$GITHUB_ENV"
           echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
 
@@ -149,15 +163,14 @@ jobs:
           sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list \
             https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
           sudo apt-get update
-          sudo apt-get install -y vulkan-sdk
+          sudo apt-get install -y --no-install-recommends vulkan-sdk
 
       - name: Install build tooling
         run: |
           sudo apt-get update
-          # patchelf sets the $ORIGIN RPATH on the CUDA binary; the rest are the
-          # baseline C/C++ + CMake toolchain.
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake patchelf
+          # Baseline C/C++ + CMake toolchain (idempotent on images that already
+          # ship them; explicit so an image change can't silently drop a tool).
+          sudo apt-get install -y --no-install-recommends build-essential cmake
 
       - name: Configure
         working-directory: whisper.cpp
@@ -313,8 +326,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: whisper-cli-darwin-arm64-metal.tar.gz
-          path: whisper.cpp/whisper-cli-darwin-arm64-metal.tar.gz
+          name: ${{ env.ASSET }}
+          path: whisper.cpp/${{ env.ASSET }}
           if-no-files-found: error
 
   # ------------------------------------------------------------------------
@@ -384,8 +397,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: whisper-cli-windows-amd64-cpu.zip
-          path: whisper.cpp/whisper-cli-windows-amd64-cpu.zip
+          name: ${{ env.ASSET }}
+          path: whisper.cpp/${{ env.ASSET }}
           if-no-files-found: error
 
   # ------------------------------------------------------------------------
@@ -407,30 +420,32 @@ jobs:
           # so merge-multiple drops them all into dist/ with the contract names.
           merge-multiple: true
 
-      - name: Checksums + inventory
+      - name: Checksums + publish release
         working-directory: dist
-        run: |
-          set -euo pipefail
-          ls -la
-          # Expect exactly the six contract archives before publishing.
-          expected="whisper-cli-darwin-arm64-metal.tar.gz \
-            whisper-cli-linux-amd64-cpu.tar.gz \
-            whisper-cli-linux-arm64-cpu.tar.gz \
-            whisper-cli-linux-amd64-vulkan.tar.gz \
-            whisper-cli-linux-amd64-cuda.tar.gz \
-            whisper-cli-windows-amd64-cpu.zip"
-          for f in $expected; do
-            test -f "$f" || { echo "missing expected asset: $f"; exit 1; }
-          done
-          # sha256sum-format lines ("<hex>  <filename>") over every archive.
-          sha256sum $expected > checksums.txt
-          cat checksums.txt
-
-      - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          ls -la
+          # The six contract archives, named ONCE - the same array drives the
+          # existence check, checksums.txt, and the release upload, so a leg
+          # added to the matrix but missed here fails loudly instead of being
+          # silently unchecksummed or unattached.
+          expected=(
+            whisper-cli-darwin-arm64-metal.tar.gz
+            whisper-cli-linux-amd64-cpu.tar.gz
+            whisper-cli-linux-arm64-cpu.tar.gz
+            whisper-cli-linux-amd64-vulkan.tar.gz
+            whisper-cli-linux-amd64-cuda.tar.gz
+            whisper-cli-windows-amd64-cpu.zip
+          )
+          for f in "${expected[@]}"; do
+            test -f "$f" || { echo "missing expected asset: $f"; exit 1; }
+          done
+          # sha256sum-format lines ("<hex>  <filename>") over every archive.
+          sha256sum "${expected[@]}" > checksums.txt
+          cat checksums.txt
+
           TAG="whisper-cpp-${UPSTREAM_REF}-${BUILD_REV}"
           TITLE="whisper.cpp binaries ${UPSTREAM_REF} (build ${BUILD_REV})"
           # Refuse to clobber an existing published release - a deliberate rebuild
@@ -443,10 +458,5 @@ jobs:
             --title "$TITLE" \
             --notes "whisper.cpp \`whisper-cli\` binaries built from ggml-org/whisper.cpp ${UPSTREAM_REF} (build ${BUILD_REV}). Static builds; flat archives (binary + any bundled runtime libs). Verify with checksums.txt." \
             --latest=false \
-            dist/whisper-cli-darwin-arm64-metal.tar.gz \
-            dist/whisper-cli-linux-amd64-cpu.tar.gz \
-            dist/whisper-cli-linux-arm64-cpu.tar.gz \
-            dist/whisper-cli-linux-amd64-vulkan.tar.gz \
-            dist/whisper-cli-linux-amd64-cuda.tar.gz \
-            dist/whisper-cli-windows-amd64-cpu.zip \
-            dist/checksums.txt
+            "${expected[@]}" \
+            checksums.txt
