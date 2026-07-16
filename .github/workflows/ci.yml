@@ -39,8 +39,10 @@ jobs:
       - name: Test (race)
         run: go test -race ./...
 
+      # golangci-lint-action@v8 installs golangci-lint v2 (required for Go 1.25),
+      # matching audiosilo-server's CI; the v6 action rejects v2 version strings.
       - name: Lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v8
         with:
           version: v2.12.2
 
