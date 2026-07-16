@@ -176,9 +176,25 @@ internal/
             Pause/resume/retry/cancel/delete + PurgeScratch (reclaim chapters/ when
             done/paused/failed). Publishes book.state/stage.progress/queue.stats.
             M2 runs the pipeline composite executor (real inspect/split, stubs beyond).
-  metaops/  meta.audiosilo.app client (coverage/lookup, 1h TTL cache, graceful
-            degrade) + async folder-scan job manager over audiosilo-meta pkg/scan +
-            the library_roots PathAllowed check. stdlib HTTP + the meta module only.
+  metaops/  meta.audiosilo.app client (coverage/lookup, capped 1h TTL caches,
+            graceful degrade) + async folder-scan job manager over audiosilo-meta
+            pkg/scan + the library_roots PathAllowed check. Coverage resolves
+            asin -> isbn -> a fuzzy title-search fallback scored by
+            audiosilo-server's pure-stdlib pkg/match (Coverage carries matched_by
+            "asin"|"isbn"|"search"|"manual" + work_title provenance). Scans STREAM:
+            the manager drives pkg/scan's OnProgress/OnBook hooks, books appear
+            incrementally (identity provisional until done - the corroborated,
+            sorted final list replaces the array), coverage resolves in a bounded
+            pool gated by precomputed identity fingerprints (a stale worker can
+            never clobber a fresh verdict), and List() serves job summaries
+            (running + last 10 finished) so a reloaded UI reattaches. Persisted
+            candidate_overrides (hide / manual work match, keyed by the CANONICAL
+            absolute source_path - scan roots and override paths are resolved via
+            the same helper) are applied at scan time and reflected live on
+            completed jobs via read-time patches; OverrideService owns the
+            validate -> resolve -> persist -> reflect workflow (store injected as
+            a PersistFunc, so metaops still never imports store). Deps: stdlib
+            HTTP + the meta module + audiosilo-server/pkg/match.
   events/   SSE hub: Publish -> monotonic-id fan-out, ring-buffer replay from
             Last-Event-ID, ephemeral heartbeats, slow-subscriber eviction, optional
             durable-sink persister (feeds store.events)
@@ -189,8 +205,15 @@ internal/
   server/   http.Server wiring, graceful shutdown, the startup banner
 web/          the SPA: Vite + React 19 + TS + Tailwind v4 (npm, Node 24); dist/ is embedded
               src/lib/ holds pure, vitest-tested logic (apiClient, candidates, books,
-              pipelineState, recentRoots, useEventStream); src/components/{library,running}/
-              are the Library/Running tab views; components stay thin over src/lib
+              pipelineState, recentRoots, useEventStream, scanStore); src/components/
+              {library,running}/ are the Library/Running tab views; components stay
+              thin over src/lib. The Library tab's scan + selection state lives in
+              scanStore.ts - a module-level external store (useSyncExternalStore)
+              owning the 700ms poll loop, so tab switches (AppShell unmounts
+              panels) and reloads (GET /scans reattach) never lose a running scan;
+              sign-out calls scanStore.reset(). API calls key books by the
+              daemon-computed absolute source_path (NEVER a client-side join);
+              the relative path is display/selection only.
 scripts/build-web.sh   build the SPA + embed it into bin/ (-tags embedui)
 Dockerfile             multi-stage: node build -> go build (embedui) -> debian-slim
                        runtime that apt-installs ffmpeg/ffprobe (so toolfetch never
@@ -334,6 +357,30 @@ Milestones from the workspace plan; each is shippable.
   internal/audio also now sorts multi-file books with audiosilo-meta's exported
   `scan.NaturalLess` (meta PR #33) instead of a private copy - chapter numbers
   spoiler-gate contributed sidecars, so the shared comparator is load-bearing.
+- **Library UX round (done, post-M3b):** the first-real-use feedback batch.
+  Matching quality: coverage now falls back from asin/isbn to a fuzzy
+  title-search against meta.audiosilo.app scored by audiosilo-server's
+  pkg/match, with matched_by/work_title provenance shown in the UI (a tagless,
+  ASIN-less folder book matches by title alone). Scans stream: audiosilo-meta
+  pkg/scan gained OnProgress/OnBook hooks (meta PR #35), so the Library tab
+  shows per-folder progress and incremental candidates. Manual match: a per-row
+  Match modal searches the public meta API (GET /api/v1/meta/search proxy) and
+  persists the pick; Hide/Unhide persists too (candidate_overrides, migration
+  0003, keyed by canonical absolute source_path; "Show hidden (n)" re-shows).
+  The tab-switch bug is fixed at the root: all scan/selection state lives in
+  web scanStore.ts (module-level external store owning the poll loop), with
+  GET /scans powering reload reattach. POST /books candidates + overrides key
+  on the daemon-computed absolute source_path (the old relative-path flow
+  silently broke PathAllowed); books.work_id persists any matched work for
+  later pipeline stages. Side quests: the server module became properly
+  fetchable (server PR #39 - a testdata apostrophe made every version's module
+  zip invalid, so pkg/match is a normal require, no replace directive), and
+  config.yaml's listen key is honored (the --listen flag default no longer
+  clobbers it). Gate verified: full Go + web gates, an API smoke against the
+  live meta service (search-fallback match, hide, manual match, trailing-slash
+  canonicalization), and an 8/8 headless-Chromium drive (login -> scan ->
+  provenance -> tab-switch persistence -> hide/unhide -> match modal -> reload
+  reattach -> process). Done-tab cost columns wait for M5/M6 cost capture.
 - **M4-M8 (planned):** QA/spelling ports (M4), the agent runner (claude +
   codex) with staged context dirs enforcing the invariants, the fact-pass +
   synthesis + audit loop, contribution (intake/PR/local), and packaging

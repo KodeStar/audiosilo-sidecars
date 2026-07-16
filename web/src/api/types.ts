@@ -85,24 +85,39 @@ export interface ChangePasswordBody {
 
 export type ScanStatus = 'running' | 'done' | 'error';
 
+// How a book's identity resolved to a known work. asin/isbn are automatic exact
+// matches; search is an automatic title-search match; manual is a user override.
+// Absent means no match (unknown work).
+export type MatchedBy = 'asin' | 'isbn' | 'search' | 'manual';
+
 export interface ScanProgress {
   phase: string; // "scanning" | "coverage" | "done"
-  done: number;
-  total: number;
+  groups_done: number;
+  groups_total: number;
+  books_found: number;
+  coverage_done: number;
+  coverage_total: number;
 }
 
 // Coverage is the per-book metadata verdict. Known/HasCharacters/HasRecaps are
-// meaningful only when available === true.
+// meaningful only when available === true. matched_by/work_title describe how the
+// identity resolved (set for search/manual matches, so the UI can show provenance).
 export interface Coverage {
   available: boolean;
   known: boolean;
   work_id?: string;
   has_characters: boolean;
   has_recaps: boolean;
+  matched_by?: MatchedBy;
+  work_title?: string;
 }
 
 export interface ScannedBook {
+  // Root-relative folder (display + in-scan selection key).
   path: string;
+  // ABSOLUTE folder - the daemon-computed durable identity every API call keys
+  // on (candidates, overrides). Never derive it by joining paths client-side.
+  source_path: string;
   title: string;
   subtitle?: string;
   authors?: string[];
@@ -117,24 +132,87 @@ export interface ScannedBook {
   // Where each field came from ("tag" | "path" | "filename").
   sources?: Record<string, string>;
   coverage: Coverage;
+  // True when the user has hidden this book from the default candidate list (a
+  // persisted daemon-side override). Excluded from the default view; re-showable.
+  hidden?: boolean;
 }
 
-export interface ScanResult {
-  root: string;
-  books: ScannedBook[];
-}
+// ScanStats is the end-of-scan summary the daemon attaches once status is "done".
+// The exact keys are daemon-owned; we do not render them field-by-field yet.
+export type ScanStats = Record<string, number>;
 
+// ScanJob is the full poll view. books is TOP-LEVEL and grows incrementally while
+// running; identity/coverage fields are provisional until status === "done", when
+// the authoritative list replaces the array (re-render from books, keyed by path).
 export interface ScanJob {
   id: string;
   path: string;
   status: ScanStatus;
   error?: string;
+  started_at?: string;
   progress: ScanProgress;
-  result?: ScanResult;
+  books: ScannedBook[];
+  stats?: ScanStats;
+}
+
+// ScanSummary is a ScanJob without its books - the shape GET /scans returns per
+// job, used to reattach to an in-flight/last scan after a page reload.
+export type ScanSummary = Omit<ScanJob, 'books'>;
+
+export interface ListScansResponse {
+  scans: ScanSummary[];
 }
 
 export interface CreateScanResponse {
   job_id: string;
+}
+
+// --- pipeline: overrides (persisted per-book hide + manual-match state) ---
+
+// Override is the daemon-persisted per-book override: hidden and/or a manual
+// work_id match. work_title is the display label for a manual match. work_id/
+// work_title/updated_at are optional to mirror the Go DTO's omitempty (a hide-only
+// override omits them).
+export interface Override {
+  source_path: string;
+  hidden: boolean;
+  work_id?: string;
+  work_title?: string;
+  updated_at?: string;
+}
+
+// SetOverrideBody is a FULL desired-state upsert (hidden=false + work_id="" clears
+// the override). POST /overrides.
+export interface SetOverrideBody {
+  source_path: string;
+  hidden: boolean;
+  work_id: string;
+}
+
+// SetOverrideResponse echoes the stored override plus the recomputed coverage when
+// a work_id was set (matched_by "manual"); coverage is null otherwise.
+export interface SetOverrideResponse {
+  override: Override;
+  coverage: Coverage | null;
+}
+
+// --- meta search (manual-match lookup against meta.audiosilo.app) ---
+
+export interface MetaSearchSeries {
+  name: string;
+  position: string;
+}
+
+export interface MetaSearchResult {
+  id: string;
+  title: string;
+  authors: string[];
+  series: MetaSearchSeries | null;
+  cover_url: string;
+}
+
+export interface MetaSearchResponse {
+  results: MetaSearchResult[];
 }
 
 // --- pipeline: books ---
@@ -152,6 +230,9 @@ export interface BookCandidate {
   isbn: string;
   coverage?: Coverage;
   sources?: Record<string, string>;
+  // A manual-match work id carried from an override, so the enqueued book keeps
+  // the identity the user picked. Omitted when the book has no manual match.
+  work_id?: string;
 }
 
 export interface CreateBooksRequest {

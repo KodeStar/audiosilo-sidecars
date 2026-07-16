@@ -50,7 +50,8 @@ func newPipelineEnv(t *testing.T, libraryRoots []string) *pipelineEnv {
 
 	hub := events.NewHub(64)
 	sched := scheduler.New(db, hub, scheduler.NewStubExecutor(0, 0), 2, t.TempDir())
-	scans := metaops.NewScanManager(context.Background(), metaops.NewClient(""), "")
+	meta := metaops.NewClient(cfg.Metadata.BaseURL)
+	scans := metaops.NewScanManager(context.Background(), meta, "", storeOverrides(db))
 
 	env := &testEnv{password: pw}
 	env.api = New(Deps{
@@ -63,6 +64,7 @@ func newPipelineEnv(t *testing.T, libraryRoots []string) *pipelineEnv {
 		Store:     db,
 		Scheduler: sched,
 		Scans:     scans,
+		Meta:      meta,
 		Config:    cfg,
 	})
 	env.srv = httptest.NewServer(env.api.Handler())

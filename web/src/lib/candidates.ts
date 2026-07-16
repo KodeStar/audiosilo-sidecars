@@ -2,7 +2,13 @@
 // filtering, coverage-badge derivation, and series-gap detection. Kept free of
 // React so it stays exhaustively unit-testable (components call into it).
 
-import type { BookCandidate, BookCreateResult, Coverage, ScannedBook } from '@/api/types';
+import type {
+  BookCandidate,
+  BookCreateResult,
+  Coverage,
+  ScannedBook,
+  SetOverrideBody,
+} from '@/api/types';
 
 // The two expressive-layer dimensions the tool contributes.
 export type CoverageDimension = 'characters' | 'recaps';
@@ -33,12 +39,25 @@ export function isCovered(book: ScannedBook): boolean {
   return !!c && c.available && c.known && c.has_characters && c.has_recaps;
 }
 
+// manualWorkId returns the manual-match work id for a book, or '' when the book
+// is not manually matched. It is still used for override-payload preservation
+// (never clobber a manual match) and provenance display - distinct from the
+// enqueue's work_id, which carries any resolved match (see toCandidate).
+export function manualWorkId(book: ScannedBook): string {
+  const c = book.coverage;
+  if (c && c.matched_by === 'manual' && c.work_id) return c.work_id;
+  return '';
+}
+
 // toCandidate maps a scanned book to the POST /books candidate shape, carrying
 // the identity/series fields the daemon needs to enqueue it plus the advisory
-// coverage + provenance snapshot from the scan (persisted, not re-derived).
+// coverage + provenance snapshot from the scan (persisted, not re-derived). The
+// resolved work_id is carried through for ANY matched kind (asin/isbn/search/
+// manual) so later pipeline/contribution stages reference the matched work via
+// books.work_id without re-resolving - there is no server-side re-resolution.
 export function toCandidate(book: ScannedBook): BookCandidate {
-  return {
-    source_path: book.path,
+  const candidate: BookCandidate = {
+    source_path: book.source_path,
     title: book.title,
     authors: book.authors ?? [],
     series: book.series ?? '',
@@ -48,16 +67,29 @@ export function toCandidate(book: ScannedBook): BookCandidate {
     coverage: book.coverage,
     sources: book.sources,
   };
+  const c = book.coverage;
+  if (c && c.known && c.work_id) candidate.work_id = c.work_id;
+  return candidate;
 }
 
-// filterCandidates applies the visible-set filters. When excludeCovered is true,
-// books that already have both sidecars are hidden. Order is preserved.
+// filterCandidates applies the visible-set filters. Hidden books are dropped
+// unless includeHidden is set (the "show hidden" toggle). When excludeCovered is
+// true, books that already have both sidecars are dropped. Order is preserved.
 export function filterCandidates(
   books: ScannedBook[],
-  opts: { excludeCovered: boolean },
+  opts: { excludeCovered: boolean; includeHidden?: boolean },
 ): ScannedBook[] {
-  if (!opts.excludeCovered) return books;
-  return books.filter((b) => !isCovered(b));
+  return books.filter((b) => {
+    if (b.hidden && !opts.includeHidden) return false;
+    if (opts.excludeCovered && isCovered(b)) return false;
+    return true;
+  });
+}
+
+// hiddenBooks returns just the books the user has hidden (for the "Show hidden
+// (n)" affordance and the dimmed hidden section). Order is preserved.
+export function hiddenBooks(books: ScannedBook[]): ScannedBook[] {
+  return books.filter((b) => b.hidden);
 }
 
 // POS_SENTINEL sorts an empty/unparseable position last. It matches the Go
@@ -105,6 +137,58 @@ export function tallyResults(results: BookCreateResult[]): ResultTally {
     else failed++;
   }
   return { created, conflicts, failed };
+}
+
+// summarizeTally renders a one-line note from an already-computed tally (so the
+// tally is computed once per submit and the store + a summary line agree).
+export function summarizeTally({ created, conflicts, failed }: ResultTally): string {
+  const parts: string[] = [];
+  if (created > 0) parts.push(`${created} enqueued`);
+  if (conflicts > 0) parts.push(`${conflicts} already enqueued`);
+  if (failed > 0) parts.push(`${failed} failed`);
+  return parts.length > 0 ? parts.join(', ') + '.' : 'Nothing to enqueue.';
+}
+
+// matchProvenanceLabel describes a non-automatic identity match for the UI, or
+// null when the match needs no extra chrome (asin/isbn exact matches, no match).
+// Only "search" and "manual" surface a label - they are advisory, so the user can
+// see (and, for manual, undo) how a book was matched.
+export function matchProvenanceLabel(coverage: Coverage | undefined): string | null {
+  if (!coverage || !coverage.matched_by) return null;
+  const title = coverage.work_title ?? '';
+  const suffix = title ? `: ${title}` : '';
+  if (coverage.matched_by === 'manual') return `manual match${suffix}`;
+  if (coverage.matched_by === 'search') return `matched by title search${suffix}`;
+  return null;
+}
+
+// isManualMatch reports whether a book carries a user-supplied manual match (so
+// the row can offer "Clear match").
+export function isManualMatch(coverage: Coverage | undefined): boolean {
+  return coverage?.matched_by === 'manual';
+}
+
+// clearedCoverage is the local coverage a book reverts to right after its manual
+// match is cleared: available but no longer resolved to a work (reads as "unknown
+// work"). A fresh scan re-resolves it authoritatively.
+export function clearedCoverage(): Coverage {
+  return { available: true, known: false, has_characters: false, has_recaps: false };
+}
+
+// overridePayload builds the FULL desired-state POST /overrides body for a book,
+// preserving whatever the book already carries for the dimension the change does
+// not touch: hiding preserves an existing manual work_id (never clobbers a match),
+// and matching preserves the current hidden flag. changes.workId === '' clears the
+// match; changes.hidden === false unhides.
+export function overridePayload(
+  book: ScannedBook,
+  changes: { hidden?: boolean; workId?: string },
+): SetOverrideBody {
+  return {
+    source_path: book.source_path,
+    hidden: changes.hidden ?? book.hidden ?? false,
+    work_id: changes.workId ?? manualWorkId(book),
+  };
 }
 
 // seriesGapHint reports the series for which a selected book skips an earlier

@@ -134,6 +134,36 @@ describe('ApiClient', () => {
     expect(JSON.parse(init.body as string).candidates).toHaveLength(1);
   });
 
+  it('GETs the scan list for reattach', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { scans: [] }));
+    const client = pipelineClient();
+
+    await expect(client.listScans()).resolves.toEqual({ scans: [] });
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/scans');
+  });
+
+  it('POSTs an override upsert', async () => {
+    const client = pipelineClient();
+    fetchMock.mockResolvedValue(jsonResponse(200, { override: {}, coverage: null }));
+    await client.setOverride({ source_path: '/b', hidden: true, work_id: '' });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('/api/v1/overrides');
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body as string)).toEqual({
+      source_path: '/b',
+      hidden: true,
+      work_id: '',
+    });
+  });
+
+  it('GETs meta search with an encoded query', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { results: [] }));
+    const client = pipelineClient();
+
+    await client.metaSearch('dune & sand');
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/meta/search?q=dune%20%26%20sand');
+  });
+
   it('routes book control actions to the right endpoints', async () => {
     fetchMock.mockResolvedValue(new Response(null, { status: 204 }));
     const client = pipelineClient();

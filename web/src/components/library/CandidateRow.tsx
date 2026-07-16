@@ -1,10 +1,21 @@
+import { memo } from 'react';
 import type { ScannedBook } from '@/api/types';
+import { isManualMatch, matchProvenanceLabel } from '@/lib/candidates';
 import { CoverageBadge } from './CoverageBadge';
 
 interface CandidateRowProps {
   book: ScannedBook;
   checked: boolean;
   onToggle: (path: string, checked: boolean) => void;
+  // Row actions. A hidden row shows Unhide; a visible row shows Hide + Match (and
+  // Clear match when the book carries a manual match). Omitted callbacks hide the
+  // corresponding control.
+  onMatch?: (book: ScannedBook) => void;
+  onClearMatch?: (book: ScannedBook) => void;
+  onHide?: (book: ScannedBook) => void;
+  onUnhide?: (book: ScannedBook) => void;
+  // Disables this row's actions while one of its overrides is in flight.
+  busy?: boolean;
 }
 
 // A provenance-labelled identity chip (ASIN/ISBN). The title tooltip surfaces
@@ -30,7 +41,48 @@ function IdentityChip({
   );
 }
 
-export function CandidateRow({ book, checked, onToggle }: CandidateRowProps) {
+function RowButton({
+  onClick,
+  disabled,
+  children,
+  title,
+}: {
+  onClick: () => void;
+  disabled?: boolean;
+  children: React.ReactNode;
+  title?: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      className="rounded border border-edge bg-raised px-2 py-1 text-xs text-body transition-colors hover:bg-edge disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      {children}
+    </button>
+  );
+}
+
+// CandidateRow is memoized. To be clear about what that does and does NOT buy:
+// while a scan is running, every ~700ms poll parses a fresh JSON payload, so each
+// book object is a new reference and the memo does NOT skip (identities change
+// every tick). The memo pays off once polling stops - then a re-render driven by a
+// selection toggle, a busy-state change, or a hide/match action only reconciles the
+// rows whose own props actually changed, instead of every row. It relies on the
+// parent passing stable callbacks (onToggle et al. are bound once) so an unchanged
+// row's props stay referentially equal.
+export const CandidateRow = memo(function CandidateRow({
+  book,
+  checked,
+  onToggle,
+  onMatch,
+  onClearMatch,
+  onHide,
+  onUnhide,
+  busy = false,
+}: CandidateRowProps) {
   const authors = (book.authors ?? []).join(', ');
   const seriesText =
     book.series && book.series_position
@@ -41,15 +93,24 @@ export function CandidateRow({ book, checked, onToggle }: CandidateRowProps) {
     book.runtime_min && book.runtime_min > 0 ? formatRuntime(book.runtime_min) : '';
   const chapterText = book.chapters && book.chapters > 0 ? `${book.chapters} ch` : '';
 
+  const hidden = !!book.hidden;
+  const provenance = matchProvenanceLabel(book.coverage);
+  const manual = isManualMatch(book.coverage);
+
   return (
-    <tr className="border-t border-edge align-top hover:bg-raised/40">
+    <tr
+      className={
+        'border-t border-edge align-top hover:bg-raised/40' + (hidden ? ' opacity-60' : '')
+      }
+    >
       <td className="px-3 py-3">
         <input
           type="checkbox"
           checked={checked}
+          disabled={hidden}
           onChange={(e) => onToggle(book.path, e.target.checked)}
           aria-label={`Select ${book.title}`}
-          className="mt-0.5 h-4 w-4 accent-pink-600"
+          className="mt-0.5 h-4 w-4 accent-pink-600 disabled:cursor-not-allowed disabled:opacity-40"
         />
       </td>
       <td className="px-3 py-3">
@@ -76,10 +137,60 @@ export function CandidateRow({ book, checked, onToggle }: CandidateRowProps) {
       </td>
       <td className="px-3 py-3">
         <CoverageBadge coverage={book.coverage} />
+        {provenance && (
+          <div className="mt-1 text-[11px] italic text-dim" title={provenance}>
+            {provenance}
+          </div>
+        )}
+      </td>
+      <td className="px-3 py-3">
+        <div className="flex flex-wrap justify-end gap-1.5">
+          {hidden ? (
+            onUnhide && (
+              <RowButton
+                onClick={() => onUnhide(book)}
+                disabled={busy}
+                title="Show this book again"
+              >
+                Unhide
+              </RowButton>
+            )
+          ) : (
+            <>
+              {onMatch && (
+                <RowButton
+                  onClick={() => onMatch(book)}
+                  disabled={busy}
+                  title="Match this book against meta.audiosilo.app"
+                >
+                  Match
+                </RowButton>
+              )}
+              {manual && onClearMatch && (
+                <RowButton
+                  onClick={() => onClearMatch(book)}
+                  disabled={busy}
+                  title="Remove the manual match"
+                >
+                  Clear match
+                </RowButton>
+              )}
+              {onHide && (
+                <RowButton
+                  onClick={() => onHide(book)}
+                  disabled={busy}
+                  title="Hide this book from the list"
+                >
+                  Hide
+                </RowButton>
+              )}
+            </>
+          )}
+        </div>
       </td>
     </tr>
   );
-}
+});
 
 function formatRuntime(minutes: number): string {
   const h = Math.floor(minutes / 60);

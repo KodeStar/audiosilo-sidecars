@@ -4,6 +4,7 @@ import { fetchApiBase } from '@/lib/apiBase';
 import { clearToken, getToken, setToken } from '@/lib/token';
 import { Login } from '@/components/Login';
 import { AppShell } from '@/components/AppShell';
+import { scanStore } from '@/lib/scanStore';
 
 export function App() {
   // API base is resolved once at boot (see fetchApiBase). null = still resolving.
@@ -44,6 +45,9 @@ export function App() {
   }
 
   function handleSignOut() {
+    // Clear the module-level scan store so the next user starts clean and the
+    // once-per-session reattach latch is re-armed.
+    scanStore.reset();
     clearToken();
     setTokenState(null);
   }

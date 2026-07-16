@@ -77,6 +77,16 @@ func (a *API) handleGetScan(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, job)
 }
 
+type listScansResponse struct {
+	Scans []metaops.ScanJobSummary `json:"scans"`
+}
+
+// handleListScans returns the running + recent scan jobs (newest first, no book
+// lists) so a reloaded UI can reattach to in-flight and just-finished scans.
+func (a *API) handleListScans(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, listScansResponse{Scans: a.scans.List()})
+}
+
 // --- books ---
 
 // bookCandidate is one selected book to enqueue. Coverage and Sources are the
@@ -91,6 +101,7 @@ type bookCandidate struct {
 	SeriesPos  string            `json:"series_pos"`
 	ASIN       string            `json:"asin"`
 	ISBN       string            `json:"isbn"`
+	WorkID     string            `json:"work_id,omitempty"`
 	Coverage   json.RawMessage   `json:"coverage,omitempty"`
 	Sources    map[string]string `json:"sources,omitempty"`
 }
@@ -154,6 +165,7 @@ func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
 			ASIN:            strings.TrimSpace(c.ASIN),
 			ISBN:            strings.TrimSpace(c.ISBN),
 			IdentitySources: sources,
+			WorkID:          strings.TrimSpace(c.WorkID),
 			Coverage:        c.Coverage,
 		}
 		b, err := a.store.CreateBook(ctx, nb)
@@ -197,6 +209,7 @@ type bookView struct {
 	ASIN            string            `json:"asin,omitempty"`
 	ISBN            string            `json:"isbn,omitempty"`
 	IdentitySources map[string]string `json:"identity_sources"`
+	WorkID          string            `json:"work_id,omitempty"`
 	State           string            `json:"state"`
 	Lane            string            `json:"lane"`
 	Status          string            `json:"status"`
@@ -243,8 +256,8 @@ func buildBookView(b store.Book, progress []store.Progress) bookView {
 	return bookView{
 		ID: b.ID, SourcePath: b.SourcePath, Title: b.Title, Authors: authors,
 		Series: b.Series, SeriesPos: b.SeriesPos, ASIN: b.ASIN, ISBN: b.ISBN,
-		IdentitySources: idsrc,
-		State:           b.State, Lane: string(state.LaneOf(state.State(b.State))),
+		IdentitySources: idsrc, WorkID: b.WorkID,
+		State: b.State, Lane: string(state.LaneOf(state.State(b.State))),
 		Status: b.Status, Error: b.Error, Coverage: b.Coverage,
 		Progress: progress, ScratchBytes: b.ScratchBytes,
 		CreatedAt: b.CreatedAt, UpdatedAt: b.UpdatedAt,

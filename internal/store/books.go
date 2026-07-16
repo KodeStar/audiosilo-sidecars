@@ -76,10 +76,14 @@ type Book struct {
 	ASIN            string
 	ISBN            string
 	IdentitySources map[string]string
-	State           string
-	Status          string
-	Error           string
-	Coverage        json.RawMessage // '' in the DB decodes to nil
+	// WorkID is the meta.audiosilo.app work this book was matched to at enqueue time
+	// (from its coverage verdict or a manual match), advisory enrichment keyed off
+	// the path identity. Empty when unmatched.
+	WorkID   string
+	State    string
+	Status   string
+	Error    string
+	Coverage json.RawMessage // '' in the DB decodes to nil
 	// ScratchBytes is the accounted on-disk size of the book's work dir, written by
 	// the split stage and PurgeScratch so reads never have to walk the dir.
 	ScratchBytes int64
@@ -99,6 +103,8 @@ type NewBook struct {
 	ASIN            string
 	ISBN            string
 	IdentitySources map[string]string
+	// WorkID is the matched meta.audiosilo.app work id (advisory; empty when unmatched).
+	WorkID string
 	// Coverage is the advisory metadata-coverage snapshot captured at scan time
 	// (empty when unknown). It is stored as-is and returned on the book view.
 	Coverage json.RawMessage
@@ -150,10 +156,10 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 	res, err := db.sql.ExecContext(ctx,
 		`INSERT INTO books
 		 (source_path, work_dir, title, authors, series, series_pos, asin, isbn,
-		  identity_sources, state, status, error, coverage, created_at, updated_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,'','',?,?,?)`,
+		  identity_sources, work_id, state, status, error, coverage, created_at, updated_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,'','',?,?,?)`,
 		nb.SourcePath, nb.WorkDir, nb.Title, authors, nb.Series, nb.SeriesPos,
-		nb.ASIN, nb.ISBN, idsrc, st, string(nb.Coverage), now, now)
+		nb.ASIN, nb.ISBN, idsrc, nb.WorkID, st, string(nb.Coverage), now, now)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return Book{}, ErrDuplicate
@@ -177,6 +183,7 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 		ASIN:            nb.ASIN,
 		ISBN:            nb.ISBN,
 		IdentitySources: nb.IdentitySources,
+		WorkID:          nb.WorkID,
 		State:           st,
 		Coverage:        nb.Coverage,
 		CreatedAt:       now,
@@ -185,14 +192,14 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 }
 
 const bookCols = `id, source_path, work_dir, title, authors, series, series_pos,
-	asin, isbn, identity_sources, state, status, error, coverage, scratch_bytes,
+	asin, isbn, identity_sources, work_id, state, status, error, coverage, scratch_bytes,
 	created_at, updated_at`
 
 func scanBook(sc interface{ Scan(...any) error }) (Book, error) {
 	var b Book
 	var authors, idsrc, coverage string
 	if err := sc.Scan(&b.ID, &b.SourcePath, &b.WorkDir, &b.Title, &authors,
-		&b.Series, &b.SeriesPos, &b.ASIN, &b.ISBN, &idsrc, &b.State, &b.Status,
+		&b.Series, &b.SeriesPos, &b.ASIN, &b.ISBN, &idsrc, &b.WorkID, &b.State, &b.Status,
 		&b.Error, &coverage, &b.ScratchBytes, &b.CreatedAt, &b.UpdatedAt); err != nil {
 		return Book{}, err
 	}

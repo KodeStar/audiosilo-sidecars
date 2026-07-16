@@ -148,7 +148,20 @@ func Run(ctx context.Context, opts Options) error {
 	// scheduler runs its own goroutine (under a child context so it can be stopped
 	// independently) and reconciles crash state on start.
 	metaClient := metaops.NewClient(cfg.Metadata.BaseURL)
-	scanMgr := metaops.NewScanManager(ctx, metaClient, tools.FFprobe)
+	// The scan manager applies persisted candidate overrides (hide / manual work
+	// match) from the store, adapted to metaops' store-agnostic interface.
+	overrideSrc := func(ctx context.Context) (map[string]metaops.Override, error) {
+		rows, err := db.ListOverrides(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[string]metaops.Override, len(rows))
+		for _, o := range rows {
+			out[o.SourcePath] = metaops.Override{Hidden: o.Hidden, WorkID: o.WorkID, WorkTitle: o.WorkTitle}
+		}
+		return out, nil
+	}
+	scanMgr := metaops.NewScanManager(ctx, metaClient, tools.FFprobe, overrideSrc)
 	workRoot := filepath.Join(opts.DataDir, "work")
 	exec := pipeline.NewExecutor(pipeline.Config{
 		DB:      db,
@@ -195,6 +208,7 @@ func Run(ctx context.Context, opts Options) error {
 		Store:       db,
 		Scheduler:   sched,
 		Scans:       scanMgr,
+		Meta:        metaClient,
 		Config:      cfg,
 		Save:        func(c config.Config) error { return config.Save(opts.DataDir, c) },
 		FFmpegPath:  tools.FFmpeg,

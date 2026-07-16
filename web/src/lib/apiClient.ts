@@ -4,8 +4,12 @@ import type {
   CreateBooksResponse,
   CreateScanResponse,
   ListBooksResponse,
+  ListScansResponse,
   LoginResponse,
+  MetaSearchResponse,
   ScanJob,
+  SetOverrideBody,
+  SetOverrideResponse,
   Settings,
   SettingsUpdate,
   SystemInfo,
@@ -137,6 +141,32 @@ export class ApiClient {
 
   getScan(id: string): Promise<ScanJob> {
     return this.request<ScanJob>(`/api/v1/scans/${encodeURIComponent(id)}`);
+  }
+
+  // listScans returns recent scans newest-first (each without its books), so the
+  // Library tab can reattach to the last scan after a page reload.
+  listScans(): Promise<ListScansResponse> {
+    return this.request<ListScansResponse>('/api/v1/scans');
+  }
+
+  // --- pipeline: overrides (hide + manual match) ---
+  // The daemon also serves GET /api/v1/overrides (for external callers), but the
+  // web UI never lists overrides directly - they ride on the scan payload - so no
+  // listOverrides client method exists.
+  //
+  // setOverride upserts a book's full desired override state (hidden=false +
+  // work_id="" clears it). The response carries the recomputed coverage when a
+  // work_id was set (matched_by "manual"), else null.
+  setOverride(body: SetOverrideBody): Promise<SetOverrideResponse> {
+    return this.request<SetOverrideResponse>('/api/v1/overrides', {
+      method: 'POST',
+      body,
+    });
+  }
+
+  // --- meta search (manual-match lookup) ---
+  metaSearch(q: string): Promise<MetaSearchResponse> {
+    return this.request<MetaSearchResponse>(`/api/v1/meta/search?q=${encodeURIComponent(q)}`);
   }
 
   // --- pipeline: books ---

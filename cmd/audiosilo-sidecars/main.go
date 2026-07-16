@@ -58,7 +58,10 @@ func isFlag(s string) bool { return len(s) > 0 && s[0] == '-' }
 func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	data := fs.String("data", defaultDataDir(), "data directory (config, auth, secrets)")
-	listen := fs.String("listen", config.DefaultListen, "bind address host:port")
+	// Default empty = "use the config file's listen value" - a non-empty flag
+	// default would silently override config.yaml on every run (server.Run
+	// treats any non-empty Listen as an explicit override).
+	listen := fs.String("listen", "", "bind address host:port (default "+config.DefaultListen+", overrides config.yaml)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

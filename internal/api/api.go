@@ -6,6 +6,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"sync"
 
@@ -32,6 +33,10 @@ type Deps struct {
 	Store     *store.DB
 	Scheduler *scheduler.Scheduler
 	Scans     *metaops.ScanManager
+	// Meta is the community-metadata client backing the manual-match and
+	// meta-search endpoints. It may be nil (metadata unconfigured); the handlers
+	// that need it guard on nil / the disabled state and return 503.
+	Meta *metaops.Client
 	// Config is the loaded configuration. The API owns it after construction and
 	// serializes reads/writes; Save persists mutations (e.g. cors_origins) back to
 	// config.yaml.
@@ -71,6 +76,8 @@ type API struct {
 	store      *store.DB
 	sched      *scheduler.Scheduler
 	scans      *metaops.ScanManager
+	meta       *metaops.Client
+	overrides  *metaops.OverrideService
 	ffmpeg     string
 	ffprobe    string
 	asr        ASRInfo
@@ -87,7 +94,7 @@ func New(d Deps) *API {
 	if save == nil {
 		save = func(config.Config) error { return nil }
 	}
-	return &API{
+	a := &API{
 		auth:       d.Auth,
 		limiter:    d.Limiter,
 		secrets:    d.Secrets,
@@ -97,6 +104,7 @@ func New(d Deps) *API {
 		store:      d.Store,
 		sched:      d.Scheduler,
 		scans:      d.Scans,
+		meta:       d.Meta,
 		ffmpeg:     d.FFmpegPath,
 		ffprobe:    d.FFprobePath,
 		asr:        d.ASR,
@@ -104,6 +112,28 @@ func New(d Deps) *API {
 		cfg:        d.Config,
 		save:       save,
 	}
+	// The override-upsert workflow lives in metaops (transport-only handler over
+	// it). It needs the store + scan manager; requirePipeline gates the handler
+	// on the same deps, so the service is present whenever the handler runs. The
+	// persist func adapts metaops' store-agnostic row to the store, so metaops
+	// never imports store.
+	if d.Store != nil && d.Scans != nil {
+		a.overrides = metaops.NewOverrideService(d.Meta, d.Scans,
+			func(ctx context.Context, ov metaops.StoredOverride) (metaops.StoredOverride, error) {
+				saved, err := d.Store.UpsertOverride(ctx, store.Override{
+					SourcePath: ov.SourcePath, Hidden: ov.Hidden,
+					WorkID: ov.WorkID, WorkTitle: ov.WorkTitle,
+				})
+				if err != nil {
+					return metaops.StoredOverride{}, err
+				}
+				return metaops.StoredOverride{
+					SourcePath: saved.SourcePath, Hidden: saved.Hidden,
+					WorkID: saved.WorkID, WorkTitle: saved.WorkTitle, UpdatedAt: saved.UpdatedAt,
+				}, nil
+			})
+	}
+	return a
 }
 
 // Handler returns the fully-wired HTTP handler for the /api/v1 surface, with CORS
@@ -124,7 +154,13 @@ func (a *API) Handler() http.Handler {
 	// Pipeline / Library (M1). requirePipeline 503s these when the pipeline deps
 	// are not wired, composed here so no handler repeats the guard.
 	mux.HandleFunc("POST /api/v1/scans", a.requireAuth(a.requirePipeline(a.handleCreateScan)))
+	mux.HandleFunc("GET /api/v1/scans", a.requireAuth(a.requirePipeline(a.handleListScans)))
 	mux.HandleFunc("GET /api/v1/scans/{id}", a.requireAuth(a.requirePipeline(a.handleGetScan)))
+	mux.HandleFunc("GET /api/v1/overrides", a.requireAuth(a.requirePipeline(a.handleListOverrides)))
+	mux.HandleFunc("POST /api/v1/overrides", a.requireAuth(a.requirePipeline(a.handleUpsertOverride)))
+	// meta/search needs only an authed caller + a configured metadata client (no
+	// store/scheduler), so it uses requireMeta rather than requirePipeline.
+	mux.HandleFunc("GET /api/v1/meta/search", a.requireAuth(a.requireMeta(a.handleMetaSearch)))
 	mux.HandleFunc("POST /api/v1/books", a.requireAuth(a.requirePipeline(a.handleCreateBooks)))
 	mux.HandleFunc("GET /api/v1/books", a.requireAuth(a.requirePipeline(a.handleListBooks)))
 	mux.HandleFunc("GET /api/v1/books/{id}", a.requireAuth(a.requirePipeline(a.handleGetBook)))
