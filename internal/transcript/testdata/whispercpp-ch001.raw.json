@@ -1,0 +1,38 @@
+{
+  "systeminfo": "AVX = 0 | NEON = 1 | METAL = 1",
+  "model": {
+    "type": "large"
+  },
+  "params": {
+    "model": "ggml-large-v3-turbo.bin",
+    "language": "en",
+    "translate": false
+  },
+  "result": {
+    "language": "en"
+  },
+  "transcription": [
+    {
+      "timestamps": {"from": "00:00:00,000", "to": "00:00:02,400"},
+      "offsets": {"from": 0, "to": 2400},
+      "text": " Chapter one.",
+      "tokens": [
+        {"text": "[_BEG_]", "timestamps": {"from": "00:00:00,000", "to": "00:00:00,000"}, "offsets": {"from": 0, "to": 0}, "id": 50364, "p": 0.9},
+        {"text": " Chapter", "timestamps": {"from": "00:00:00,000", "to": "00:00:00,600"}, "offsets": {"from": 0, "to": 600}, "id": 30003, "p": 0.98},
+        {"text": " one.", "timestamps": {"from": "00:00:00,600", "to": "00:00:01,100"}, "offsets": {"from": 600, "to": 1100}, "id": 42, "p": 0.95}
+      ]
+    },
+    {
+      "timestamps": {"from": "00:00:02,400", "to": "00:00:05,000"},
+      "offsets": {"from": 2400, "to": 5000},
+      "text": " The road went ever on.",
+      "tokens": [
+        {"text": " The", "timestamps": {"from": "00:00:02,400", "to": "00:00:02,600"}, "offsets": {"from": 2400, "to": 2600}, "id": 264, "p": 0.99},
+        {"text": " road", "timestamps": {"from": "00:00:02,600", "to": "00:00:03,000"}, "offsets": {"from": 2600, "to": 3000}, "id": 926, "p": 0.97},
+        {"text": " went", "timestamps": {"from": "00:00:03,000", "to": "00:00:03,300"}, "offsets": {"from": 3000, "to": 3300}, "id": 1437, "p": 0.9},
+        {"text": " ever", "timestamps": {"from": "00:00:03,300", "to": "00:00:03,700"}, "offsets": {"from": 3300, "to": 3700}, "id": 1562, "p": 0.88},
+        {"text": " on.", "timestamps": {"from": "00:00:03,700", "to": "00:00:04,200"}, "offsets": {"from": 3700, "to": 4200}, "id": 322, "p": 0.93}
+      ]
+    }
+  ]
+}
