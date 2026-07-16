@@ -105,29 +105,38 @@ internal/
             only on a daemon RESTART (the backend is resolved once at startup, unlike
             cors_origins, which the API re-reads live per request). agent-model
             routing stays a typed stub.
-  toolfetch/ resolve ffmpeg/ffprobe (explicit path -> next to the binary -> $PATH ->
-            HTTPS download from pinned hosts into <data>/tools when auto_download,
-            extracted fully in-process (archive/zip + archive/tar over an xz decoder,
-            per-entry name sanitization - no host tar), self-checked by running
-            -version, no digest pinning); ported from
-            audiosilo-server. Resolve() runs once at startup; a missing tool
-            degrades gracefully (the audio stage fails that book, daemon keeps working).
-            M3a added LocateBinary (the same lookup for whisper-cli) and EnsureModel
-            (HTTPS ggml-model download, size floor + atomic rename + cache-hit skip).
+  toolfetch/ fetches the three external artifact families, all gated by
+            tools.auto_download and confined to <data>/tools: ffmpeg/ffprobe static
+            builds (explicit path -> next to the binary -> $PATH -> HTTPS download,
+            in-process extraction w/ per-entry name sanitization, -version
+            self-check; ported from audiosilo-server); the whisper-cli release
+            binaries (M3b: EnsureWhisperCLI - platform+device asset table over the
+            pinned WhisperCLIReleaseTag, sha256 verified against the release's
+            checksums.txt, temp-dir extraction under a hard size budget, --help
+            self-check, atomic install + .meta written last; CPU fallback on
+            accelerated self-check failure, device-aware cache hit, stale-cache
+            degrade when a refresh fails); and ggml ASR models (EnsureModel: size
+            floor + .meta sidecar + atomic rename). LocateBinary is the shared
+            no-download lookup. A missing artifact degrades gracefully (the stage
+            parks/fails that book; the daemon keeps working).
   audio/    the mechanical audio stages: Inspect (ffprobe -> probe.json + normalized
             manifest.json; marker parsing + contiguity ported from audio_extract.py;
             single-file marker books AND multi-file "files" books) and Split (ffmpeg
             each chapter -> mono/16k FLAC under chapters/, resumable via temp+rename,
             per-chapter progress, ctx-cancel clean). Pure/tool-driven, no scheduler deps.
-  asr/      the ASR backend abstraction (M3a): Backend{ID,Detect,EnsureReady,Transcribe}
-            over a normalized Job (audio/outDir/chapter/prompt/language), producing RAW
-            per-chapter output byte-for-byte. Two backends behind Select
-            (auto|mlx-whisper|whisper-cpp): mlxwhisper (darwin/arm64; manages a pinned
-            venv under <data>/tools/mlx-venv, model self-downloads via HF) and whispercpp
-            (all platforms; resolves whisper-cli via toolfetch.LocateBinary, downloads
-            ggml-large-v3-turbo into <data>/tools/models). One job at a time is the
-            scheduler's job (Lane A cap 1); this package doesn't self-serialize. Never
-            seeds the initial prompt with a guess. Gated live smoke: -tags asrlive.
+  asr/      the ASR backend abstraction (M3a/M3b): Backend{ID,Detect,EnsureReady,
+            Transcribe} over a normalized Job (audio/outDir/chapter/prompt/language),
+            producing RAW per-chapter output byte-for-byte. Two backends behind
+            Select (auto|mlx-whisper|whisper-cpp): mlxwhisper (darwin/arm64; manages
+            a pinned venv under <data>/tools/mlx-venv, model self-downloads via HF)
+            and whispercpp (all platforms; whisper-cli resolves local-first via
+            toolfetch.LocateBinary, else the toolfetch auto-download cache - Detect
+            is optimistic when auto-download can supply a binary, EnsureReady(ctx)
+            performs the fetch + downloads ggml-large-v3-turbo; an explicit
+            whisper_cli_path that does not resolve is a loud error). One job at a
+            time is the scheduler's job (Lane A cap 1); this package doesn't
+            self-serialize. Never seeds the initial prompt with a guess. Gated live
+            smoke: -tags asrlive.
   transcript/ the normalized transcript contract (audiosilo-transcript/v1) + Sanitize
             (NaN/Infinity->null, string-aware) + format-detecting adapters (openai-whisper
             /mlx AND whisper.cpp -ojf) + Complete (resume/skip test, ports
@@ -297,15 +306,34 @@ Milestones from the workspace plan; each is shippable.
   and a live daemon smoke (real 3-chapter m4b through inspect -> split -> asr(real
   mlx) -> sanitizing -> done, transcripts-raw `0444`, text non-empty, kill -9
   mid-asr on a second book resumes without re-transcribing the completed chapter).
-- **M3b (in progress):** whisper.cpp binaries for non-Apple hardware. The
-  **CI build matrix has landed** (`.github/workflows/whisper-binaries.yml`,
+- **M3b (done):** whisper.cpp binaries for non-Apple hardware, zero manual
+  installs. The **CI build matrix** (`.github/workflows/whisper-binaries.yml`,
   manually dispatched: macOS Metal w/ embedded metallib + a real tiny-model
   transcription smoke, Linux CUDA w/ bundled cudart/cublas + `$ORIGIN` RPATH,
   Linux Vulkan, Linux amd64/arm64 + Windows CPU; ldd allow-list gates; flat
-  archives + checksums.txt published as a `whisper-cpp-<ref>-<rev>` GitHub
+  archives + checksums.txt) publishes a `whisper-cpp-<ref>-<rev>` GitHub
   release - the asset names + tag are the distribution contract
-  `toolfetch.WhisperCLIReleaseTag` consumes, publish-then-bump-const on
-  upgrades). The toolfetch auto-download client is in flight.
+  `toolfetch.WhisperCLIReleaseTag` consumes (publish first, then bump the
+  const). The **auto-download client** (`toolfetch.EnsureWhisperCLI`, gated by
+  `tools.auto_download`) picks the asset by platform + detected device,
+  verifies its sha256 against the release's checksums.txt (a missing line or
+  mismatch adopts nothing), extracts to a temp dir with a hard total size
+  budget, self-checks `--help`, installs atomically under
+  `<data>/tools/whisper-cpp/` and writes a `.meta` (tag/asset/sha/fallback)
+  LAST. Policies: an accelerated asset failing its self-check falls back once
+  to the CPU asset (sticky until a tag bump); the cache hit is device-aware
+  (installing a GPU driver later re-downloads the accelerated build); a failed
+  refresh degrades to the previously-installed binary; an explicit
+  `asr.whisper_cli_path` that does not resolve is a loud error, never silently
+  replaced. asr's whisper-cpp `Detect` is optimistic when auto-download can
+  supply a binary; `EnsureReady` (now `EnsureReady(ctx)` - backends use their
+  own data dir) does the real fetch per book and the pipeline PARKS
+  (needs_attention, actionable message) on its failure instead of hard-failing.
+  The `v1.9.1-1` release is live with all 6 assets; the client was live-smoked
+  against it (download + verify + self-check + zero-network cache hit).
+  internal/audio also now sorts multi-file books with audiosilo-meta's exported
+  `scan.NaturalLess` (meta PR #33) instead of a private copy - chapter numbers
+  spoiler-gate contributed sidecars, so the shared comparator is load-bearing.
 - **M4-M8 (planned):** QA/spelling ports (M4), the agent runner (claude +
   codex) with staged context dirs enforcing the invariants, the fact-pass +
   synthesis + audit loop, contribution (intake/PR/local), and packaging
