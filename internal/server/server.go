@@ -125,7 +125,7 @@ func Run(ctx context.Context, opts Options) error {
 	metaClient := metaops.NewClient(cfg.Metadata.BaseURL)
 	scanMgr := metaops.NewScanManager(ctx, metaClient, tools.FFprobe)
 	workRoot := filepath.Join(opts.DataDir, "work")
-	exec := pipeline.NewExecutor(tools.FFmpeg, tools.FFprobe, scheduler.NewStubExecutor(0, 0))
+	exec := pipeline.NewExecutor(db, tools.FFmpeg, tools.FFprobe, scheduler.NewStubExecutor(0, 0))
 	sched := scheduler.New(db, hub, exec, cfg.Agent.Concurrency, workRoot)
 	schedCtx, cancelSched := context.WithCancel(ctx)
 	defer cancelSched()

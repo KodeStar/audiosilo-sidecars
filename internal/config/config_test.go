@@ -173,23 +173,6 @@ func TestNewFieldsRoundTripAndEnv(t *testing.T) {
 	}
 }
 
-// TestMigrateLegacyFFprobe proves a pre-Tools config's scan.ffprobe_path is
-// adopted into the canonical tools.ffprobe_path on load.
-func TestMigrateLegacyFFprobe(t *testing.T) {
-	dir := t.TempDir()
-	legacy := "metadata:\n  base_url: https://meta.audiosilo.app\nscan:\n  ffprobe_path: /legacy/ffprobe\n"
-	if err := os.WriteFile(filepath.Join(dir, FileName), []byte(legacy), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(dir)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.Tools.FFprobePath != "/legacy/ffprobe" {
-		t.Errorf("legacy scan.ffprobe_path not migrated: tools.ffprobe_path = %q", cfg.Tools.FFprobePath)
-	}
-}
-
 func TestValidateRejectsBadNewFields(t *testing.T) {
 	rel := Default()
 	rel.LibraryRoots = []string{"relative/path"}

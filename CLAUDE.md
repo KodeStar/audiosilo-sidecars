@@ -97,11 +97,12 @@ internal/
             M1 added library_roots (scan allow-list), metadata.base_url;
             agent.concurrency is now live (scheduler agent lane). M2 added tools.
             {ffmpeg_path,ffprobe_path,auto_download} - the SINGLE source of truth for
-            tool paths (the legacy scan.ffprobe_path config/env key is migrated into
-            tools.ffprobe_path on load). asr/agent-model routing stay typed stubs.
+            tool paths (the ffprobe knob lives under tools.*; the folder scan uses
+            the resolved path). asr/agent-model routing stay typed stubs.
   toolfetch/ resolve ffmpeg/ffprobe (explicit path -> next to the binary -> $PATH ->
-            checksummed HTTPS download into <data>/tools when auto_download); ported
-            from audiosilo-server. Resolve() runs once at startup; a missing tool
+            HTTPS download from pinned hosts into <data>/tools when auto_download,
+            self-checked by running -version, no digest pinning); ported from
+            audiosilo-server. Resolve() runs once at startup; a missing tool
             degrades gracefully (the audio stage fails that book, daemon keeps working).
   audio/    the mechanical audio stages: Inspect (ffprobe -> probe.json + normalized
             manifest.json; marker parsing + contiguity ported from audio_extract.py;
@@ -214,8 +215,8 @@ Milestones from the workspace plan; each is shippable.
   SSE), plus the earlier Go smoke (pause/resume, kill -9 + resume with no
   duplicated stages, live coverage check against meta.audiosilo.app).
 - **M2 (done):** the real mechanical audio stages. `internal/toolfetch` resolves
-  ffmpeg/ffprobe (config path -> next to the binary -> `$PATH` -> checksummed
-  download into `<data>/tools`); `internal/audio` does ffprobe **inspect** (marker
+  ffmpeg/ffprobe (config path -> next to the binary -> `$PATH` -> HTTPS
+  download into `<data>/tools`, self-checked by `-version`); `internal/audio` does ffprobe **inspect** (marker
   normalization + contiguity check ported from `audio_extract.py`, writing
   `probe.json`/`manifest.json`; single-file marker books and multi-file "files"
   books) and ffmpeg **split** to mono/16k FLAC (resumable, per-chapter progress).

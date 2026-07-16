@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
 )
@@ -81,11 +82,7 @@ func within(path, root string) bool {
 	if err != nil {
 		return false
 	}
-	return rel != ".." && !hasDotDotPrefix(rel) && !filepath.IsAbs(rel)
-}
-
-func hasDotDotPrefix(rel string) bool {
-	return len(rel) >= 3 && rel[0] == '.' && rel[1] == '.' && (rel[2] == filepath.Separator)
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
 // Purge deletes a book's reclaimable scratch - the split chapters/ directory (and,

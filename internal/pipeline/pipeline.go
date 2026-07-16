@@ -20,6 +20,7 @@ import (
 
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
+	"github.com/kodestar/audiosilo-sidecars/internal/scratch"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
@@ -27,17 +28,20 @@ import (
 // Executor is the composite stage executor. ffmpeg/ffprobe are the resolved tool
 // paths ("" when unavailable, in which case the audio stages fail their book with
 // a clear error while the rest of the daemon keeps working). fallback runs every
-// stage the real executors don't yet implement.
+// stage the real executors don't yet implement. db is used to account a book's
+// scratch size once split has written the chapter FLACs.
 type Executor struct {
+	db       *store.DB
 	ffmpeg   string
 	ffprobe  string
 	fallback scheduler.Executor
 }
 
 // NewExecutor builds a composite executor over the resolved tool paths, delegating
-// unimplemented stages to fallback (the stub executor in M2).
-func NewExecutor(ffmpeg, ffprobe string, fallback scheduler.Executor) *Executor {
-	return &Executor{ffmpeg: ffmpeg, ffprobe: ffprobe, fallback: fallback}
+// unimplemented stages to fallback (the stub executor in M2). db may be nil in
+// tests that don't assert scratch accounting.
+func NewExecutor(db *store.DB, ffmpeg, ffprobe string, fallback scheduler.Executor) *Executor {
+	return &Executor{db: db, ffmpeg: ffmpeg, ffprobe: ffprobe, fallback: fallback}
 }
 
 // Execute routes a stage to its implementation. Inspecting and splitting are real
@@ -89,6 +93,13 @@ func (e *Executor) split(ctx context.Context, book store.Book, report scheduler.
 		}
 	}); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("split: %w", err)
+	}
+	// Account the work dir's on-disk size now (one walk) so the book list and the
+	// /system gauge serve scratch_bytes from the DB without walking on every read.
+	if e.db != nil {
+		if n, derr := scratch.DirSize(book.WorkDir); derr == nil {
+			_ = e.db.UpdateScratchBytes(ctx, book.ID, n)
+		}
 	}
 	result := scheduler.StageResult{
 		Metrics: metrics(map[string]any{

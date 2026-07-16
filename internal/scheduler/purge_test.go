@@ -30,9 +30,16 @@ func TestPurgeScratchAllowedStates(t *testing.T) {
 	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, h.workRoot)
 	ctx := context.Background()
 
-	// A done book: purge removes chapters/.
+	// A done book: purge removes chapters/ and re-accounts scratch_bytes to what
+	// remains (a durable manifest here).
 	b := h.addBook(t, db, "done-book", "", "")
 	chapters := seedChapters(t, b.WorkDir)
+	if err := os.WriteFile(filepath.Join(b.WorkDir, "manifest.json"), []byte("durable"), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+	if err := db.UpdateScratchBytes(ctx, b.ID, 999999); err != nil { // pre-purge accounting
+		t.Fatal(err)
+	}
 	if err := db.SetBookState(ctx, b.ID, string(state.Done), "", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -41,6 +48,11 @@ func TestPurgeScratchAllowedStates(t *testing.T) {
 	}
 	if _, err := os.Stat(chapters); !os.IsNotExist(err) {
 		t.Error("PurgeScratch(done) did not remove chapters/")
+	}
+	// scratch_bytes now reflects only the surviving durable (7 bytes), not the
+	// pre-purge value.
+	if got, _ := db.GetBook(ctx, b.ID); got.ScratchBytes != 7 {
+		t.Errorf("PurgeScratch did not re-account scratch_bytes: got %d, want 7", got.ScratchBytes)
 	}
 
 	// A paused book is also purgeable.

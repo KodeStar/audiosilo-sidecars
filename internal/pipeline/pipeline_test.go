@@ -68,7 +68,7 @@ func TestPipelineInspectSplitToDone(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 	hub := events.NewHub(1024)
 
-	exe := NewExecutor(ffmpeg, ffprobe, scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond))
+	exe := NewExecutor(db, ffmpeg, ffprobe, scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond))
 	sched := scheduler.New(db, hub, exe, 2, workRoot)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -106,6 +106,10 @@ func TestPipelineInspectSplitToDone(t *testing.T) {
 	sn, err := scheduler.ReadSentinel(b.WorkDir, string(state.Inspecting))
 	if err != nil || !sn.Result.MarkersContiguous {
 		t.Errorf("inspecting sentinel = %+v, %v; want MarkersContiguous", sn.Result, err)
+	}
+	// Split accounted the work dir's on-disk scratch into the persisted column.
+	if final.ScratchBytes <= 0 {
+		t.Errorf("scratch_bytes = %d after split, want > 0", final.ScratchBytes)
 	}
 }
 

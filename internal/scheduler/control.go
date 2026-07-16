@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/scratch"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
@@ -160,7 +158,15 @@ func (s *Scheduler) PurgeScratch(ctx context.Context, id int64) error {
 	if busy {
 		return ErrBusy
 	}
-	return scratch.Purge(s.workRoot, b.WorkDir)
+	if err := scratch.Purge(s.workRoot, b.WorkDir); err != nil {
+		return err
+	}
+	// Re-account what remains (the durables) in one walk, so scratch_bytes reflects
+	// the reclaim without a read-side walk. A gauge failure must not fail the purge.
+	if n, derr := scratch.DirSize(b.WorkDir); derr == nil {
+		_ = s.db.UpdateScratchBytes(ctx, id, n)
+	}
+	return nil
 }
 
 // purgeAllowed reports whether a book is in a state where reclaiming its chapters
@@ -180,22 +186,11 @@ func purgeAllowed(b store.Book) bool {
 
 // removeWorkDir deletes a removed book's scratch dir, but ONLY when it resolves to
 // a path inside the daemon's work root - a guard so a doctored or legacy WorkDir
-// can never make delete rm an arbitrary location. A missing dir is fine.
+// can never make delete rm an arbitrary location. It shares scratch.Confined with
+// the purge path, so both destructive operations enforce the one guard. A missing
+// dir is fine.
 func (s *Scheduler) removeWorkDir(workDir string) {
-	if s.workRoot == "" || workDir == "" {
-		return
+	if wd, ok := scratch.Confined(s.workRoot, workDir); ok {
+		_ = os.RemoveAll(wd)
 	}
-	root, err := filepath.Abs(s.workRoot)
-	if err != nil {
-		return
-	}
-	wd, err := filepath.Abs(workDir)
-	if err != nil {
-		return
-	}
-	// Must be strictly inside the root (never the root itself).
-	if wd == root || !strings.HasPrefix(wd, root+string(filepath.Separator)) {
-		return
-	}
-	_ = os.RemoveAll(wd)
 }

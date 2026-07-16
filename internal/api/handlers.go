@@ -108,15 +108,21 @@ var tabs = []tabInfo{
 	{ID: "settings", Label: "Settings", Status: "ready"},
 }
 
-func (a *API) handleSystem(w http.ResponseWriter, _ *http.Request) {
+func (a *API) handleSystem(w http.ResponseWriter, r *http.Request) {
 	cfg := a.snapshot()
+	// The daemon-total disk gauge is served from the accounted column (no walk).
+	// The store is absent in the M0 auth-only wiring, so degrade to 0 there.
+	var scratchTotal int64
+	if a.store != nil {
+		scratchTotal, _ = a.store.SumScratchBytes(r.Context())
+	}
 	writeJSON(w, http.StatusOK, systemResponse{
 		Version:      a.version,
 		DataDir:      a.dataDir,
 		Listen:       cfg.Listen,
 		Tabs:         tabs,
 		Tools:        toolsInfo{FFmpeg: a.ffmpeg, FFprobe: a.ffprobe},
-		ScratchBytes: scratchBytes(a.workRoot()),
+		ScratchBytes: scratchTotal,
 	})
 }
 

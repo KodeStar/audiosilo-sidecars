@@ -41,28 +41,28 @@ func TestSpecFor(t *testing.T) {
 
 func TestCached(t *testing.T) {
 	dir := t.TempDir()
-	if fm, fp := Cached(dir); fm != "" || fp != "" {
-		t.Fatalf("empty dir: Cached=%q,%q want empty", fm, fp)
+	if fm, fp := cached(dir); fm != "" || fp != "" {
+		t.Fatalf("empty dir: cached=%q,%q want empty", fm, fp)
 	}
 	for _, tool := range []string{"ffmpeg", "ffprobe"} {
 		fakeTool(t, dir, tool)
 	}
-	fm, fp := Cached(dir)
+	fm, fp := cached(dir)
 	if fm == "" || fp == "" {
-		t.Fatalf("Cached after writing tools = %q,%q want both set", fm, fp)
+		t.Fatalf("cached after writing tools = %q,%q want both set", fm, fp)
 	}
 }
 
-// Ensure must short-circuit (no download) when both tools are already cached AND
+// ensure must short-circuit (no download) when both tools are already cached AND
 // pass their self-check. The stubs here `exit 0` on `-version`, so they verify.
 func TestEnsureUsesCache(t *testing.T) {
 	dir := t.TempDir()
 	for _, tool := range []string{"ffmpeg", "ffprobe"} {
 		fakeTool(t, dir, tool)
 	}
-	fm, fp := Ensure(context.Background(), dir, discard())
+	fm, fp := ensure(context.Background(), dir, discard())
 	if fm != filepath.Join(dir, binName("ffmpeg")) || fp != filepath.Join(dir, binName("ffprobe")) {
-		t.Fatalf("Ensure with cache = %q,%q want the cached paths", fm, fp)
+		t.Fatalf("ensure with cache = %q,%q want the cached paths", fm, fp)
 	}
 }
 

@@ -289,7 +289,24 @@ func TestPurgeScratchEndpoint(t *testing.T) {
 	if cr.Results[0].Book == nil {
 		t.Fatal("no book in create result")
 	}
-	id := strconv.FormatInt(cr.Results[0].Book.ID, 10)
+	bookID := cr.Results[0].Book.ID
+	id := strconv.FormatInt(bookID, 10)
+
+	// The list serves scratch_bytes from the persisted column, not a work-dir walk:
+	// account a size directly in the store and expect the API to echo it (the book's
+	// work dir does not exist on disk, so a walk would report 0).
+	if err := env.db.UpdateScratchBytes(context.Background(), bookID, 4096); err != nil {
+		t.Fatal(err)
+	}
+	{
+		r := env.do(t, http.MethodGet, "/api/v1/books", token, "")
+		var lr listBooksResponse
+		_ = json.NewDecoder(r.Body).Decode(&lr)
+		r.Body.Close()
+		if len(lr.Books) != 1 || lr.Books[0].ScratchBytes != 4096 {
+			t.Fatalf("list scratch_bytes = %+v, want the column value 4096 (no walk)", lr.Books)
+		}
+	}
 
 	// A queued book (running, non-terminal) is not purgeable -> 409.
 	if r := env.do(t, http.MethodPost, "/api/v1/books/"+id+"/purge-scratch", token, ""); r.StatusCode != http.StatusConflict {

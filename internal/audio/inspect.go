@@ -96,7 +96,7 @@ func inspectMarkers(ctx context.Context, bookFile, workDir, ffprobePath string) 
 	if ffprobePath == "" {
 		return Manifest{}, false, errors.New("ffprobe unavailable; cannot read chapter markers")
 	}
-	raw, meta, err := probeFile(ctx, bookFile, ffprobePath)
+	raw, meta, err := probeFile(ctx, bookFile, ffprobePath, true)
 	if err != nil {
 		return Manifest{}, false, fmt.Errorf("ffprobe %s: %w", bookFile, err)
 	}
@@ -149,7 +149,10 @@ func inspectFiles(ctx context.Context, files []string, workDir, ffprobePath stri
 	for i, f := range files {
 		var dur float64
 		if ffprobePath != "" {
-			if _, meta, err := probeFile(ctx, f, ffprobePath); err == nil {
+			// A files-style book needs only each file's duration (format), not its
+			// chapters - the chapters are synthesized one-per-file - so skip the
+			// -show_chapters output.
+			if _, meta, err := probeFile(ctx, f, ffprobePath, false); err == nil {
 				dur = parseFloat(meta.Format.Duration)
 			}
 		}
@@ -205,19 +208,20 @@ type probeMeta struct {
 	} `json:"chapters"`
 }
 
-// probeFile runs `ffprobe -show_format -show_chapters -of json` and returns both
-// the raw output (for probe.json) and the parsed subset.
-func probeFile(ctx context.Context, path, ffprobePath string) ([]byte, probeMeta, error) {
+// probeFile runs `ffprobe -show_format [-show_chapters] -of json` and returns both
+// the raw output (for probe.json) and the parsed subset. showChapters is set only
+// for a single-file marker book (which needs the embedded chapters); a files-style
+// per-file probe wants just the duration, so it omits the chapter output.
+func probeFile(ctx context.Context, path, ffprobePath string, showChapters bool) ([]byte, probeMeta, error) {
 	cctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
+	args := []string{"-v", "error", "-show_format"}
+	if showChapters {
+		args = append(args, "-show_chapters")
+	}
+	args = append(args, "-of", "json", path)
 	//nolint:gosec // ffprobePath is an operator-resolved tool path; path is a library file
-	cmd := exec.CommandContext(cctx, ffprobePath,
-		"-v", "error",
-		"-show_format",
-		"-show_chapters",
-		"-of", "json",
-		path,
-	)
+	cmd := exec.CommandContext(cctx, ffprobePath, args...)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, probeMeta{}, err

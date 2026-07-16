@@ -97,6 +97,41 @@ func TestBookCRUDAndDedup(t *testing.T) {
 	}
 }
 
+func TestScratchBytesRoundTripAndSum(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	a, _ := db.CreateBook(ctx, NewBook{SourcePath: "/s/a", WorkDir: "/w/a", Title: "A"})
+	b, _ := db.CreateBook(ctx, NewBook{SourcePath: "/s/b", WorkDir: "/w/b", Title: "B"})
+
+	// A fresh book accounts zero scratch, so the daemon total starts at zero.
+	if a.ScratchBytes != 0 {
+		t.Errorf("new book scratch_bytes = %d, want 0", a.ScratchBytes)
+	}
+	if sum, err := db.SumScratchBytes(ctx); err != nil || sum != 0 {
+		t.Fatalf("SumScratchBytes(fresh) = %d,%v, want 0,nil", sum, err)
+	}
+
+	// The write side (split / purge) records a size; reads then serve the column.
+	if err := db.UpdateScratchBytes(ctx, a.ID, 1500); err != nil {
+		t.Fatalf("UpdateScratchBytes: %v", err)
+	}
+	if err := db.UpdateScratchBytes(ctx, b.ID, 500); err != nil {
+		t.Fatalf("UpdateScratchBytes: %v", err)
+	}
+	got, _ := db.GetBook(ctx, a.ID)
+	if got.ScratchBytes != 1500 {
+		t.Errorf("GetBook scratch_bytes = %d, want 1500", got.ScratchBytes)
+	}
+	if sum, err := db.SumScratchBytes(ctx); err != nil || sum != 2000 {
+		t.Errorf("SumScratchBytes = %d,%v, want 2000,nil", sum, err)
+	}
+
+	// A missing id is reported.
+	if err := db.UpdateScratchBytes(ctx, 9999, 1); !errors.Is(err, ErrNotFound) {
+		t.Errorf("UpdateScratchBytes(missing) = %v, want ErrNotFound", err)
+	}
+}
+
 func TestSetBookPipelineStateLeavesStatusAndError(t *testing.T) {
 	db := open(t)
 	ctx := context.Background()

@@ -5,7 +5,7 @@
 //
 // Resolve owns the full lookup order: an explicit configured path, then a copy
 // next to the daemon binary, then $PATH, and only if none of those turn up a tool
-// (and auto-download is enabled) does it fall back to Ensure, which caches a
+// (and auto-download is enabled) does it fall back to ensure, which caches a
 // static build under <data>/tools/ and reuses it forever.
 //
 // Everything degrades gracefully: offline, auto-download disabled, or an
@@ -14,11 +14,12 @@
 // start. Integrity: downloads are HTTPS-only from pinned, reputable hosts (GitHub
 // release assets from BtbN's FFmpeg-Builds for Linux/Windows; evermeet.cx for
 // macOS), and every downloaded binary is sanity-checked by running `-version`
-// before it is adopted.
+// before it is adopted (there is no digest pinning).
 package toolfetch
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -28,7 +29,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"time"
 )
 
@@ -62,7 +62,7 @@ func Resolve(ctx context.Context, cfg ResolveConfig, toolsDir string, log *slog.
 	ffmpeg := resolveLocal("ffmpeg", cfg.FFmpegPath)
 	ffprobe := resolveLocal("ffprobe", cfg.FFprobePath)
 	if (ffmpeg == "" || ffprobe == "") && cfg.AutoDownload {
-		dffmpeg, dffprobe := Ensure(ctx, toolsDir, log)
+		dffmpeg, dffprobe := ensure(ctx, toolsDir, log)
 		if ffmpeg == "" {
 			ffmpeg = dffmpeg
 		}
@@ -140,8 +140,8 @@ func binName(tool string) string {
 	return tool
 }
 
-// Cached returns the cached paths for ffmpeg and ffprobe in dir, each "" if absent.
-func Cached(dir string) (ffmpeg, ffprobe string) {
+// cached returns the cached paths for ffmpeg and ffprobe in dir, each "" if absent.
+func cached(dir string) (ffmpeg, ffprobe string) {
 	return cachedOne(dir, "ffmpeg"), cachedOne(dir, "ffprobe")
 }
 
@@ -153,16 +153,16 @@ func cachedOne(dir, tool string) string {
 	return ""
 }
 
-// Ensure returns usable ffmpeg/ffprobe paths under dir, downloading a static build
+// ensure returns usable ffmpeg/ffprobe paths under dir, downloading a static build
 // for the current platform if they aren't cached yet. Either result is "" when the
 // tool couldn't be made available (offline, unsupported platform, or a failed
-// integrity check) - the caller degrades gracefully and retries next start.
-func Ensure(ctx context.Context, dir string, log *slog.Logger) (ffmpeg, ffprobe string) {
+// self-check) - the caller degrades gracefully and retries next start.
+func ensure(ctx context.Context, dir string, log *slog.Logger) (ffmpeg, ffprobe string) {
 	// Verify the cached copies rather than trusting a bare stat - a download killed
 	// mid-write (or a disk/FS fault) can leave a non-runnable binary that a stat
 	// happily reports as present. verified discards a failing one so we fall through
 	// and re-download it.
-	if ffmpeg, ffprobe = Cached(dir); ffmpeg != "" && ffprobe != "" {
+	if ffmpeg, ffprobe = cached(dir); ffmpeg != "" && ffprobe != "" {
 		ffmpeg = verified(ctx, ffmpeg, log)
 		ffprobe = verified(ctx, ffprobe, log)
 		if ffmpeg != "" && ffprobe != "" {
@@ -173,18 +173,18 @@ func Ensure(ctx context.Context, dir string, log *slog.Logger) (ffmpeg, ffprobe 
 	if !ok {
 		log.Warn("no ffmpeg auto-download source for this platform; install ffmpeg/ffprobe to enable the audio stages",
 			"platform", runtime.GOOS+"/"+runtime.GOARCH)
-		return Cached(dir)
+		return cached(dir)
 	}
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		log.Warn("ffmpeg auto-download: cannot create tools dir", "dir", dir, "err", err)
-		return Cached(dir)
+		return cached(dir)
 	}
 	log.Info("ffmpeg/ffprobe not found locally - downloading a static build (one time)", "into", dir)
 	if err := download(ctx, s, dir); err != nil {
 		log.Warn("ffmpeg auto-download failed; running without it (will retry next start)", "err", err)
-		return Cached(dir)
+		return cached(dir)
 	}
-	ffmpeg, ffprobe = Cached(dir)
+	ffmpeg, ffprobe = cached(dir)
 	// Adopt only binaries that actually run on this machine.
 	ffmpeg = verified(ctx, ffmpeg, log)
 	ffprobe = verified(ctx, ffprobe, log)
@@ -305,7 +305,7 @@ func extractZip(r io.Reader, destDir string) error {
 	if int64(len(buf)) > maxToolBytes {
 		return fmt.Errorf("zip exceeds %d bytes", maxToolBytes)
 	}
-	zr, err := zip.NewReader(strings.NewReader(string(buf)), int64(len(buf)))
+	zr, err := zip.NewReader(bytes.NewReader(buf), int64(len(buf)))
 	if err != nil {
 		return err
 	}

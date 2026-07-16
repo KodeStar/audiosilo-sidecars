@@ -11,7 +11,6 @@ import (
 
 	"github.com/kodestar/audiosilo-sidecars/internal/metaops"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
-	"github.com/kodestar/audiosilo-sidecars/internal/scratch"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
@@ -222,20 +221,13 @@ type bookDetail struct {
 // endpoint uses buildBookView with a pre-fetched progress slice to avoid an N+1.
 func (a *API) bookToView(ctx context.Context, b store.Book) bookView {
 	progress, _ := a.store.ListProgress(ctx, b.ID)
-	v := buildBookView(b, progress)
-	v.ScratchBytes = scratchBytes(b.WorkDir)
-	return v
-}
-
-// scratchBytes reports a work dir's on-disk size, tolerating any walk error (a
-// gauge must never fail a book view).
-func scratchBytes(workDir string) int64 {
-	n, _ := scratch.DirSize(workDir)
-	return n
+	return buildBookView(b, progress)
 }
 
 // buildBookView assembles a bookView from a book and its (possibly nil) progress
-// rows, normalizing the always-present JSON fields.
+// rows, normalizing the always-present JSON fields. scratch_bytes is served from
+// the persisted column (written by the split stage / PurgeScratch), so no read
+// walks the work dir.
 func buildBookView(b store.Book, progress []store.Progress) bookView {
 	authors := b.Authors
 	if authors == nil {
@@ -254,7 +246,8 @@ func buildBookView(b store.Book, progress []store.Progress) bookView {
 		IdentitySources: idsrc,
 		State:           b.State, Lane: string(state.LaneOf(state.State(b.State))),
 		Status: b.Status, Error: b.Error, Coverage: b.Coverage,
-		Progress: progress, CreatedAt: b.CreatedAt, UpdatedAt: b.UpdatedAt,
+		Progress: progress, ScratchBytes: b.ScratchBytes,
+		CreatedAt: b.CreatedAt, UpdatedAt: b.UpdatedAt,
 	}
 }
 
@@ -277,9 +270,7 @@ func (a *API) handleListBooks(w http.ResponseWriter, r *http.Request) {
 	}
 	views := make([]bookView, 0, len(books))
 	for _, b := range books {
-		v := buildBookView(b, progressByBook[b.ID])
-		v.ScratchBytes = scratchBytes(b.WorkDir)
-		views = append(views, v)
+		views = append(views, buildBookView(b, progressByBook[b.ID]))
 	}
 	writeJSON(w, http.StatusOK, listBooksResponse{Books: views})
 }

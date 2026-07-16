@@ -80,8 +80,11 @@ type Book struct {
 	Status          string
 	Error           string
 	Coverage        json.RawMessage // '' in the DB decodes to nil
-	CreatedAt       string
-	UpdatedAt       string
+	// ScratchBytes is the accounted on-disk size of the book's work dir, written by
+	// the split stage and PurgeScratch so reads never have to walk the dir.
+	ScratchBytes int64
+	CreatedAt    string
+	UpdatedAt    string
 }
 
 // NewBook is the input to CreateBook: the identity/metadata fields a caller
@@ -182,14 +185,15 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 }
 
 const bookCols = `id, source_path, work_dir, title, authors, series, series_pos,
-	asin, isbn, identity_sources, state, status, error, coverage, created_at, updated_at`
+	asin, isbn, identity_sources, state, status, error, coverage, scratch_bytes,
+	created_at, updated_at`
 
 func scanBook(sc interface{ Scan(...any) error }) (Book, error) {
 	var b Book
 	var authors, idsrc, coverage string
 	if err := sc.Scan(&b.ID, &b.SourcePath, &b.WorkDir, &b.Title, &authors,
 		&b.Series, &b.SeriesPos, &b.ASIN, &b.ISBN, &idsrc, &b.State, &b.Status,
-		&b.Error, &coverage, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		&b.Error, &coverage, &b.ScratchBytes, &b.CreatedAt, &b.UpdatedAt); err != nil {
 		return Book{}, err
 	}
 	if authors != "" {
@@ -273,6 +277,28 @@ func (db *DB) SetBookCoverage(ctx context.Context, id int64, coverage json.RawMe
 		`UPDATE books SET coverage=?, updated_at=? WHERE id=?`,
 		string(coverage), timestamp(nowFn()), id)
 	return checkAffected(res, err)
+}
+
+// UpdateScratchBytes records a book's accounted on-disk scratch size (computed by
+// a single DirSize walk at split completion / after a purge), so book-list and
+// system reads serve it from the column without walking the work dir.
+func (db *DB) UpdateScratchBytes(ctx context.Context, id, bytes int64) error {
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE books SET scratch_bytes=?, updated_at=? WHERE id=?`,
+		bytes, timestamp(nowFn()), id)
+	return checkAffected(res, err)
+}
+
+// SumScratchBytes returns the daemon-total accounted scratch across all books -
+// the /system disk gauge, served from the column with no filesystem walk.
+func (db *DB) SumScratchBytes(ctx context.Context) (int64, error) {
+	var total int64
+	err := db.sql.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(scratch_bytes), 0) FROM books`).Scan(&total)
+	if err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 // DeleteBook removes a book and (via ON DELETE CASCADE) its stage_runs/progress.
