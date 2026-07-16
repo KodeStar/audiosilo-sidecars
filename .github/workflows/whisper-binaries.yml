@@ -1,0 +1,452 @@
+name: whisper-binaries
+
+# Build a whisper.cpp `whisper-cli` binary matrix and publish it as assets on a
+# GitHub Release of THIS repo. The Go daemon's M3b auto-download client fetches
+# these at runtime, so the DISTRIBUTION CONTRACT below is load-bearing and must
+# match the client byte-for-byte.
+#
+# ---------------------------------------------------------------------------
+# DISTRIBUTION CONTRACT (do not rename anything here without changing the Go
+# downloader in lock-step - the asset filenames and the release-tag scheme are
+# the wire format between this workflow and the client):
+#
+#   Release tag:   whisper-cpp-<upstream_ref>-<build_rev>   e.g. whisper-cpp-v1.9.1-1
+#   Release title: whisper.cpp binaries <upstream_ref> (build <build_rev>)
+#   Non-draft, non-prerelease. Fails if the tag already exists (a deliberate
+#   rebuild bumps build_rev rather than silently clobbering a published asset).
+#
+#   Assets (NO version in the filename - the tag carries the version in the URL
+#   path; the client builds the URL from tag + fixed filename):
+#     whisper-cli-darwin-arm64-metal.tar.gz
+#     whisper-cli-linux-amd64-cpu.tar.gz
+#     whisper-cli-linux-arm64-cpu.tar.gz
+#     whisper-cli-linux-amd64-vulkan.tar.gz
+#     whisper-cli-linux-amd64-cuda.tar.gz
+#     whisper-cli-windows-amd64-cpu.zip
+#     checksums.txt  (sha256sum-format lines "<hex>  <filename>", one per archive)
+#
+#   Archive layout is FLAT: whisper-cli (or whisper-cli.exe) at the archive root,
+#   plus any required shared libraries beside it - no directories. The Go
+#   downloader extracts every regular file into ONE directory and runs
+#   `whisper-cli --help` as a self-check, so a bundled lib must resolve when it
+#   sits next to the binary (hence the $ORIGIN RPATH on the CUDA leg).
+# ---------------------------------------------------------------------------
+#
+# SECURITY: this is `workflow_dispatch` ONLY - never a `pull_request` or
+# `pull_request_target` trigger, so untrusted fork code can never reach the
+# write-scoped token (the same "pwn request" concern documented in ci.yml).
+# The workflow's default token is read-only (permissions: contents: read); only
+# the final `release` job is granted `contents: write`, and solely to create the
+# release. Every build compiles ONLY from the pinned upstream ref supplied at
+# dispatch (a ggml-org/whisper.cpp tag), so there is no code path where a build
+# runs attacker-controlled source with a privileged token.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "ggml-org/whisper.cpp tag to build (e.g. v1.9.1)"
+        type: string
+        default: "v1.9.1"
+      build_rev:
+        description: "Our build revision (bump to rebuild the same upstream ref)"
+        type: string
+        default: "1"
+
+# Least privilege by default; the release job opts up to contents: write below.
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REF: ${{ inputs.upstream_ref }}
+  BUILD_REV: ${{ inputs.build_rev }}
+  # Cover common consumer + datacenter arches so one CUDA binary runs broadly.
+  # We MUST pin this: whisper.cpp/ggml defaults CMAKE_CUDA_ARCHITECTURES to
+  # "native", which would target only the (absent) GPU of the build runner.
+  # 61 Pascal, 70 Volta, 75 Turing, 80 Ampere(A100), 86 Ampere(30xx),
+  # 89 Ada(40xx), 90 Hopper.
+  CUDA_ARCHS: "61;70;75;80;86;89;90"
+
+jobs:
+  # ------------------------------------------------------------------------
+  # Linux legs share one job via an explicit matrix. Backend-specific setup
+  # (Vulkan SDK, CUDA toolkit, CUDA lib bundling) is gated on matrix.leg.
+  #
+  # ubuntu-22.04 is chosen deliberately over a newer image: it ships an OLDER
+  # glibc, and a binary built against an older glibc runs on newer systems (the
+  # reverse is not true). Building on 22.04 maximises the range of user machines
+  # the binary loads on.
+  # ------------------------------------------------------------------------
+  build-linux:
+    name: build ${{ matrix.leg }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: linux-amd64-cpu
+            runner: ubuntu-22.04
+            asset: whisper-cli-linux-amd64-cpu.tar.gz
+            cmake_flags: ""
+            # ldd allow-list beyond the always-allowed base (see the check below).
+            extra_libs: ""
+          - leg: linux-arm64-cpu
+            runner: ubuntu-22.04-arm
+            asset: whisper-cli-linux-arm64-cpu.tar.gz
+            cmake_flags: ""
+            extra_libs: ""
+          - leg: linux-amd64-vulkan
+            runner: ubuntu-22.04
+            asset: whisper-cli-linux-amd64-vulkan.tar.gz
+            cmake_flags: "-DGGML_VULKAN=1"
+            # libvulkan.so.1 is provided by the user's GPU driver / loader at
+            # runtime; we rely on the system copy and never bundle it.
+            extra_libs: "libvulkan.so"
+          - leg: linux-amd64-cuda
+            runner: ubuntu-22.04
+            asset: whisper-cli-linux-amd64-cuda.tar.gz
+            cmake_flags: "-DGGML_CUDA=1 -DGGML_CUDA_NCCL=OFF"
+            # libcuda.so.1 is the NVIDIA DRIVER stub (present only on GPU hosts,
+            # "not found" on the toolkit-only build runner - allowed either way).
+            # The cudart/cublas/cublasLt runtime libs are BUNDLED flat beside the
+            # binary and reached via an $ORIGIN RPATH (see the bundle step), so
+            # they are allowed as resolved deps too.
+            extra_libs: "libcuda.so libcudart.so libcublas.so libcublasLt.so"
+    steps:
+      - name: Clone whisper.cpp @ ${{ env.UPSTREAM_REF }}
+        run: |
+          git clone --depth 1 --branch "$UPSTREAM_REF" \
+            https://github.com/ggml-org/whisper.cpp whisper.cpp
+
+      # CUDA is the largest toolchain; reclaim runner disk (only ~14 GB free by
+      # default) before installing it so the toolkit + build both fit.
+      - name: Free disk space (CUDA leg)
+        if: matrix.leg == 'linux-amd64-cuda'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
+      - name: Install CUDA toolkit (CUDA leg)
+        if: matrix.leg == 'linux-amd64-cuda'
+        run: |
+          # NVIDIA's own apt repo - transparent and pin-free (no third-party
+          # action). cuda-toolkit-12-6 pulls nvcc + cublas/cudart dev packages.
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cuda-toolkit-12-6
+          echo "CUDA_PATH=/usr/local/cuda-12.6" >> "$GITHUB_ENV"
+          echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
+
+      - name: Install Vulkan SDK (Vulkan leg)
+        if: matrix.leg == 'linux-amd64-vulkan'
+        run: |
+          # LunarG SDK provides glslc / shaderc, needed at build time to compile
+          # the Vulkan compute shaders. jammy == Ubuntu 22.04.
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc >/dev/null
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list \
+            https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk
+
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          # patchelf sets the $ORIGIN RPATH on the CUDA binary; the rest are the
+          # baseline C/C++ + CMake toolchain.
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake patchelf
+
+      - name: Configure
+        working-directory: whisper.cpp
+        run: |
+          # BUILD_SHARED_LIBS=OFF everywhere -> libwhisper/libggml are static, so
+          # the only dynamic deps are system libs (+ the backend runtime we allow
+          # or bundle). GGML_OPENMP=OFF keeps the dependency set to exactly the
+          # ldd allow-list (an OpenMP build would pull in libgomp.so.1); ggml's
+          # own pthread threadpool handles multi-threading without it.
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_OPENMP=OFF \
+            -DGGML_NATIVE=OFF \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
+            ${{ matrix.cmake_flags }}
+
+      - name: Build whisper-cli
+        working-directory: whisper.cpp
+        run: cmake --build build --config Release --target whisper-cli -j"$(nproc)"
+
+      - name: Stage + bundle
+        working-directory: whisper.cpp
+        run: |
+          set -euo pipefail
+          BIN=build/bin/whisper-cli
+          test -f "$BIN" || { echo "expected binary $BIN missing"; exit 1; }
+          mkdir -p pkg
+          cp "$BIN" pkg/whisper-cli
+
+          if [ "${{ matrix.leg }}" = "linux-amd64-cuda" ]; then
+            # Bundle the CUDA runtime libs FLAT beside the binary and point the
+            # binary's RPATH at its own dir ($ORIGIN), so it runs on a host that
+            # has only the NVIDIA driver (no toolkit installed). This is the
+            # precedented approach (llama.cpp's CUDA releases ship the same libs).
+            for lib in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
+              src="$CUDA_PATH/targets/x86_64-linux/lib/$lib"
+              test -f "$src" || { echo "expected CUDA lib $src missing"; exit 1; }
+              cp -L "$src" pkg/
+            done
+            patchelf --set-rpath '$ORIGIN' pkg/whisper-cli
+          fi
+
+      - name: ldd allow-list check
+        working-directory: whisper.cpp
+        env:
+          EXTRA_LIBS: ${{ matrix.extra_libs }}
+        run: |
+          set -uo pipefail
+          # Fail if the binary links anything outside the allowed set - this
+          # catches an accidental dynamic dependency that would break on a user
+          # machine. Allowed: the C/C++ runtime + loader (universally present),
+          # plus the per-leg backend libs declared in matrix.extra_libs (Vulkan
+          # loader from the driver; the bundled CUDA libs; the CUDA driver stub).
+          # A "=> not found" driver lib (e.g. libcuda.so.1 on this GPU-less
+          # runner) is fine as long as its soname is in the allow-list.
+          BIN=pkg/whisper-cli
+          ALLOW="libc.so libm.so libpthread.so libdl.so librt.so libstdc++.so libgcc_s.so ld-linux linux-vdso $EXTRA_LIBS"
+          echo "ldd $BIN:"; ldd "$BIN" || true
+          bad=0
+          while read -r soname _; do
+            case "$soname" in "" | statically) continue ;; esac
+            # The dynamic-loader line is an absolute path with no "=>", so reduce
+            # to the basename before matching (e.g. /lib64/ld-linux-x86-64.so.2 ->
+            # ld-linux-x86-64.so.2). "=>" lines already start with a bare soname.
+            soname=${soname##*/}
+            ok=0
+            for a in $ALLOW; do
+              case "$soname" in ${a}*) ok=1; break ;; esac
+            done
+            if [ "$ok" -ne 1 ]; then echo "DISALLOWED dependency: $soname"; bad=1; fi
+          done < <(ldd "$BIN" 2>/dev/null | sed 's/^[[:space:]]*//')
+          [ "$bad" -eq 0 ] || { echo "ldd check failed"; exit 1; }
+
+      # The CUDA binary dynamically links libcuda.so.1 (the driver), which the
+      # loader cannot resolve on this GPU-less runner - the process cannot even
+      # start, so --help is impossible here (it is NOT that GPU init runs; the
+      # dynamic loader fails first). The ldd + file-exists checks cover it. Every
+      # other leg loads fine, and --help prints usage before any device init.
+      - name: Smoke test (--help)
+        if: matrix.leg != 'linux-amd64-cuda'
+        working-directory: whisper.cpp
+        run: ./pkg/whisper-cli --help
+
+      - name: Package (flat tar.gz)
+        working-directory: whisper.cpp
+        run: tar -czf "${{ matrix.asset }}" -C pkg .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: whisper.cpp/${{ matrix.asset }}
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------------
+  # macOS / Apple Silicon (Metal). macos-14 is an arm64 runner.
+  # ------------------------------------------------------------------------
+  build-macos:
+    name: build darwin-arm64-metal
+    runs-on: macos-14
+    env:
+      ASSET: whisper-cli-darwin-arm64-metal.tar.gz
+    steps:
+      - name: Clone whisper.cpp @ ${{ env.UPSTREAM_REF }}
+        run: |
+          git clone --depth 1 --branch "$UPSTREAM_REF" \
+            https://github.com/ggml-org/whisper.cpp whisper.cpp
+
+      - name: Configure
+        working-directory: whisper.cpp
+        run: |
+          # Metal is on by default on Apple. GGML_METAL_EMBED_LIBRARY=ON compiles
+          # the Metal shader source INTO the binary, so the single file works with
+          # no default.metallib sidecar next to it (the archive is just the binary).
+          # Static libs (BUILD_SHARED_LIBS=OFF) keep it self-contained; OpenMP off
+          # to avoid a libomp runtime dependency.
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_OPENMP=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON
+
+      - name: Build whisper-cli
+        working-directory: whisper.cpp
+        run: cmake --build build --config Release --target whisper-cli -j"$(sysctl -n hw.ncpu)"
+
+      - name: Stage + verify
+        working-directory: whisper.cpp
+        run: |
+          set -euo pipefail
+          BIN=build/bin/whisper-cli
+          test -f "$BIN" || { echo "expected binary $BIN missing"; exit 1; }
+          mkdir -p pkg
+          cp "$BIN" pkg/whisper-cli
+          # Log the linkage for auditing; only system frameworks/dylibs expected.
+          otool -L pkg/whisper-cli
+
+      - name: Smoke test (--help)
+        working-directory: whisper.cpp
+        run: ./pkg/whisper-cli --help
+
+      - name: Package (flat tar.gz)
+        working-directory: whisper.cpp
+        run: tar -czf "$ASSET" -C pkg .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-cli-darwin-arm64-metal.tar.gz
+          path: whisper.cpp/whisper-cli-darwin-arm64-metal.tar.gz
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------------
+  # Windows / amd64 (CPU). MSVC default generator, multi-config.
+  # ------------------------------------------------------------------------
+  build-windows:
+    name: build windows-amd64-cpu
+    runs-on: windows-latest
+    env:
+      ASSET: whisper-cli-windows-amd64-cpu.zip
+    steps:
+      - name: Clone whisper.cpp @ ${{ env.UPSTREAM_REF }}
+        shell: bash
+        run: |
+          git clone --depth 1 --branch "$UPSTREAM_REF" \
+            https://github.com/ggml-org/whisper.cpp whisper.cpp
+
+      - name: Configure
+        working-directory: whisper.cpp
+        shell: bash
+        run: |
+          # CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded statically links the MSVC C
+          # runtime (the /MT flavour), so users need no Visual C++ redistributable.
+          # Static libs + OpenMP off keep the output to just whisper-cli.exe.
+          cmake -B build \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_OPENMP=OFF \
+            -DGGML_NATIVE=OFF \
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON
+
+      - name: Build whisper-cli
+        working-directory: whisper.cpp
+        shell: bash
+        run: cmake --build build --config Release --target whisper-cli -j
+
+      - name: Stage + verify
+        working-directory: whisper.cpp
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=build/bin/Release/whisper-cli.exe
+          test -f "$BIN" || { echo "expected binary $BIN missing"; exit 1; }
+          mkdir -p pkg
+          cp "$BIN" pkg/whisper-cli.exe
+          # Include any DLLs that still landed beside the binary (a static build
+          # should produce none, but if one is required it must ship flat).
+          for dll in build/bin/Release/*.dll; do
+            [ -e "$dll" ] && cp "$dll" pkg/ || true
+          done
+          ls -la pkg
+
+      - name: Smoke test (--help)
+        working-directory: whisper.cpp
+        shell: pwsh
+        run: |
+          & .\pkg\whisper-cli.exe --help
+          if ($LASTEXITCODE -ne 0) { throw "whisper-cli --help exited $LASTEXITCODE" }
+
+      - name: Package (flat zip)
+        working-directory: whisper.cpp
+        shell: pwsh
+        run: Compress-Archive -Path pkg\* -DestinationPath $env:ASSET -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-cli-windows-amd64-cpu.zip
+          path: whisper.cpp/whisper-cli-windows-amd64-cpu.zip
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------------
+  # Gather every archive, checksum it, and cut the release. This is the ONLY
+  # job with write permission, and only to create the release.
+  # ------------------------------------------------------------------------
+  release:
+    name: publish release
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          # Flatten: every artifact holds a single archive named for its asset,
+          # so merge-multiple drops them all into dist/ with the contract names.
+          merge-multiple: true
+
+      - name: Checksums + inventory
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls -la
+          # Expect exactly the six contract archives before publishing.
+          expected="whisper-cli-darwin-arm64-metal.tar.gz \
+            whisper-cli-linux-amd64-cpu.tar.gz \
+            whisper-cli-linux-arm64-cpu.tar.gz \
+            whisper-cli-linux-amd64-vulkan.tar.gz \
+            whisper-cli-linux-amd64-cuda.tar.gz \
+            whisper-cli-windows-amd64-cpu.zip"
+          for f in $expected; do
+            test -f "$f" || { echo "missing expected asset: $f"; exit 1; }
+          done
+          # sha256sum-format lines ("<hex>  <filename>") over every archive.
+          sha256sum $expected > checksums.txt
+          cat checksums.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="whisper-cpp-${UPSTREAM_REF}-${BUILD_REV}"
+          TITLE="whisper.cpp binaries ${UPSTREAM_REF} (build ${BUILD_REV})"
+          # Refuse to clobber an existing published release - a deliberate rebuild
+          # bumps build_rev, which yields a fresh tag.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG already exists - bump build_rev to rebuild"; exit 1
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TITLE" \
+            --notes "whisper.cpp \`whisper-cli\` binaries built from ggml-org/whisper.cpp ${UPSTREAM_REF} (build ${BUILD_REV}). Static builds; flat archives (binary + any bundled runtime libs). Verify with checksums.txt." \
+            --latest=false \
+            dist/whisper-cli-darwin-arm64-metal.tar.gz \
+            dist/whisper-cli-linux-amd64-cpu.tar.gz \
+            dist/whisper-cli-linux-arm64-cpu.tar.gz \
+            dist/whisper-cli-linux-amd64-vulkan.tar.gz \
+            dist/whisper-cli-linux-amd64-cuda.tar.gz \
+            dist/whisper-cli-windows-amd64-cpu.zip \
+            dist/checksums.txt
