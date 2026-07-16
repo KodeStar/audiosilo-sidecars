@@ -98,7 +98,9 @@ internal/
             agent.concurrency is now live (scheduler agent lane). M2 added tools.
             {ffmpeg_path,ffprobe_path,auto_download} - the SINGLE source of truth for
             tool paths (the ffprobe knob lives under tools.*; the folder scan uses
-            the resolved path). asr/agent-model routing stay typed stubs.
+            the resolved path). M3a made asr.* live: backend
+            (auto|mlx-whisper|whisper-cpp), model, language, whisper_cli_path (device
+            informational). agent-model routing stays a typed stub.
   toolfetch/ resolve ffmpeg/ffprobe (explicit path -> next to the binary -> $PATH ->
             HTTPS download from pinned hosts into <data>/tools when auto_download,
             extracted fully in-process (archive/zip + archive/tar over an xz decoder,
@@ -106,18 +108,38 @@ internal/
             -version, no digest pinning); ported from
             audiosilo-server. Resolve() runs once at startup; a missing tool
             degrades gracefully (the audio stage fails that book, daemon keeps working).
+            M3a added LocateBinary (the same lookup for whisper-cli) and EnsureModel
+            (HTTPS ggml-model download, size floor + atomic rename + cache-hit skip).
   audio/    the mechanical audio stages: Inspect (ffprobe -> probe.json + normalized
             manifest.json; marker parsing + contiguity ported from audio_extract.py;
             single-file marker books AND multi-file "files" books) and Split (ffmpeg
             each chapter -> mono/16k FLAC under chapters/, resumable via temp+rename,
             per-chapter progress, ctx-cancel clean). Pure/tool-driven, no scheduler deps.
+  asr/      the ASR backend abstraction (M3a): Backend{ID,Detect,EnsureReady,Transcribe}
+            over a normalized Job (audio/outDir/chapter/prompt/language), producing RAW
+            per-chapter output byte-for-byte. Two backends behind Select
+            (auto|mlx-whisper|whisper-cpp): mlxwhisper (darwin/arm64; manages a pinned
+            venv under <data>/tools/mlx-venv, model self-downloads via HF) and whispercpp
+            (all platforms; resolves whisper-cli via toolfetch.LocateBinary, downloads
+            ggml-large-v3-turbo into <data>/tools/models). One job at a time is the
+            scheduler's job (Lane A cap 1); this package doesn't self-serialize. Never
+            seeds the initial prompt with a guess. Gated live smoke: -tags asrlive.
+  transcript/ the normalized transcript contract (audiosilo-transcript/v1) + Sanitize
+            (NaN/Infinity->null, string-aware) + format-detecting adapters (openai-whisper
+            /mlx AND whisper.cpp -ojf) + Complete (resume/skip test, ports
+            transcript_is_complete) + writers (transcripts-json/ normalized,
+            transcripts-text/ concatenated text). NEVER writes transcripts-raw/.
   scratch/  per-book DirSize gauge + Purge (removes chapters/, keeps durables),
             confined to the work root. Manual purge only in M2; auto-purge is M7.
             A purge also invalidates the split sentinel (scheduler.purgeInvalidatedStages)
             so a later retry re-splits rather than skipping into an empty chapters/.
   pipeline/ composite scheduler.Executor: routes inspecting -> audio.Inspect,
-            splitting -> audio.Split, every other stage -> the stub (M3+ replaces
-            more). Constructed in server.go with the toolfetch-resolved paths.
+            splitting -> audio.Split, asr -> the per-chapter internal/asr loop
+            (resumable: skip complete raws, delete+retry malformed, freeze each raw
+            0444, write asr.json provenance, account scratch), sanitizing ->
+            internal/transcript normalization; every other stage -> the stub (M4+
+            replaces more; retranscribing is still a stub). Constructed in server.go
+            with the toolfetch-resolved paths and the asr.Select-chosen backend.
   auth/     single admin password (argon2id, generated + printed once on first run),
             opaque SHA-256-hashed session tokens, a per-IP login rate limiter; the
             Store interface is storage-agnostic (MemStore for tests; the SQLite
@@ -244,15 +266,39 @@ Milestones from the workspace plan; each is shippable.
   m4b through inspecting -> splitting -> done, mid-split kill + resume without
   redoing chapters, purge drops the gauge, a non-contiguous book parks
   needs_attention).
-- **M3-M8 (planned):** ASR backends (mlx-whisper + whisper.cpp), QA/spelling ports,
-  the agent runner (claude + codex) with staged context dirs enforcing the
-  invariants, the fact-pass + synthesis + audit loop, contribution (intake/PR/local),
-  and packaging (GoReleaser + Docker matrix). See the plan for the full table.
+- **M3a (done):** the ASR stage is real. `internal/asr` abstracts a `Backend`
+  (`ID`/`Detect`/`EnsureReady`/`Transcribe`) over a normalized `Job` and
+  `Select`s auto|mlx-whisper|whisper-cpp (auto = mlx on darwin/arm64 with python3,
+  else whisper-cpp when a whisper-cli binary is found, else unavailable).
+  **mlxwhisper** manages a pinned venv under `<data>/tools/mlx-venv` (the model
+  self-downloads via Hugging Face on first run); **whispercpp** resolves
+  `whisper-cli` (config path -> beside the binary -> `$PATH`; binary
+  auto-download is deferred to **M3b**) and downloads `ggml-large-v3-turbo`
+  into `<data>/tools/models`. `internal/transcript` owns the normalized
+  **audiosilo-transcript/v1** contract: NaN/Infinity sanitizing, format-detecting
+  adapters (openai-whisper/mlx AND whisper.cpp `-ojf`), the `Complete` resume test,
+  and the derived `transcripts-json/`+`transcripts-text/` layers - the raw output
+  stays byte-for-byte immutable (frozen `0444`) in `transcripts-raw/`. The pipeline
+  `asr` stage runs a per-chapter resumable loop (skip complete raws, delete+retry
+  malformed, freeze `0444`, write `asr.json` provenance, account scratch) staying in
+  **Lane A (cap 1)** so only one book transcribes at a time (Metal contention);
+  `sanitizing` derives the json/text layers. `/system` gains an `asr` block
+  (backend/available/device/version). Gate verified: full Go race + lint + web gates
+  green; a gated `-tags asrlive` mlx smoke (fresh venv 26s + real transcription);
+  and a live daemon smoke (real 3-chapter m4b through inspect -> split -> asr(real
+  mlx) -> sanitizing -> done, transcripts-raw `0444`, text non-empty, kill -9
+  mid-asr on a second book resumes without re-transcribing the completed chapter).
+- **M3b, M4-M8 (planned):** the whisper.cpp CI-built binary matrix + auto-download
+  (M3b), QA/spelling ports (M4), the agent runner (claude + codex) with staged
+  context dirs enforcing the invariants, the fact-pass + synthesis + audit loop,
+  contribution (intake/PR/local), and packaging (GoReleaser + Docker matrix). See
+  the plan for the full table.
 
 Still **not built**: the **Done** tab (full board is M6), the Running tab's richer
-board (stage timeline / ETA / cost, M6), and the pipeline stages beyond split
-(ASR/QA/agent/contribute) - the scheduler runs the composite executor whose
-non-mechanical stages are still stubs, and the config `asr`/agent-model sections
-stay typed stubs. Auto-purge/startup-GC of scratch is M7 (M2 is manual purge only).
-`/system` reports Library/Running/Settings as `ready` and only Done as `planned`
-(the Go-side tab labels). Keep this file honest as milestones land.
+board (stage timeline / ETA / cost, M6), and the pipeline stages beyond sanitizing
+(QA/agent/contribute) - the scheduler runs the composite executor whose remaining
+non-mechanical stages (including `retranscribing`) are still stubs, and the config
+agent-model section stays a typed stub. Auto-purge/startup-GC of scratch is M7 (M2
+is manual purge only). `/system` reports Library/Running/Settings as `ready` and
+only Done as `planned` (the Go-side tab labels). Keep this file honest as milestones
+land.
