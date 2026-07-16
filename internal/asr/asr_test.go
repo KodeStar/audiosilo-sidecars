@@ -122,11 +122,11 @@ func TestMLXEnsureReadyAndTranscribe(t *testing.T) {
 	if !cap.Available {
 		t.Fatalf("fake python3 should make mlx available: %+v", cap)
 	}
-	if err := b.EnsureReady(context.Background(), dataDir); err != nil {
+	if err := b.EnsureReady(context.Background()); err != nil {
 		t.Fatalf("EnsureReady: %v", err)
 	}
 	// Idempotent: a second call is a no-op (venv already provisioned).
-	if err := b.EnsureReady(context.Background(), dataDir); err != nil {
+	if err := b.EnsureReady(context.Background()); err != nil {
 		t.Fatalf("EnsureReady (2nd): %v", err)
 	}
 	// Transcribe writes chNNN.json into OutDir named from the FLAC stem.
@@ -151,7 +151,7 @@ func TestMLXEnsureReadyRequiresPython(t *testing.T) {
 	empty := t.TempDir()
 	t.Setenv("PATH", empty)
 	b := newMLXWhisper(SelectConfig{DataDir: t.TempDir(), Log: discardLogger()})
-	if err := b.EnsureReady(context.Background(), b.dataDir); err == nil {
+	if err := b.EnsureReady(context.Background()); err == nil {
 		t.Fatal("EnsureReady should fail without python3")
 	}
 }
@@ -175,7 +175,7 @@ func TestMLXVenvInvocationWithSpaceInPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := newMLXWhisper(SelectConfig{DataDir: dataDir, Log: discardLogger()})
-	if err := b.EnsureReady(context.Background(), dataDir); err != nil {
+	if err := b.EnsureReady(context.Background()); err != nil {
 		t.Fatalf("EnsureReady under spaced path: %v", err)
 	}
 	outDir := filepath.Join(dataDir, "raw")
@@ -319,8 +319,18 @@ func TestWhisperCppDetectAndTranscribe(t *testing.T) {
 	}
 }
 
+// noLocalWhisper empties $PATH so no whisper-cli resolves locally. The managed-
+// cache tests use this (with an EMPTY explicit path) to disable local resolution -
+// an explicit-but-missing path is no longer a way to do that, it is a loud
+// misconfiguration (see TestWhisperCppExplicitPathMissingIsLoud).
+func noLocalWhisper(t *testing.T) {
+	t.Helper()
+	t.Setenv("PATH", t.TempDir())
+}
+
 func TestWhisperCppUnavailableWithoutCLI(t *testing.T) {
-	b := newWhisperCpp(SelectConfig{WhisperCLIPath: filepath.Join(t.TempDir(), "nope"), DataDir: t.TempDir(), Log: discardLogger()})
+	noLocalWhisper(t)
+	b := newWhisperCpp(SelectConfig{DataDir: t.TempDir(), Log: discardLogger()})
 	cap, _ := b.Detect(context.Background())
 	if cap.Available {
 		t.Error("missing whisper-cli should be unavailable")
@@ -330,17 +340,60 @@ func TestWhisperCppUnavailableWithoutCLI(t *testing.T) {
 	}
 }
 
+// TestWhisperCppExplicitPathMissingIsLoud (DENIED): a configured-but-unresolvable
+// asr.whisper_cli_path is a loud misconfiguration - Detect reports unavailable
+// naming the path, EnsureReady errors naming the path, and NO download is ever
+// attempted (auto-download must never silently paper over a typo). The managed
+// cache is refused too: cliPath never substitutes it for the configured path.
+func TestWhisperCppExplicitPathMissingIsLoud(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script stub is unix-only")
+	}
+	missing := filepath.Join(t.TempDir(), "nope")
+	dataDir := t.TempDir()
+	b := newWhisperCpp(SelectConfig{AutoDownload: true, WhisperCLIPath: missing, DataDir: dataDir, Log: discardLogger()})
+
+	cap, _ := b.Detect(context.Background())
+	if cap.Available {
+		t.Error("an explicit-but-missing path must be unavailable, not masked by auto-download")
+	}
+	if !strings.Contains(cap.Detail, missing) {
+		t.Errorf("Detect detail = %q, want it to name the configured path", cap.Detail)
+	}
+
+	var called bool
+	restore := ensureWhisperCLI
+	ensureWhisperCLI = func(context.Context, string, string, *slog.Logger) (string, error) {
+		called = true
+		return "", nil
+	}
+	defer func() { ensureWhisperCLI = restore }()
+
+	err := b.EnsureReady(context.Background())
+	if err == nil || !strings.Contains(err.Error(), missing) {
+		t.Fatalf("EnsureReady = %v, want an error naming the configured path", err)
+	}
+	if called {
+		t.Error("an explicit-path misconfiguration must never trigger a download")
+	}
+	// Even with a managed cache present, the explicit path stays authoritative.
+	seedWhisperCache(t, dataDir)
+	if got := b.cliPath(); got != "" {
+		t.Errorf("cliPath = %q, want empty (never the cache when an explicit path is configured)", got)
+	}
+}
+
 // TestWhisperCppDetectAutoDownload: with no local binary, availability now tracks
 // tools.auto_download AND whether the pinned release publishes an asset for this
 // platform. Written to hold on both darwin/arm64 (a metal asset exists) and
 // linux/amd64 CI (a cpu asset exists) as well as any unsupported platform.
 func TestWhisperCppDetectAutoDownload(t *testing.T) {
-	nope := filepath.Join(t.TempDir(), "nope") // explicit-but-missing: no PATH fallback
+	noLocalWhisper(t)
 	device := detectWhisperDevice()
 	_, supported := toolfetch.WhisperCLIAssetFor(runtime.GOOS, runtime.GOARCH, device)
 
 	// auto-download ON, no binary.
-	on := newWhisperCpp(SelectConfig{AutoDownload: true, WhisperCLIPath: nope, DataDir: t.TempDir(), Log: discardLogger()})
+	on := newWhisperCpp(SelectConfig{AutoDownload: true, DataDir: t.TempDir(), Log: discardLogger()})
 	cap, _ := on.Detect(context.Background())
 	if supported {
 		if !cap.Available {
@@ -357,7 +410,7 @@ func TestWhisperCppDetectAutoDownload(t *testing.T) {
 	}
 
 	// auto-download OFF, no binary: always unavailable with a clear Detail.
-	off := newWhisperCpp(SelectConfig{AutoDownload: false, WhisperCLIPath: nope, DataDir: t.TempDir(), Log: discardLogger()})
+	off := newWhisperCpp(SelectConfig{AutoDownload: false, DataDir: t.TempDir(), Log: discardLogger()})
 	capOff, _ := off.Detect(context.Background())
 	if capOff.Available {
 		t.Error("auto-download off with no binary must be unavailable")
@@ -375,8 +428,9 @@ func TestWhisperCppEnsureReadyAutoDownloadsBinary(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-script stub is unix-only")
 	}
+	noLocalWhisper(t)
 	dataDir := t.TempDir()
-	b := newWhisperCpp(SelectConfig{AutoDownload: true, WhisperCLIPath: filepath.Join(t.TempDir(), "nope"), DataDir: dataDir, Log: discardLogger()})
+	b := newWhisperCpp(SelectConfig{AutoDownload: true, DataDir: dataDir, Log: discardLogger()})
 
 	// Pre-seed the ggml model + its sidecar so EnsureModel is a cache hit (no HTTP).
 	model := b.modelPath(dataDir)
@@ -411,7 +465,7 @@ func TestWhisperCppEnsureReadyAutoDownloadsBinary(t *testing.T) {
 	}
 	defer func() { ensureWhisperCLI = restore }()
 
-	if err := b.EnsureReady(context.Background(), dataDir); err != nil {
+	if err := b.EnsureReady(context.Background()); err != nil {
 		t.Fatalf("EnsureReady: %v", err)
 	}
 	if !called {
@@ -427,7 +481,8 @@ func TestWhisperCppEnsureReadyAutoDownloadsBinary(t *testing.T) {
 // TestWhisperCppEnsureReadyNoAutoDownload: with auto-download off and no binary,
 // EnsureReady fails clearly and never invokes the downloader.
 func TestWhisperCppEnsureReadyNoAutoDownload(t *testing.T) {
-	b := newWhisperCpp(SelectConfig{AutoDownload: false, WhisperCLIPath: filepath.Join(t.TempDir(), "nope"), DataDir: t.TempDir(), Log: discardLogger()})
+	noLocalWhisper(t)
+	b := newWhisperCpp(SelectConfig{AutoDownload: false, DataDir: t.TempDir(), Log: discardLogger()})
 	var called bool
 	restore := ensureWhisperCLI
 	ensureWhisperCLI = func(context.Context, string, string, *slog.Logger) (string, error) {
@@ -436,7 +491,7 @@ func TestWhisperCppEnsureReadyNoAutoDownload(t *testing.T) {
 	}
 	defer func() { ensureWhisperCLI = restore }()
 
-	if err := b.EnsureReady(context.Background(), b.dataDir); err == nil {
+	if err := b.EnsureReady(context.Background()); err == nil {
 		t.Fatal("EnsureReady should fail without a binary and auto-download off")
 	}
 	if called {
@@ -449,13 +504,14 @@ func TestWhisperCppEnsureReadyNoAutoDownload(t *testing.T) {
 // degrades a failed refresh to a still-present cached binary, so by contract an
 // error from it means nothing is usable.
 func TestWhisperCppEnsureReadyDownloadErrorPropagates(t *testing.T) {
-	b := newWhisperCpp(SelectConfig{AutoDownload: true, WhisperCLIPath: filepath.Join(t.TempDir(), "nope"), DataDir: t.TempDir(), Log: discardLogger()})
+	noLocalWhisper(t)
+	b := newWhisperCpp(SelectConfig{AutoDownload: true, DataDir: t.TempDir(), Log: discardLogger()})
 	restore := ensureWhisperCLI
 	ensureWhisperCLI = func(context.Context, string, string, *slog.Logger) (string, error) {
 		return "", errors.New("boom")
 	}
 	defer func() { ensureWhisperCLI = restore }()
-	if err := b.EnsureReady(context.Background(), b.dataDir); err == nil {
+	if err := b.EnsureReady(context.Background()); err == nil {
 		t.Fatal("a download error must propagate from EnsureReady")
 	}
 }
@@ -495,8 +551,9 @@ func TestWhisperCppEnsureReadyRefreshesExistingCache(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-script stub is unix-only")
 	}
+	noLocalWhisper(t)
 	dataDir := t.TempDir()
-	b := newWhisperCpp(SelectConfig{AutoDownload: true, WhisperCLIPath: filepath.Join(t.TempDir(), "nope"), DataDir: dataDir, Log: discardLogger()})
+	b := newWhisperCpp(SelectConfig{AutoDownload: true, DataDir: dataDir, Log: discardLogger()})
 	seedWhisperCache(t, dataDir)
 	seedWhisperModel(t, b, dataDir)
 
@@ -514,7 +571,7 @@ func TestWhisperCppEnsureReadyRefreshesExistingCache(t *testing.T) {
 	}
 	defer func() { ensureWhisperCLI = restore }()
 
-	if err := b.EnsureReady(context.Background(), dataDir); err != nil {
+	if err := b.EnsureReady(context.Background()); err != nil {
 		t.Fatalf("EnsureReady: %v", err)
 	}
 	if !called {
@@ -534,8 +591,9 @@ func TestWhisperCppEnsureReadyNoAutoDownloadKeepsCache(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-script stub is unix-only")
 	}
+	noLocalWhisper(t)
 	dataDir := t.TempDir()
-	b := newWhisperCpp(SelectConfig{AutoDownload: false, WhisperCLIPath: filepath.Join(t.TempDir(), "nope"), DataDir: dataDir, Log: discardLogger()})
+	b := newWhisperCpp(SelectConfig{AutoDownload: false, DataDir: dataDir, Log: discardLogger()})
 	seedWhisperCache(t, dataDir)
 	seedWhisperModel(t, b, dataDir)
 
@@ -547,7 +605,7 @@ func TestWhisperCppEnsureReadyNoAutoDownloadKeepsCache(t *testing.T) {
 	}
 	defer func() { ensureWhisperCLI = restore }()
 
-	if err := b.EnsureReady(context.Background(), dataDir); err != nil {
+	if err := b.EnsureReady(context.Background()); err != nil {
 		t.Fatalf("EnsureReady with a cache and auto-download off: %v", err)
 	}
 	if called {
@@ -574,7 +632,7 @@ func TestWhisperCppEnsureReadyLocalInstallNeverManaged(t *testing.T) {
 	}
 	defer func() { ensureWhisperCLI = restore }()
 
-	if err := b.EnsureReady(context.Background(), dataDir); err != nil {
+	if err := b.EnsureReady(context.Background()); err != nil {
 		t.Fatalf("EnsureReady with a local install: %v", err)
 	}
 	if called {

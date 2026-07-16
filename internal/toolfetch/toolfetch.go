@@ -1,23 +1,33 @@
-// Package toolfetch resolves and, when necessary, fetches the external media
-// tools the audio stages need (ffmpeg for the chapter FLAC split, ffprobe for
-// inspect). It is ported from audiosilo-server's internal/toolfetch and trimmed
-// to the two tools M2 uses.
+// Package toolfetch resolves and, when necessary, fetches the external artifacts
+// the pipeline needs. It manages three artifact families, all cached under
+// <data>/tools:
 //
-// Resolve owns the full lookup order: an explicit configured path, then a copy
-// next to the daemon binary, then $PATH, and only if none of those turn up a tool
-// (and auto-download is enabled) does it fall back to ensure, which caches a
-// static build under <data>/tools/ and reuses it forever.
+//   - ffmpeg/ffprobe static builds (this file): Resolve owns the full lookup
+//     order - an explicit configured path, then a copy next to the daemon binary,
+//     then $PATH - and only if none of those turn up a tool (and auto-download is
+//     enabled) does it fall back to ensure, which caches a static build and
+//     reuses it forever. Ported from audiosilo-server's internal/toolfetch.
+//   - the whisper.cpp `whisper-cli` binary (whisper.go): EnsureWhisperCLI fetches
+//     the platform+device build from this repo's pinned release, verified against
+//     the release's checksums.txt (a missing line or a digest mismatch adopts
+//     nothing), with a one-shot CPU fallback when an accelerated build fails its
+//     self-check on the user's machine and a stale-cache degrade when a refresh
+//     fails offline.
+//   - ggml ASR models (model.go): EnsureModel downloads a model with a size floor
+//     and a .meta sidecar, so a truncated/corrupted cache is re-fetched rather
+//     than trusted forever.
 //
 // Everything degrades gracefully: offline, auto-download disabled, or an
-// unsupported platform just means the tool is absent (an audio stage then fails
-// that book while the rest of the daemon keeps working) and a retry on the next
-// start. Integrity: downloads are HTTPS-only from pinned, reputable hosts (GitHub
-// release assets from BtbN's FFmpeg-Builds for Linux/Windows; evermeet.cx for
-// macOS), and every downloaded binary is sanity-checked by running `-version`
-// before it is adopted (there is no digest pinning). Extraction is fully
-// in-process (stdlib archive/zip + archive/tar over an xz decoder) with per-entry
-// name sanitization, so there is no dependency on a host `tar` and no archive
-// entry can write outside the destination directory.
+// unsupported platform just means the artifact is absent (the affected stage then
+// parks/fails that book while the rest of the daemon keeps working) and a retry
+// on the next run. Integrity: downloads are HTTPS-only from pinned, reputable
+// hosts (BtbN's FFmpeg-Builds for Linux/Windows and evermeet.cx for macOS ffmpeg;
+// this repo's GitHub release for whisper-cli; Hugging Face for models), and every
+// downloaded binary is sanity-checked by running it (`-version` / `--help`)
+// before it is adopted. Extraction is fully in-process (stdlib archive/zip +
+// archive/tar over xz/gzip decoders) with per-entry name sanitization and byte
+// budgets, so there is no dependency on a host `tar` and no archive entry can
+// write outside the destination directory or fill the disk.
 package toolfetch
 
 import (
@@ -439,7 +449,8 @@ func copyExec(src, dst string) error {
 // writeExec writes r to path as an executable (0o755). It is the common case of
 // writeMode for a tool binary.
 func writeExec(path string, r io.Reader) error {
-	return writeMode(path, r, 0o755)
+	_, err := writeMode(path, r, 0o755)
+	return err
 }
 
 // writeMode writes r to path with perm atomically: it streams into a sibling temp
@@ -447,23 +458,25 @@ func writeExec(path string, r io.Reader) error {
 // mid-copy can never leave a truncated file at the final path (which a cache-hit
 // check would then adopt forever, since a stat can't tell a partial file from a
 // whole one). perm lets a caller preserve an archive entry's own mode (an
-// executable binary vs a plain shared library beside it).
-func writeMode(path string, r io.Reader, perm os.FileMode) error {
+// executable binary vs a plain shared library beside it). It returns the byte
+// count written so budget-enforcing callers can detect an over-cap entry.
+func writeMode(path string, r io.Reader, perm os.FileMode) (int64, error) {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".partial-"+filepath.Base(path)+"-")
 	if err != nil {
-		return err
+		return 0, err
 	}
 	tmpName := tmp.Name()
-	defer func() { _ = os.Remove(tmpName) }()  // no-op once renamed into place
-	if _, err := io.Copy(tmp, r); err != nil { //nolint:gosec // bounded by the caller's LimitReader
+	defer func() { _ = os.Remove(tmpName) }() // no-op once renamed into place
+	n, err := io.Copy(tmp, r)                 //nolint:gosec // bounded by the caller's LimitReader
+	if err != nil {
 		_ = tmp.Close()
-		return err
+		return n, err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return n, err
 	}
 	if err := os.Chmod(tmpName, perm); err != nil {
-		return err
+		return n, err
 	}
-	return os.Rename(tmpName, path)
+	return n, os.Rename(tmpName, path)
 }

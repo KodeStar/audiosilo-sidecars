@@ -95,10 +95,12 @@ func (m *mlxWhisper) Detect(_ context.Context) (Capability, error) {
 	return cap, nil
 }
 
-// EnsureReady builds the pinned venv if it is not already present, and otherwise
-// enforces the pinned version on an existing venv (see ensurePinnedVersion). It is
-// idempotent: a venv already at mlxWhisperVersion is left alone.
-func (m *mlxWhisper) EnsureReady(ctx context.Context, dataDir string) error {
+// EnsureReady builds the pinned venv (under the backend's own data dir) if it is
+// not already present, and otherwise enforces the pinned version on an existing
+// venv (see ensurePinnedVersion). It is idempotent: a venv already at
+// mlxWhisperVersion is left alone.
+func (m *mlxWhisper) EnsureReady(ctx context.Context) error {
+	dataDir := m.dataDir
 	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
 		return errors.New("mlx-whisper requires macOS on Apple Silicon (darwin/arm64)")
 	}

@@ -52,7 +52,7 @@ func TestLiveMLX(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	if err := b.EnsureReady(ctx, dataDir); err != nil {
+	if err := b.EnsureReady(ctx); err != nil {
 		t.Fatalf("EnsureReady (venv build): %v", err)
 	}
 	t.Logf("venv ready in %s", time.Since(start).Round(time.Second))

@@ -352,13 +352,19 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, report schedul
 	}); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("asr: write provenance: %w", err)
 	}
-	// Prepare the backend once per book run (build the venv / fetch the model).
-	// Idempotent + logged inside the backend.
-	if err := setup.Backend.EnsureReady(ctx, e.dataDir); err != nil {
+	// Prepare the backend once per book run (fetch the binary/model, build the
+	// venv). Idempotent + logged inside the backend. A failure here is an
+	// environment/tooling precondition (offline first run, a misconfigured
+	// whisper_cli_path), never a book-content error - with auto-download on,
+	// Detect is optimistic (no network I/O), so a fresh offline box only trips at
+	// this step. Park needs_attention so Retry re-admits the book once the human
+	// fixes the environment, rather than hard-failing it.
+	if err := setup.Backend.EnsureReady(ctx); err != nil {
 		if ctx.Err() != nil {
 			return scheduler.StageResult{}, ctx.Err()
 		}
-		return scheduler.StageResult{}, fmt.Errorf("asr: prepare %s: %w", setup.Backend.ID(), err)
+		return scheduler.StageResult{}, scheduler.Park(
+			"ASR setup failed (" + setup.Backend.ID() + "): " + err.Error() + " - fix this, then retry")
 	}
 
 	total := len(manifest.Chapters)

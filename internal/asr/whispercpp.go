@@ -22,9 +22,12 @@ const whisperCLIName = "whisper-cli"
 const modelsSubdir = "models"
 
 // whisperCppModelURL is the pinned Hugging Face source for the default model
-// (~1.6 GiB). Both the model AND (when auto-download is enabled) the whisper-cli
-// binary are fetched: the model from here, the binary from the pinned release via
-// toolfetch.EnsureWhisperCLI.
+// (~1.6 GiB). ggerganov/whisper.cpp is the CANONICAL Hugging Face home for the
+// ggml model files - the ggml-org/whisper.cpp HF repo does NOT exist (it returns
+// 401, verified 2026-07-16), so do not "fix" the org back to ggml-org (ggml-org
+// is only the GitHub org, not the HF one). Both the model AND (when auto-download
+// is enabled) the whisper-cli binary are fetched: the model from here, the binary
+// from the pinned release via toolfetch.EnsureWhisperCLI.
 const whisperCppModelURL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
 
 // minWhisperModelBytes is the floor a downloaded model must exceed to be trusted
@@ -82,8 +85,14 @@ func (w *whisperCpp) localCLIPath() string {
 // cliPath resolves the whisper-cli binary to invoke: the local install, else the
 // toolfetch auto-download cache under <data>/tools/whisper-cpp, else "". A binary
 // EnsureReady auto-downloaded lands in the cache, so a later Transcribe finds it
-// here without re-resolving.
+// here without re-resolving. An EXPLICIT configured path is authoritative: it
+// resolves to itself or to nothing - never to the managed cache, which would
+// silently mask a typo'd asr.whisper_cli_path (Detect/EnsureReady surface that
+// misconfiguration loudly instead).
 func (w *whisperCpp) cliPath() string {
+	if w.cliExplicit != "" {
+		return w.localCLIPath()
+	}
 	if p := w.localCLIPath(); p != "" {
 		return p
 	}
@@ -102,6 +111,13 @@ func (w *whisperCpp) modelPath(dataDir string) string {
 func (w *whisperCpp) Detect(_ context.Context) (Capability, error) {
 	device := detectWhisperDevice()
 	cap := Capability{Backend: IDWhisperCpp, Device: device}
+	if w.cliExplicit != "" && w.localCLIPath() == "" {
+		// An operator who configured a path meant that one: a typo must surface as a
+		// loud misconfiguration, never be silently replaced by the managed cache or
+		// an auto-download.
+		cap.Detail = "configured whisper_cli_path not found: " + w.cliExplicit
+		return cap, nil
+	}
 	if cli := w.cliPath(); cli != "" {
 		cap.Available = true
 		cap.Version = "whisper.cpp (" + cli + ")"
@@ -122,31 +138,36 @@ func (w *whisperCpp) Detect(_ context.Context) (Capability, error) {
 // EnsureReady makes the backend runnable: it settles the whisper-cli binary, then
 // downloads the ggml model if it is missing. Both steps are idempotent + logged.
 //
-// Binary policy: a LOCAL install (localCLIPath) is the user's own - used as-is,
-// never touched. Otherwise the auto-download cache is OURS to manage: when
-// auto-download is on, ensureWhisperCLI ALWAYS runs, even if a cached binary
-// already resolves - its cache-hit path is a cheap .meta read with zero network
-// I/O when the pinned tag matches, and it is the only place a tag bump (upgrade)
-// or a meta-less partial install gets repaired; gating it on "no binary resolves"
+// Binary policy: an EXPLICIT configured path that does not resolve is a loud error
+// (a typo'd asr.whisper_cli_path must never be silently replaced by a download). A
+// LOCAL install (localCLIPath) is the user's own - used as-is, never touched.
+// Otherwise the auto-download cache is OURS to manage: when auto-download is on,
+// ensureWhisperCLI ALWAYS runs, even if a cached binary already resolves - its
+// cache-hit path is a cheap .meta read with zero network I/O when the pinned tag
+// matches, and it is the only place a tag bump (upgrade), a device change, or a
+// meta-less partial install gets repaired; gating it on "no binary resolves"
 // would leave a stale cache in place forever. toolfetch itself degrades a failed
 // refresh to the previously-installed cached binary, so an error from it means
 // nothing is usable. With auto-download off, a pre-existing cache keeps working.
-func (w *whisperCpp) EnsureReady(ctx context.Context, dataDir string) error {
+func (w *whisperCpp) EnsureReady(ctx context.Context) error {
+	if w.cliExplicit != "" && w.localCLIPath() == "" {
+		return fmt.Errorf("configured whisper_cli_path not found: %s", w.cliExplicit)
+	}
 	if w.localCLIPath() == "" {
 		// No user-owned local install: resolve through the managed cache.
 		if w.autoDownload {
-			if _, err := ensureWhisperCLI(ctx, toolsDir(dataDir), detectWhisperDevice(), w.log); err != nil {
+			if _, err := ensureWhisperCLI(ctx, toolsDir(w.dataDir), detectWhisperDevice(), w.log); err != nil {
 				return fmt.Errorf("whisper-cli download: %w", err)
 			}
 		}
 		// A successful ensure and a pre-existing cache both resolve here (the local
 		// half is already known empty, so only the cache needs checking); a bare miss
 		// (auto-download off and nothing cached) is the clear install-or-enable error.
-		if toolfetch.CachedWhisperCLI(toolsDir(dataDir)) == "" {
+		if toolfetch.CachedWhisperCLI(toolsDir(w.dataDir)) == "" {
 			return fmt.Errorf("whisper-cli not found; install whisper.cpp or enable tools.auto_download to enable the %s backend", IDWhisperCpp)
 		}
 	}
-	dest := w.modelPath(dataDir)
+	dest := w.modelPath(w.dataDir)
 	if _, err := toolfetch.EnsureModel(ctx, whisperCppModelURL, dest, minWhisperModelBytes, w.log); err != nil {
 		return fmt.Errorf("whisper.cpp model: %w", err)
 	}

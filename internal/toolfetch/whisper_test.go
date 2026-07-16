@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -308,21 +309,73 @@ func TestEnsureWhisperCLICPUFallback(t *testing.T) {
 		t.Fatalf("path = %q, want %q", got, wantPath)
 	}
 	meta, ok := readJSONSidecar[whisperMeta](metaPath(wantPath))
-	if !ok || meta.Asset != cpuAsset || meta.Tag != WhisperCLIReleaseTag {
-		t.Errorf("meta = %+v ok=%v, want the adopted CPU asset %q at tag %q", meta, ok, cpuAsset, WhisperCLIReleaseTag)
+	if !ok || meta.Asset != cpuAsset || meta.Tag != WhisperCLIReleaseTag || !meta.Fallback {
+		t.Errorf("meta = %+v ok=%v, want the adopted CPU asset %q at tag %q with Fallback=true", meta, ok, cpuAsset, WhisperCLIReleaseTag)
 	}
 	if hits != 4 { // (checksums + cuda) + (checksums + cpu)
 		t.Errorf("fallback hits = %d, want 4", hits)
 	}
 
-	// Stickiness: the next call is a tag-gated cache hit - the broken accelerated
-	// asset is NOT re-attempted until the release tag bumps.
+	// Stickiness: the recorded Fallback keeps the next call a cache hit even though
+	// the desired (cuda) asset differs from the installed one - the broken
+	// accelerated asset is NOT re-attempted until the release tag bumps.
 	got2, err := ensureWhisperCLIPlatform(context.Background(), toolsDir, "linux", "amd64", "cuda", discard())
 	if err != nil || got2 != wantPath {
 		t.Fatalf("sticky cache hit = %q,%v", got2, err)
 	}
 	if hits != 4 {
 		t.Errorf("after the sticky cache hit, hits = %d, want 4 (no re-attempt)", hits)
+	}
+}
+
+// TestEnsureWhisperCLIDeviceUpgradeRedownloads: a PLAIN install (no fallback) is
+// device-sensitive. A box whose detected device was cpu installs the CPU asset as
+// its desired build; when the device later becomes cuda (the user installs an
+// NVIDIA driver), the cache no longer matches the desired asset and the
+// accelerated build is re-downloaded - it does not stay stuck on CPU
+// transcription until the next tag bump. Only a RECORDED fallback is sticky
+// (covered by TestEnsureWhisperCLICPUFallback).
+func TestEnsureWhisperCLIDeviceUpgradeRedownloads(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("whisper-cli stub is a shell script; skip on Windows")
+	}
+	const (
+		cudaAsset = "whisper-cli-linux-amd64-cuda.tar.gz"
+		cpuAsset  = "whisper-cli-linux-amd64-cpu.tar.gz"
+	)
+	ok := "#!/bin/sh\nexit 0\n"
+	assets := map[string][]byte{
+		cpuAsset:  buildTarGz(t, map[string]string{whisperCLIBase: ok}),
+		cudaAsset: buildTarGz(t, map[string]string{whisperCLIBase: ok, "libcudart.so": "LIB"}),
+	}
+	var hits int
+	serveWhisperMulti(t, assets, checksumsFor(assets), &hits)
+	toolsDir := t.TempDir()
+
+	// First install: the detected device IS cpu, so the CPU asset is the desired
+	// build, not a fallback.
+	if _, err := ensureWhisperCLIPlatform(context.Background(), toolsDir, "linux", "amd64", "cpu", discard()); err != nil {
+		t.Fatalf("initial cpu install: %v", err)
+	}
+	binPath := filepath.Join(toolsDir, whisperSubdir, binName(whisperCLIBase))
+	if meta, mok := readJSONSidecar[whisperMeta](metaPath(binPath)); !mok || meta.Asset != cpuAsset || meta.Fallback {
+		t.Fatalf("initial meta = %+v ok=%v, want plain (non-fallback) cpu asset", meta, mok)
+	}
+	if hits != 2 {
+		t.Fatalf("initial install hits = %d, want 2", hits)
+	}
+
+	// The detected device becomes cuda: the plain CPU install no longer matches the
+	// desired asset, so the accelerated build is fetched.
+	got, err := ensureWhisperCLIPlatform(context.Background(), toolsDir, "linux", "amd64", "cuda", discard())
+	if err != nil || got != binPath {
+		t.Fatalf("device-upgrade ensure = %q,%v", got, err)
+	}
+	if hits != 4 {
+		t.Errorf("device upgrade hits = %d, want 4 (must re-download the accelerated build)", hits)
+	}
+	if meta, mok := readJSONSidecar[whisperMeta](metaPath(binPath)); !mok || meta.Asset != cudaAsset || meta.Fallback {
+		t.Errorf("post-upgrade meta = %+v ok=%v, want the plain cuda asset", meta, mok)
 	}
 }
 
@@ -398,9 +451,10 @@ func seedStaleWhisperInstall(t *testing.T, toolsDir, asset string) string {
 // TestEnsureWhisperCLIOfflineKeepsStaleCache: a failed refresh (here a release
 // whose checksums.txt lacks the asset, standing in for offline/broken) with a
 // previously-installed binary still present degrades to that stale binary instead
-// of erroring - and leaves the stale .meta untouched, so the tag gate keeps
-// missing and a later run retries the refresh. ALLOWED. (The DENIED counterpart -
-// a failed refresh with NO cache errors - is TestEnsureWhisperCLIMissingChecksumLine.)
+// of erroring - logging the operator-visible warning - and leaves the stale .meta
+// untouched, so the tag gate keeps missing and a later run retries the refresh.
+// ALLOWED. (The DENIED counterpart - a failed refresh with NO cache errors - is
+// TestEnsureWhisperCLIMissingChecksumLine.)
 func TestEnsureWhisperCLIOfflineKeepsStaleCache(t *testing.T) {
 	asset, device := whisperTestAsset(t)
 	// Empty checksums.txt: every refresh fails at the verification step.
@@ -409,16 +463,71 @@ func TestEnsureWhisperCLIOfflineKeepsStaleCache(t *testing.T) {
 	toolsDir := t.TempDir()
 	binPath := seedStaleWhisperInstall(t, toolsDir, asset)
 
-	got, err := EnsureWhisperCLI(context.Background(), toolsDir, device, discard())
+	var logBuf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logBuf, nil))
+	got, err := EnsureWhisperCLI(context.Background(), toolsDir, device, log)
 	if err != nil {
 		t.Fatalf("a failed refresh with a cached binary must degrade, not error: %v", err)
 	}
 	if got != binPath {
 		t.Errorf("path = %q, want the stale cached %q", got, binPath)
 	}
+	if !strings.Contains(logBuf.String(), "proceeding with the previously-installed binary") {
+		t.Errorf("expected the stale-cache warning to be logged, got:\n%s", logBuf.String())
+	}
 	meta, ok := readJSONSidecar[whisperMeta](metaPath(binPath))
 	if !ok || meta.Tag == WhisperCLIReleaseTag {
 		t.Errorf("stale .meta must survive untouched (retry next run), got %+v ok=%v", meta, ok)
+	}
+}
+
+// TestExtractAllTarGzBudget: extraction enforces a TOTAL uncompressed-bytes budget
+// as a HARD error - an over-cap archive (one huge entry, or several small ones
+// summing over the cap) is rejected outright, never silently truncated at the cap.
+func TestExtractAllTarGzBudget(t *testing.T) {
+	restore := maxWhisperArchiveBytes
+	maxWhisperArchiveBytes = 64
+	defer func() { maxWhisperArchiveBytes = restore }()
+
+	// One entry over the whole budget.
+	big := buildTarGz(t, map[string]string{whisperCLIBase: strings.Repeat("A", 100)})
+	if err := extractAllTarGz(bytes.NewReader(big), t.TempDir()); err == nil {
+		t.Error("an over-budget entry must be a hard error, not a truncation")
+	}
+	// Entries individually under the budget but summing over it.
+	many := buildTarGz(t, map[string]string{
+		whisperCLIBase: strings.Repeat("B", 40),
+		"lib-a.so":     strings.Repeat("C", 40),
+	})
+	if err := extractAllTarGz(bytes.NewReader(many), t.TempDir()); err == nil {
+		t.Error("entries summing over the budget must be a hard error")
+	}
+}
+
+// TestEnsureWhisperCLIOversizeExtractionRejected: a checksum-valid archive whose
+// UNCOMPRESSED content exceeds the cap (tiny compressed, hostile/corrupt when
+// inflated - the disk-filling shape) is rejected end to end and nothing is
+// adopted. DENIED.
+func TestEnsureWhisperCLIOversizeExtractionRejected(t *testing.T) {
+	asset, device := whisperTestAsset(t)
+	restore := maxWhisperArchiveBytes
+	maxWhisperArchiveBytes = 1024
+	defer func() { maxWhisperArchiveBytes = restore }()
+
+	// Highly compressible: ~4 KiB uncompressed (over the 1 KiB cap) but a tiny
+	// compressed download (under it), so only the extraction budget can catch it.
+	archive := buildTarGz(t, map[string]string{whisperCLIBase: strings.Repeat("A", 4096)})
+	if int64(len(archive)) > maxWhisperArchiveBytes {
+		t.Fatalf("fixture: compressed size %d must sit under the cap %d", len(archive), maxWhisperArchiveBytes)
+	}
+	serveWhisperRelease(t, asset, archive, sha256hex(archive)+"  "+asset+"\n", nil)
+
+	toolsDir := t.TempDir()
+	if _, err := EnsureWhisperCLI(context.Background(), toolsDir, device, discard()); err == nil {
+		t.Fatal("an over-budget extraction must fail the ensure")
+	}
+	if CachedWhisperCLI(toolsDir) != "" {
+		t.Error("nothing must be adopted from an over-budget archive")
 	}
 }
 

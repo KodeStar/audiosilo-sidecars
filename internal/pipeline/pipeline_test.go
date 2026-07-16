@@ -33,6 +33,7 @@ type fakeBackend struct {
 	before        func(chapter int)
 	block         chan struct{} // when non-nil, Transcribe waits on it (or ctx)
 	transcribeErr error         // when non-nil, Transcribe returns it (a real failure)
+	ensureErr     error         // when non-nil, EnsureReady returns it (an environment precondition)
 	// emptyMode scripts per-chapter empty output across attempts: "" normal (always
 	// non-empty), "once" empty on the first attempt then non-empty, "always" empty on
 	// every attempt. An empty attempt writes a valid-but-segmentless raw transcript.
@@ -47,7 +48,7 @@ func (f *fakeBackend) Detect(context.Context) (asr.Capability, error) {
 	return asr.Capability{Backend: "fake", Available: true, Device: "cpu", Version: "fake"}, nil
 }
 
-func (f *fakeBackend) EnsureReady(context.Context, string) error { return nil }
+func (f *fakeBackend) EnsureReady(context.Context) error { return f.ensureErr }
 
 func (f *fakeBackend) Transcribe(ctx context.Context, job asr.Job) error {
 	if f.before != nil {
@@ -463,6 +464,31 @@ func TestASRStageUnavailableParks(t *testing.T) {
 	}
 	if !strings.Contains(pe.Reason, "no python3") {
 		t.Errorf("park reason = %q, want it to carry the unavailability detail", pe.Reason)
+	}
+}
+
+// TestASRStageEnsureReadyFailureParks asserts an EnsureReady failure PARKS the
+// book needs_attention with actionable guidance rather than hard-failing it: with
+// auto-download on, Detect is optimistic (available=true, no network I/O), so a
+// fresh offline box passes the availability gate and first trips at EnsureReady's
+// binary/model fetch - an environment/tooling precondition, never a book-content
+// error, and Retry must be able to re-admit the book once the human fixes it.
+func TestASRStageEnsureReadyFailureParks(t *testing.T) {
+	work := t.TempDir()
+	writeManifest(t, work, 1)
+	seedFLACs(t, work, 1)
+	fake := newFakeBackend()
+	fake.ensureErr = errors.New("whisper-cli download: dial tcp: no route to host")
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil)
+	var pe *scheduler.ParkError
+	if !errors.As(err, &pe) {
+		t.Fatalf("asr stage error = %v, want a ParkError (needs_attention)", err)
+	}
+	if !strings.Contains(pe.Reason, "ASR setup failed") ||
+		!strings.Contains(pe.Reason, "no route to host") ||
+		!strings.Contains(pe.Reason, "retry") {
+		t.Errorf("park reason = %q, want the setup-failed guidance carrying the underlying cause", pe.Reason)
 	}
 }
 

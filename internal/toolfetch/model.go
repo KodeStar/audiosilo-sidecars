@@ -99,9 +99,12 @@ const progressStep = 100 << 20
 
 // progressWriter is an io.Writer that logs cumulative download progress every
 // progressStep bytes. It counts only; the bytes flow to the real sink alongside it
-// (io.MultiWriter). Total exposes the final byte count for a completion log.
+// (io.MultiWriter). what names the artifact in the log line (an ASR model, a
+// whisper-cli asset), so the shared progress plumbing never mislabels what it is
+// fetching. Total exposes the final byte count for a completion log.
 type progressWriter struct {
 	log     *slog.Logger
+	what    string
 	Total   int64
 	nextLog int64
 }
@@ -109,7 +112,7 @@ type progressWriter struct {
 func (p *progressWriter) Write(b []byte) (int, error) {
 	p.Total += int64(len(b))
 	if p.Total >= p.nextLog {
-		p.log.Info("downloading ASR model", "downloaded_mb", p.Total>>20)
+		p.log.Info("downloading "+p.what, "downloaded_mb", p.Total>>20)
 		p.nextLog += progressStep
 	}
 	return len(b), nil
@@ -139,7 +142,7 @@ func downloadModel(ctx context.Context, url, destPath string, minBytes int64, lo
 	tmpName := tmp.Name()
 	defer func() { _ = os.Remove(tmpName) }() // no-op once renamed
 
-	pw := &progressWriter{log: log, nextLog: progressStep}
+	pw := &progressWriter{log: log, what: "ASR model", nextLog: progressStep}
 	n, err := io.Copy(io.MultiWriter(tmp, pw), io.LimitReader(resp.Body, maxModelBytes+1))
 	if err != nil {
 		_ = tmp.Close()

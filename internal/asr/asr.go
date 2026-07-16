@@ -93,13 +93,16 @@ type Job struct {
 
 // Backend is one ASR implementation. Detect is cheap and side-effect-free (probe
 // availability + device). EnsureReady is idempotent and may be expensive (build a
-// venv, download a model); it is called once before a book's chapters. Transcribe
-// runs ONE chapter to a raw output file; per-chapter resume is the caller's
-// concern (the pipeline skips chapters whose raw output already parses complete).
+// venv, download a binary/model); it is called once before a book's chapters and
+// works against the backend's own configured data dir (from SelectConfig - it
+// takes no dataDir parameter, so EnsureReady and Transcribe can never validate
+// one directory and resolve another). Transcribe runs ONE chapter to a raw output
+// file; per-chapter resume is the caller's concern (the pipeline skips chapters
+// whose raw output already parses complete).
 type Backend interface {
 	ID() string
 	Detect(ctx context.Context) (Capability, error)
-	EnsureReady(ctx context.Context, dataDir string) error
+	EnsureReady(ctx context.Context) error
 	Transcribe(ctx context.Context, job Job) error
 }
 

@@ -67,11 +67,17 @@ var whisperReleaseBase = "https://github.com/KodeStar/audiosilo-sidecars/release
 // whisperMeta is the sidecar written LAST, after the binary is fully in place, so a
 // process killed mid-install never leaves a final dir the cache-hit path would
 // trust. It records the pinned tag (an upgrade invalidates the cache), the asset it
-// came from, and the verified sha256, for diagnostics/auditing.
+// came from, the verified sha256, and whether the asset was adopted via the CPU
+// self-check fallback. Fallback keeps the fallback sticky (the broken accelerated
+// asset is not re-attempted until the tag bumps), while a plain install stays
+// device-sensitive: a box that installed the CPU asset because its detected device
+// WAS cpu re-downloads the accelerated build as soon as the device changes (say,
+// an NVIDIA driver gets installed).
 type whisperMeta struct {
-	Tag    string `json:"tag"`
-	Asset  string `json:"asset"`
-	SHA256 string `json:"sha256"`
+	Tag      string `json:"tag"`
+	Asset    string `json:"asset"`
+	SHA256   string `json:"sha256"`
+	Fallback bool   `json:"fallback,omitempty"`
 }
 
 // WhisperCLIAssetFor maps a platform+device to the pinned release asset that
@@ -128,15 +134,18 @@ func CachedWhisperCLI(toolsDir string) string {
 // beside it, resolved by an $ORIGIN RPATH). device selects the linux/amd64 build
 // variant (cuda/vulkan/cpu).
 //
-// Cache hit: a .meta sidecar stamped with the pinned tag AND the binary present
-// returns immediately with NO network I/O. A tag mismatch (an upgrade) or a missing
-// binary re-downloads.
+// Cache hit: a .meta sidecar stamped with the pinned tag, the binary present, AND
+// the recorded asset still matching the CURRENT device's desired asset (or being a
+// recorded CPU fallback) returns immediately with NO network I/O. A tag mismatch
+// (an upgrade), a missing binary, or a device change (a plain CPU install on a box
+// that now detects cuda/vulkan) re-downloads.
 //
 // Integrity: HTTPS-only; the asset's sha256 is looked up in the release's
 // checksums.txt (a missing line is a hard DENY, never "skip verification") and
 // verified byte-for-byte while streaming - a mismatch adopts nothing. Extraction
-// runs into a TEMP dir with per-entry name sanitization and size caps; the binary
-// is self-checked (`--help` must exit 0) before the temp dir is atomically moved
+// runs into a TEMP dir with per-entry name sanitization and a hard uncompressed-
+// bytes budget (an over-cap archive is rejected, never truncated); the binary is
+// self-checked (`--help` must exit 0) before the temp dir is atomically moved
 // into place; the .meta is written LAST.
 //
 // Degradation: a failed refresh (offline, a broken release) with a previously-
@@ -166,12 +175,22 @@ func EnsureWhisperCLI(ctx context.Context, toolsDir, device string, log *slog.Lo
 // the test host (production always passes runtime.GOOS/GOARCH).
 func ensureWhisperCLIPlatform(ctx context.Context, toolsDir, goos, goarch, device string, log *slog.Logger) (string, error) {
 	binPath := filepath.Join(toolsDir, whisperSubdir, binName(whisperCLIBase))
+	desired, desiredOK := WhisperCLIAssetFor(goos, goarch, device)
 
-	// Cache hit: the sidecar's tag matches the pin and the binary is present. The
-	// .meta is written last, so its presence proves a complete prior install.
+	// Cache hit: the sidecar's tag matches the pin, the binary is present, and the
+	// install still fits the CURRENT device - it holds the desired asset, or it is a
+	// recorded CPU fallback (sticky until the tag bumps). A plain install whose
+	// asset no longer matches (the detected device changed, e.g. a driver arrived)
+	// falls through and re-downloads the accelerated build. The .meta is written
+	// last, so its presence proves a complete prior install. (No desired asset for
+	// the platform means we cannot do better than what is cached.)
 	if meta, ok := readJSONSidecar[whisperMeta](metaPath(binPath)); ok && meta.Tag == WhisperCLIReleaseTag {
 		if info, err := os.Stat(binPath); err == nil && !info.IsDir() {
-			return binPath, nil
+			if !desiredOK || meta.Asset == desired || meta.Fallback {
+				return binPath, nil
+			}
+			log.Info("whisper-cli cache holds a different device's build; refreshing",
+				"cached_asset", meta.Asset, "desired_asset", desired)
 		}
 	}
 
@@ -206,6 +225,7 @@ func refreshWhisperCLI(ctx context.Context, toolsDir, goos, goarch, device strin
 		return err
 	}
 
+	fallback := false
 	sum, err := installWhisperAsset(ctx, toolsDir, finalDir, asset, log)
 	if err != nil {
 		// Only a SELF-CHECK failure (binary verified + extracted but won't run here)
@@ -217,15 +237,16 @@ func refreshWhisperCLI(ctx context.Context, toolsDir, goos, goarch, device strin
 		}
 		log.Warn("whisper-cli accelerated build failed its self-check on this machine; falling back to the CPU build",
 			"asset", asset, "cpu_asset", cpuAsset, "err", err)
-		asset = cpuAsset
+		asset, fallback = cpuAsset, true
 		if sum, err = installWhisperAsset(ctx, toolsDir, finalDir, asset, log); err != nil {
 			return err
 		}
 	}
 
 	// Write the sidecar LAST: only now is the final dir a complete, trusted install.
-	// It records the asset actually adopted (the CPU one after a fallback).
-	if err := writeJSONSidecar(metaPath(binPath), whisperMeta{Tag: WhisperCLIReleaseTag, Asset: asset, SHA256: sum}); err != nil {
+	// It records the asset actually adopted, and whether it was the CPU fallback
+	// (which the cache-hit gate treats as sticky until the next tag bump).
+	if err := writeJSONSidecar(metaPath(binPath), whisperMeta{Tag: WhisperCLIReleaseTag, Asset: asset, SHA256: sum, Fallback: fallback}); err != nil {
 		return err
 	}
 	log.Info("whisper-cli ready", "path", binPath, "asset", asset, "tag", WhisperCLIReleaseTag)
@@ -324,7 +345,7 @@ func downloadWhisperAsset(ctx context.Context, tag, asset, destPath string, log 
 		return "", err
 	}
 	h := sha256.New()
-	pw := &progressWriter{log: log, nextLog: progressStep}
+	pw := &progressWriter{log: log, what: "whisper-cli asset", nextLog: progressStep}
 	// Bound the copy at cap+1 so an over-cap body trips the ceiling rather than
 	// filling the disk, and hash every byte we accept.
 	n, err := io.Copy(io.MultiWriter(f, h, pw), io.LimitReader(resp.Body, maxWhisperArchiveBytes+1))
@@ -427,9 +448,11 @@ func extractWhisperArchive(asset, archivePath, destDir string) error {
 
 // extractAllTarGz extracts every regular file from a gzip-compressed tar into
 // destDir by basename (never joining the archive's own path), rejecting any unsafe
-// entry name outright and capping each file. An entry that carries an executable
-// mode bit is written 0o755, else 0o644 - so a bundled shared library is not
-// needlessly executable while the binary is.
+// entry name outright. A running uncompressed-bytes budget (maxWhisperArchiveBytes
+// across ALL entries) makes an over-cap archive a HARD error - never a silent
+// truncation, and a checksum-valid but hostile/corrupt archive cannot fill the
+// disk. An entry that carries an executable mode bit is written 0o755, else 0o644 -
+// so a bundled shared library is not needlessly executable while the binary is.
 func extractAllTarGz(r io.Reader, destDir string) error {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
@@ -438,6 +461,7 @@ func extractAllTarGz(r io.Reader, destDir string) error {
 	defer func() { _ = gz.Close() }()
 	tr := tar.NewReader(gz)
 	found := 0
+	remaining := maxWhisperArchiveBytes
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -453,9 +477,16 @@ func extractAllTarGz(r io.Reader, destDir string) error {
 			continue
 		}
 		perm := archiveEntryPerm(hdr.Mode&0o111 != 0)
-		if err := writeMode(filepath.Join(destDir, filepath.Base(hdr.Name)), io.LimitReader(tr, maxWhisperArchiveBytes), perm); err != nil {
+		// Read one byte past the remaining budget so an over-budget entry is DETECTED
+		// (written > remaining) and rejected, rather than silently truncated at the cap.
+		n, err := writeMode(filepath.Join(destDir, filepath.Base(hdr.Name)), io.LimitReader(tr, remaining+1), perm)
+		if err != nil {
 			return err
 		}
+		if n > remaining {
+			return fmt.Errorf("archive exceeds the %d-byte uncompressed budget at entry %q", maxWhisperArchiveBytes, hdr.Name)
+		}
+		remaining -= n
 		found++
 	}
 	if found == 0 {
@@ -465,14 +496,16 @@ func extractAllTarGz(r io.Reader, destDir string) error {
 }
 
 // extractAllZip extracts every regular file from an on-disk zip into destDir by
-// basename, with the same safety (basename-only, per-file cap, executable bit
-// preserved) as the tar path. The caller enforces the archive size cap.
+// basename, with the same safety (basename-only, unsafe names rejected, executable
+// bit preserved, a running uncompressed-bytes budget with hard over-cap errors) as
+// the tar path. The caller enforces the compressed-archive size cap.
 func extractAllZip(ra io.ReaderAt, size int64, destDir string) error {
 	zr, err := zip.NewReader(ra, size)
 	if err != nil {
 		return err
 	}
 	found := 0
+	remaining := maxWhisperArchiveBytes
 	for _, zf := range zr.File {
 		if zf.FileInfo().IsDir() {
 			continue
@@ -485,11 +518,16 @@ func extractAllZip(ra io.ReaderAt, size int64, destDir string) error {
 			return err
 		}
 		perm := archiveEntryPerm(zf.FileInfo().Mode()&0o111 != 0)
-		err = writeMode(filepath.Join(destDir, filepath.Base(zf.Name)), io.LimitReader(rc, maxWhisperArchiveBytes), perm)
+		// One byte past the remaining budget: over-budget is detected, never truncated.
+		n, err := writeMode(filepath.Join(destDir, filepath.Base(zf.Name)), io.LimitReader(rc, remaining+1), perm)
 		_ = rc.Close()
 		if err != nil {
 			return err
 		}
+		if n > remaining {
+			return fmt.Errorf("archive exceeds the %d-byte uncompressed budget at entry %q", maxWhisperArchiveBytes, zf.Name)
+		}
+		remaining -= n
 		found++
 	}
 	if found == 0 {
