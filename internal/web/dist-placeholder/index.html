@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AudioSilo Sidecars</title>
+    <style>
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #0b111b;
+        color: #d1d5db;
+        font-family:
+          Roboto,
+          system-ui,
+          -apple-system,
+          sans-serif;
+      }
+      main {
+        max-width: 34rem;
+        padding: 2rem;
+        text-align: center;
+      }
+      h1 {
+        color: #f3f4f6;
+        font-weight: 600;
+      }
+      code {
+        color: #db2777;
+      }
+      a {
+        color: #db2777;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>AudioSilo Sidecars</h1>
+      <p>
+        The web UI has not been built into this binary. Run
+        <code>scripts/build-web.sh</code> to build the SPA and rebuild the
+        daemon, or use the JSON API directly under <code>/api/v1</code>.
+      </p>
+    </main>
+  </body>
+</html>
