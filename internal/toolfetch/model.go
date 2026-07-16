@@ -33,10 +33,10 @@ func metaPath(destPath string) string { return destPath + ".meta" }
 // LocateBinary resolves an external binary WITHOUT downloading it, using the same
 // order as the ffmpeg/ffprobe resolution: an explicit path/name (honored exactly),
 // then a copy next to the daemon binary, then $PATH. It returns "" when none is
-// found. This is the shared lookup the ASR whisper.cpp backend reuses to find
-// whisper-cli. (Auto-downloading the whisper.cpp binary itself is deferred to a
-// later milestone's CI-built matrix; a missing binary means that backend is
-// unavailable, surfaced with a clear message.)
+// found. This is the shared lookup the ASR whisper.cpp backend tries first for
+// whisper-cli; when it comes up empty and auto-download is on, the backend falls
+// back to EnsureWhisperCLI, which fetches a prebuilt binary from the pinned release
+// (see whisper.go).
 func LocateBinary(name, explicit string) string {
 	return resolveLocal(name, explicit)
 }

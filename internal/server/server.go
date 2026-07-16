@@ -128,6 +128,7 @@ func Run(ctx context.Context, opts Options) error {
 		Model:          cfg.ASR.Model,
 		Language:       cfg.ASR.Language,
 		WhisperCLIPath: cfg.ASR.WhisperCLIPath,
+		AutoDownload:   cfg.Tools.AutoDownload,
 		DataDir:        opts.DataDir,
 		Log:            toolLog,
 	})
@@ -166,6 +167,7 @@ func Run(ctx context.Context, opts Options) error {
 			Model:          cfg.ASR.Model,
 			Language:       cfg.ASR.Language,
 			WhisperCLIPath: cfg.ASR.WhisperCLIPath,
+			AutoDownload:   cfg.Tools.AutoDownload,
 			DataDir:        opts.DataDir,
 			Log:            toolLog,
 		},

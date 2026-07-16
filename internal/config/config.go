@@ -56,9 +56,12 @@ const (
 // selects/forces an ASR backend; Model/Language fall back to each backend's
 // default when empty (mlx-community/whisper-large-v3-turbo or
 // ggml-large-v3-turbo.bin; "en"). WhisperCLIPath explicitly locates the
-// whisper.cpp binary. The device is NOT a config knob (no backend honors an
-// override yet) - /system reports the device the resolved backend actually
-// detected; a device override can return here once a backend honors it.
+// whisper.cpp binary; when it is empty and the binary is not found locally, the
+// whisper-cpp backend auto-downloads a prebuilt whisper-cli from the pinned release
+// (gated by tools.auto_download, on a supported platform). The device is NOT a
+// config knob (no backend honors an override yet) - /system reports the device the
+// resolved backend actually detected; a device override can return here once a
+// backend honors it.
 //
 // Changing asr.backend (or the tool paths) takes effect only on a daemon RESTART:
 // the backend is resolved once at startup (asr.Select in server.go). This is unlike
@@ -102,7 +105,10 @@ type ToolsConfig struct {
 	FFprobePath string `yaml:"ffprobe_path"`
 	// AutoDownload, when true (the default), fetches a static build into
 	// <data>/tools when neither an explicit path, a copy next to the binary, nor
-	// $PATH turns up the tool. Set false for an air-gapped/managed environment.
+	// $PATH turns up the tool. It also gates the whisper-cpp ASR backend's fetch of
+	// a prebuilt whisper-cli from the pinned release (internal/toolfetch), so a user
+	// on non-Apple hardware gets a working ASR backend with no manual install. Set
+	// false for an air-gapped/managed environment.
 	AutoDownload bool `yaml:"auto_download"`
 }
 

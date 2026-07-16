@@ -4,8 +4,9 @@
 //   - mlx-whisper (darwin/arm64): the validated path, managing its own pinned
 //     Python venv under <data>/tools/mlx-venv and letting mlx-whisper fetch the
 //     Hugging Face model on first run.
-//   - whisper-cpp (every platform): a resolved whisper-cli binary plus a ggml
-//     model this package downloads into <data>/tools/models.
+//   - whisper-cpp (every platform): a whisper-cli binary - resolved locally, or
+//     auto-downloaded (a prebuilt from the pinned release, when tools.auto_download
+//     is on) - plus a ggml model this package downloads into <data>/tools/models.
 //
 // A backend produces the RAW per-chapter output byte-for-byte; normalization into
 // the audiosilo-transcript/v1 contract (and NaN sanitizing) is internal/transcript's
@@ -101,12 +102,17 @@ type Backend interface {
 // SelectConfig chooses and configures a backend. Backend is "auto" (or ""),
 // "mlx-whisper", or "whisper-cpp". Model/Language fall back to the backend
 // defaults. WhisperCLIPath is an explicit whisper-cli location ("" resolves it).
-// DataDir is the daemon data dir; backends derive <DataDir>/tools/... from it.
+// AutoDownload mirrors tools.auto_download: when set, the whisper-cpp backend may
+// fetch a prebuilt whisper-cli binary from the pinned release if none resolves
+// locally (Detect then reports available on a supported platform, and EnsureReady
+// performs the fetch). DataDir is the daemon data dir; backends derive
+// <DataDir>/tools/... from it.
 type SelectConfig struct {
 	Backend        string
 	Model          string
 	Language       string
 	WhisperCLIPath string
+	AutoDownload   bool
 	DataDir        string
 	Log            *slog.Logger
 }

@@ -22,23 +22,31 @@ const whisperCLIName = "whisper-cli"
 const modelsSubdir = "models"
 
 // whisperCppModelURL is the pinned Hugging Face source for the default model
-// (~1.6 GiB). Only the model is auto-downloaded here; the whisper-cli binary is
-// not (its CI-built matrix is M3b), so a missing binary means unavailable.
-const whisperCppModelURL = "https://huggingface.co/ggml-org/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
+// (~1.6 GiB). Both the model AND (when auto-download is enabled) the whisper-cli
+// binary are fetched: the model from here, the binary from the pinned release via
+// toolfetch.EnsureWhisperCLI.
+const whisperCppModelURL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
 
 // minWhisperModelBytes is the floor a downloaded model must exceed to be trusted
 // (the real file is ~1.6 GiB; this rejects a truncated download or an HTML error
 // page). Kept well below the true size for headroom.
 const minWhisperModelBytes = 1 << 30 // 1 GiB
 
+// ensureWhisperCLI is the whisper-cli auto-download entry point, a package var so a
+// test can substitute it (mirrors toolfetch's platformSpec seam) and exercise
+// EnsureReady's ordering without a real network fetch. Production always uses the
+// real toolfetch implementation.
+var ensureWhisperCLI = toolfetch.EnsureWhisperCLI
+
 // whisperCpp is the cross-platform ASR backend over a resolved whisper-cli binary
 // and a downloaded ggml model.
 type whisperCpp struct {
-	cliExplicit string // configured whisper-cli path ("" resolves automatically)
-	modelName   string // ggml model filename (default DefaultWhisperCppModel)
-	language    string
-	dataDir     string
-	log         *slog.Logger
+	cliExplicit  string // configured whisper-cli path ("" resolves automatically)
+	modelName    string // ggml model filename (default DefaultWhisperCppModel)
+	language     string
+	autoDownload bool // fetch a prebuilt whisper-cli when none resolves locally
+	dataDir      string
+	log          *slog.Logger
 }
 
 func newWhisperCpp(cfg SelectConfig) *whisperCpp {
@@ -51,20 +59,26 @@ func newWhisperCpp(cfg SelectConfig) *whisperCpp {
 		lang = DefaultLanguage
 	}
 	return &whisperCpp{
-		cliExplicit: cfg.WhisperCLIPath,
-		modelName:   model,
-		language:    lang,
-		dataDir:     cfg.DataDir,
-		log:         orDiscard(cfg.Log),
+		cliExplicit:  cfg.WhisperCLIPath,
+		modelName:    model,
+		language:     lang,
+		autoDownload: cfg.AutoDownload,
+		dataDir:      cfg.DataDir,
+		log:          orDiscard(cfg.Log),
 	}
 }
 
 func (w *whisperCpp) ID() string { return IDWhisperCpp }
 
-// cliPath resolves the whisper-cli binary (explicit -> beside daemon -> PATH), or
-// "" if not found.
+// cliPath resolves the whisper-cli binary (explicit -> beside daemon -> PATH ->
+// the toolfetch auto-download cache under <data>/tools/whisper-cpp), or "" if not
+// found anywhere. A binary EnsureReady auto-downloaded lands in the cache, so a
+// later Transcribe finds it here without re-resolving.
 func (w *whisperCpp) cliPath() string {
-	return toolfetch.LocateBinary(whisperCLIName, w.cliExplicit)
+	if p := toolfetch.LocateBinary(whisperCLIName, w.cliExplicit); p != "" {
+		return p
+	}
+	return toolfetch.CachedWhisperCLI(toolsDir(w.dataDir))
 }
 
 // modelPath is the cached model file location under <data>/tools/models.
@@ -72,25 +86,62 @@ func (w *whisperCpp) modelPath(dataDir string) string {
 	return filepath.Join(toolsDir(dataDir), modelsSubdir, w.modelName)
 }
 
-// Detect reports availability (a resolvable whisper-cli) and the informational
-// device. It does not download the model (that is EnsureReady).
+// Detect reports availability and the informational device. It is available when a
+// whisper-cli binary resolves locally OR when auto-download is on and the pinned
+// release publishes a binary for this platform+device (fetched lazily by
+// EnsureReady). It performs no network I/O and does not download the model.
 func (w *whisperCpp) Detect(_ context.Context) (Capability, error) {
-	cap := Capability{Backend: IDWhisperCpp, Device: detectWhisperDevice()}
-	cli := w.cliPath()
-	if cli == "" {
-		cap.Detail = "whisper-cli not found (explicit path, beside the binary, or PATH); install whisper.cpp - binary auto-download arrives in a later milestone (M3b)"
+	device := detectWhisperDevice()
+	cap := Capability{Backend: IDWhisperCpp, Device: device}
+	if cli := w.cliPath(); cli != "" {
+		cap.Available = true
+		cap.Version = "whisper.cpp (" + cli + ")"
 		return cap, nil
 	}
-	cap.Available = true
-	cap.Version = "whisper.cpp (" + cli + ")"
+	if w.autoDownload {
+		if asset, ok := toolfetch.WhisperCLIAvailableFor(runtime.GOOS, runtime.GOARCH, device); ok {
+			// A binary will be fetched on first use; Version stays empty until it is.
+			cap.Available = true
+			cap.Detail = "whisper-cli will be downloaded on first use (" + asset + ")"
+			return cap, nil
+		}
+	}
+	cap.Detail = "whisper-cli not found (explicit path, beside the binary, or PATH); install whisper.cpp, or enable tools.auto_download on a supported platform (Apple Silicon, Linux x86-64/arm64, or Windows x86-64)"
 	return cap, nil
 }
 
-// EnsureReady downloads the ggml model if it is missing (the whisper-cli binary
-// must already be present - Detect gates on it). Idempotent + logged.
+// EnsureReady makes the backend runnable: it settles the whisper-cli binary, then
+// downloads the ggml model if it is missing. Both steps are idempotent + logged.
+//
+// Binary policy: a LOCAL install (explicit path, beside the daemon, $PATH) is the
+// user's own - used as-is, never touched. Otherwise the auto-download cache is OURS
+// to manage: when auto-download is on, ensureWhisperCLI ALWAYS runs, even if a
+// cached binary already resolves - its cache-hit path is a cheap .meta read with
+// zero network I/O when the pinned tag matches, and it is the only place a tag bump
+// (upgrade) or a meta-less partial install gets repaired; gating it on "no binary
+// resolves" would leave a stale cache in place forever. Graceful degrade: if the
+// refresh fails (offline) but a cached binary is still present, proceed on the
+// stale binary with a warning rather than failing the book; fail only when nothing
+// is usable. With auto-download off, a pre-existing cache keeps working as before.
 func (w *whisperCpp) EnsureReady(ctx context.Context, dataDir string) error {
-	if w.cliPath() == "" {
-		return fmt.Errorf("whisper-cli not found; install whisper.cpp to enable the %s backend", IDWhisperCpp)
+	if toolfetch.LocateBinary(whisperCLIName, w.cliExplicit) == "" {
+		// No user-owned local install: resolve through the managed cache.
+		switch {
+		case w.autoDownload:
+			if _, err := ensureWhisperCLI(ctx, toolsDir(dataDir), detectWhisperDevice(), w.log); err != nil {
+				cached := toolfetch.CachedWhisperCLI(toolsDir(dataDir))
+				if cached == "" {
+					return fmt.Errorf("whisper-cli download: %w", err)
+				}
+				w.log.Warn("whisper-cli refresh failed; proceeding with the cached binary",
+					"path", cached, "err", err)
+			}
+		case toolfetch.CachedWhisperCLI(toolsDir(dataDir)) == "":
+			return fmt.Errorf("whisper-cli not found; install whisper.cpp or enable tools.auto_download to enable the %s backend", IDWhisperCpp)
+		}
+		if w.cliPath() == "" {
+			return fmt.Errorf("whisper-cli still unresolved after auto-download")
+		}
 	}
 	dest := w.modelPath(dataDir)
 	if _, err := toolfetch.EnsureModel(ctx, whisperCppModelURL, dest, minWhisperModelBytes, w.log); err != nil {

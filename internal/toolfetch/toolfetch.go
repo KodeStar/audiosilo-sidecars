@@ -414,12 +414,19 @@ func copyExec(src, dst string) error {
 	return writeExec(dst, io.LimitReader(in, maxToolBytes))
 }
 
-// writeExec writes r to path (0o755) atomically: it streams into a sibling temp
-// file and renames it into place only after a clean close, so a process killed
-// mid-copy can never leave a truncated binary at the final path (which Ensure
-// would then adopt forever, since a stat can't tell a partial file from a whole
-// one).
+// writeExec writes r to path as an executable (0o755). It is the common case of
+// writeMode for a tool binary.
 func writeExec(path string, r io.Reader) error {
+	return writeMode(path, r, 0o755)
+}
+
+// writeMode writes r to path with perm atomically: it streams into a sibling temp
+// file and renames it into place only after a clean close, so a process killed
+// mid-copy can never leave a truncated file at the final path (which a cache-hit
+// check would then adopt forever, since a stat can't tell a partial file from a
+// whole one). perm lets a caller preserve an archive entry's own mode (an
+// executable binary vs a plain shared library beside it).
+func writeMode(path string, r io.Reader, perm os.FileMode) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".partial-"+filepath.Base(path)+"-")
 	if err != nil {
 		return err
@@ -433,7 +440,7 @@ func writeExec(path string, r io.Reader) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Chmod(tmpName, 0o755); err != nil { //nolint:gosec // tool must be executable
+	if err := os.Chmod(tmpName, perm); err != nil {
 		return err
 	}
 	return os.Rename(tmpName, path)

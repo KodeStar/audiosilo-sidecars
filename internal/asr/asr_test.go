@@ -2,15 +2,18 @@ package asr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
+	"github.com/kodestar/audiosilo-sidecars/internal/toolfetch"
 )
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -324,6 +327,282 @@ func TestWhisperCppUnavailableWithoutCLI(t *testing.T) {
 	}
 	if cap.Detail == "" {
 		t.Error("unavailable whisper-cpp must carry a Detail")
+	}
+}
+
+// TestWhisperCppDetectAutoDownload: with no local binary, availability now tracks
+// tools.auto_download AND whether the pinned release publishes an asset for this
+// platform. Written to hold on both darwin/arm64 (a metal asset exists) and
+// linux/amd64 CI (a cpu asset exists) as well as any unsupported platform.
+func TestWhisperCppDetectAutoDownload(t *testing.T) {
+	nope := filepath.Join(t.TempDir(), "nope") // explicit-but-missing: no PATH fallback
+	device := detectWhisperDevice()
+	_, supported := toolfetch.WhisperCLIAvailableFor(runtime.GOOS, runtime.GOARCH, device)
+
+	// auto-download ON, no binary.
+	on := newWhisperCpp(SelectConfig{AutoDownload: true, WhisperCLIPath: nope, DataDir: t.TempDir(), Log: discardLogger()})
+	cap, _ := on.Detect(context.Background())
+	if supported {
+		if !cap.Available {
+			t.Errorf("supported platform with auto-download should be available: %+v", cap)
+		}
+		if cap.Version != "" {
+			t.Errorf("pre-download availability must not claim a Version, got %q", cap.Version)
+		}
+		if !strings.Contains(cap.Detail, "downloaded on first use") {
+			t.Errorf("Detail should explain the pending download, got %q", cap.Detail)
+		}
+	} else if cap.Available {
+		t.Error("unsupported platform must not be available via auto-download")
+	}
+
+	// auto-download OFF, no binary: always unavailable with a clear Detail.
+	off := newWhisperCpp(SelectConfig{AutoDownload: false, WhisperCLIPath: nope, DataDir: t.TempDir(), Log: discardLogger()})
+	capOff, _ := off.Detect(context.Background())
+	if capOff.Available {
+		t.Error("auto-download off with no binary must be unavailable")
+	}
+	if capOff.Detail == "" {
+		t.Error("unavailable whisper-cpp must carry a Detail")
+	}
+}
+
+// TestWhisperCppEnsureReadyAutoDownloadsBinary drives EnsureReady's ordering through
+// the injectable ensureWhisperCLI seam (no real network): the binary is fetched into
+// the cache, then found by cliPath so Transcribe can use it. The model step is a
+// no-op via a pre-seeded model + sidecar.
+func TestWhisperCppEnsureReadyAutoDownloadsBinary(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script stub is unix-only")
+	}
+	dataDir := t.TempDir()
+	b := newWhisperCpp(SelectConfig{AutoDownload: true, WhisperCLIPath: filepath.Join(t.TempDir(), "nope"), DataDir: dataDir, Log: discardLogger()})
+
+	// Pre-seed the ggml model + its sidecar so EnsureModel is a cache hit (no HTTP).
+	model := b.modelPath(dataDir)
+	if err := os.MkdirAll(filepath.Dir(model), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(model, []byte("ggml"), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(model+".meta", []byte(`{"size":4,"url":"seed"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Before EnsureReady there is no binary.
+	if b.cliPath() != "" {
+		t.Fatal("precondition: no whisper-cli should resolve yet")
+	}
+
+	var called bool
+	restore := ensureWhisperCLI
+	ensureWhisperCLI = func(_ context.Context, toolsDir, _ string, _ *slog.Logger) (string, error) {
+		called = true
+		dir := filepath.Join(toolsDir, "whisper-cpp")
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return "", err
+		}
+		p := filepath.Join(dir, "whisper-cli")
+		if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil { //nolint:gosec // test stub
+			return "", err
+		}
+		return p, nil
+	}
+	defer func() { ensureWhisperCLI = restore }()
+
+	if err := b.EnsureReady(context.Background(), dataDir); err != nil {
+		t.Fatalf("EnsureReady: %v", err)
+	}
+	if !called {
+		t.Error("EnsureReady should auto-download the binary when none resolves")
+	}
+	// The downloaded binary is now resolvable (via the toolfetch cache) so Transcribe
+	// will find it.
+	if got := b.cliPath(); got == "" {
+		t.Error("cliPath should resolve the auto-downloaded binary after EnsureReady")
+	}
+}
+
+// TestWhisperCppEnsureReadyNoAutoDownload: with auto-download off and no binary,
+// EnsureReady fails clearly and never invokes the downloader.
+func TestWhisperCppEnsureReadyNoAutoDownload(t *testing.T) {
+	b := newWhisperCpp(SelectConfig{AutoDownload: false, WhisperCLIPath: filepath.Join(t.TempDir(), "nope"), DataDir: t.TempDir(), Log: discardLogger()})
+	var called bool
+	restore := ensureWhisperCLI
+	ensureWhisperCLI = func(context.Context, string, string, *slog.Logger) (string, error) {
+		called = true
+		return "", nil
+	}
+	defer func() { ensureWhisperCLI = restore }()
+
+	if err := b.EnsureReady(context.Background(), b.dataDir); err == nil {
+		t.Fatal("EnsureReady should fail without a binary and auto-download off")
+	}
+	if called {
+		t.Error("auto-download off must not invoke the downloader")
+	}
+}
+
+// TestWhisperCppEnsureReadyDownloadErrorPropagates: a failing download with NO
+// cached binary to fall back on surfaces as an EnsureReady error (the book then
+// parks, not silently proceeds).
+func TestWhisperCppEnsureReadyDownloadErrorPropagates(t *testing.T) {
+	b := newWhisperCpp(SelectConfig{AutoDownload: true, WhisperCLIPath: filepath.Join(t.TempDir(), "nope"), DataDir: t.TempDir(), Log: discardLogger()})
+	restore := ensureWhisperCLI
+	ensureWhisperCLI = func(context.Context, string, string, *slog.Logger) (string, error) {
+		return "", errors.New("boom")
+	}
+	defer func() { ensureWhisperCLI = restore }()
+	if err := b.EnsureReady(context.Background(), b.dataDir); err == nil {
+		t.Fatal("a download error must propagate from EnsureReady")
+	}
+}
+
+// seedWhisperCache pre-populates the managed auto-download cache with an executable
+// whisper-cli stub under <dataDir>/tools/whisper-cpp and returns its path.
+func seedWhisperCache(t *testing.T, dataDir string) string {
+	t.Helper()
+	return writeScript(t, filepath.Join(toolsDir(dataDir), "whisper-cpp", "whisper-cli"), "#!/bin/sh\nexit 0\n")
+}
+
+// seedWhisperModel pre-seeds the ggml model + its sidecar so EnsureModel is a cache
+// hit (no HTTP) for the given backend.
+func seedWhisperModel(t *testing.T, b *whisperCpp, dataDir string) {
+	t.Helper()
+	model := b.modelPath(dataDir)
+	if err := os.MkdirAll(filepath.Dir(model), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(model, []byte("ggml"), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(model+".meta", []byte(`{"size":4,"url":"seed"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestWhisperCppEnsureReadyRefreshesExistingCache: with auto-download on and NO
+// user-owned local install, EnsureReady must invoke ensureWhisperCLI even though a
+// cached binary already resolves - that call's .meta-gated cache-hit path is the
+// ONLY place a tag bump (upgrade) or a meta-less partial install is repaired, so
+// skipping it whenever cliPath() resolved would strand the cache on the old tag
+// forever (the QA-found defect). The re-download-on-tag-mismatch behavior itself is
+// covered end to end in toolfetch's TestEnsureWhisperCLITagUpgrade (httptest hits
+// counted); this test pins the asr-side contract that the call always happens.
+func TestWhisperCppEnsureReadyRefreshesExistingCache(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script stub is unix-only")
+	}
+	dataDir := t.TempDir()
+	b := newWhisperCpp(SelectConfig{AutoDownload: true, WhisperCLIPath: filepath.Join(t.TempDir(), "nope"), DataDir: dataDir, Log: discardLogger()})
+	seedWhisperCache(t, dataDir)
+	seedWhisperModel(t, b, dataDir)
+
+	// Precondition: the cached binary already resolves - the old (buggy) gate
+	// "cliPath() == \"\"" would have skipped the refresh entirely.
+	if b.cliPath() == "" {
+		t.Fatal("precondition: the seeded cache binary should resolve")
+	}
+
+	var called bool
+	restore := ensureWhisperCLI
+	ensureWhisperCLI = func(context.Context, string, string, *slog.Logger) (string, error) {
+		called = true
+		return "", nil
+	}
+	defer func() { ensureWhisperCLI = restore }()
+
+	if err := b.EnsureReady(context.Background(), dataDir); err != nil {
+		t.Fatalf("EnsureReady: %v", err)
+	}
+	if !called {
+		t.Error("EnsureReady must run ensureWhisperCLI even when a cached binary resolves (tag upgrades never fire otherwise)")
+	}
+}
+
+// TestWhisperCppEnsureReadyOfflineKeepsStaleCache: a failing refresh (offline) with
+// a cached binary still present proceeds on the stale binary instead of failing the
+// book, and logs a warning.
+func TestWhisperCppEnsureReadyOfflineKeepsStaleCache(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script stub is unix-only")
+	}
+	dataDir := t.TempDir()
+	var logBuf strings.Builder
+	log := slog.New(slog.NewTextHandler(&logBuf, nil))
+	b := newWhisperCpp(SelectConfig{AutoDownload: true, WhisperCLIPath: filepath.Join(t.TempDir(), "nope"), DataDir: dataDir, Log: log})
+	cached := seedWhisperCache(t, dataDir)
+	seedWhisperModel(t, b, dataDir)
+
+	restore := ensureWhisperCLI
+	ensureWhisperCLI = func(context.Context, string, string, *slog.Logger) (string, error) {
+		return "", errors.New("offline")
+	}
+	defer func() { ensureWhisperCLI = restore }()
+
+	if err := b.EnsureReady(context.Background(), dataDir); err != nil {
+		t.Fatalf("EnsureReady must degrade to the cached binary when offline: %v", err)
+	}
+	if got := b.cliPath(); got != cached {
+		t.Errorf("cliPath after offline degrade = %q, want the cached %q", got, cached)
+	}
+	if !strings.Contains(logBuf.String(), "proceeding with the cached binary") {
+		t.Errorf("expected a stale-cache warning, got:\n%s", logBuf.String())
+	}
+}
+
+// TestWhisperCppEnsureReadyNoAutoDownloadKeepsCache: with auto-download off, a
+// pre-existing cache keeps working (no downloader call, no error).
+func TestWhisperCppEnsureReadyNoAutoDownloadKeepsCache(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script stub is unix-only")
+	}
+	dataDir := t.TempDir()
+	b := newWhisperCpp(SelectConfig{AutoDownload: false, WhisperCLIPath: filepath.Join(t.TempDir(), "nope"), DataDir: dataDir, Log: discardLogger()})
+	seedWhisperCache(t, dataDir)
+	seedWhisperModel(t, b, dataDir)
+
+	var called bool
+	restore := ensureWhisperCLI
+	ensureWhisperCLI = func(context.Context, string, string, *slog.Logger) (string, error) {
+		called = true
+		return "", nil
+	}
+	defer func() { ensureWhisperCLI = restore }()
+
+	if err := b.EnsureReady(context.Background(), dataDir); err != nil {
+		t.Fatalf("EnsureReady with a cache and auto-download off: %v", err)
+	}
+	if called {
+		t.Error("auto-download off must never invoke the downloader")
+	}
+}
+
+// TestWhisperCppEnsureReadyLocalInstallNeverManaged: a user-owned local install
+// (explicit path) is used as-is - the managed-cache refresh must NOT run.
+func TestWhisperCppEnsureReadyLocalInstallNeverManaged(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script stub is unix-only")
+	}
+	dataDir := t.TempDir()
+	cli := fakeWhisperCLI(t)
+	b := newWhisperCpp(SelectConfig{AutoDownload: true, WhisperCLIPath: cli, DataDir: dataDir, Log: discardLogger()})
+	seedWhisperModel(t, b, dataDir)
+
+	var called bool
+	restore := ensureWhisperCLI
+	ensureWhisperCLI = func(context.Context, string, string, *slog.Logger) (string, error) {
+		called = true
+		return "", nil
+	}
+	defer func() { ensureWhisperCLI = restore }()
+
+	if err := b.EnsureReady(context.Background(), dataDir); err != nil {
+		t.Fatalf("EnsureReady with a local install: %v", err)
+	}
+	if called {
+		t.Error("a user-owned local install must never trigger the managed-cache refresh")
 	}
 }
 
