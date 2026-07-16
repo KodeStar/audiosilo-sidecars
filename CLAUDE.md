@@ -93,17 +93,35 @@ This mirrors audiosilo-server's `-tags embedplayer`. Do not commit
 ```
 cmd/audiosilo-sidecars/   entrypoint: `serve` (default) + `version`; flags --data, --listen
 internal/
-  config/   config.yaml in <data>/ + AUDIOSILO_SIDECARS_* env overrides; Load/Save/Validate;
-            asr + agent sections are typed stubs consumed by later milestones
+  config/   config.yaml in <data>/ + AUDIOSILO_SIDECARS_* env overrides; Load/Save/Validate.
+            M1 added library_roots (scan allow-list), metadata.base_url, scan.ffprobe_path;
+            agent.concurrency is now live (scheduler agent lane). asr/agent-model routing
+            stay typed stubs for later milestones.
   auth/     single admin password (argon2id, generated + printed once on first run),
             opaque SHA-256-hashed session tokens, a per-IP login rate limiter; the
-            Store interface is storage-agnostic (JSON file store today, SQLite in M1)
+            Store interface is storage-agnostic (MemStore for tests; the SQLite
+            store.AuthStore in production - the M0 JSON store was removed in M1)
   secrets/  named secrets (anthropic/openai keys, github PAT) in the OS keychain
             (go-keyring) with a 0600 secrets.json fallback; read API is presence-only
+  store/    SQLite (modernc, pure Go; single writer + WAL) + append-only migrations:
+            books, stage_runs, progress, events (durable log, 30-day prune), rates
+            (EWMA seed, create-only in M1), settings KV, sessions. Plain tested CRUD;
+            AuthStore adapts it to auth.Store. Holds the SCHEDULING truth.
+  state/    per-book pipeline state machine: table-driven states/lanes/transitions,
+            CanStart/NextState guards, the audit fix-loop cap. Pure, no I/O.
+  scheduler/ one wake-on-event goroutine over three lanes (ASR cap 1 / agent cap =
+            config, series-locked / mechanical cap 2) with StubExecutor + _done/<stage>.json
+            sentinels (the CONTENT truth) and crash reconcile. Pause/resume/retry/cancel/
+            delete. Publishes book.state/stage.progress/queue.stats.
+  metaops/  meta.audiosilo.app client (coverage/lookup, 1h TTL cache, graceful
+            degrade) + async folder-scan job manager over audiosilo-meta pkg/scan +
+            the library_roots PathAllowed check. stdlib HTTP + the meta module only.
   events/   SSE hub: Publish -> monotonic-id fan-out, ring-buffer replay from
-            Last-Event-ID, ephemeral heartbeats, slow-subscriber eviction
-  api/      transport-only HTTP: auth/system/settings/events handlers + middleware
-            (bearer auth, allow-list CORS, security headers). NO business logic here.
+            Last-Event-ID, ephemeral heartbeats, slow-subscriber eviction, optional
+            durable-sink persister (feeds store.events)
+  api/      transport-only HTTP: auth/system/settings/events + M1 scans/books/control
+            handlers + middleware (bearer auth, allow-list CORS, security headers).
+            NO business logic here.
   web/      go:embed of the SPA (build-tag selected) + SPA-fallback static serving
   server/   http.Server wiring, graceful shutdown, the startup banner
 web/          the SPA: Vite + React 19 + TS + Tailwind v4 (npm, Node 24); dist/ is embedded
@@ -112,8 +130,10 @@ Dockerfile             multi-stage: node build -> go build (embedui) -> distrole
 ```
 
 **Dependency direction** (transport-only rule): `server -> {api, auth, secrets,
-events, config, web}`; `api -> {auth, secrets, events, config}`. Handlers marshal
-DTOs and call into the injected packages; they hold no logic.
+events, config, store, scheduler, metaops, web}`; `api -> {auth, secrets, events,
+config, store, scheduler, metaops}`; `scheduler -> {store, state, events}`;
+`state` is pure. Handlers marshal DTOs and call into the injected packages; they
+hold no logic (state transitions live in `state`, dispatch in `scheduler`).
 
 ## Conventions
 
@@ -147,15 +167,27 @@ Milestones from the workspace plan; each is shippable.
   placeholders; Settings is real - password change + write-only secrets), and the
   Dockerfile stub. **Gate:** login local + remote-with-auth; SSE heartbeat visible
   in the UI liveness dot.
-- **M1 (planned):** SQLite store, the per-book state machine + scheduler (stub
-  executors), `pkg/scan` (folder identification) + the coverage/lookup client, and
-  the Library tab end to end.
+- **M1 (Go side done; Library tab UI pending):** SQLite store + migrations
+  (`internal/store`), the per-book state machine (`internal/state`), the
+  three-lane scheduler over stub executors with crash-resume sentinels
+  (`internal/scheduler`), the folder scan (`audiosilo-meta pkg/scan`) + coverage/
+  lookup client (`internal/metaops`), and the pipeline API surface (`POST /scans`,
+  `GET /scans/{id}`, `POST /books`, `GET /books[/{id}]`, `POST /books/{id}/{pause,
+  resume,retry,cancel}`, `DELETE /books/{id}`; `/system` library tab = ready). The
+  scheduler runs stub executors that write `_done/<stage>.json` sentinels so the
+  whole machine runs end to end; real executors arrive M2+. **Still pending:** the
+  React **Library tab UI** (folder picker -> scan table with coverage badges ->
+  checkbox select -> Process N books), a separate follow-up task consuming this
+  API. Gate verified: `go build/vet/test -race/golangci-lint` green + a live smoke
+  (scan -> books -> stub pipeline to done, pause/resume, kill -9 + resume with no
+  duplicated stages, and a live coverage check against meta.audiosilo.app).
 - **M2-M8 (planned):** toolfetch + audio (ffmpeg split), ASR backends
   (mlx-whisper + whisper.cpp), QA/spelling ports, the agent runner (claude +
   codex) with staged context dirs enforcing the invariants, the fact-pass +
   synthesis + audit loop, contribution (intake/PR/local), and packaging
   (GoReleaser + Docker matrix). See the plan for the full table.
 
-Everything past M0 is **not built yet** - the config `asr`/`agent` sections,
-the extra tabs, and the pipeline packages are stubs or absent. Keep this file
-honest as milestones land.
+M1's Go daemon is built; the Running/Done tabs and the pipeline's real executors
+(audio/ASR/QA/agent/contribute) are **not built yet** - the scheduler runs stub
+executors, and the config `asr`/agent-model sections stay typed stubs. Keep this
+file honest as milestones land.
