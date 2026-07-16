@@ -101,7 +101,7 @@ func (db *DB) ListStageRuns(ctx context.Context, bookID int64) ([]StageRun, erro
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []StageRun
 	for rows.Next() {
 		r, err := scanRun(rows)
@@ -121,7 +121,7 @@ func (db *DB) OpenStageRuns(ctx context.Context) ([]StageRun, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []StageRun
 	for rows.Next() {
 		r, err := scanRun(rows)
@@ -142,7 +142,7 @@ func (db *DB) SucceededStages(ctx context.Context, bookID int64) (map[string]boo
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := map[string]bool{}
 	for rows.Next() {
 		var s string
@@ -203,7 +203,7 @@ func (db *DB) ListProgress(ctx context.Context, bookID int64) ([]Progress, error
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []Progress
 	for rows.Next() {
 		var p Progress

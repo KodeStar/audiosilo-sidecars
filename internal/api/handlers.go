@@ -91,7 +91,7 @@ type systemResponse struct {
 // tabs is the static M0 tab list. Only Settings is functional; the rest are
 // placeholders whose real content lands in later milestones.
 var tabs = []tabInfo{
-	{ID: "library", Label: "Library", Status: "planned"},
+	{ID: "library", Label: "Library", Status: "ready"},
 	{ID: "running", Label: "Running", Status: "planned"},
 	{ID: "done", Label: "Done", Status: "planned"},
 	{ID: "settings", Label: "Settings", Status: "ready"},

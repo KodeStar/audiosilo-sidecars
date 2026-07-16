@@ -19,6 +19,8 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/auth"
 	"github.com/kodestar/audiosilo-sidecars/internal/config"
 	"github.com/kodestar/audiosilo-sidecars/internal/events"
+	"github.com/kodestar/audiosilo-sidecars/internal/metaops"
+	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/secrets"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 	"github.com/kodestar/audiosilo-sidecars/internal/web"
@@ -67,7 +69,7 @@ func Run(ctx context.Context, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if n, perr := db.PruneEvents(ctx, time.Now().Add(-eventRetention)); perr != nil {
 		return fmt.Errorf("prune events: %w", perr)
 	} else if n > 0 {
@@ -94,15 +96,30 @@ func Run(ctx context.Context, opts Options) error {
 	})
 	go hub.RunHeartbeat(ctx, heartbeatInterval)
 
+	// Pipeline wiring (M1): the metadata client, the async scan manager, and the
+	// three-lane scheduler over stub executors. The scheduler runs its own
+	// goroutine and reconciles crash state on start.
+	metaClient := metaops.NewClient(cfg.Metadata.BaseURL)
+	scanMgr := metaops.NewScanManager(ctx, metaClient, cfg.Scan.FFprobePath)
+	sched := scheduler.New(db, hub, scheduler.NewStubExecutor(0, 0), cfg.Agent.Concurrency)
+	go func() {
+		if err := sched.Start(ctx); err != nil {
+			fmt.Fprintf(opts.Out, "[error] scheduler stopped: %v\n", err)
+		}
+	}()
+
 	apiHandler := api.New(api.Deps{
-		Auth:    mgr,
-		Limiter: auth.NewRateLimiter(10, 0.5), // burst 10, refill 1 per 2s
-		Secrets: sec,
-		Events:  hub,
-		Version: opts.Version,
-		DataDir: opts.DataDir,
-		Config:  cfg,
-		Save:    func(c config.Config) error { return config.Save(opts.DataDir, c) },
+		Auth:      mgr,
+		Limiter:   auth.NewRateLimiter(10, 0.5), // burst 10, refill 1 per 2s
+		Secrets:   sec,
+		Events:    hub,
+		Version:   opts.Version,
+		DataDir:   opts.DataDir,
+		Store:     db,
+		Scheduler: sched,
+		Scans:     scanMgr,
+		Config:    cfg,
+		Save:      func(c config.Config) error { return config.Save(opts.DataDir, c) },
 	}).Handler()
 
 	root := http.NewServeMux()

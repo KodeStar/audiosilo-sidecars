@@ -11,7 +11,7 @@ import (
 type metaServer struct {
 	lookup   map[string]string // asin/isbn -> work id ("" => 404)
 	missing  map[string][]string
-	hasMiss  bool                         // include a missing[] list in /coverage
+	hasMiss  bool // include a missing[] list in /coverage
 	work     map[string]struct{ c, r bool }
 	requests map[string]int
 }

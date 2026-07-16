@@ -63,7 +63,7 @@ func ReadSentinel(workDir, stage string) (Sentinel, error) {
 // write means the stage is genuinely done and must not re-run. The write is
 // atomic (temp file + rename).
 func WriteSentinel(workDir, stage string, result StageResult) error {
-	if err := os.MkdirAll(doneDir(workDir), 0o755); err != nil {
+	if err := os.MkdirAll(doneDir(workDir), 0o750); err != nil {
 		return err
 	}
 	runs := 0

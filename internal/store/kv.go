@@ -34,7 +34,7 @@ func (db *DB) SetSetting(ctx context.Context, key, value string) error {
 // --- durable event log ---
 
 // InsertEvent appends a published event to the durable log. bookID <= 0 stores
-// NULL (a daemon-wide event). payload is stored as-is ('' becomes '{}').
+// NULL (a daemon-wide event). payload is stored as-is (” becomes '{}').
 func (db *DB) InsertEvent(ctx context.Context, ts time.Time, eventType string, bookID int64, payload json.RawMessage) error {
 	p := string(payload)
 	if p == "" {
@@ -80,7 +80,7 @@ func (db *DB) ListEvents(ctx context.Context, bookID int64, limit int) ([]Logged
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []LoggedEvent
 	for rows.Next() {
 		var e LoggedEvent

@@ -180,4 +180,3 @@ func (m *ScanManager) finishDone(id string, result *ScanResult) {
 		job.Result = result
 	}
 }
-

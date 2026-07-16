@@ -169,7 +169,7 @@ func (db *DB) ListBooks(ctx context.Context) ([]Book, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []Book
 	for rows.Next() {
 		b, err := scanBook(rows)

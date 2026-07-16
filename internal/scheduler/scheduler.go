@@ -330,7 +330,7 @@ func (s *Scheduler) runStage(ctx context.Context, b store.Book) {
 func (s *Scheduler) execute(ctx context.Context, b store.Book, stage state.State, _ int64) (StageResult, error) {
 	report := func(done, total int) {
 		_ = s.db.SetProgress(ctx, b.ID, string(stage), done, total)
-		s.hub.Publish("stage.progress", map[string]any{
+		_ = s.hub.Publish("stage.progress", map[string]any{
 			"book_id": b.ID, "stage": string(stage), "done": done, "total": total,
 		})
 	}
@@ -470,7 +470,7 @@ func parseSeriesPos(pos string) float64 {
 // --- events ---
 
 func (s *Scheduler) publishState(bookID int64, st, status string) {
-	s.hub.Publish("book.state", map[string]any{"book_id": bookID, "state": st, "status": status})
+	_ = s.hub.Publish("book.state", map[string]any{"book_id": bookID, "state": st, "status": status})
 }
 
 func (s *Scheduler) publishQueueStats(books []store.Book) {
@@ -487,7 +487,7 @@ func (s *Scheduler) publishQueueStats(books []store.Book) {
 			queued++
 		}
 	}
-	s.hub.Publish("queue.stats", map[string]any{
+	_ = s.hub.Publish("queue.stats", map[string]any{
 		"asr_active":        counts[state.LaneASR],
 		"agent_active":      counts[state.LaneAgent],
 		"mechanical_active": counts[state.LaneMechanical],

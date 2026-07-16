@@ -12,7 +12,10 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/auth"
 	"github.com/kodestar/audiosilo-sidecars/internal/config"
 	"github.com/kodestar/audiosilo-sidecars/internal/events"
+	"github.com/kodestar/audiosilo-sidecars/internal/metaops"
+	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/secrets"
+	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
 
 // Deps are the collaborators the API needs.
@@ -23,6 +26,12 @@ type Deps struct {
 	Events  *events.Hub
 	Version string
 	DataDir string
+	// Store, Scheduler, and Scans back the M1 Library/pipeline endpoints. They may
+	// be nil in tests that only exercise the M0 auth/settings surface; the
+	// pipeline handlers guard on nil and return 503.
+	Store     *store.DB
+	Scheduler *scheduler.Scheduler
+	Scans     *metaops.ScanManager
 	// Config is the loaded configuration. The API owns it after construction and
 	// serializes reads/writes; Save persists mutations (e.g. cors_origins) back to
 	// config.yaml.
@@ -38,6 +47,9 @@ type API struct {
 	events  *events.Hub
 	version string
 	dataDir string
+	store   *store.DB
+	sched   *scheduler.Scheduler
+	scans   *metaops.ScanManager
 
 	mu   sync.Mutex // guards cfg
 	cfg  config.Config
@@ -57,6 +69,9 @@ func New(d Deps) *API {
 		events:  d.Events,
 		version: d.Version,
 		dataDir: d.DataDir,
+		store:   d.Store,
+		sched:   d.Scheduler,
+		scans:   d.Scans,
 		cfg:     d.Config,
 		save:    save,
 	}
@@ -76,6 +91,19 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/system", a.requireAuth(a.handleSystem))
 	mux.HandleFunc("GET /api/v1/settings", a.requireAuth(a.handleGetSettings))
 	mux.HandleFunc("PUT /api/v1/settings", a.requireAuth(a.handlePutSettings))
+
+	// Pipeline / Library (M1).
+	mux.HandleFunc("POST /api/v1/scans", a.requireAuth(a.handleCreateScan))
+	mux.HandleFunc("GET /api/v1/scans/{id}", a.requireAuth(a.handleGetScan))
+	mux.HandleFunc("POST /api/v1/books", a.requireAuth(a.handleCreateBooks))
+	mux.HandleFunc("GET /api/v1/books", a.requireAuth(a.handleListBooks))
+	mux.HandleFunc("GET /api/v1/books/{id}", a.requireAuth(a.handleGetBook))
+	mux.HandleFunc("POST /api/v1/books/{id}/pause", a.requireAuth(a.bookAction((*scheduler.Scheduler).Pause)))
+	mux.HandleFunc("POST /api/v1/books/{id}/resume", a.requireAuth(a.bookAction((*scheduler.Scheduler).Resume)))
+	mux.HandleFunc("POST /api/v1/books/{id}/retry", a.requireAuth(a.bookAction((*scheduler.Scheduler).Retry)))
+	mux.HandleFunc("POST /api/v1/books/{id}/cancel", a.requireAuth(a.bookAction((*scheduler.Scheduler).Cancel)))
+	mux.HandleFunc("DELETE /api/v1/books/{id}", a.requireAuth(a.handleDeleteBook))
+
 	// SSE authenticates itself (token in the query, since EventSource cannot set
 	// an Authorization header).
 	mux.HandleFunc("GET /api/v1/events", a.handleEvents)
