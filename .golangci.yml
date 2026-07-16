@@ -38,10 +38,6 @@ linters:
         # not attacker-influenced. This rule is false-positive heavy.
         - G115
   exclusions:
-    paths:
-      # web/ is the JavaScript frontend; its node_modules contains an unrelated
-      # third-party Go file (flatted) that must not be linted as our code.
-      - web/
     rules:
       # Tests favour terseness; the security linters target production code paths.
       - path: _test\.go
