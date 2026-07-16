@@ -133,3 +133,29 @@ func TestWriteSSEFormat(t *testing.T) {
 		t.Errorf("heartbeat SSE contains id line: %q", buf.String())
 	}
 }
+
+// TestPersisterReceivesRealEventsOnly verifies the durable sink sees every
+// published real event (with its assigned id) but never a heartbeat.
+func TestPersisterReceivesRealEventsOnly(t *testing.T) {
+	h := NewHub(8)
+	var got []Event
+	h.SetPersister(func(ev Event) { got = append(got, ev) })
+
+	if err := h.Publish("book.state", map[string]string{"state": "asr"}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := h.Publish("queue.stats", map[string]int{"queued": 1}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	h.Heartbeat() // must NOT reach the persister
+
+	if len(got) != 2 {
+		t.Fatalf("persister saw %d events, want 2", len(got))
+	}
+	if got[0].ID != 1 || got[0].Type != "book.state" {
+		t.Errorf("event 0 = %+v", got[0])
+	}
+	if got[1].ID != 2 || got[1].Type != "queue.stats" {
+		t.Errorf("event 1 = %+v", got[1])
+	}
+}

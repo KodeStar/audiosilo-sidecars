@@ -114,36 +114,8 @@ func TestChangePassword(t *testing.T) {
 	}
 }
 
-func TestFileStorePersistsAcrossReopen(t *testing.T) {
-	dir := t.TempDir()
-	store, err := NewFileStore(dir)
-	if err != nil {
-		t.Fatalf("NewFileStore: %v", err)
-	}
-	m := New(store)
-	pw, _ := m.EnsureAdmin()
-	tok, err := m.Login(pw)
-	if err != nil {
-		t.Fatalf("Login: %v", err)
-	}
-
-	// Reopen: admin and session survive.
-	store2, err := NewFileStore(dir)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	m2 := New(store2)
-	// First-run must NOT re-provision.
-	if again, _ := m2.EnsureAdmin(); again != "" {
-		t.Error("EnsureAdmin reprovisioned on reopen")
-	}
-	if ok, _ := m2.Resolve(tok); !ok {
-		t.Error("session did not survive reopen")
-	}
-	if _, err := m2.Login(pw); err != nil {
-		t.Errorf("login after reopen: %v", err)
-	}
-}
+// Reopen-persistence across a store backend is covered by the SQLite AuthStore
+// tests in internal/store; the auth package itself is storage-agnostic.
 
 type clock struct{ t time.Time }
 

@@ -6,11 +6,13 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/api"
@@ -18,8 +20,13 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/config"
 	"github.com/kodestar/audiosilo-sidecars/internal/events"
 	"github.com/kodestar/audiosilo-sidecars/internal/secrets"
+	"github.com/kodestar/audiosilo-sidecars/internal/store"
 	"github.com/kodestar/audiosilo-sidecars/internal/web"
 )
+
+// eventRetention is how long the durable event log is kept; older rows are
+// pruned on startup so the log cannot grow without bound.
+const eventRetention = 30 * 24 * time.Hour
 
 // heartbeatInterval is how often the event hub emits a keepalive/liveness frame.
 const heartbeatInterval = 25 * time.Second
@@ -56,11 +63,18 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 
-	authStore, err := auth.NewFileStore(opts.DataDir)
+	db, err := store.Open(ctx, filepath.Join(opts.DataDir, store.FileName))
 	if err != nil {
-		return fmt.Errorf("open auth store: %w", err)
+		return fmt.Errorf("open store: %w", err)
 	}
-	mgr := auth.New(authStore)
+	defer db.Close()
+	if n, perr := db.PruneEvents(ctx, time.Now().Add(-eventRetention)); perr != nil {
+		return fmt.Errorf("prune events: %w", perr)
+	} else if n > 0 {
+		fmt.Fprintf(opts.Out, "[info] pruned %d event(s) older than 30 days\n", n)
+	}
+
+	mgr := auth.New(db.AuthStore())
 	oneTimePassword, err := mgr.EnsureAdmin()
 	if err != nil {
 		return fmt.Errorf("provision admin: %w", err)
@@ -72,6 +86,12 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	hub := events.NewHub(events.DefaultRingSize)
+	// Persist every published event to the durable log (fire-and-forget; a log
+	// write failure must never break live delivery).
+	hub.SetPersister(func(ev events.Event) {
+		bookID := bookIDOf(ev.Data)
+		_ = db.InsertEvent(context.Background(), time.Now(), ev.Type, bookID, ev.Data)
+	})
 	go hub.RunHeartbeat(ctx, heartbeatInterval)
 
 	apiHandler := api.New(api.Deps{
@@ -130,6 +150,23 @@ func shutdown(srv *http.Server) error {
 // dataFile returns the config file path used to detect a first run.
 func dataFile(dir string) string {
 	return dir + string(os.PathSeparator) + config.FileName
+}
+
+// bookIDOf extracts an optional book_id from an event payload so the durable log
+// can key book-scoped events (book.state/stage.progress) to their book, while
+// daemon-wide events (queue.stats/heartbeat data) store NULL. A payload without
+// the field yields 0.
+func bookIDOf(data json.RawMessage) int64 {
+	if len(data) == 0 {
+		return 0
+	}
+	var probe struct {
+		BookID int64 `json:"book_id"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return 0
+	}
+	return probe.BookID
 }
 
 // printBanner writes the startup banner. The one-time password is printed only

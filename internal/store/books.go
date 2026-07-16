@@ -1,0 +1,230 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	sqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
+)
+
+// ErrNotFound is returned when a lookup by id/path finds no row.
+var ErrNotFound = errors.New("not found")
+
+// ErrDuplicate is returned by CreateBook when source_path already exists.
+var ErrDuplicate = errors.New("duplicate source_path")
+
+// Book is a persisted pipeline book. authors/identity_sources/coverage are
+// decoded from their JSON columns. State/Status are opaque strings here (the
+// store never interprets them); internal/state owns their meaning.
+type Book struct {
+	ID              int64
+	SourcePath      string
+	WorkDir         string
+	Title           string
+	Authors         []string
+	Series          string
+	SeriesPos       string
+	ASIN            string
+	ISBN            string
+	IdentitySources map[string]string
+	State           string
+	Status          string
+	Error           string
+	Coverage        json.RawMessage // '' in the DB decodes to nil
+	CreatedAt       string
+	UpdatedAt       string
+}
+
+// NewBook is the input to CreateBook: the identity/metadata fields a caller
+// supplies. State defaults to "queued".
+type NewBook struct {
+	SourcePath      string
+	WorkDir         string
+	Title           string
+	Authors         []string
+	Series          string
+	SeriesPos       string
+	ASIN            string
+	ISBN            string
+	IdentitySources map[string]string
+	State           string // "" defaults to queued
+}
+
+func isUniqueViolation(err error) bool {
+	var serr *sqlite.Error
+	if errors.As(err, &serr) {
+		return serr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE ||
+			serr.Code() == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY
+	}
+	return false
+}
+
+func marshalJSON(v any) (string, error) {
+	if v == nil {
+		return "", nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// CreateBook inserts a queued book. It returns ErrDuplicate if source_path is
+// already tracked, so the API can report a per-item conflict.
+func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
+	authors, err := marshalJSON(nb.Authors)
+	if err != nil {
+		return Book{}, err
+	}
+	if authors == "" {
+		authors = "[]"
+	}
+	idsrc, err := marshalJSON(nb.IdentitySources)
+	if err != nil {
+		return Book{}, err
+	}
+	if idsrc == "" {
+		idsrc = "{}"
+	}
+	st := nb.State
+	if st == "" {
+		st = "queued"
+	}
+	now := timestamp(nowFn())
+	res, err := db.sql.ExecContext(ctx,
+		`INSERT INTO books
+		 (source_path, work_dir, title, authors, series, series_pos, asin, isbn,
+		  identity_sources, state, status, error, coverage, created_at, updated_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,'','','',?,?)`,
+		nb.SourcePath, nb.WorkDir, nb.Title, authors, nb.Series, nb.SeriesPos,
+		nb.ASIN, nb.ISBN, idsrc, st, now, now)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return Book{}, ErrDuplicate
+		}
+		return Book{}, fmt.Errorf("insert book: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return Book{}, err
+	}
+	return db.GetBook(ctx, id)
+}
+
+const bookCols = `id, source_path, work_dir, title, authors, series, series_pos,
+	asin, isbn, identity_sources, state, status, error, coverage, created_at, updated_at`
+
+func scanBook(sc interface{ Scan(...any) error }) (Book, error) {
+	var b Book
+	var authors, idsrc, coverage string
+	if err := sc.Scan(&b.ID, &b.SourcePath, &b.WorkDir, &b.Title, &authors,
+		&b.Series, &b.SeriesPos, &b.ASIN, &b.ISBN, &idsrc, &b.State, &b.Status,
+		&b.Error, &coverage, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		return Book{}, err
+	}
+	if authors != "" {
+		if err := json.Unmarshal([]byte(authors), &b.Authors); err != nil {
+			return Book{}, fmt.Errorf("decode authors: %w", err)
+		}
+	}
+	if idsrc != "" {
+		if err := json.Unmarshal([]byte(idsrc), &b.IdentitySources); err != nil {
+			return Book{}, fmt.Errorf("decode identity_sources: %w", err)
+		}
+	}
+	if coverage != "" {
+		b.Coverage = json.RawMessage(coverage)
+	}
+	return b, nil
+}
+
+// GetBook returns the book with id, or ErrNotFound.
+func (db *DB) GetBook(ctx context.Context, id int64) (Book, error) {
+	row := db.sql.QueryRowContext(ctx, `SELECT `+bookCols+` FROM books WHERE id = ?`, id)
+	b, err := scanBook(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Book{}, ErrNotFound
+	}
+	return b, err
+}
+
+// GetBookBySourcePath returns the book with source_path, or ErrNotFound.
+func (db *DB) GetBookBySourcePath(ctx context.Context, path string) (Book, error) {
+	row := db.sql.QueryRowContext(ctx, `SELECT `+bookCols+` FROM books WHERE source_path = ?`, path)
+	b, err := scanBook(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Book{}, ErrNotFound
+	}
+	return b, err
+}
+
+// ListBooks returns all books ordered by id.
+func (db *DB) ListBooks(ctx context.Context) ([]Book, error) {
+	rows, err := db.sql.QueryContext(ctx, `SELECT `+bookCols+` FROM books ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Book
+	for rows.Next() {
+		b, err := scanBook(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// SetBookState updates a book's state, status, and error together (the fields the
+// scheduler mutates on every transition) and bumps updated_at.
+func (db *DB) SetBookState(ctx context.Context, id int64, state, status, errMsg string) error {
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE books SET state=?, status=?, error=?, updated_at=? WHERE id=?`,
+		state, status, errMsg, timestamp(nowFn()), id)
+	return checkAffected(res, err)
+}
+
+// SetBookStatus updates only the orthogonal status flag (paused/needs_attention/
+// failed and back), preserving the pipeline state. errMsg is stored as-is
+// (callers pass "" to clear it).
+func (db *DB) SetBookStatus(ctx context.Context, id int64, status, errMsg string) error {
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE books SET status=?, error=?, updated_at=? WHERE id=?`,
+		status, errMsg, timestamp(nowFn()), id)
+	return checkAffected(res, err)
+}
+
+// SetBookCoverage stores the coverage JSON snapshot for a book.
+func (db *DB) SetBookCoverage(ctx context.Context, id int64, coverage json.RawMessage) error {
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE books SET coverage=?, updated_at=? WHERE id=?`,
+		string(coverage), timestamp(nowFn()), id)
+	return checkAffected(res, err)
+}
+
+// DeleteBook removes a book and (via ON DELETE CASCADE) its stage_runs/progress.
+func (db *DB) DeleteBook(ctx context.Context, id int64) error {
+	res, err := db.sql.ExecContext(ctx, `DELETE FROM books WHERE id = ?`, id)
+	return checkAffected(res, err)
+}
+
+// checkAffected maps a zero-row UPDATE/DELETE to ErrNotFound.
+func checkAffected(res sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}

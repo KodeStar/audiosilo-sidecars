@@ -72,7 +72,16 @@ type Hub struct {
 	ring    []Event
 	ringCap int
 	nextID  uint64
+	persist func(Event) // optional durable sink; set via SetPersister
 }
+
+// SetPersister installs an optional sink invoked for every published (real,
+// non-heartbeat) event AFTER it has been assigned an id and fanned out. The hub
+// stays the live fan-out; the sink is how the durable event log (internal/store)
+// captures the same stream for later log views. It is called outside the hub
+// lock, so a slow write never blocks publishers. Not safe to call concurrently
+// with Publish; set it once at wiring time.
+func (h *Hub) SetPersister(fn func(Event)) { h.persist = fn }
 
 // NewHub returns a hub retaining ringSize recent events for replay. A ringSize
 // <= 0 uses DefaultRingSize.
@@ -95,7 +104,6 @@ func (h *Hub) Publish(eventType string, payload any) error {
 		return err
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	h.nextID++
 	ev := Event{ID: h.nextID, Type: eventType, Data: data}
 	h.ring = append(h.ring, ev)
@@ -103,6 +111,12 @@ func (h *Hub) Publish(eventType string, payload any) error {
 		h.ring = h.ring[len(h.ring)-h.ringCap:]
 	}
 	h.fanout(ev)
+	persist := h.persist
+	h.mu.Unlock()
+	// Persist outside the lock so a slow durable write never stalls publishers.
+	if persist != nil {
+		persist(ev)
+	}
 	return nil
 }
 
