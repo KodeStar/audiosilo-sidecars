@@ -41,13 +41,33 @@ export function isDone(book: BookView): boolean {
 }
 
 // A control action the UI can invoke on a book.
-export type BookAction = 'pause' | 'resume' | 'retry' | 'cancel' | 'delete';
+export type BookAction = 'pause' | 'resume' | 'retry' | 'cancel' | 'delete' | 'purge';
+
+// purgeable mirrors the scheduler's PurgeScratch guard: chapters/ may be reclaimed
+// only when a book is done, paused, or failed/cancelled (a running book still
+// needs them). needs_attention keeps its chapters (a fix/retranscribe may need
+// them), matching the daemon (which 409s a needs_attention purge).
+function purgeable(book: BookView): boolean {
+  return isDone(book) || book.status === 'paused' || book.status === 'failed';
+}
 
 // availableActions derives the control set from a book's status/state. The
 // scheduler is the source of truth (it 409s an invalid op), so this only keeps
 // the UI tidy - it never has to be exhaustive. Mirrors internal/scheduler's
-// control semantics (Cancel marks a book failed; Retry clears failed/parked).
+// control semantics (Cancel marks a book failed; Retry clears failed/parked). A
+// 'purge' is offered only when the book is purgeable AND actually holds scratch.
 export function availableActions(book: BookView): BookAction[] {
+  const base = baseActions(book);
+  if (purgeable(book) && (book.scratch_bytes ?? 0) > 0) {
+    // Insert purge before the destructive delete/cancel so it reads as the milder
+    // reclaim option.
+    const tail = base[base.length - 1];
+    return [...base.slice(0, -1), 'purge', tail];
+  }
+  return base;
+}
+
+function baseActions(book: BookView): BookAction[] {
   if (isDone(book)) return ['delete'];
   switch (book.status) {
     case 'paused':
@@ -59,6 +79,25 @@ export function availableActions(book: BookView): BookAction[] {
     default:
       return ['pause', 'cancel'];
   }
+}
+
+// formatBytes renders a byte count as a short human string ("0 B", "512 KB",
+// "1.2 GB"). Binary units (1024). Kept pure + tested; the Running/Done rows show
+// per-book scratch and the daemon-total disk gauge with it.
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  // Whole bytes show no decimal; larger units show one decimal unless it rounds
+  // to a whole number.
+  const rounded = unit === 0 ? value : Math.round(value * 10) / 10;
+  const text = Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+  return `${text} ${units[unit]}`;
 }
 
 // sortBooks orders the list newest-created first, keeping done books last so the

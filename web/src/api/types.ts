@@ -17,11 +17,21 @@ export interface SystemTab {
   status: TabStatus;
 }
 
+// Resolved media-tool paths (empty when a tool could not be located). Read-only
+// diagnostic info surfaced on /system.
+export interface ToolsInfo {
+  ffmpeg: string;
+  ffprobe: string;
+}
+
 export interface SystemInfo {
   version: string;
   data_dir: string;
   listen: string;
   tabs: SystemTab[];
+  tools: ToolsInfo;
+  // Daemon-total on-disk scratch (sum of every book's work dir), the disk gauge.
+  scratch_bytes: number;
 }
 
 // Secrets are presence booleans only - the actual values never cross the wire.
@@ -163,6 +173,9 @@ export interface BookView {
   coverage?: Coverage;
   identity_sources?: Record<string, string>;
   progress: BookProgress[];
+  // Current on-disk size of the book's work dir in bytes (chapters + durables);
+  // 0 when not yet created or already purged.
+  scratch_bytes: number;
   created_at: string;
   updated_at: string;
 }

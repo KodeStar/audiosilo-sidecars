@@ -1,6 +1,6 @@
 import { memo } from 'react';
 import type { BookView } from '@/api/types';
-import { availableActions, isDone, type BookAction } from '@/lib/books';
+import { availableActions, formatBytes, isDone, type BookAction } from '@/lib/books';
 import { normalizeLane, stateChipClass, stateLabel, statusBadge } from '@/lib/pipelineState';
 
 interface BookRowProps {
@@ -15,7 +15,12 @@ const ACTION_LABEL: Record<BookAction, string> = {
   retry: 'Retry',
   cancel: 'Cancel',
   delete: 'Delete',
+  purge: 'Free disk',
 };
+
+// mildActions render in the neutral style; the rest (destructive/reclaim) in the
+// warn style.
+const MILD_ACTIONS = new Set<BookAction>(['pause', 'resume', 'retry']);
 
 // BookRow is memoized: the Running list re-renders on every SSE patch, but a row
 // whose props are unchanged (referential equality on the patched book object)
@@ -62,6 +67,11 @@ export const BookRow = memo(function BookRow({ book, busy, onAction }: BookRowPr
               {stageProgress.done}/{stageProgress.total}
             </span>
           )}
+          {book.scratch_bytes > 0 && (
+            <span className="text-[11px] text-dim" title="Scratch on disk (chapters + durables)">
+              {formatBytes(book.scratch_bytes)} on disk
+            </span>
+          )}
         </div>
         {book.error && book.status !== 'paused' && (
           <p className="mt-1 text-xs text-pink-500">{book.error}</p>
@@ -77,9 +87,9 @@ export const BookRow = memo(function BookRow({ book, busy, onAction }: BookRowPr
             onClick={() => onAction(book.id, action)}
             className={
               'rounded-md border px-3 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ' +
-              (action === 'cancel' || action === 'delete'
-                ? 'border-edge text-dim hover:border-pink-600 hover:text-pink-400'
-                : 'border-edge text-body hover:border-pink-600 hover:text-hi')
+              (MILD_ACTIONS.has(action)
+                ? 'border-edge text-body hover:border-pink-600 hover:text-hi'
+                : 'border-edge text-dim hover:border-pink-600 hover:text-pink-400')
             }
           >
             {ACTION_LABEL[action]}

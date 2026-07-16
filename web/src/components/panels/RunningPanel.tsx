@@ -66,6 +66,15 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
       ) {
         return;
       }
+      if (
+        action === 'purge' &&
+        !window.confirm(
+          'Free the split audio for this book? The chapter FLACs are deleted; ' +
+            'they will be re-created from the source if the book runs again.',
+        )
+      ) {
+        return;
+      }
       setBusyId(id);
       setActionError(null);
       try {
@@ -84,6 +93,9 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
             break;
           case 'delete':
             await client.deleteBook(id);
+            break;
+          case 'purge':
+            await client.purgeScratch(id);
             break;
         }
         await load();

@@ -171,6 +171,10 @@ export class ApiClient {
     return this.request<void>(`/api/v1/books/${id}`, { method: 'DELETE' });
   }
 
+  purgeScratch(id: number): Promise<void> {
+    return this.request<void>(`/api/v1/books/${id}/purge-scratch`, { method: 'POST' });
+  }
+
   private bookAction(id: number, action: 'pause' | 'resume' | 'retry' | 'cancel'): Promise<void> {
     return this.request<void>(`/api/v1/books/${id}/${action}`, { method: 'POST' });
   }
