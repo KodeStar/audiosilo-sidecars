@@ -22,6 +22,19 @@ type Executor interface {
 	Execute(ctx context.Context, book store.Book, stage state.State, report ProgressFunc) (StageResult, error)
 }
 
+// ParkError is an executor error that asks the scheduler to park the book
+// needs_attention (a human must act) instead of marking it failed. It suits a
+// known, non-transient stop - an unimplemented stage, or an input the automatic
+// pipeline cannot yet handle - where a blind Retry would just fail again. runStage
+// maps it to StatusNeedsAttention (carrying Reason), so the book waits in the
+// Running tab flagged for attention rather than as an error.
+type ParkError struct{ Reason string }
+
+func (e *ParkError) Error() string { return e.Reason }
+
+// Park builds a ParkError with the given human-facing reason.
+func Park(reason string) error { return &ParkError{Reason: reason} }
+
 // StubExecutor is the M1 placeholder executor: it sleeps a short, bounded time
 // (so the whole state machine runs end to end and lanes visibly occupy), reports
 // a couple of progress ticks, then writes the stage sentinel. Outcomes are

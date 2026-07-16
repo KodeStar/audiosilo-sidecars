@@ -50,12 +50,23 @@ func (e *Executor) Execute(ctx context.Context, book store.Book, stage state.Sta
 	switch stage {
 	case state.Inspecting:
 		return e.inspect(ctx, book)
+	case state.MarkersNormalizing:
+		// A book whose chapter markers are not a clean contiguous run (or that has no
+		// usable markers at all) lands here. Automatic marker normalization is a later
+		// milestone (M5), so rather than let the stub advance it into a split with no
+		// manifest, park it needs_attention with a clear, human-facing reason.
+		return scheduler.StageResult{}, scheduler.Park(MarkersNormalizingMsg)
 	case state.Splitting:
 		return e.split(ctx, book, report)
 	default:
 		return e.fallback.Execute(ctx, book, stage, report)
 	}
 }
+
+// MarkersNormalizingMsg is the needs_attention reason a book is parked with when
+// its chapter markers cannot be normalized automatically yet (M5). Exported so a
+// test (and later the UI) can assert/label it exactly.
+const MarkersNormalizingMsg = "chapter markers need manual mapping - automatic normalization arrives in a later milestone (M5)"
 
 // inspect probes the book's source audio, writes probe.json + manifest.json, and
 // records whether the chapter markers are contiguous (drives the
@@ -96,9 +107,12 @@ func (e *Executor) split(ctx context.Context, book store.Book, report scheduler.
 	}
 	// Account the work dir's on-disk size now (one walk) so the book list and the
 	// /system gauge serve scratch_bytes from the DB without walking on every read.
+	// Use a non-cancellable context: split completed successfully, so a shutdown/
+	// cancel racing this final gauge write must not silently drop it and leave the
+	// column stale (the accounting is the last durable step, like closing the run).
 	if e.db != nil {
 		if n, derr := scratch.DirSize(book.WorkDir); derr == nil {
-			_ = e.db.UpdateScratchBytes(ctx, book.ID, n)
+			_ = e.db.UpdateScratchBytes(context.WithoutCancel(ctx), book.ID, n)
 		}
 	}
 	result := scheduler.StageResult{

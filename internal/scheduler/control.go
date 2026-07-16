@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/scratch"
@@ -138,12 +139,25 @@ func (s *Scheduler) Delete(ctx context.Context, id int64) error {
 	return nil
 }
 
+// purgeInvalidatedStages are the stage sentinels a scratch purge must drop so the
+// book re-runs those stages instead of trusting a stale "done" marker. Their
+// durable output (the chapter FLACs) IS the scratch scratch.Purge reclaims, so
+// after a purge the content-truth sentinel would otherwise let runStage's crash-
+// resume fast-path skip the stage and hand a later stage (ASR, M3) an empty
+// chapters/. Coupled to scratch.Purge's reclaim set - it grows as later milestones
+// reclaim more scratch (e.g. ASR working files in M3).
+var purgeInvalidatedStages = []state.State{state.Splitting}
+
 // PurgeScratch reclaims a book's split chapters/ (the M2 heavy scratch) while
 // keeping its durables (probe.json/manifest.json/transcripts). It is a manual,
 // user-initiated reclaim: allowed only when the book is done, paused, or
-// failed/cancelled - never mid-run (a running book still needs its chapters). It
-// refuses an in-flight book (ErrBusy) so a worker never races the delete, and the
-// removal is confined to the work root by scratch.Purge.
+// failed/cancelled - never mid-run (a running book still needs its chapters).
+//
+// It reserves the book id for the duration (a pseudo-inflight entry) so a
+// concurrent Resume/Retry-triggered dispatch cannot start a stage that races the
+// chapter removal, and a concurrent Delete sees it busy (ErrBusy) - the same
+// window Delete already guards. The removal is confined to the work root by
+// scratch.Purge.
 func (s *Scheduler) PurgeScratch(ctx context.Context, id int64) error {
 	b, err := s.db.GetBook(ctx, id)
 	if err != nil {
@@ -152,21 +166,58 @@ func (s *Scheduler) PurgeScratch(ctx context.Context, id int64) error {
 	if !purgeAllowed(b) {
 		return ErrInvalidOp
 	}
-	s.mu.Lock()
-	_, busy := s.inflight[id]
-	s.mu.Unlock()
-	if busy {
+	// Reserve under the same lock dispatch/Delete use: fail if already in-flight,
+	// otherwise hold the slot so no worker starts for this id until we release it.
+	if !s.reserve(id) {
 		return ErrBusy
 	}
+	defer s.unreserve(id)
+
 	if err := scratch.Purge(s.workRoot, b.WorkDir); err != nil {
 		return err
 	}
-	// Re-account what remains (the durables) in one walk, so scratch_bytes reflects
-	// the reclaim without a read-side walk. A gauge failure must not fail the purge.
+	// The reclaimed artifacts include a completed stage's output, so drop that
+	// stage's sentinel (and its recorded success) - a later Retry/reconcile must
+	// re-run it rather than skip it and feed the next stage an empty chapters/.
+	for _, st := range purgeInvalidatedStages {
+		_ = os.Remove(SentinelPath(b.WorkDir, string(st)))
+	}
+	// Re-account what remains (the durables) in one walk so scratch_bytes reflects
+	// the reclaim without a read-side walk. If the walk itself fails, the pre-purge
+	// value is now definitely wrong (we just deleted the chapters), so record 0
+	// rather than leave a stale over-count.
 	if n, derr := scratch.DirSize(b.WorkDir); derr == nil {
 		_ = s.db.UpdateScratchBytes(ctx, id, n)
+	} else {
+		slog.Warn("purge: re-accounting the work dir failed; recording 0 scratch",
+			"book_id", id, "work_dir", b.WorkDir, "err", derr)
+		_ = s.db.UpdateScratchBytes(ctx, id, 0)
 	}
 	return nil
+}
+
+// reserve inserts a pseudo-inflight entry for id (lane-less, cancel is a no-op) so
+// dispatch/startWorker skip it and Delete treats it as busy. It returns false if
+// the id is already in-flight (a real worker or another reservation). Callers pair
+// it with unreserve.
+func (s *Scheduler) reserve(id int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, busy := s.inflight[id]; busy {
+		return false
+	}
+	s.inflight[id] = &inflightBook{lane: state.LaneNone, cancel: func() {}}
+	return true
+}
+
+// unreserve drops a reservation and wakes the dispatch loop, so a book made
+// dispatchable during the reservation (e.g. a Resume that landed mid-purge) is
+// picked up now that the slot is free.
+func (s *Scheduler) unreserve(id int64) {
+	s.mu.Lock()
+	delete(s.inflight, id)
+	s.mu.Unlock()
+	s.notify()
 }
 
 // purgeAllowed reports whether a book is in a state where reclaiming its chapters

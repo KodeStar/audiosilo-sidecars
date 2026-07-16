@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { ApiClient } from '@/lib/apiClient';
 import { ApiError } from '@/lib/apiClient';
-import type { SecretsPresence, Settings } from '@/api/types';
+import type { SecretsPresence, Settings, ToolsInfo } from '@/api/types';
 import { ChangePasswordForm } from './settings/ChangePasswordForm';
 import { SecretRow } from './settings/SecretRow';
 
@@ -17,6 +17,7 @@ const SECRET_FIELDS: { key: keyof SecretsPresence; label: string }[] = [
 
 export function SettingsPanel({ client }: SettingsPanelProps) {
   const [settings, setSettings] = useState<Settings | null>(null);
+  const [tools, setTools] = useState<ToolsInfo | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -30,6 +31,23 @@ export function SettingsPanel({ client }: SettingsPanelProps) {
         setLoadError('Could not load settings.');
       }
     }
+  }, [client]);
+
+  // The resolved media-tool paths live on /system (read-only diagnostics), so
+  // fetch them once on mount alongside the settings load.
+  useEffect(() => {
+    let cancelled = false;
+    client
+      .system()
+      .then((info) => {
+        if (!cancelled) setTools(info.tools);
+      })
+      .catch(() => {
+        // A tools read failure is non-fatal; the block simply shows nothing.
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [client]);
 
   useEffect(() => {
@@ -65,6 +83,19 @@ export function SettingsPanel({ client }: SettingsPanelProps) {
           <dd className="font-mono text-body">
             {settings.cors_origins.length > 0 ? settings.cors_origins.join(', ') : 'none'}
           </dd>
+        </dl>
+      </Card>
+
+      <Card>
+        <SectionTitle>Media tools</SectionTitle>
+        <p className="mb-4 max-w-prose text-sm text-dim">
+          Resolved at startup (an explicit path, a copy next to the daemon, $PATH, or an
+          auto-downloaded build). The audio stages need both; a missing tool fails those books while
+          the rest of the daemon keeps working.
+        </p>
+        <dl className="grid grid-cols-[max-content_1fr] items-center gap-x-6 gap-y-2 text-sm">
+          <ToolRow label="ffmpeg" path={tools?.ffmpeg} />
+          <ToolRow label="ffprobe" path={tools?.ffprobe} />
         </dl>
       </Card>
 
@@ -107,6 +138,19 @@ export function SettingsPanel({ client }: SettingsPanelProps) {
         </ComingSoon>
       </Card>
     </div>
+  );
+}
+
+// ToolRow shows a resolved tool path, or a muted "Not found" when the daemon
+// could not locate it.
+function ToolRow({ label, path }: { label: string; path?: string }) {
+  return (
+    <>
+      <dt className="text-dim">{label}</dt>
+      <dd className={path ? 'break-all font-mono text-body' : 'text-sm text-dim'}>
+        {path ? path : 'Not found'}
+      </dd>
+    </>
   );
 }
 

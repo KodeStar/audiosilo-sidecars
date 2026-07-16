@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -86,6 +88,60 @@ func TestManifestRoundTrip(t *testing.T) {
 	}
 	if got.ChapterCount != 2 || got.Chapters[1].Title != "B" || got.Style != StyleMarkers {
 		t.Errorf("round-trip manifest = %+v", got)
+	}
+}
+
+func TestCompleteNearZeroDuration(t *testing.T) {
+	dir := t.TempDir()
+	small := filepath.Join(dir, "tiny.flac")
+	if err := os.WriteFile(small, make([]byte, 40), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+	// A sub-minFlacBytes file for a normal-length chapter is NOT complete (a real
+	// truncation), so resume re-splits it.
+	if complete(small, 30.0) {
+		t.Error("a sub-minFlacBytes file for a 30s chapter should not be complete")
+	}
+	// The same tiny file for a sub-second chapter IS complete, so resume does not
+	// re-split a legitimately near-silent short chapter forever.
+	if !complete(small, 0.3) {
+		t.Error("a sub-second chapter with a non-empty file should be complete")
+	}
+	// A zero-byte file is never complete, even for a short chapter.
+	empty := filepath.Join(dir, "empty.flac")
+	if err := os.WriteFile(empty, nil, 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+	if complete(empty, 0.3) {
+		t.Error("an empty file must not count as complete")
+	}
+}
+
+func TestNaturalLess(t *testing.T) {
+	order := func(in []string) []string {
+		out := append([]string(nil), in...)
+		sort.SliceStable(out, func(i, j int) bool { return naturalLess(out[i], out[j]) })
+		return out
+	}
+	cases := []struct {
+		name     string
+		in, want []string
+	}{
+		{"unpadded", []string{"ch10", "ch1", "ch2"}, []string{"ch1", "ch2", "ch10"}},
+		{"mixed padding", []string{"Chapter 10.mp3", "Chapter 1.mp3", "Chapter 02.mp3"},
+			[]string{"Chapter 1.mp3", "Chapter 02.mp3", "Chapter 10.mp3"}},
+		{"case-insensitive words", []string{"Beta 2", "alpha 10", "alpha 2"},
+			[]string{"alpha 2", "alpha 10", "Beta 2"}},
+	}
+	for _, c := range cases {
+		if got := order(c.in); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: natural order = %v, want %v", c.name, got, c.want)
+		}
+	}
+	// Ties are stable: equal keys keep their input order under SliceStable.
+	dup := order([]string{"track 3", "track 3", "track 1"})
+	if !reflect.DeepEqual(dup, []string{"track 1", "track 3", "track 3"}) {
+		t.Errorf("stable tie order = %v", dup)
 	}
 }
 
@@ -214,7 +270,7 @@ func TestSplitResumesAfterDeletingOne(t *testing.T) {
 	if mtime(t, ch1) != mt1 || mtime(t, ch3) != mt3 {
 		t.Error("kept chapters were rewritten on resume (mtime changed)")
 	}
-	if !complete(ch2) {
+	if !complete(ch2, m.Chapters[1].Duration) {
 		t.Error("deleted chapter was not restored on resume")
 	}
 }

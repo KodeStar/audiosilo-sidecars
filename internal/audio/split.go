@@ -54,7 +54,7 @@ func Split(ctx context.Context, m Manifest, workDir, ffmpegPath string, report P
 			return err // clean pause/cancel/shutdown; completed chapters remain
 		}
 		out := filepath.Join(chaptersDir, ChapterFileName(ch.Chapter))
-		if complete(out) {
+		if complete(out, ch.Duration) {
 			if report != nil {
 				report(i+1, total)
 			}
@@ -104,10 +104,22 @@ func splitChapter(ctx context.Context, m Manifest, ch Chapter, ffmpegPath, out s
 	return os.Rename(tmp, out)
 }
 
-// complete reports whether a chapter FLAC already exists at a plausible size.
-func complete(path string) bool {
+// complete reports whether a chapter FLAC already exists and is plausibly whole,
+// so resume can skip it. The usual signal is a size at/above minFlacBytes. A
+// legitimately near-silent, sub-second chapter can encode to a FLAC below that
+// floor, though, which would make every resume re-split it forever - so when the
+// manifest says the chapter runs under a second, any non-empty final file counts
+// as complete. The atomic temp+rename in splitChapter still guarantees a file at
+// the final path is never a truncated partial.
+func complete(path string, chapterDuration float64) bool {
 	info, err := os.Stat(path)
-	return err == nil && !info.IsDir() && info.Size() >= minFlacBytes
+	if err != nil || info.IsDir() {
+		return false
+	}
+	if info.Size() >= minFlacBytes {
+		return true
+	}
+	return chapterDuration < 1.0 && info.Size() > 0
 }
 
 // ftoa formats a seconds value with millisecond precision for ffmpeg -ss/-t.

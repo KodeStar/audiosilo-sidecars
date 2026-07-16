@@ -101,7 +101,9 @@ internal/
             the resolved path). asr/agent-model routing stay typed stubs.
   toolfetch/ resolve ffmpeg/ffprobe (explicit path -> next to the binary -> $PATH ->
             HTTPS download from pinned hosts into <data>/tools when auto_download,
-            self-checked by running -version, no digest pinning); ported from
+            extracted fully in-process (archive/zip + archive/tar over an xz decoder,
+            per-entry name sanitization - no host tar), self-checked by running
+            -version, no digest pinning); ported from
             audiosilo-server. Resolve() runs once at startup; a missing tool
             degrades gracefully (the audio stage fails that book, daemon keeps working).
   audio/    the mechanical audio stages: Inspect (ffprobe -> probe.json + normalized
@@ -111,6 +113,8 @@ internal/
             per-chapter progress, ctx-cancel clean). Pure/tool-driven, no scheduler deps.
   scratch/  per-book DirSize gauge + Purge (removes chapters/, keeps durables),
             confined to the work root. Manual purge only in M2; auto-purge is M7.
+            A purge also invalidates the split sentinel (scheduler.purgeInvalidatedStages)
+            so a later retry re-splits rather than skipping into an empty chapters/.
   pipeline/ composite scheduler.Executor: routes inspecting -> audio.Inspect,
             splitting -> audio.Split, every other stage -> the stub (M3+ replaces
             more). Constructed in server.go with the toolfetch-resolved paths.
@@ -148,7 +152,9 @@ web/          the SPA: Vite + React 19 + TS + Tailwind v4 (npm, Node 24); dist/ 
               pipelineState, recentRoots, useEventStream); src/components/{library,running}/
               are the Library/Running tab views; components stay thin over src/lib
 scripts/build-web.sh   build the SPA + embed it into bin/ (-tags embedui)
-Dockerfile             multi-stage: node build -> go build (embedui) -> distroless
+Dockerfile             multi-stage: node build -> go build (embedui) -> debian-slim
+                       runtime that apt-installs ffmpeg/ffprobe (so toolfetch never
+                       auto-downloads in the container)
 ```
 
 **Dependency direction** (transport-only rule): `server -> {api, auth, secrets,
@@ -224,12 +230,20 @@ Milestones from the workspace plan; each is shippable.
   splitting -> audio.Split, everything else -> the stub) into the scheduler.
   `internal/scratch` tracks per-book disk usage and reclaims `chapters/`
   (`PurgeScratch` + `POST /books/{id}/purge-scratch`, allowed only when
-  done/paused/failed); `scratch_bytes` rides on the book view and a daemon-total
-  gauge + resolved tool paths surface on `/system`. Non-contiguous markers set
-  `MarkersContiguous=false` and defer to the (still-stubbed) markers_normalizing
-  stage. Gate verified: full Go + web gates green, plus a live smoke (real 3-chapter
+  done/paused/failed; the purge reserves the book id so a concurrent resume/retry
+  can't race the chapter removal, and it drops the split sentinel so a retry
+  re-splits); `scratch_bytes` rides on the book view and a daemon-total gauge +
+  resolved tool paths surface on `/system` (shown in the Running header strip and
+  a read-only Settings "Media tools" block). Non-contiguous markers (and a
+  markerless file) set `MarkersContiguous=false`; the `markers_normalizing` stage
+  then **parks the book needs_attention** with a clear message - automatic marker
+  normalization is deferred to M5, so the book waits for a human rather than
+  failing misleadingly at split. The Docker image bundles ffmpeg/ffprobe
+  (debian-slim runtime), so the container never triggers a tool auto-download.
+  Gate verified: full Go + web gates green, plus a live smoke (real 3-chapter
   m4b through inspecting -> splitting -> done, mid-split kill + resume without
-  redoing chapters, purge drops the gauge).
+  redoing chapters, purge drops the gauge, a non-contiguous book parks
+  needs_attention).
 - **M3-M8 (planned):** ASR backends (mlx-whisper + whisper.cpp), QA/spelling ports,
   the agent runner (claude + codex) with staged context dirs enforcing the
   invariants, the fact-pass + synthesis + audit loop, contribution (intake/PR/local),

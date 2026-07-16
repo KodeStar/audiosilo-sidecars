@@ -281,11 +281,15 @@ func (db *DB) SetBookCoverage(ctx context.Context, id int64, coverage json.RawMe
 
 // UpdateScratchBytes records a book's accounted on-disk scratch size (computed by
 // a single DirSize walk at split completion / after a purge), so book-list and
-// system reads serve it from the column without walking the work dir.
+// system reads serve it from the column without walking the work dir. It is a pure
+// gauge write and deliberately does NOT bump updated_at: scratch size is bookkeeping
+// about disk, not a change to the book's pipeline state, and a spurious updated_at
+// bump would reorder the Running list (which sorts by created_at, but callers also
+// use updated_at as a "last real change" signal).
 func (db *DB) UpdateScratchBytes(ctx context.Context, id, bytes int64) error {
 	res, err := db.sql.ExecContext(ctx,
-		`UPDATE books SET scratch_bytes=?, updated_at=? WHERE id=?`,
-		bytes, timestamp(nowFn()), id)
+		`UPDATE books SET scratch_bytes=? WHERE id=?`,
+		bytes, id)
 	return checkAffected(res, err)
 }
 

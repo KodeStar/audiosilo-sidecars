@@ -5,6 +5,7 @@ import type { BookStateEvent, BookView, QueueStatsEvent, StageProgressEvent } fr
 import {
   applyBookState,
   applyStageProgress,
+  formatBytes,
   isDone,
   sortBooks,
   type BookAction,
@@ -22,9 +23,14 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
   const [books, setBooks] = useState<BookView[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [stats, setStats] = useState<QueueStatsEvent | null>(null);
+  const [scratchBytes, setScratchBytes] = useState<number | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
+  // Reload the books AND the daemon-total scratch gauge together. Fetching the
+  // gauge here (not just on mount) keeps it fresh after an action - notably a
+  // purge, which drops the total. The two calls are independent, so a gauge
+  // failure never blocks the pipeline list.
   const load = useCallback(async () => {
     try {
       const { books: list } = await client.listBooks();
@@ -32,6 +38,12 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
       setLoadError(null);
     } catch (err) {
       setLoadError(err instanceof ApiError ? err.message : 'Could not load the pipeline.');
+    }
+    try {
+      const info = await client.system();
+      setScratchBytes(info.scratch_bytes);
+    } catch {
+      // A gauge read failure is non-fatal; leave the previous value.
     }
   }, [client]);
 
@@ -131,7 +143,12 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
 
   return (
     <div className="flex flex-col gap-4">
-      <QueueStrip stats={stats} activeCount={active.length} doneCount={done.length} />
+      <QueueStrip
+        stats={stats}
+        activeCount={active.length}
+        doneCount={done.length}
+        scratchBytes={scratchBytes}
+      />
 
       {actionError && (
         <p role="alert" className="text-sm text-pink-500">
@@ -158,9 +175,11 @@ interface QueueStripProps {
   stats: QueueStatsEvent | null;
   activeCount: number;
   doneCount: number;
+  // Daemon-total on-disk scratch (from /system); null until first fetched.
+  scratchBytes: number | null;
 }
 
-function QueueStrip({ stats, activeCount, doneCount }: QueueStripProps) {
+function QueueStrip({ stats, activeCount, doneCount, scratchBytes }: QueueStripProps) {
   return (
     <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-xl border border-edge bg-surface px-4 py-3 text-sm">
       <Stat label="Active" value={activeCount} />
@@ -172,6 +191,15 @@ function QueueStrip({ stats, activeCount, doneCount }: QueueStripProps) {
           <Stat label="Agent" value={stats.agent_active} muted />
           <Stat label="Mechanical" value={stats.mechanical_active} muted />
           <Stat label="Queued" value={stats.queued} muted />
+        </>
+      )}
+      {scratchBytes !== null && (
+        <>
+          <span className="hidden text-edge sm:inline">|</span>
+          <span className="flex items-baseline gap-1.5">
+            <span className="font-semibold text-hi">{formatBytes(scratchBytes)}</span>
+            <span className="text-xs uppercase tracking-wide text-dim">Scratch</span>
+          </span>
         </>
       )}
     </div>

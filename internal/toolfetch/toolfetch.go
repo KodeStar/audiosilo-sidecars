@@ -14,13 +14,18 @@
 // start. Integrity: downloads are HTTPS-only from pinned, reputable hosts (GitHub
 // release assets from BtbN's FFmpeg-Builds for Linux/Windows; evermeet.cx for
 // macOS), and every downloaded binary is sanity-checked by running `-version`
-// before it is adopted (there is no digest pinning).
+// before it is adopted (there is no digest pinning). Extraction is fully
+// in-process (stdlib archive/zip + archive/tar over an xz decoder) with per-entry
+// name sanitization, so there is no dependency on a host `tar` and no archive
+// entry can write outside the destination directory.
 package toolfetch
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -29,12 +34,22 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
+
+	"github.com/ulikunitz/xz"
 )
 
-// maxToolBytes caps a single extracted binary (defends against a decompression
-// bomb and is comfortably above ffmpeg's real size).
-const maxToolBytes = 300 << 20 // 300 MiB
+// maxToolBytes caps a single extracted binary and the compressed download itself
+// (defends against a decompression bomb and is comfortably above ffmpeg's real
+// size). It is a var, not a const, only so tests can shrink it to exercise the
+// oversize-rejection paths without fabricating a 300 MiB fixture.
+var maxToolBytes int64 = 300 << 20 // 300 MiB
+
+// platformSpec resolves the download spec for the running platform. It is a
+// package var wrapping specFor so a test can point ensure's download branch at an
+// httptest server without a real network fetch. Production always uses specFor.
+var platformSpec = specFor
 
 // Tools are the resolved absolute paths to ffmpeg and ffprobe. Either is "" when
 // the tool could not be located or fetched.
@@ -169,7 +184,7 @@ func ensure(ctx context.Context, dir string, log *slog.Logger) (ffmpeg, ffprobe 
 			return ffmpeg, ffprobe
 		}
 	}
-	s, ok := specFor(runtime.GOOS, runtime.GOARCH)
+	s, ok := platformSpec(runtime.GOOS, runtime.GOARCH)
 	if !ok {
 		log.Warn("no ffmpeg auto-download source for this platform; install ffmpeg/ffprobe to enable the audio stages",
 			"platform", runtime.GOOS+"/"+runtime.GOARCH)
@@ -252,8 +267,10 @@ func download(ctx context.Context, s spec, dir string) error {
 	return nil
 }
 
-// fetchArchive downloads url and extracts it into destDir. tar.xz is handled by
-// shelling out to the system tar (present on Linux/macOS); zip uses the stdlib.
+// fetchArchive downloads url and extracts the ffmpeg/ffprobe binaries into
+// destDir. Both archive kinds are handled fully in-process (no host `tar`): zip
+// via archive/zip, tar.xz via archive/tar over an xz decoder. Each path enforces
+// the maxToolBytes cap and per-entry name sanitization.
 func fetchArchive(ctx context.Context, url, kind, destDir string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -271,23 +288,30 @@ func fetchArchive(ctx context.Context, url, kind, destDir string) error {
 
 	switch kind {
 	case "tar.xz":
+		// Stream the compressed archive to a bounded temp file first (fail if it
+		// exceeds the cap), then decode+extract from it. Buffering to disk keeps peak
+		// memory flat regardless of the archive size.
 		f, err := os.CreateTemp(destDir, "dl-*.tar.xz")
 		if err != nil {
 			return err
 		}
 		defer func() { _ = os.Remove(f.Name()) }()
-		if _, err := io.Copy(f, resp.Body); err != nil {
+		n, err := io.Copy(f, io.LimitReader(resp.Body, maxToolBytes+1))
+		if err != nil {
 			_ = f.Close()
 			return err
 		}
-		_ = f.Close()
-		// -J = xz; tar contains the archive's path safety.
-		//nolint:gosec // fixed argv (tar + our own temp paths), no shell, no user input
-		cmd := exec.CommandContext(ctx, "tar", "-xJf", f.Name(), "-C", destDir)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("tar extract: %v: %s", err, out)
+		if n > maxToolBytes {
+			_ = f.Close()
+			return fmt.Errorf("download %s exceeds %d bytes", url, maxToolBytes)
 		}
-		return nil
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			_ = f.Close()
+			return err
+		}
+		err = extractTarXz(f, destDir)
+		_ = f.Close()
+		return err
 	case "zip":
 		return extractZip(resp.Body, destDir)
 	default:
@@ -296,7 +320,9 @@ func fetchArchive(ctx context.Context, url, kind, destDir string) error {
 }
 
 // extractZip writes only the ffmpeg/ffprobe binaries from a zip stream into
-// destDir (basename only - avoids zip-slip and skips the rest of the archive).
+// destDir. It extracts by basename into destDir (never joining the archive's own
+// path), so a zip-slip entry name like "../../evil" cannot escape - and rejects
+// an over-cap archive up front.
 func extractZip(r io.Reader, destDir string) error {
 	buf, err := io.ReadAll(io.LimitReader(r, maxToolBytes+1))
 	if err != nil {
@@ -326,6 +352,56 @@ func extractZip(r io.Reader, destDir string) error {
 		}
 	}
 	return nil
+}
+
+// extractTarXz writes only the ffmpeg/ffprobe binaries from a tar.xz stream into
+// destDir. Every entry name is sanitized (safeEntryName rejects absolute paths and
+// any ".." traversal) before use, and binaries are written by basename into
+// destDir, so no entry can escape. Non-tool entries are skipped; each copied
+// binary is bounded by the cap.
+func extractTarXz(r io.Reader, destDir string) error {
+	xr, err := xz.NewReader(r)
+	if err != nil {
+		return fmt.Errorf("open xz: %w", err)
+	}
+	tr := tar.NewReader(xr)
+	want := map[string]bool{binName("ffmpeg"): true, binName("ffprobe"): true}
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !safeEntryName(hdr.Name) {
+			return fmt.Errorf("tar entry %q is unsafe", hdr.Name)
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		if !want[filepath.Base(hdr.Name)] {
+			continue
+		}
+		if err := writeExec(filepath.Join(destDir, filepath.Base(hdr.Name)), io.LimitReader(tr, maxToolBytes)); err != nil {
+			return err
+		}
+	}
+}
+
+// safeEntryName reports whether an archive entry name is safe to extract: not
+// absolute and containing no ".." element (which could traverse out of destDir).
+// It is the per-entry guard the tar path enforces before touching the filesystem.
+func safeEntryName(name string) bool {
+	if name == "" || filepath.IsAbs(name) || strings.HasPrefix(name, "/") {
+		return false
+	}
+	for _, part := range strings.Split(filepath.ToSlash(name), "/") {
+		if part == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // copyExec copies src to dst as an executable.

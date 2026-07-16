@@ -130,6 +130,20 @@ func TestScratchBytesRoundTripAndSum(t *testing.T) {
 	if err := db.UpdateScratchBytes(ctx, 9999, 1); !errors.Is(err, ErrNotFound) {
 		t.Errorf("UpdateScratchBytes(missing) = %v, want ErrNotFound", err)
 	}
+
+	// A scratch-gauge write must NOT bump updated_at: it is disk bookkeeping, not a
+	// pipeline-state change, and must not reorder the Running list.
+	before, _ := db.GetBook(ctx, a.ID)
+	if err := db.UpdateScratchBytes(ctx, a.ID, 4242); err != nil {
+		t.Fatalf("UpdateScratchBytes: %v", err)
+	}
+	after, _ := db.GetBook(ctx, a.ID)
+	if after.UpdatedAt != before.UpdatedAt {
+		t.Errorf("UpdateScratchBytes bumped updated_at: %q -> %q", before.UpdatedAt, after.UpdatedAt)
+	}
+	if after.ScratchBytes != 4242 {
+		t.Errorf("scratch_bytes = %d, want 4242", after.ScratchBytes)
+	}
 }
 
 func TestSetBookPipelineStateLeavesStatusAndError(t *testing.T) {

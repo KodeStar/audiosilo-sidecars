@@ -354,7 +354,14 @@ func (s *Scheduler) runStage(ctx context.Context, b store.Book) {
 	}
 	if err != nil {
 		_ = s.db.FinishStageRun(ctx, runID, false, metricsErr(err))
-		s.setStatus(b.ID, state.StatusFailed, err.Error())
+		// A ParkError is a deliberate "a human must act" stop (e.g. an unimplemented
+		// stage), so park the book needs_attention rather than flag a hard failure.
+		var pe *ParkError
+		if errors.As(err, &pe) {
+			s.setStatus(b.ID, state.StatusNeedsAttention, pe.Error())
+		} else {
+			s.setStatus(b.ID, state.StatusFailed, err.Error())
+		}
 		return
 	}
 	if ferr := s.db.FinishStageRun(ctx, runID, true, result.Metrics); ferr != nil {
