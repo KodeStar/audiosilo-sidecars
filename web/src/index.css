@@ -1,0 +1,61 @@
+@import 'tailwindcss';
+
+@import '@fontsource/roboto/300.css';
+@import '@fontsource/roboto/400.css';
+@import '@fontsource/roboto/500.css';
+@import '@fontsource/roboto/700.css';
+
+/* AudioSilo brand tokens (dark-first). These mirror the product design system. */
+@theme {
+  --color-deep: #0b111b;
+  --color-surface: #161f2c;
+  --color-raised: #1a2331;
+  --color-edge: #2c3340;
+  --color-hi: #f3f4f6;
+  --color-body: #d1d5db;
+  --color-dim: #9ca3af;
+  --color-success: #22c55e;
+  --color-pink-500: #ec4899;
+  --color-pink-600: #db2777;
+  --color-pink-700: #be185d;
+
+  --font-sans: 'Roboto', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background-color: var(--color-deep);
+  color: var(--color-body);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Visible focus ring for keyboard users, in brand pink. */
+:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 2px var(--color-deep),
+    0 0 0 4px var(--color-pink-500);
+  border-radius: 4px;
+}
+
+@keyframes heartbeat-pulse {
+  0% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.6);
+    opacity: 0.55;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
