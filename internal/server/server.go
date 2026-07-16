@@ -6,13 +6,13 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/api"
@@ -91,22 +91,29 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	hub := events.NewHub(events.DefaultRingSize)
-	// Persist every published event to the durable log (fire-and-forget; a log
-	// write failure must never break live delivery).
-	hub.SetPersister(func(ev events.Event) {
-		bookID := bookIDOf(ev.Data)
-		_ = db.InsertEvent(context.Background(), time.Now(), ev.Type, bookID, ev.Data)
-	})
+	// Persist every published event to the durable log via an async, ordered
+	// persister: the hub enqueues under its lock (preserving id order) and a single
+	// background goroutine does the DB writes, so a slow write never stalls
+	// publishers and events are logged in the order the ids were assigned.
+	persister := newEventPersister(db, opts.Out, eventQueueSize)
+	persister.start()
+	hub.SetPersister(persister.enqueue)
 	go hub.RunHeartbeat(ctx, heartbeatInterval)
 
 	// Pipeline wiring (M1): the metadata client, the async scan manager, and the
 	// three-lane scheduler over stub executors. The scheduler runs its own
-	// goroutine and reconciles crash state on start.
+	// goroutine (under a child context so it can be stopped independently) and
+	// reconciles crash state on start.
 	metaClient := metaops.NewClient(cfg.Metadata.BaseURL)
 	scanMgr := metaops.NewScanManager(ctx, metaClient, cfg.Scan.FFprobePath)
-	sched := scheduler.New(db, hub, scheduler.NewStubExecutor(0, 0), cfg.Agent.Concurrency)
+	workRoot := filepath.Join(opts.DataDir, "work")
+	sched := scheduler.New(db, hub, scheduler.NewStubExecutor(0, 0), cfg.Agent.Concurrency, workRoot)
+	schedCtx, cancelSched := context.WithCancel(ctx)
+	defer cancelSched()
+	schedDone := make(chan struct{})
 	go func() {
-		if err := sched.Start(ctx); err != nil {
+		defer close(schedDone)
+		if err := sched.Start(schedCtx); err != nil {
 			fmt.Fprintf(opts.Out, "[error] scheduler stopped: %v\n", err)
 		}
 	}()
@@ -148,12 +155,83 @@ func Run(ctx context.Context, opts Options) error {
 		errCh <- err
 	}()
 
+	var runErr error
 	select {
 	case err := <-errCh:
-		return err
+		runErr = err
 	case <-ctx.Done():
-		return shutdown(srv)
+		_ = shutdown(srv)
 	}
+	// Stop the scheduler and wait for its in-flight workers to fully drain BEFORE
+	// the deferred db.Close() runs, so no stage worker writes to a closed database.
+	// sched.Start returns only after ctx is cancelled AND wg.Wait completes.
+	cancelSched()
+	<-schedDone
+	// Drain and stop the durable event persister (its queue may hold late events).
+	persister.Close()
+	return runErr
+}
+
+// eventQueueSize bounds the durable-event persister's backlog. A full queue drops
+// the oldest surplus (the live SSE stream already delivered it); the durable log
+// is best-effort scaffolding for future log views.
+const eventQueueSize = 1024
+
+// eventPersister writes published events to the durable log off the hot path. The
+// hub enqueues under its lock (so ids stay ordered) via enqueue, which never
+// blocks; a single background goroutine performs the DB writes.
+type eventPersister struct {
+	db      *store.DB
+	out     io.Writer
+	ch      chan events.Event
+	done    chan struct{}
+	dropped atomic.Uint64
+}
+
+// newEventPersister builds a persister with a bounded queue. Call start to launch
+// the drain goroutine.
+func newEventPersister(db *store.DB, out io.Writer, buffer int) *eventPersister {
+	if buffer < 1 {
+		buffer = 1
+	}
+	return &eventPersister{
+		db:   db,
+		out:  out,
+		ch:   make(chan events.Event, buffer),
+		done: make(chan struct{}),
+	}
+}
+
+// start launches the single drain goroutine.
+func (p *eventPersister) start() { go p.drain() }
+
+// enqueue queues an event for durable persistence. It is called by the hub UNDER
+// its lock and MUST never block: on a full queue the event is dropped (best-effort
+// log) and a drop counter is bumped and logged.
+func (p *eventPersister) enqueue(ev events.Event) {
+	select {
+	case p.ch <- ev:
+	default:
+		n := p.dropped.Add(1)
+		if n == 1 || n%1000 == 0 {
+			fmt.Fprintf(p.out, "[warn] durable event log overloaded; dropped %d event(s) total\n", n)
+		}
+	}
+}
+
+// drain performs the DB writes until the queue is closed, then signals done.
+func (p *eventPersister) drain() {
+	defer close(p.done)
+	for ev := range p.ch {
+		_ = p.db.InsertEvent(context.Background(), time.Now(), ev.ID, ev.Type, ev.BookID, ev.Data)
+	}
+}
+
+// Close stops accepting events and waits for the queue to drain. It must be called
+// only after all publishers have stopped (no Publish can race a closed channel).
+func (p *eventPersister) Close() {
+	close(p.ch)
+	<-p.done
 }
 
 // pruneDailyInterval is the cadence of the background event-log prune.
@@ -195,23 +273,6 @@ func shutdown(srv *http.Server) error {
 // dataFile returns the config file path used to detect a first run.
 func dataFile(dir string) string {
 	return dir + string(os.PathSeparator) + config.FileName
-}
-
-// bookIDOf extracts an optional book_id from an event payload so the durable log
-// can key book-scoped events (book.state/stage.progress) to their book, while
-// daemon-wide events (queue.stats/heartbeat data) store NULL. A payload without
-// the field yields 0.
-func bookIDOf(data json.RawMessage) int64 {
-	if len(data) == 0 {
-		return 0
-	}
-	var probe struct {
-		BookID int64 `json:"book_id"`
-	}
-	if err := json.Unmarshal(data, &probe); err != nil {
-		return 0
-	}
-	return probe.BookID
 }
 
 // printBanner writes the startup banner. The one-time password is printed only

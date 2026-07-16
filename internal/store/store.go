@@ -41,8 +41,15 @@ type DB struct {
 // nowFn is overridable in tests.
 var nowFn = func() time.Time { return time.Now().UTC() }
 
-// timestamp formats a moment in the store's canonical RFC3339 UTC form.
-func timestamp(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+// timeLayout is a FIXED-WIDTH UTC layout: nine fractional digits and a literal
+// Z, so a lexicographic string compare of two timestamps is always chronological.
+// time.RFC3339Nano trims trailing zeros in the fraction, which breaks that
+// invariant ("...00Z" sorts after "...00.5Z" though it is earlier); the web
+// sortBooks helper relies on the ordering holding.
+const timeLayout = "2006-01-02T15:04:05.000000000Z"
+
+// timestamp formats a moment in the store's canonical fixed-width UTC form.
+func timestamp(t time.Time) string { return t.UTC().Format(timeLayout) }
 
 // Open opens (creating if needed) the SQLite database at dsn and applies pending
 // migrations. Pass ":memory:" for tests. WAL + busy_timeout + foreign_keys are

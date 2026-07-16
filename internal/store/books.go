@@ -2,14 +2,59 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
 
 	sqlite "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
+
+// workDirSlugMax caps the human-readable slug portion of a derived work dir, so a
+// very long title cannot produce an unwieldy path component.
+const workDirSlugMax = 48
+
+// DeriveWorkDir returns a unique per-book scratch directory under root. The
+// source_path hash guarantees uniqueness (two books may share a title), while the
+// title slug keeps the path human-readable. An empty/all-symbol title falls back
+// to "book"; the slug is length-capped. It lives here (next to CreateBook/NewBook)
+// so the identity-derivation logic is unit-testable without the transport layer.
+func DeriveWorkDir(root, sourcePath, title string) string {
+	sum := sha256.Sum256([]byte(sourcePath))
+	name := slug(title)
+	if name == "" {
+		name = "book"
+	}
+	return filepath.Join(root, name+"-"+hex.EncodeToString(sum[:])[:8])
+}
+
+// slug lowercases and hyphenates a title into a filesystem-safe, length-capped
+// directory-name fragment.
+func slug(s string) string {
+	var b strings.Builder
+	prevDash := false
+	for _, r := range strings.ToLower(strings.TrimSpace(s)) {
+		if b.Len() >= workDirSlugMax {
+			break
+		}
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+			prevDash = false
+		default:
+			if !prevDash && b.Len() > 0 {
+				b.WriteByte('-')
+				prevDash = true
+			}
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
 
 // ErrNotFound is returned when a lookup by id/path finds no row.
 var ErrNotFound = errors.New("not found")
@@ -116,7 +161,24 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 	if err != nil {
 		return Book{}, err
 	}
-	return db.GetBook(ctx, id)
+	// Build the returned book from the input + assigned id/timestamps instead of a
+	// second round-trip SELECT: the row was just inserted from exactly these values.
+	return Book{
+		ID:              id,
+		SourcePath:      nb.SourcePath,
+		WorkDir:         nb.WorkDir,
+		Title:           nb.Title,
+		Authors:         nb.Authors,
+		Series:          nb.Series,
+		SeriesPos:       nb.SeriesPos,
+		ASIN:            nb.ASIN,
+		ISBN:            nb.ISBN,
+		IdentitySources: nb.IdentitySources,
+		State:           st,
+		Coverage:        nb.Coverage,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}, nil
 }
 
 const bookCols = `id, source_path, work_dir, title, authors, series, series_pos,
@@ -180,6 +242,18 @@ func (db *DB) SetBookState(ctx context.Context, id int64, state, status, errMsg 
 	res, err := db.sql.ExecContext(ctx,
 		`UPDATE books SET state=?, status=?, error=?, updated_at=? WHERE id=?`,
 		state, status, errMsg, timestamp(nowFn()), id)
+	return checkAffected(res, err)
+}
+
+// SetBookPipelineState updates ONLY the pipeline state (and updated_at), leaving
+// status and error untouched. The scheduler's advance() uses it: a normal forward
+// transition must never clobber a status set concurrently (a pause/cancel landing
+// in the window between a stage completing and its state advancing) nor wipe a
+// prior error. Compare SetBookState, which sets state+status+error together.
+func (db *DB) SetBookPipelineState(ctx context.Context, id int64, state string) error {
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE books SET state=?, updated_at=? WHERE id=?`,
+		state, timestamp(nowFn()), id)
 	return checkAffected(res, err)
 }
 

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,7 +48,7 @@ func newPipelineEnv(t *testing.T, libraryRoots []string) *pipelineEnv {
 	cfg.Metadata.BaseURL = "" // disabled: coverage is 'unavailable' in tests
 
 	hub := events.NewHub(64)
-	sched := scheduler.New(db, hub, scheduler.NewStubExecutor(0, 0), 2)
+	sched := scheduler.New(db, hub, scheduler.NewStubExecutor(0, 0), 2, t.TempDir())
 	scans := metaops.NewScanManager(context.Background(), metaops.NewClient(""), "")
 
 	env := &testEnv{password: pw}
@@ -269,6 +270,75 @@ func TestBookControlEndpoints(t *testing.T) {
 		r.Body.Close()
 	} else {
 		r.Body.Close()
+	}
+}
+
+func TestCreateBooksEnforcesLibraryRoots(t *testing.T) {
+	root := t.TempDir()
+	env := newPipelineEnv(t, []string{root})
+	token := env.login(t)
+
+	// The paths are resolved (symlink-evaluated) by PathAllowed; create both so the
+	// resolution is stable on platforms with a symlinked temp root (e.g. macOS).
+	inside := filepath.Join(root, "book-a")
+	if err := os.MkdirAll(inside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "book-b")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"candidates":[
+		{"source_path":"` + inside + `","title":"Inside"},
+		{"source_path":"` + outside + `","title":"Outside"}
+	]}`
+	resp := env.do(t, http.MethodPost, "/api/v1/books", token, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("create books = %d, want 200", resp.StatusCode)
+	}
+	var cr createBooksResponse
+	_ = json.NewDecoder(resp.Body).Decode(&cr)
+	resp.Body.Close()
+
+	byPath := map[string]bookCreateResult{}
+	for _, r := range cr.Results {
+		byPath[r.SourcePath] = r
+	}
+	// Allowed: inside a root -> created.
+	if !byPath[inside].Created {
+		t.Errorf("inside-root book not created: %+v", byPath[inside])
+	}
+	// Denied: outside every root -> not created, per-item error, batch still 200.
+	if byPath[outside].Created || byPath[outside].Error != "path not allowed" {
+		t.Errorf("outside-root book should be denied: %+v", byPath[outside])
+	}
+}
+
+func TestStageRunWireShapeSnakeCase(t *testing.T) {
+	env := newPipelineEnv(t, nil)
+	token := env.login(t)
+	resp := env.do(t, http.MethodPost, "/api/v1/books", token, `{"candidates":[{"source_path":"/b/sr","title":"SR"}]}`)
+	var cr createBooksResponse
+	_ = json.NewDecoder(resp.Body).Decode(&cr)
+	resp.Body.Close()
+	id := cr.Results[0].Book.ID
+
+	// Record a stage run directly in the store, then read the detail view.
+	runID, err := env.db.StartStageRun(context.Background(), id, "asr", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.db.FinishStageRun(context.Background(), runID, true, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	r := env.do(t, http.MethodGet, "/api/v1/books/"+strconv.FormatInt(id, 10), token, "")
+	body := readAll(t, r)
+	for _, key := range []string{`"id"`, `"book_id"`, `"stage"`, `"attempt"`, `"started_at"`, `"finished_at"`, `"ok"`, `"metrics"`} {
+		if !strings.Contains(body, key) {
+			t.Errorf("stage-run JSON missing snake_case key %s: %s", key, body)
+		}
 	}
 }
 

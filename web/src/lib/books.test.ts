@@ -19,23 +19,44 @@ function bk(partial: Partial<BookView>): BookView {
 }
 
 describe('applyBookState', () => {
-  it('patches the matching book state + lane + status', () => {
+  it('patches the matching book state + lane + status + error', () => {
     const books = [bk({ id: 1, state: 'queued' }), bk({ id: 2, state: 'asr', lane: 'asr' })];
     const out = applyBookState(books, {
       book_id: 2,
       state: 'sanitizing',
       lane: 'mechanical',
-      status: 'paused',
+      status: 'failed',
+      error: 'boom',
     });
     expect(out[1].state).toBe('sanitizing');
     expect(out[1].lane).toBe('mechanical'); // the served lane rides along the patch
-    expect(out[1].status).toBe('paused');
+    expect(out[1].status).toBe('failed');
+    expect(out[1].error).toBe('boom'); // the error rides along too (F8)
     expect(out[0]).toBe(books[0]); // untouched reference
+  });
+
+  it('clears the error when an advance publishes an empty error', () => {
+    const books = [bk({ id: 1, state: 'asr', status: 'failed', error: 'old failure' })];
+    const out = applyBookState(books, {
+      book_id: 1,
+      state: 'sanitizing',
+      lane: 'mechanical',
+      status: '',
+      error: '',
+    });
+    expect(out[0].status).toBe('');
+    expect(out[0].error).toBe('');
   });
 
   it('returns the same array reference when no book matches', () => {
     const books = [bk({ id: 1 })];
-    const out = applyBookState(books, { book_id: 99, state: 'done', lane: '', status: '' });
+    const out = applyBookState(books, {
+      book_id: 99,
+      state: 'done',
+      lane: '',
+      status: '',
+      error: '',
+    });
     expect(out).toBe(books);
   });
 });

@@ -30,7 +30,11 @@ const HeartbeatType = "heartbeat"
 type Event struct {
 	ID   uint64
 	Type string
-	Data json.RawMessage
+	// BookID is the book this event concerns (0 = daemon-wide). It is carried for
+	// the durable event log's book_id column and is NOT serialized onto the SSE
+	// wire (the web payload keeps book_id inside Data). Set via PublishBook.
+	BookID int64
+	Data   json.RawMessage
 }
 
 // WriteSSE writes e in the text/event-stream wire format to w. The id line is
@@ -76,10 +80,13 @@ type Hub struct {
 }
 
 // SetPersister installs an optional sink invoked for every published (real,
-// non-heartbeat) event AFTER it has been assigned an id and fanned out. The hub
+// non-heartbeat) event after it has been assigned an id and fanned out. The hub
 // stays the live fan-out; the sink is how the durable event log (internal/store)
-// captures the same stream for later log views. It is called outside the hub
-// lock, so a slow write never blocks publishers. Not safe to call concurrently
+// captures the same stream for later log views. It is invoked UNDER the hub lock,
+// in id order, so the durable log observes events in the same order the ids were
+// assigned - therefore the sink MUST be non-blocking (enqueue to a buffered
+// channel and drop on overflow; do the actual DB write on a background goroutine)
+// so a slow durable write never stalls publishers. Not safe to call concurrently
 // with Publish; set it once at wiring time.
 func (h *Hub) SetPersister(fn func(Event)) { h.persist = fn }
 
@@ -96,27 +103,34 @@ func NewHub(ringSize int) *Hub {
 	}
 }
 
-// Publish assigns a new id to a typed event, records it in the ring buffer, and
-// delivers it to every subscriber. A subscriber whose buffer is full is evicted.
+// Publish assigns a new id to a daemon-wide (book-less) event, records it in the
+// ring buffer, and delivers it to every subscriber. A subscriber whose buffer is
+// full is evicted.
 func (h *Hub) Publish(eventType string, payload any) error {
+	return h.PublishBook(eventType, 0, payload)
+}
+
+// PublishBook is Publish for a book-scoped event: bookID is carried on the Event
+// (for the durable log's book_id column) without changing the SSE wire payload.
+func (h *Hub) PublishBook(eventType string, bookID int64, payload any) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 	h.mu.Lock()
 	h.nextID++
-	ev := Event{ID: h.nextID, Type: eventType, Data: data}
+	ev := Event{ID: h.nextID, Type: eventType, BookID: bookID, Data: data}
 	h.ring = append(h.ring, ev)
 	if len(h.ring) > h.ringCap {
 		h.ring = h.ring[len(h.ring)-h.ringCap:]
 	}
 	h.fanout(ev)
-	persist := h.persist
-	h.mu.Unlock()
-	// Persist outside the lock so a slow durable write never stalls publishers.
-	if persist != nil {
-		persist(ev)
+	// Persist UNDER the lock so the durable sink observes events in id order. The
+	// sink is required to be non-blocking (see SetPersister), so this never stalls.
+	if h.persist != nil {
+		h.persist(ev)
 	}
+	h.mu.Unlock()
 	return nil
 }
 

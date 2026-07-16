@@ -7,9 +7,15 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	metascan "github.com/kodestar/audiosilo-meta/pkg/scan"
 )
+
+// coverageWorkers bounds concurrent per-book coverage lookups during a scan, so a
+// large folder resolves coverage in parallel without opening an unbounded number
+// of HTTP connections. The shared client's TTL caches are mutex-safe.
+const coverageWorkers = 8
 
 // ScanStatus is a job's lifecycle state.
 type ScanStatus string
@@ -134,22 +140,39 @@ func (m *ScanManager) run(id, path string) {
 	}
 
 	books := make([]ScannedBook, len(res.Books))
-	m.setProgress(id, ScanProgress{Phase: "coverage", Done: 0, Total: len(res.Books)})
 	for i, b := range res.Books {
-		sb := ScannedBook{
+		books[i] = ScannedBook{
 			Path: b.Path, Title: b.Title, Subtitle: b.Subtitle, Authors: b.Authors,
 			Narrators: b.Narrators, Series: b.Series, SeriesPosition: b.SeriesPosition,
 			ASIN: b.ASIN, ISBN: b.ISBN, RuntimeMin: b.RuntimeMin, Chapters: b.Chapters,
 			AudioFiles: b.AudioFiles, Sources: b.Sources,
 		}
-		// Coverage never fails the scan: a down/absent service marks it unavailable.
-		cov, cerr := m.client.CoverageFor(m.ctx, b.ASIN, b.ISBN)
-		if cerr == nil {
-			sb.Coverage = cov
-		}
-		books[i] = sb
-		m.setProgress(id, ScanProgress{Phase: "coverage", Done: i + 1, Total: len(res.Books)})
 	}
+	m.setProgress(id, ScanProgress{Phase: "coverage", Done: 0, Total: len(books)})
+
+	// Resolve per-book coverage in a bounded worker pool. Each worker writes only
+	// its own index (books[i]), so the result order matches the scan order with no
+	// locking; a monotonic atomic counter drives the progress bar.
+	var (
+		wg   sync.WaitGroup
+		sem  = make(chan struct{}, coverageWorkers)
+		done atomic.Int64
+	)
+	for i := range books {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			// Coverage never fails the scan: a down/absent service marks it unavailable.
+			if cov, cerr := m.client.CoverageFor(m.ctx, books[i].ASIN, books[i].ISBN); cerr == nil {
+				books[i].Coverage = cov
+			}
+			n := done.Add(1)
+			m.setProgress(id, ScanProgress{Phase: "coverage", Done: int(n), Total: len(books)})
+		}(i)
+	}
+	wg.Wait()
 
 	m.finishDone(id, &ScanResult{Root: res.Root, Books: books})
 }

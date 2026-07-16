@@ -287,6 +287,46 @@ func TestCORSAllowListedOrigin(t *testing.T) {
 	}
 }
 
+func TestCORSPreflightAllowsDelete(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.login(t)
+	// Configure an allowed origin.
+	env.do(t, http.MethodPut, "/api/v1/settings", token, `{"cors_origins":["http://ui.example"]}`).Body.Close()
+
+	// A DELETE preflight from the allowed origin -> 204 with DELETE in Allow-Methods
+	// (the web Running tab deletes books cross-origin in dev).
+	req, _ := http.NewRequest(http.MethodOptions, env.srv.URL+"/api/v1/books/1", nil)
+	req.Header.Set("Origin", "http://ui.example")
+	req.Header.Set("Access-Control-Request-Method", "DELETE")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("preflight do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("allowed DELETE preflight = %d, want 204", resp.StatusCode)
+	}
+	if allow := resp.Header.Get("Access-Control-Allow-Methods"); !strings.Contains(allow, "DELETE") {
+		t.Errorf("Allow-Methods = %q, must include DELETE", allow)
+	}
+
+	// A preflight from a disallowed origin -> 403 with no CORS headers.
+	req2, _ := http.NewRequest(http.MethodOptions, env.srv.URL+"/api/v1/books/1", nil)
+	req2.Header.Set("Origin", "http://evil.example")
+	req2.Header.Set("Access-Control-Request-Method", "DELETE")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("denied preflight do: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Errorf("disallowed preflight = %d, want 403", resp2.StatusCode)
+	}
+	if got := resp2.Header.Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("disallowed preflight got ACAO = %q", got)
+	}
+}
+
 func TestEventsStreamHeartbeatAndAuth(t *testing.T) {
 	env := newTestEnv(t)
 

@@ -9,14 +9,14 @@ import (
 // StageRun is one execution (or attempt) of a stage for a book. Ok is a nullable
 // tri-state: nil = still running, false = failed/interrupted, true = completed.
 type StageRun struct {
-	ID         int64
-	BookID     int64
-	Stage      string
-	Attempt    int
-	StartedAt  string
-	FinishedAt string // "" while running
-	Ok         *bool
-	Metrics    json.RawMessage
+	ID         int64           `json:"id"`
+	BookID     int64           `json:"book_id"`
+	Stage      string          `json:"stage"`
+	Attempt    int             `json:"attempt"`
+	StartedAt  string          `json:"started_at"`
+	FinishedAt string          `json:"finished_at"` // "" while running
+	Ok         *bool           `json:"ok"`
+	Metrics    json.RawMessage `json:"metrics"`
 }
 
 // StartStageRun opens a new run for (book, stage) with finished_at NULL and
@@ -132,30 +132,11 @@ func (db *DB) OpenStageRuns(ctx context.Context) ([]StageRun, error) {
 	return out, rows.Err()
 }
 
-// SucceededStages returns the distinct set of stages that have at least one ok=1
-// run for a book - the "DB says done" set the reconcile cross-checks against
-// on-disk sentinels.
-func (db *DB) SucceededStages(ctx context.Context, bookID int64) (map[string]bool, error) {
-	rows, err := db.sql.QueryContext(ctx,
-		`SELECT DISTINCT stage FROM stage_runs WHERE book_id=? AND ok=1`, bookID)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	out := map[string]bool{}
-	for rows.Next() {
-		var s string
-		if err := rows.Scan(&s); err != nil {
-			return nil, err
-		}
-		out[s] = true
-	}
-	return out, rows.Err()
-}
-
 // SucceededStagesAll returns, for every book, the set of stages with at least
-// one ok=1 run, in one grouped query. Reconcile uses it instead of calling
-// SucceededStages per book (an N+1 across the whole catalogue at startup).
+// one ok=1 run, in one grouped query - the "DB says done" set the reconcile
+// cross-checks against on-disk sentinels. A single grouped query avoids a per-book
+// N+1 across the whole catalogue at startup; callers that want one book's set
+// index the result by book id.
 func (db *DB) SucceededStagesAll(ctx context.Context) (map[int64]map[string]bool, error) {
 	rows, err := db.sql.QueryContext(ctx,
 		`SELECT DISTINCT book_id, stage FROM stage_runs WHERE ok=1`)

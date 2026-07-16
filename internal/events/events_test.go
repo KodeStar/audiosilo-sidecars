@@ -2,6 +2,7 @@ package events
 
 import (
 	"bytes"
+	"sync"
 	"testing"
 )
 
@@ -157,5 +158,59 @@ func TestPersisterReceivesRealEventsOnly(t *testing.T) {
 	}
 	if got[1].ID != 2 || got[1].Type != "queue.stats" {
 		t.Errorf("event 1 = %+v", got[1])
+	}
+}
+
+// TestPersisterSeesEventsInIDOrderUnderConcurrency verifies the sink observes
+// events strictly in id order even when many goroutines Publish concurrently -
+// the guarantee that lets an async persister enqueue in a stable order. The sink
+// runs under the hub lock, so the id sequence it sees must be gap-free 1..N.
+func TestPersisterSeesEventsInIDOrderUnderConcurrency(t *testing.T) {
+	h := NewHub(0)
+	var mu sync.Mutex
+	var ids []uint64
+	h.SetPersister(func(ev Event) {
+		mu.Lock()
+		ids = append(ids, ev.ID)
+		mu.Unlock()
+	})
+
+	const goroutines, per = 8, 50
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < per; i++ {
+				_ = h.Publish("tick", i)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if len(ids) != goroutines*per {
+		t.Fatalf("persisted %d events, want %d", len(ids), goroutines*per)
+	}
+	for i, id := range ids {
+		if id != uint64(i+1) {
+			t.Fatalf("id at position %d = %d, want %d (order not preserved)", i, id, i+1)
+		}
+	}
+}
+
+// TestPublishBookCarriesBookID verifies the book scope rides on the Event for the
+// durable log without leaking onto the SSE wire payload.
+func TestPublishBookCarriesBookID(t *testing.T) {
+	h := NewHub(0)
+	var got Event
+	h.SetPersister(func(ev Event) { got = ev })
+	if err := h.PublishBook("book.state", 42, map[string]string{"state": "asr"}); err != nil {
+		t.Fatalf("PublishBook: %v", err)
+	}
+	if got.BookID != 42 {
+		t.Errorf("BookID = %d, want 42", got.BookID)
+	}
+	if bytes.Contains(got.Data, []byte("BookID")) {
+		t.Errorf("BookID leaked into wire payload: %s", got.Data)
 	}
 }

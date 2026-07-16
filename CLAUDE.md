@@ -205,6 +205,6 @@ M1 is built end to end (Library tab + a minimal Running tab over the stub
 scheduler). Still **not built**: the **Done** tab (full board is M6), the Running
 tab's richer board (stage timeline / ETA / cost, M6), and the pipeline's real
 executors (audio/ASR/QA/agent/contribute) - the scheduler runs stub executors,
-and the config `asr`/agent-model sections stay typed stubs. Note: `/system` still
-reports the Running/Done tabs as `planned` (a Go-side label); the Running tab is
-nonetheless fully rendered and usable. Keep this file honest as milestones land.
+and the config `asr`/agent-model sections stay typed stubs. `/system` reports
+Library/Running/Settings as `ready` and only Done as `planned` (the Go-side tab
+labels). Keep this file honest as milestones land.

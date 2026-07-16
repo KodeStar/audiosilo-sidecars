@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/kodestar/audiosilo-sidecars/internal/auth"
 )
 
 func open(t *testing.T) *DB {
@@ -93,6 +97,34 @@ func TestBookCRUDAndDedup(t *testing.T) {
 	}
 }
 
+func TestSetBookPipelineStateLeavesStatusAndError(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	b, _ := db.CreateBook(ctx, NewBook{SourcePath: "/p", WorkDir: "/w", Title: "P"})
+	// Put the book in a paused-with-error condition.
+	if err := db.SetBookStatus(ctx, b.ID, "paused", "boom"); err != nil {
+		t.Fatal(err)
+	}
+	// A pipeline-state advance must move ONLY state, leaving status and error intact.
+	if err := db.SetBookPipelineState(ctx, b.ID, "splitting"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := db.GetBook(ctx, b.ID)
+	if got.State != "splitting" {
+		t.Errorf("state = %q, want splitting", got.State)
+	}
+	if got.Status != "paused" {
+		t.Errorf("status = %q, want paused (not clobbered)", got.Status)
+	}
+	if got.Error != "boom" {
+		t.Errorf("error = %q, want boom (not wiped)", got.Error)
+	}
+	// A missing id is reported.
+	if err := db.SetBookPipelineState(ctx, 9999, "asr"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing id = %v, want ErrNotFound", err)
+	}
+}
+
 func TestStatusCheckConstraint(t *testing.T) {
 	db := open(t)
 	ctx := context.Background()
@@ -132,11 +164,6 @@ func TestStageRunsAndReconcileHelpers(t *testing.T) {
 	if ok != 1 {
 		t.Fatalf("CountStageSuccesses = %d", ok)
 	}
-	succ, _ := db.SucceededStages(ctx, b.ID)
-	if !succ["asr"] {
-		t.Fatalf("SucceededStages = %+v", succ)
-	}
-	// The grouped variant buckets the same success by book id.
 	allSucc, err := db.SucceededStagesAll(ctx)
 	if err != nil {
 		t.Fatalf("SucceededStagesAll: %v", err)
@@ -147,9 +174,9 @@ func TestStageRunsAndReconcileHelpers(t *testing.T) {
 	if err := db.DeleteStageSuccess(ctx, b.ID, "asr"); err != nil {
 		t.Fatal(err)
 	}
-	succ, _ = db.SucceededStages(ctx, b.ID)
-	if succ["asr"] {
-		t.Fatalf("DeleteStageSuccess did not remove: %+v", succ)
+	allSucc, _ = db.SucceededStagesAll(ctx)
+	if allSucc[b.ID]["asr"] {
+		t.Fatalf("DeleteStageSuccess did not remove: %+v", allSucc[b.ID])
 	}
 
 	runs, _ := db.ListStageRuns(ctx, b.ID)
@@ -198,10 +225,10 @@ func TestEventsLogAndPrune(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 	// One recent, one old.
-	if err := db.InsertEvent(ctx, now, "book.state", 7, json.RawMessage(`{"state":"asr"}`)); err != nil {
+	if err := db.InsertEvent(ctx, now, 42, "book.state", 7, json.RawMessage(`{"state":"asr"}`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InsertEvent(ctx, now.Add(-40*24*time.Hour), "queue.stats", 0, nil); err != nil {
+	if err := db.InsertEvent(ctx, now.Add(-40*24*time.Hour), 7, "queue.stats", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	evs, _ := db.ListEvents(ctx, 0, 10)
@@ -211,6 +238,10 @@ func TestEventsLogAndPrune(t *testing.T) {
 	byBook, _ := db.ListEvents(ctx, 7, 10)
 	if len(byBook) != 1 || byBook[0].BookID == nil || *byBook[0].BookID != 7 {
 		t.Fatalf("ListEvents by book = %+v", byBook)
+	}
+	// The SSE hub id round-trips into the durable log.
+	if byBook[0].HubID != 42 {
+		t.Fatalf("hub_id = %d, want 42", byBook[0].HubID)
 	}
 	removed, err := db.PruneEvents(ctx, now.Add(-30*24*time.Hour))
 	if err != nil {
@@ -282,5 +313,93 @@ func TestAuthStoreRoundTrip(t *testing.T) {
 	}
 	if ok, _ := as.HasSession("tok-hash"); ok {
 		t.Fatal("session survived removal")
+	}
+}
+
+// TestAuthStoreReopenPersists is the real reopen regression: a file-backed store
+// keeps the provisioned admin, its sessions, and its password across a Close/Open
+// cycle (the durable-auth-in-SQLite guarantee the M1 migration off the JSON files
+// established). The auth package itself is storage-agnostic, so this lives here.
+func TestAuthStoreReopenPersists(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "sidecars.db")
+
+	db, err := Open(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	mgr := auth.New(db.AuthStore())
+	pw, err := mgr.EnsureAdmin()
+	if err != nil || pw == "" {
+		t.Fatalf("EnsureAdmin: pw=%q err=%v", pw, err)
+	}
+	tok, err := mgr.Login(pw)
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	db2, err := Open(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer func() { _ = db2.Close() }()
+	mgr2 := auth.New(db2.AuthStore())
+
+	// The admin is not re-provisioned (no new one-time password).
+	if pw2, _ := mgr2.EnsureAdmin(); pw2 != "" {
+		t.Errorf("EnsureAdmin re-provisioned after reopen: %q", pw2)
+	}
+	// The session still resolves.
+	if ok, _ := mgr2.Resolve(tok); !ok {
+		t.Error("session did not survive reopen")
+	}
+	// The password still verifies (login succeeds).
+	if _, err := mgr2.Login(pw); err != nil {
+		t.Errorf("password did not survive reopen: %v", err)
+	}
+}
+
+func TestTimestampFixedWidthLexicographic(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	// A moment 500ms later. With time.RFC3339Nano the earlier value renders with no
+	// fraction ("...00Z") and sorts AFTER "...00.5Z"; the fixed-width layout keeps
+	// lexicographic == chronological.
+	half := base.Add(500 * time.Millisecond)
+	if timestamp(base) >= timestamp(half) {
+		t.Fatalf("fixed-width timestamps not chronological: %q vs %q", timestamp(base), timestamp(half))
+	}
+}
+
+func TestDeriveWorkDir(t *testing.T) {
+	root := filepath.Join("data", "work")
+
+	// Distinct source paths yield distinct dirs even when the title is identical.
+	a := DeriveWorkDir(root, "/books/one", "Same Title")
+	b := DeriveWorkDir(root, "/books/two", "Same Title")
+	if a == b {
+		t.Fatalf("distinct sources collided: %q == %q", a, b)
+	}
+
+	// An all-symbol/empty title falls back to the "book" slug.
+	sym := filepath.Base(DeriveWorkDir(root, "/x", "!!!@@@###"))
+	if !strings.HasPrefix(sym, "book-") {
+		t.Errorf("all-symbol title fallback = %q, want book- prefix", sym)
+	}
+	empty := filepath.Base(DeriveWorkDir(root, "/y", "   "))
+	if !strings.HasPrefix(empty, "book-") {
+		t.Errorf("empty title fallback = %q, want book- prefix", empty)
+	}
+
+	// A very long title is truncated to a bounded path component.
+	long := filepath.Base(DeriveWorkDir(root, "/z", strings.Repeat("abcd ", 60)))
+	if len(long) > 60 {
+		t.Errorf("long title not truncated: %d chars (%q)", len(long), long)
+	}
+
+	// Same input is deterministic.
+	if DeriveWorkDir(root, "/books/one", "Same Title") != a {
+		t.Error("DeriveWorkDir is not deterministic")
 	}
 }

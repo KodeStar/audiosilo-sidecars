@@ -56,37 +56,45 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
 
   useEventStream(apiBase, token, { onEvent });
 
-  async function handleAction(id: number, action: BookAction) {
-    if (action === 'cancel' && !window.confirm('Cancel this book? Its progress will be stopped.')) {
-      return;
-    }
-    setBusyId(id);
-    setActionError(null);
-    try {
-      switch (action) {
-        case 'pause':
-          await client.pauseBook(id);
-          break;
-        case 'resume':
-          await client.resumeBook(id);
-          break;
-        case 'retry':
-          await client.retryBook(id);
-          break;
-        case 'cancel':
-          await client.cancelBook(id);
-          break;
-        case 'delete':
-          await client.deleteBook(id);
-          break;
+  // Stable across renders (deps: client, load) so the memoized BookRow only
+  // re-renders when its own props change, not on every parent render.
+  const handleAction = useCallback(
+    async (id: number, action: BookAction) => {
+      if (
+        action === 'cancel' &&
+        !window.confirm('Cancel this book? Its progress will be stopped.')
+      ) {
+        return;
       }
-      await load();
-    } catch (err) {
-      setActionError(err instanceof ApiError ? err.message : 'The action failed.');
-    } finally {
-      setBusyId(null);
-    }
-  }
+      setBusyId(id);
+      setActionError(null);
+      try {
+        switch (action) {
+          case 'pause':
+            await client.pauseBook(id);
+            break;
+          case 'resume':
+            await client.resumeBook(id);
+            break;
+          case 'retry':
+            await client.retryBook(id);
+            break;
+          case 'cancel':
+            await client.cancelBook(id);
+            break;
+          case 'delete':
+            await client.deleteBook(id);
+            break;
+        }
+        await load();
+      } catch (err) {
+        setActionError(err instanceof ApiError ? err.message : 'The action failed.');
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [client, load],
+  );
 
   if (loadError) {
     return (

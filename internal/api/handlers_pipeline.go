@@ -2,8 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -124,6 +122,9 @@ func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	// Enforce the same library_roots allow-list scans use (empty list = allow any
+	// local path), so a book can only be enqueued from a permitted location.
+	roots := a.snapshot().LibraryRoots
 	results := make([]bookCreateResult, 0, len(req.Candidates))
 	created := 0
 	for _, c := range req.Candidates {
@@ -134,13 +135,18 @@ func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
 			results = append(results, res)
 			continue
 		}
+		if ok, perr := metaops.PathAllowed(sp, roots); perr != nil || !ok {
+			res.Error = "path not allowed"
+			results = append(results, res)
+			continue
+		}
 		sources := c.Sources
 		if sources == nil {
 			sources = map[string]string{}
 		}
 		nb := store.NewBook{
 			SourcePath:      sp,
-			WorkDir:         a.workDir(sp, c.Title),
+			WorkDir:         store.DeriveWorkDir(a.workRoot(), sp, c.Title),
 			Title:           strings.TrimSpace(c.Title),
 			Authors:         c.Authors,
 			Series:          strings.TrimSpace(c.Series),
@@ -171,35 +177,11 @@ func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, createBooksResponse{Results: results})
 }
 
-// workDir derives a unique per-book scratch directory under <data>/work. The
-// source_path hash guarantees uniqueness (two books may share a title), while the
-// title slug keeps the path human-readable.
-func (a *API) workDir(sourcePath, title string) string {
-	sum := sha256.Sum256([]byte(sourcePath))
-	name := slug(title)
-	if name == "" {
-		name = "book"
-	}
-	return filepath.Join(a.dataDir, "work", name+"-"+hex.EncodeToString(sum[:])[:8])
-}
-
-// slug lowercases and hyphenates a title for a filesystem-safe directory name.
-func slug(s string) string {
-	var b strings.Builder
-	prevDash := false
-	for _, r := range strings.ToLower(strings.TrimSpace(s)) {
-		switch {
-		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
-			b.WriteRune(r)
-			prevDash = false
-		default:
-			if !prevDash && b.Len() > 0 {
-				b.WriteByte('-')
-				prevDash = true
-			}
-		}
-	}
-	return strings.Trim(b.String(), "-")
+// workRoot is the daemon's per-book scratch-dir root (<data>/work). The
+// slug/hash derivation itself lives in internal/store (DeriveWorkDir) so it is
+// unit-testable without the transport layer.
+func (a *API) workRoot() string {
+	return filepath.Join(a.dataDir, "work")
 }
 
 // bookView is the API shape of a book, with live progress merged in. Lane is the

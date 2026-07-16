@@ -138,7 +138,7 @@ func TestReconcileClosesOpenRunsAndRewindsOnMissingSentinel(t *testing.T) {
 	_ = db.FinishStageRun(ctx, asrID, true, nil)
 	// NOTE: no ASR sentinel written -> the reconcile must rewind to asr.
 
-	sched := New(db, h.hub, NewStubExecutor(0, 0), 2)
+	sched := New(db, h.hub, NewStubExecutor(0, 0), 2, h.workRoot)
 	sched.ctx = ctx
 	if err := sched.Reconcile(ctx); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -164,7 +164,8 @@ func TestReconcileClosesOpenRunsAndRewindsOnMissingSentinel(t *testing.T) {
 		t.Fatalf("rewound to %q, want asr", cur.State)
 	}
 	// asr's success was dropped; inspecting's kept.
-	succ, _ := db.SucceededStages(ctx, b.ID)
+	allSucc, _ := db.SucceededStagesAll(ctx)
+	succ := allSucc[b.ID]
 	if succ[string(state.ASR)] {
 		t.Error("asr success should have been dropped")
 	}
@@ -178,7 +179,7 @@ func TestControlOpErrors(t *testing.T) {
 	db := h.openDB(t)
 	ctx := context.Background()
 	b := h.addBook(t, db, "ctrl", "", "")
-	sched := New(db, h.hub, NewStubExecutor(0, 0), 2)
+	sched := New(db, h.hub, NewStubExecutor(0, 0), 2, h.workRoot)
 
 	// Resume a non-paused book -> invalid.
 	if err := sched.Resume(ctx, b.ID); err != ErrInvalidOp {

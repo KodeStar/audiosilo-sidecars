@@ -33,9 +33,11 @@ func (db *DB) SetSetting(ctx context.Context, key, value string) error {
 
 // --- durable event log ---
 
-// InsertEvent appends a published event to the durable log. bookID <= 0 stores
-// NULL (a daemon-wide event). payload is stored as-is (” becomes '{}').
-func (db *DB) InsertEvent(ctx context.Context, ts time.Time, eventType string, bookID int64, payload json.RawMessage) error {
+// InsertEvent appends a published event to the durable log. hubID is the SSE
+// hub's monotonic event id (stored so the durable log and the live stream share
+// an ordering key). bookID <= 0 stores NULL (a daemon-wide event). payload is
+// stored as-is (an empty payload becomes '{}').
+func (db *DB) InsertEvent(ctx context.Context, ts time.Time, hubID uint64, eventType string, bookID int64, payload json.RawMessage) error {
 	p := string(payload)
 	if p == "" {
 		p = "{}"
@@ -45,14 +47,15 @@ func (db *DB) InsertEvent(ctx context.Context, ts time.Time, eventType string, b
 		bid = bookID
 	}
 	_, err := db.sql.ExecContext(ctx,
-		`INSERT INTO events (ts, type, book_id, payload) VALUES (?,?,?,?)`,
-		timestamp(ts), eventType, bid, p)
+		`INSERT INTO events (hub_id, ts, type, book_id, payload) VALUES (?,?,?,?,?)`,
+		hubID, timestamp(ts), eventType, bid, p)
 	return err
 }
 
 // LoggedEvent is one row of the durable event log.
 type LoggedEvent struct {
 	ID      int64           `json:"id"`
+	HubID   uint64          `json:"hub_id"`
 	TS      string          `json:"ts"`
 	Type    string          `json:"type"`
 	BookID  *int64          `json:"book_id"`
@@ -72,11 +75,11 @@ func (db *DB) ListEvents(ctx context.Context, bookID int64, limit int) ([]Logged
 	)
 	if bookID > 0 {
 		rows, err = db.sql.QueryContext(ctx,
-			`SELECT id, ts, type, book_id, payload FROM events WHERE book_id=? ORDER BY id DESC LIMIT ?`,
+			`SELECT id, hub_id, ts, type, book_id, payload FROM events WHERE book_id=? ORDER BY id DESC LIMIT ?`,
 			bookID, limit)
 	} else {
 		rows, err = db.sql.QueryContext(ctx,
-			`SELECT id, ts, type, book_id, payload FROM events ORDER BY id DESC LIMIT ?`, limit)
+			`SELECT id, hub_id, ts, type, book_id, payload FROM events ORDER BY id DESC LIMIT ?`, limit)
 	}
 	if err != nil {
 		return nil, err
@@ -87,7 +90,7 @@ func (db *DB) ListEvents(ctx context.Context, bookID int64, limit int) ([]Logged
 		var e LoggedEvent
 		var bid sql.NullInt64
 		var payload string
-		if err := rows.Scan(&e.ID, &e.TS, &e.Type, &bid, &payload); err != nil {
+		if err := rows.Scan(&e.ID, &e.HubID, &e.TS, &e.Type, &bid, &payload); err != nil {
 			return nil, err
 		}
 		if bid.Valid {

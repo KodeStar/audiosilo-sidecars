@@ -114,8 +114,9 @@ func TestChangePassword(t *testing.T) {
 	}
 }
 
-// Reopen-persistence across a store backend is covered by the SQLite AuthStore
-// tests in internal/store; the auth package itself is storage-agnostic.
+// Reopen-persistence across a real Close/Open cycle of the file-backed store is
+// covered by store.TestAuthStoreReopenPersists (internal/store); the auth package
+// itself is storage-agnostic, so its tests use the in-memory MemStore.
 
 type clock struct{ t time.Time }
 

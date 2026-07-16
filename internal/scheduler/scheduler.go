@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -48,6 +49,11 @@ type Scheduler struct {
 	hub      *events.Hub
 	exec     Executor
 	agentCap int
+	// workRoot is the daemon's work directory root (<data>/work). Delete removes a
+	// book's scratch dir only when it lives inside this root - a guard so a
+	// doctored WorkDir can never make delete rm an arbitrary path. Empty disables
+	// the on-disk cleanup (tests that don't exercise it).
+	workRoot string
 
 	ctx  context.Context //nolint:containedctx // daemon-lifetime ctx for workers
 	wake chan struct{}
@@ -74,8 +80,10 @@ type inflightBook struct {
 	cancel context.CancelFunc
 }
 
-// New constructs a scheduler. agentCap < 1 is clamped to 1.
-func New(db *store.DB, hub *events.Hub, exec Executor, agentCap int) *Scheduler {
+// New constructs a scheduler. agentCap < 1 is clamped to 1. workRoot is the
+// daemon's <data>/work directory (Delete's on-disk cleanup is confined to it);
+// pass "" to disable that cleanup.
+func New(db *store.DB, hub *events.Hub, exec Executor, agentCap int, workRoot string) *Scheduler {
 	if agentCap < 1 {
 		agentCap = 1
 	}
@@ -84,6 +92,7 @@ func New(db *store.DB, hub *events.Hub, exec Executor, agentCap int) *Scheduler 
 		hub:      hub,
 		exec:     exec,
 		agentCap: agentCap,
+		workRoot: workRoot,
 		wake:     make(chan struct{}, 1),
 		inflight: map[int64]*inflightBook{},
 	}
@@ -304,12 +313,25 @@ func (s *Scheduler) startWorker(b store.Book, lane state.Lane) bool {
 	return true
 }
 
-// runStage executes (or skips, if the sentinel already exists) one stage and
-// advances the book. Cancellation (pause-to-stop, cancel, or shutdown) leaves the
-// stage re-runnable: it closes the run failed but does not change book state.
+// runStage executes (or, on crash-resume, skips) one stage and advances the book.
+// Cancellation (pause-to-stop, cancel, or shutdown) leaves the stage re-runnable:
+// it closes the run failed but does not change book state.
 func (s *Scheduler) runStage(ctx context.Context, b store.Book) {
 	stage := state.State(b.State)
 	stageName := string(stage)
+
+	// Crash-resume fast path: the sentinel already exists (a crash happened after
+	// the executor wrote it but before the advance). Recover the branch decision
+	// and advance WITHOUT opening a new stage_run - re-recording the run would
+	// double-count a stage that genuinely completed. This check runs BEFORE
+	// StartStageRun so no phantom run row is ever created for a skipped stage.
+	if SentinelExists(b.WorkDir, stageName) {
+		if sn, rerr := ReadSentinel(b.WorkDir, stageName); rerr == nil {
+			s.advance(ctx, b, stage, sn.Result)
+			return
+		}
+		// An unreadable sentinel falls through to a fresh execution below.
+	}
 
 	n, err := s.db.CountStageRuns(ctx, b.ID, stageName)
 	if err != nil {
@@ -320,21 +342,14 @@ func (s *Scheduler) runStage(ctx context.Context, b store.Book) {
 		return
 	}
 
-	var result StageResult
-	if SentinelExists(b.WorkDir, stageName) {
-		// Crash after the sentinel was written but before the advance: recover the
-		// branch decision and skip re-execution.
-		if sn, rerr := ReadSentinel(b.WorkDir, stageName); rerr == nil {
-			result = sn.Result
-		} else {
-			result, err = s.execute(ctx, b, stage)
-		}
-	} else {
-		result, err = s.execute(ctx, b, stage)
-	}
+	result, err := s.execute(ctx, b, stage)
 	if errors.Is(err, context.Canceled) {
-		// Paused/cancelled/shutting down: close the run, leave state for a re-run.
-		_ = s.db.FinishStageRun(ctx, runID, false, json.RawMessage(`{"cancelled":true}`))
+		// Paused/cancelled/shutting down: the worker ctx is already cancelled, so
+		// close the run on a fresh context (mirroring setStatus) - otherwise the
+		// row stays open forever and reconcile has to close it on the next boot.
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = s.db.FinishStageRun(closeCtx, runID, false, json.RawMessage(`{"cancelled":true}`))
 		return
 	}
 	if err != nil {
@@ -353,7 +368,7 @@ func (s *Scheduler) runStage(ctx context.Context, b store.Book) {
 func (s *Scheduler) execute(ctx context.Context, b store.Book, stage state.State) (StageResult, error) {
 	report := func(done, total int) {
 		_ = s.db.SetProgress(ctx, b.ID, string(stage), done, total)
-		_ = s.hub.Publish("stage.progress", map[string]any{
+		_ = s.hub.PublishBook("stage.progress", b.ID, map[string]any{
 			"book_id": b.ID, "stage": string(stage), "done": done, "total": total,
 		})
 	}
@@ -388,15 +403,22 @@ func (s *Scheduler) advance(ctx context.Context, b store.Book, stage state.State
 		return
 	}
 
-	// Preserve any status set concurrently (e.g. a pause during this stage).
-	cur, err := s.db.GetBook(ctx, b.ID)
-	if err != nil {
+	// A transition INTO next always means a fresh execution of next, so drop any
+	// stale sentinel for it from a prior loop-back (retranscribing->qa_sweep,
+	// fixing->validating, or a re-entered qa_adjudicating). Otherwise runStage would
+	// skip next as "already done" and replay a frozen outcome. Crash-resume never
+	// routes through advance (it re-dispatches at the current state, where skipping
+	// IS correct), so this only ever clears a genuine re-entry.
+	_ = os.Remove(SentinelPath(b.WorkDir, string(next)))
+
+	// Advance the pipeline state ONLY: status and error belong to the control path
+	// (pause/cancel/fail). Writing them here would clobber a pause/cancel that
+	// landed while this stage was finishing, and would wipe any error. The book was
+	// dispatched under StatusNone, so a normal advance publishes StatusNone.
+	if err := s.db.SetBookPipelineState(ctx, b.ID, string(next)); err != nil {
 		return
 	}
-	if err := s.db.SetBookState(ctx, b.ID, string(next), cur.Status, ""); err != nil {
-		return
-	}
-	s.publishState(b.ID, string(next), cur.Status)
+	s.publishState(b.ID, string(next), "", "")
 }
 
 // advanceWaypoints promotes queued/ready books (no lane, no executor) to their
@@ -404,13 +426,16 @@ func (s *Scheduler) advance(ctx context.Context, b store.Book, stage state.State
 // loops until a pass advances nothing and returns that final, fresh book list so
 // dispatch can act on it without re-querying.
 func (s *Scheduler) advanceWaypoints(ctx context.Context) ([]store.Book, error) {
+	// One initial query; subsequent passes advance the in-memory slice so a chain
+	// of waypoints (queued -> inspecting, ready -> contributing) needs no re-read.
+	books, err := s.db.ListBooks(ctx)
+	if err != nil {
+		return nil, err
+	}
 	for {
-		books, err := s.db.ListBooks(ctx)
-		if err != nil {
-			return nil, err
-		}
 		advanced := false
-		for _, b := range books {
+		for i := range books {
+			b := books[i]
 			st := state.State(b.State)
 			if b.Status != "" || !state.IsWaypoint(st) {
 				continue
@@ -422,7 +447,8 @@ func (s *Scheduler) advanceWaypoints(ctx context.Context) ([]store.Book, error) 
 			if err := s.db.SetBookState(ctx, b.ID, string(next), "", ""); err != nil {
 				continue
 			}
-			s.publishState(b.ID, string(next), "")
+			books[i].State = string(next) // mirror the persisted advance in memory
+			s.publishState(b.ID, string(next), "", "")
 			advanced = true
 		}
 		if !advanced {
@@ -436,8 +462,16 @@ func (s *Scheduler) advanceWaypoints(ctx context.Context) ([]store.Book, error) 
 // lockHolders returns the set of book ids permitted to run an agent stage: the
 // lowest-position unfinished book in each series, plus every seriesless book
 // (each parallelizes freely). A book that has reached ready (or beyond) no longer
-// holds its series; a parked (needs_attention) predecessor still does, so it
-// blocks its successors' agent work until resumed or cancelled - by design.
+// holds its series.
+//
+// "Unfinished" is purely positional (HoldsSeriesLock tests state order, not
+// status), so a pre-Ready predecessor that is PARKED (needs_attention) OR FAILED/
+// CANCELLED (status=failed) still holds its series lock and blocks its successors'
+// agent work until the user retries or deletes it. This is deliberately
+// conservative: series carryover (the "story so far" recaps) wants earlier books
+// authored first, so a stuck predecessor should hold the line rather than let a
+// later book jump ahead. The plan flags this as a behaviour to revisit once real
+// runs show how often a predecessor gets stuck.
 func lockHolders(books []store.Book) map[int64]bool {
 	holders := map[int64]bool{}
 	best := map[string]store.Book{}
@@ -494,12 +528,13 @@ func parseSeriesPos(pos string) float64 {
 
 // --- events ---
 
-func (s *Scheduler) publishState(bookID int64, st, status string) {
-	_ = s.hub.Publish("book.state", map[string]any{
+func (s *Scheduler) publishState(bookID int64, st, status, errMsg string) {
+	_ = s.hub.PublishBook("book.state", bookID, map[string]any{
 		"book_id": bookID,
 		"state":   st,
 		"lane":    string(state.LaneOf(state.State(st))),
 		"status":  status,
+		"error":   errMsg,
 	})
 }
 
@@ -534,7 +569,8 @@ func (s *Scheduler) publishQueueStats(books []store.Book, counts map[state.Lane]
 	})
 }
 
-// setStatus writes an orthogonal status flag and publishes book.state.
+// setStatus writes an orthogonal status flag and publishes book.state, carrying
+// the error message so a client can surface it (a failed stage, a park reason).
 func (s *Scheduler) setStatus(bookID int64, status state.Status, errMsg string) {
 	ctx := context.Background()
 	b, err := s.db.GetBook(ctx, bookID)
@@ -544,7 +580,7 @@ func (s *Scheduler) setStatus(bookID int64, status state.Status, errMsg string) 
 	if err := s.db.SetBookStatus(ctx, bookID, string(status), errMsg); err != nil {
 		return
 	}
-	s.publishState(bookID, b.State, string(status))
+	s.publishState(bookID, b.State, string(status), errMsg)
 }
 
 func metricsErr(err error) json.RawMessage {

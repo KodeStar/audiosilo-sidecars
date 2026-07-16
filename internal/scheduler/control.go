@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
 )
@@ -14,14 +16,6 @@ var ErrInvalidOp = errors.New("operation not valid for book's current status")
 
 // ErrBusy is returned by Delete when a book is actively running a stage.
 var ErrBusy = errors.New("book is running a stage")
-
-// isInflight reports whether a book currently occupies a lane.
-func (s *Scheduler) isInflight(id int64) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, ok := s.inflight[id]
-	return ok
-}
 
 // cancelInflight cancels a book's running stage if any (interrupting its
 // executor); the worker then leaves the stage re-runnable.
@@ -49,7 +43,7 @@ func (s *Scheduler) Pause(ctx context.Context, id int64) error {
 		if err := s.db.SetBookStatus(ctx, id, string(state.StatusPaused), b.Error); err != nil {
 			return err
 		}
-		s.publishState(id, b.State, string(state.StatusPaused))
+		s.publishState(id, b.State, string(state.StatusPaused), b.Error)
 		return nil
 	default:
 		return ErrInvalidOp
@@ -68,7 +62,7 @@ func (s *Scheduler) Resume(ctx context.Context, id int64) error {
 	if err := s.db.SetBookStatus(ctx, id, string(state.StatusNone), ""); err != nil {
 		return err
 	}
-	s.publishState(id, b.State, "")
+	s.publishState(id, b.State, "", "")
 	s.notify()
 	return nil
 }
@@ -92,7 +86,7 @@ func (s *Scheduler) Retry(ctx context.Context, id int64) error {
 		if err := s.db.SetBookStatus(ctx, id, string(state.StatusNone), ""); err != nil {
 			return err
 		}
-		s.publishState(id, b.State, "")
+		s.publishState(id, b.State, "", "")
 		s.notify()
 		return nil
 	default:
@@ -115,19 +109,53 @@ func (s *Scheduler) Cancel(ctx context.Context, id int64) error {
 		return err
 	}
 	s.cancelInflight(id)
-	s.publishState(id, b.State, string(state.StatusFailed))
+	s.publishState(id, b.State, string(state.StatusFailed), "cancelled by user")
 	return nil
 }
 
-// Delete removes a book and its durable state. It refuses while the book is
-// actively running a stage (cancel or pause first), so a worker never writes to a
-// deleted book.
+// Delete removes a book, its durable state, and its on-disk work dir. It refuses
+// while the book is actively running a stage (cancel or pause first), so a worker
+// never writes to a deleted book. The in-flight check and the DB delete happen
+// under one lock so a worker can't start in the window between them; the books FK
+// (ON DELETE CASCADE) still leaves a narrow residual race if a worker is mid-write
+// - the user can simply re-delete.
 func (s *Scheduler) Delete(ctx context.Context, id int64) error {
-	if _, err := s.db.GetBook(ctx, id); err != nil {
+	b, err := s.db.GetBook(ctx, id)
+	if err != nil {
 		return err
 	}
-	if s.isInflight(id) {
+	s.mu.Lock()
+	if _, busy := s.inflight[id]; busy {
+		s.mu.Unlock()
 		return ErrBusy
 	}
-	return s.db.DeleteBook(ctx, id)
+	err = s.db.DeleteBook(ctx, id)
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	s.removeWorkDir(b.WorkDir)
+	return nil
+}
+
+// removeWorkDir deletes a removed book's scratch dir, but ONLY when it resolves to
+// a path inside the daemon's work root - a guard so a doctored or legacy WorkDir
+// can never make delete rm an arbitrary location. A missing dir is fine.
+func (s *Scheduler) removeWorkDir(workDir string) {
+	if s.workRoot == "" || workDir == "" {
+		return
+	}
+	root, err := filepath.Abs(s.workRoot)
+	if err != nil {
+		return
+	}
+	wd, err := filepath.Abs(workDir)
+	if err != nil {
+		return
+	}
+	// Must be strictly inside the root (never the root itself).
+	if wd == root || !strings.HasPrefix(wd, root+string(filepath.Separator)) {
+		return
+	}
+	_ = os.RemoveAll(wd)
 }

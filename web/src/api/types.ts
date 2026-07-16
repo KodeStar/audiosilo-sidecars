@@ -190,6 +190,8 @@ export interface BookStateEvent {
   state: string;
   lane: string;
   status: string;
+  // The book's error string (a failed stage or cancel reason); '' when none.
+  error: string;
 }
 
 export interface StageProgressEvent {

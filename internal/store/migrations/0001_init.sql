@@ -61,6 +61,7 @@ CREATE TABLE progress (
 -- book_id is NULL for daemon-wide events (e.g. queue stats).
 CREATE TABLE events (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    hub_id  INTEGER NOT NULL DEFAULT 0,               -- the SSE hub's monotonic event id
     ts      TEXT NOT NULL,
     type    TEXT NOT NULL,
     book_id INTEGER,

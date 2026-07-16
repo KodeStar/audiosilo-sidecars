@@ -1,8 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ApiClient } from '@/lib/apiClient';
 import { ApiError } from '@/lib/apiClient';
-import type { BookCreateResult, ScanJob, ScannedBook } from '@/api/types';
-import { filterCandidates, seriesGapHint, tallyResults, toCandidate } from '@/lib/candidates';
+import type { ScanJob, ScannedBook } from '@/api/types';
+import {
+  filterCandidates,
+  seriesGapHint,
+  tallyResults,
+  toCandidate,
+  type ResultTally,
+} from '@/lib/candidates';
 import { addRecentRoot, loadRecentRoots } from '@/lib/recentRoots';
 import { CandidateRow } from '../library/CandidateRow';
 
@@ -126,13 +132,16 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
     setNote(null);
     try {
       const { results } = await client.createBooks(selectedVisible.map(toCandidate));
-      const { created, conflicts, failed } = tallyResults(results);
+      const tally = tallyResults(results);
       setSelected(new Set());
-      if (created > 0) {
+      if (tally.created > 0) {
         onProcessed();
         return;
       }
-      setNote({ kind: conflicts > 0 || failed > 0 ? 'error' : 'ok', text: summarize(results) });
+      setNote({
+        kind: tally.conflicts > 0 || tally.failed > 0 ? 'error' : 'ok',
+        text: summarize(tally),
+      });
     } catch (err) {
       setNote({
         kind: 'error',
@@ -242,8 +251,9 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
   );
 }
 
-function summarize(results: BookCreateResult[]): string {
-  const { created, conflicts, failed } = tallyResults(results);
+// summarize renders a one-line note from an already-computed tally (the caller
+// tallies once and passes it in, so tallyResults never runs twice per submit).
+function summarize({ created, conflicts, failed }: ResultTally): string {
   const parts: string[] = [];
   if (created > 0) parts.push(`${created} enqueued`);
   if (conflicts > 0) parts.push(`${conflicts} already enqueued`);

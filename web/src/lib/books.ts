@@ -4,15 +4,16 @@
 
 import type { BookStateEvent, BookView, StageProgressEvent } from '@/api/types';
 
-// applyBookState patches the matching book's state + status. An event for a book
-// not in the list is ignored (a newly created book arrives via a list refetch,
-// which carries its full identity/coverage; SSE only patches what we already hold).
+// applyBookState patches the matching book's state + lane + status + error. An
+// event for a book not in the list is ignored (a newly created book arrives via a
+// list refetch, which carries its full identity/coverage; SSE only patches what we
+// already hold).
 export function applyBookState(books: BookView[], ev: BookStateEvent): BookView[] {
   let changed = false;
   const next = books.map((b) => {
     if (b.id !== ev.book_id) return b;
     changed = true;
-    return { ...b, state: ev.state, lane: ev.lane, status: ev.status };
+    return { ...b, state: ev.state, lane: ev.lane, status: ev.status, error: ev.error };
   });
   return changed ? next : books;
 }
@@ -67,8 +68,9 @@ export function sortBooks(books: BookView[]): BookView[] {
     const ad = isDone(a) ? 1 : 0;
     const bd = isDone(b) ? 1 : 0;
     if (ad !== bd) return ad - bd;
-    // Newest first within each group (created_at is an RFC3339 string, so a
-    // lexicographic compare is chronological).
+    // Newest first within each group. created_at is the daemon's fixed-width UTC
+    // timestamp (nine fractional digits + Z), so a lexicographic compare is exactly
+    // chronological; the id is a stable tiebreak for equal timestamps.
     if (a.created_at !== b.created_at) return a.created_at < b.created_at ? 1 : -1;
     return b.id - a.id;
   });

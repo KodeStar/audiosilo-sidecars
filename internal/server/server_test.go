@@ -7,6 +7,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kodestar/audiosilo-sidecars/internal/events"
+	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
 
 func TestPrintBannerFirstRunShowsPassword(t *testing.T) {
@@ -86,6 +89,51 @@ func TestRunBootsAndServesThenShutsDown(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not shut down")
+	}
+}
+
+func TestEventPersisterDropsOnOverflowAndDrains(t *testing.T) {
+	db, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var buf strings.Builder
+	p := newEventPersister(db, &buf, 2)
+
+	// Enqueue past capacity BEFORE the drain starts so the surplus is dropped
+	// deterministically (2 fit the buffer, the rest overflow).
+	const n = 6
+	for i := 0; i < n; i++ {
+		p.enqueue(events.Event{
+			ID:     uint64(i + 1),
+			Type:   "book.state",
+			BookID: int64(i + 1),
+			Data:   []byte(`{"state":"asr"}`),
+		})
+	}
+	if got := p.dropped.Load(); got != n-2 {
+		t.Fatalf("dropped = %d, want %d", got, n-2)
+	}
+	if !strings.Contains(buf.String(), "dropped") {
+		t.Errorf("overflow was not logged: %q", buf.String())
+	}
+
+	// Start and close: the 2 buffered events must drain into the durable log.
+	p.start()
+	p.Close()
+
+	evs, err := db.ListEvents(context.Background(), 0, 10)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(evs) != 2 {
+		t.Fatalf("persisted %d events, want 2 (the rest overflowed)", len(evs))
+	}
+	// The hub id round-trips into the durable log (newest first).
+	if evs[0].HubID == 0 {
+		t.Errorf("hub_id not persisted: %+v", evs[0])
 	}
 }
 
