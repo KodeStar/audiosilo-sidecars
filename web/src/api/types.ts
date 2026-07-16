@@ -60,3 +60,138 @@ export interface ChangePasswordBody {
   current: string;
   new: string;
 }
+
+// --- pipeline: scans (mirrors internal/metaops + internal/api handlers_pipeline) ---
+
+export type ScanStatus = 'running' | 'done' | 'error';
+
+export interface ScanProgress {
+  phase: string; // "scanning" | "coverage" | "done"
+  done: number;
+  total: number;
+}
+
+// Coverage is the per-book metadata verdict. Known/HasCharacters/HasRecaps are
+// meaningful only when available === true.
+export interface Coverage {
+  available: boolean;
+  known: boolean;
+  work_id?: string;
+  has_characters: boolean;
+  has_recaps: boolean;
+}
+
+export interface ScannedBook {
+  path: string;
+  title: string;
+  subtitle?: string;
+  authors?: string[];
+  narrators?: string[];
+  series?: string;
+  series_position?: string;
+  asin?: string;
+  isbn?: string;
+  runtime_min?: number;
+  chapters?: number;
+  audio_files: number;
+  // Where each field came from ("tag" | "path" | "filename").
+  sources?: Record<string, string>;
+  coverage: Coverage;
+}
+
+export interface ScanResult {
+  root: string;
+  books: ScannedBook[];
+}
+
+export interface ScanJob {
+  id: string;
+  path: string;
+  status: ScanStatus;
+  error?: string;
+  progress: ScanProgress;
+  result?: ScanResult;
+}
+
+export interface CreateScanResponse {
+  job_id: string;
+}
+
+// --- pipeline: books ---
+
+// BookCandidate is one selected book to enqueue (POST /books body item).
+export interface BookCandidate {
+  source_path: string;
+  title: string;
+  authors: string[];
+  series: string;
+  series_pos: string;
+  asin: string;
+  isbn: string;
+}
+
+export interface CreateBooksRequest {
+  candidates: BookCandidate[];
+}
+
+export interface BookProgress {
+  stage: string;
+  done: number;
+  total: number;
+}
+
+export interface BookView {
+  id: number;
+  source_path: string;
+  title: string;
+  authors: string[];
+  series?: string;
+  series_pos?: string;
+  asin?: string;
+  isbn?: string;
+  state: string;
+  status: string;
+  error?: string;
+  coverage?: Coverage;
+  progress: BookProgress[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BookCreateResult {
+  source_path: string;
+  created: boolean;
+  conflict?: boolean;
+  error?: string;
+  book?: BookView;
+}
+
+export interface CreateBooksResponse {
+  results: BookCreateResult[];
+}
+
+export interface ListBooksResponse {
+  books: BookView[];
+}
+
+// --- SSE event payloads (see internal/scheduler publish sites) ---
+
+export interface BookStateEvent {
+  book_id: number;
+  state: string;
+  status: string;
+}
+
+export interface StageProgressEvent {
+  book_id: number;
+  stage: string;
+  done: number;
+  total: number;
+}
+
+export interface QueueStatsEvent {
+  asr_active: number;
+  agent_active: number;
+  mechanical_active: number;
+  queued: number;
+}

@@ -59,7 +59,14 @@ export function AppShell({ client, apiBase, token, onSignOut }: AppShellProps) {
     <div className="flex min-h-screen flex-col">
       <Header stream={stream} onSignOut={handleSignOut} signingOut={signingOut} />
       {tabs.length > 0 && <TabBar tabs={tabs} active={active} onSelect={setActive} />}
-      <main className="mx-auto w-full max-w-4xl flex-1 p-6">{renderPanel(active, client)}</main>
+      <main className="mx-auto w-full max-w-4xl flex-1 p-6">
+        {renderPanel(active, {
+          client,
+          apiBase,
+          token,
+          goToRunning: () => setActive('running'),
+        })}
+      </main>
       {system && (
         <footer className="border-t border-edge px-6 py-3 text-xs text-dim">
           v{system.version} - {system.listen} - {system.data_dir}
@@ -69,17 +76,24 @@ export function AppShell({ client, apiBase, token, onSignOut }: AppShellProps) {
   );
 }
 
-function renderPanel(active: string, client: ApiClient) {
+interface PanelContext {
+  client: ApiClient;
+  apiBase: string;
+  token: string;
+  goToRunning: () => void;
+}
+
+function renderPanel(active: string, ctx: PanelContext) {
   switch (active) {
     case 'library':
-      return <LibraryPanel />;
+      return <LibraryPanel client={ctx.client} onProcessed={ctx.goToRunning} />;
     case 'running':
-      return <RunningPanel />;
+      return <RunningPanel client={ctx.client} apiBase={ctx.apiBase} token={ctx.token} />;
     case 'done':
       return <DonePanel />;
     case 'settings':
-      return <SettingsPanel client={client} />;
+      return <SettingsPanel client={ctx.client} />;
     default:
-      return <SettingsPanel client={client} />;
+      return <SettingsPanel client={ctx.client} />;
   }
 }

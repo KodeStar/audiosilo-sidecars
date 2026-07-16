@@ -1,0 +1,80 @@
+name: ci
+
+# Validate every pull request and every push to main.
+#
+# SECURITY: this uses the plain `pull_request` trigger, NOT
+# `pull_request_target`, so fork pull requests run with a read-only token and no
+# access to secrets. Do not switch to `pull_request_target` (the "pwn request"
+# supply-chain pattern) - any privileged follow-up must live in a separate
+# workflow that consumes only artifacts.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege: read the code, nothing more. No secrets are needed to validate.
+permissions:
+  contents: read
+
+jobs:
+  # Go daemon: build, vet, race-test, and lint. The default build embeds the UI
+  # placeholder, so this job needs no Node toolchain.
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (race)
+        run: go test -race ./...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.12.2
+
+  # Web SPA: typecheck, lint, prettier check, unit tests, and a production build.
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Format check
+        run: npm run format
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build

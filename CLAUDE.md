@@ -125,6 +125,9 @@ internal/
   web/      go:embed of the SPA (build-tag selected) + SPA-fallback static serving
   server/   http.Server wiring, graceful shutdown, the startup banner
 web/          the SPA: Vite + React 19 + TS + Tailwind v4 (npm, Node 24); dist/ is embedded
+              src/lib/ holds pure, vitest-tested logic (apiClient, candidates, books,
+              pipelineState, recentRoots, useEventStream); src/components/{library,running}/
+              are the Library/Running tab views; components stay thin over src/lib
 scripts/build-web.sh   build the SPA + embed it into bin/ (-tags embedui)
 Dockerfile             multi-stage: node build -> go build (embedui) -> distroless
 ```
@@ -167,27 +170,41 @@ Milestones from the workspace plan; each is shippable.
   placeholders; Settings is real - password change + write-only secrets), and the
   Dockerfile stub. **Gate:** login local + remote-with-auth; SSE heartbeat visible
   in the UI liveness dot.
-- **M1 (Go side done; Library tab UI pending):** SQLite store + migrations
-  (`internal/store`), the per-book state machine (`internal/state`), the
-  three-lane scheduler over stub executors with crash-resume sentinels
-  (`internal/scheduler`), the folder scan (`audiosilo-meta pkg/scan`) + coverage/
-  lookup client (`internal/metaops`), and the pipeline API surface (`POST /scans`,
-  `GET /scans/{id}`, `POST /books`, `GET /books[/{id}]`, `POST /books/{id}/{pause,
-  resume,retry,cancel}`, `DELETE /books/{id}`; `/system` library tab = ready). The
-  scheduler runs stub executors that write `_done/<stage>.json` sentinels so the
-  whole machine runs end to end; real executors arrive M2+. **Still pending:** the
-  React **Library tab UI** (folder picker -> scan table with coverage badges ->
-  checkbox select -> Process N books), a separate follow-up task consuming this
-  API. Gate verified: `go build/vet/test -race/golangci-lint` green + a live smoke
-  (scan -> books -> stub pipeline to done, pause/resume, kill -9 + resume with no
-  duplicated stages, and a live coverage check against meta.audiosilo.app).
+- **M1 (done):** Go side - SQLite store + migrations (`internal/store`), the
+  per-book state machine (`internal/state`), the three-lane scheduler over stub
+  executors with crash-resume sentinels (`internal/scheduler`), the folder scan
+  (`audiosilo-meta pkg/scan`) + coverage/lookup client (`internal/metaops`), and
+  the pipeline API surface (`POST /scans`, `GET /scans/{id}`, `POST /books`,
+  `GET /books[/{id}]`, `POST /books/{id}/{pause,resume,retry,cancel}`,
+  `DELETE /books/{id}`). Web side - the **Library tab** (folder path input +
+  localStorage recent-roots, scan -> poll -> candidates table with per-dimension
+  coverage badges [has/needed/unknown/unavailable], identity chips with provenance
+  tooltips, exclude-already-covered toggle, select-all-visible, series-carryover
+  gap hint, Process N books -> conflict-aware results) and a **minimal Running
+  tab** (books list fetched on mount, live-updated from the SSE hub -
+  book.state/stage.progress patches + a queue.stats header strip - with state
+  chips colored by lane, status badges, and pause/resume/retry/cancel[confirm]/
+  delete controls; the full board is M6). Non-trivial UI logic lives in pure,
+  vitest-tested modules under `web/src/lib` (`candidates.ts`, `books.ts`,
+  `pipelineState.ts`, `recentRoots.ts`); components stay thin. CI landed
+  (`.github/workflows/ci.yml`: go + web jobs). The scheduler still runs stub
+  executors that write `_done/<stage>.json` sentinels so the machine runs end to
+  end; real executors arrive M2+. Gate verified: `go build/vet/test -race/
+  golangci-lint` green, the full web gate green (`tsc`/lint/prettier/46 tests/
+  build), and a live headless-browser drive (login -> scan -> candidates with
+  coverage badges -> select 2 -> Process -> Running tab advancing to done live via
+  SSE), plus the earlier Go smoke (pause/resume, kill -9 + resume with no
+  duplicated stages, live coverage check against meta.audiosilo.app).
 - **M2-M8 (planned):** toolfetch + audio (ffmpeg split), ASR backends
   (mlx-whisper + whisper.cpp), QA/spelling ports, the agent runner (claude +
   codex) with staged context dirs enforcing the invariants, the fact-pass +
   synthesis + audit loop, contribution (intake/PR/local), and packaging
   (GoReleaser + Docker matrix). See the plan for the full table.
 
-M1's Go daemon is built; the Running/Done tabs and the pipeline's real executors
-(audio/ASR/QA/agent/contribute) are **not built yet** - the scheduler runs stub
-executors, and the config `asr`/agent-model sections stay typed stubs. Keep this
-file honest as milestones land.
+M1 is built end to end (Library tab + a minimal Running tab over the stub
+scheduler). Still **not built**: the **Done** tab (full board is M6), the Running
+tab's richer board (stage timeline / ETA / cost, M6), and the pipeline's real
+executors (audio/ASR/QA/agent/contribute) - the scheduler runs stub executors,
+and the config `asr`/agent-model sections stay typed stubs. Note: `/system` still
+reports the Running/Done tabs as `planned` (a Go-side label); the Running tab is
+nonetheless fully rendered and usable. Keep this file honest as milestones land.

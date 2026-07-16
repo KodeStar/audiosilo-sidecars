@@ -1,6 +1,11 @@
 import type {
+  BookCandidate,
   ChangePasswordBody,
+  CreateBooksResponse,
+  CreateScanResponse,
+  ListBooksResponse,
   LoginResponse,
+  ScanJob,
   Settings,
   SettingsUpdate,
   SystemInfo,
@@ -120,6 +125,54 @@ export class ApiClient {
       method: 'PUT',
       body: update,
     });
+  }
+
+  // --- pipeline: scans ---
+  createScan(path: string): Promise<CreateScanResponse> {
+    return this.request<CreateScanResponse>('/api/v1/scans', {
+      method: 'POST',
+      body: { path },
+    });
+  }
+
+  getScan(id: string): Promise<ScanJob> {
+    return this.request<ScanJob>(`/api/v1/scans/${encodeURIComponent(id)}`);
+  }
+
+  // --- pipeline: books ---
+  createBooks(candidates: BookCandidate[]): Promise<CreateBooksResponse> {
+    return this.request<CreateBooksResponse>('/api/v1/books', {
+      method: 'POST',
+      body: { candidates },
+    });
+  }
+
+  listBooks(): Promise<ListBooksResponse> {
+    return this.request<ListBooksResponse>('/api/v1/books');
+  }
+
+  pauseBook(id: number): Promise<void> {
+    return this.bookAction(id, 'pause');
+  }
+
+  resumeBook(id: number): Promise<void> {
+    return this.bookAction(id, 'resume');
+  }
+
+  retryBook(id: number): Promise<void> {
+    return this.bookAction(id, 'retry');
+  }
+
+  cancelBook(id: number): Promise<void> {
+    return this.bookAction(id, 'cancel');
+  }
+
+  deleteBook(id: number): Promise<void> {
+    return this.request<void>(`/api/v1/books/${id}`, { method: 'DELETE' });
+  }
+
+  private bookAction(id: number, action: 'pause' | 'resume' | 'retry' | 'cancel'): Promise<void> {
+    return this.request<void>(`/api/v1/books/${id}/${action}`, { method: 'POST' });
   }
 }
 

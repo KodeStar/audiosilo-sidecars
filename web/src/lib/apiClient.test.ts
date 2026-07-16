@@ -90,4 +90,67 @@ describe('ApiClient', () => {
 
     await expect(client.logout()).resolves.toBeUndefined();
   });
+
+  function pipelineClient() {
+    return new ApiClient({ baseUrl: '', getToken: () => 'tok', onAuthError: vi.fn() });
+  }
+
+  it('POSTs a scan path and reads the job id', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(202, { job_id: 'abc123' }));
+    const client = pipelineClient();
+
+    await expect(client.createScan('/lib')).resolves.toEqual({ job_id: 'abc123' });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('/api/v1/scans');
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body as string)).toEqual({ path: '/lib' });
+  });
+
+  it('GETs a scan by id (url-encoded)', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { id: 'a/b', status: 'running' }));
+    const client = pipelineClient();
+
+    await client.getScan('a/b');
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/scans/a%2Fb');
+  });
+
+  it('POSTs candidates to /books', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { results: [] }));
+    const client = pipelineClient();
+
+    await client.createBooks([
+      {
+        source_path: '/b1',
+        title: 'One',
+        authors: [],
+        series: '',
+        series_pos: '',
+        asin: '',
+        isbn: '',
+      },
+    ]);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('/api/v1/books');
+    expect(JSON.parse(init.body as string).candidates).toHaveLength(1);
+  });
+
+  it('routes book control actions to the right endpoints', async () => {
+    fetchMock.mockResolvedValue(new Response(null, { status: 204 }));
+    const client = pipelineClient();
+
+    await client.pauseBook(7);
+    await client.resumeBook(7);
+    await client.retryBook(7);
+    await client.cancelBook(7);
+    await client.deleteBook(7);
+
+    const calls = fetchMock.mock.calls.map(([url, init]) => `${init.method} ${url}`);
+    expect(calls).toEqual([
+      'POST /api/v1/books/7/pause',
+      'POST /api/v1/books/7/resume',
+      'POST /api/v1/books/7/retry',
+      'POST /api/v1/books/7/cancel',
+      'DELETE /api/v1/books/7',
+    ]);
+  });
 });
