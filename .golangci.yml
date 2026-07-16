@@ -1,0 +1,57 @@
+# golangci-lint v2 config (required for Go 1.25). Curated for a security-focused
+# local daemon: high signal, low noise. Adopted at a baseline that is green on
+# today's code - intentional, documented suppressions only. Run: `golangci-lint run`.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - bodyclose # response bodies must be closed (HTTP clients)
+    - errcheck # unchecked errors (tuned below for deliberate Close ignores)
+    - gosec # security: weak crypto, file inclusion, subprocess, etc.
+    - govet # mirrors `go vet`; printf/copylocks/struct-tag bugs
+    - ineffassign # ineffectual assignments
+    - misspell # typos in comments and user-facing error strings
+    - noctx # HTTP calls should carry a context
+    - staticcheck # the highest-value linter: SA* bugs, dead code, simplifications
+    - unused # dead internal symbols as the surface evolves
+  settings:
+    errcheck:
+      # Closing a read-only handle is best-effort; the banner/usage Fprint* calls
+      # only ever write to os.Stderr or an in-memory builder, where a write error
+      # cannot be acted on. WriteSSE checks its own Fprintf errors explicitly.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - fmt.Fprint
+        - fmt.Fprintln
+        - fmt.Fprintf
+    gosec:
+      excludes:
+        # G101: the "secret" here is the *name* of a secret slot (a map key), not
+        # a credential value; the values live in the OS keychain / 0600 file.
+        - G101
+        # G115: the only int->uint32 conversion is a bounded argon2 key length,
+        # not attacker-influenced. This rule is false-positive heavy.
+        - G115
+  exclusions:
+    paths:
+      # web/ is the JavaScript frontend; its node_modules contains an unrelated
+      # third-party Go file (flatted) that must not be linted as our code.
+      - web/
+    rules:
+      # Tests favour terseness; the security linters target production code paths.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - bodyclose
+          - noctx
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
