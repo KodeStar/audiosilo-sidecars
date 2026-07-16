@@ -41,13 +41,29 @@ const DefaultMetadataBaseURL = "https://meta.audiosilo.app"
 // running -version; no digest pinning).
 const DefaultAutoDownload = true
 
-// ASRConfig holds automatic-speech-recognition settings. It is a typed stub for
-// M0: the fields are wired through so the Settings UI and later milestones share
-// one shape, but no ASR backend runs yet.
+// ASR backend selector values. DefaultASRBackend ("auto") lets the daemon pick:
+// mlx-whisper on Apple Silicon with python3, else whisper-cpp when a whisper-cli
+// binary is found, else ASR is unavailable.
+const (
+	ASRBackendAuto       = "auto"
+	ASRBackendMLXWhisper = "mlx-whisper"
+	ASRBackendWhisperCpp = "whisper-cpp"
+	DefaultASRBackend    = ASRBackendAuto
+	DefaultASRLanguage   = "en"
+)
+
+// ASRConfig holds automatic-speech-recognition settings, live as of M3a. Backend
+// selects/forces an ASR backend; Model/Language fall back to each backend's
+// default when empty (mlx-community/whisper-large-v3-turbo or
+// ggml-large-v3-turbo.bin; "en"). WhisperCLIPath explicitly locates the
+// whisper.cpp binary. Device is informational for now (the backend reports the
+// real device it detected on /system).
 type ASRConfig struct {
-	Backend string `yaml:"backend"` // "" | "mlxwhisper" | "whispercpp" (M3)
-	Device  string `yaml:"device"`  // "" | "metal" | "cuda" | "vulkan" | "cpu" (M3)
-	Model   string `yaml:"model"`   // "" defaults to large-v3-turbo (M3)
+	Backend        string `yaml:"backend"`          // "auto" | "mlx-whisper" | "whisper-cpp"
+	Device         string `yaml:"device"`           // informational: metal|cuda|vulkan|cpu
+	Model          string `yaml:"model"`            // "" defaults per backend
+	Language       string `yaml:"language"`         // "" defaults to "en"
+	WhisperCLIPath string `yaml:"whisper_cli_path"` // explicit whisper-cli location
 }
 
 // AgentConfig holds the agent-runner settings. Typed stub for M0; the runner that
@@ -119,7 +135,7 @@ func Default() Config {
 		LibraryRoots: []string{},
 		Metadata:     MetadataConfig{BaseURL: DefaultMetadataBaseURL},
 		Tools:        ToolsConfig{AutoDownload: DefaultAutoDownload},
-		ASR:          ASRConfig{},
+		ASR:          ASRConfig{Backend: DefaultASRBackend, Language: DefaultASRLanguage},
 		Agent:        AgentConfig{Concurrency: DefaultConcurrency},
 	}
 }
@@ -143,6 +159,14 @@ func Load(dataDir string) (Config, error) {
 	applyEnv(&cfg)
 	if cfg.Agent.Concurrency == 0 {
 		cfg.Agent.Concurrency = DefaultConcurrency
+	}
+	// Normalize ASR defaults so an older/partial config.yaml (or one predating M3a)
+	// resolves to a working backend without an explicit edit.
+	if strings.TrimSpace(cfg.ASR.Backend) == "" {
+		cfg.ASR.Backend = DefaultASRBackend
+	}
+	if strings.TrimSpace(cfg.ASR.Language) == "" {
+		cfg.ASR.Language = DefaultASRLanguage
 	}
 	if cfg.CORSOrigins == nil {
 		cfg.CORSOrigins = []string{}
@@ -182,10 +206,19 @@ func applyEnv(cfg *Config) {
 		}
 	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_ASR_BACKEND"); ok {
-		cfg.ASR.Backend = v
+		cfg.ASR.Backend = strings.TrimSpace(v)
 	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_ASR_DEVICE"); ok {
 		cfg.ASR.Device = v
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_ASR_MODEL"); ok {
+		cfg.ASR.Model = strings.TrimSpace(v)
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_ASR_LANGUAGE"); ok {
+		cfg.ASR.Language = strings.TrimSpace(v)
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_ASR_WHISPER_CLI_PATH"); ok {
+		cfg.ASR.WhisperCLIPath = v
 	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_AGENT_BACKEND"); ok {
 		cfg.Agent.Backend = v
@@ -232,6 +265,12 @@ func (c Config) Validate() error {
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("metadata.base_url %q must be an absolute http(s) URL", c.Metadata.BaseURL)
 		}
+	}
+	switch c.ASR.Backend {
+	case "", ASRBackendAuto, ASRBackendMLXWhisper, ASRBackendWhisperCpp:
+	default:
+		return fmt.Errorf("asr.backend %q must be one of %q, %q, or %q",
+			c.ASR.Backend, ASRBackendAuto, ASRBackendMLXWhisper, ASRBackendWhisperCpp)
 	}
 	return nil
 }

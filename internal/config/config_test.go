@@ -28,7 +28,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	in := Default()
 	in.Listen = "0.0.0.0:9000"
 	in.CORSOrigins = []string{"http://localhost:5173"}
-	in.ASR.Backend = "whispercpp"
+	in.ASR.Backend = "whisper-cpp"
 	in.Agent.Backend = "claude"
 	in.Agent.Concurrency = 4
 	in.Agent.Claude = map[string]string{"fact_pass": "sonnet", "synthesis": "opus"}
@@ -45,7 +45,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if len(out.CORSOrigins) != 1 || out.CORSOrigins[0] != "http://localhost:5173" {
 		t.Errorf("cors = %v", out.CORSOrigins)
 	}
-	if out.ASR.Backend != "whispercpp" {
+	if out.ASR.Backend != "whisper-cpp" {
 		t.Errorf("asr backend = %q", out.ASR.Backend)
 	}
 	if out.Agent.Concurrency != 4 {
@@ -101,6 +101,7 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		"origin with path": {Listen: DefaultListen, Agent: AgentConfig{Concurrency: 1}, CORSOrigins: []string{"http://x.example/foo"}},
 		"origin no scheme": {Listen: DefaultListen, Agent: AgentConfig{Concurrency: 1}, CORSOrigins: []string{"x.example"}},
 		"origin ftp":       {Listen: DefaultListen, Agent: AgentConfig{Concurrency: 1}, CORSOrigins: []string{"ftp://x.example"}},
+		"bad asr backend":  {Listen: DefaultListen, Agent: AgentConfig{Concurrency: 1}, ASR: ASRConfig{Backend: "faster-whisper"}},
 	}
 	for name, cfg := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -132,6 +133,46 @@ func TestDefaultsForNewFields(t *testing.T) {
 	}
 	if cfg.LibraryRoots == nil {
 		t.Error("library_roots should be non-nil empty slice")
+	}
+	if cfg.ASR.Backend != ASRBackendAuto {
+		t.Errorf("asr.backend default = %q, want %q", cfg.ASR.Backend, ASRBackendAuto)
+	}
+	if cfg.ASR.Language != DefaultASRLanguage {
+		t.Errorf("asr.language default = %q, want %q", cfg.ASR.Language, DefaultASRLanguage)
+	}
+}
+
+func TestASRConfigEnvAndNormalization(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AUDIOSILO_SIDECARS_ASR_BACKEND", "whisper-cpp")
+	t.Setenv("AUDIOSILO_SIDECARS_ASR_MODEL", "ggml-tiny.bin")
+	t.Setenv("AUDIOSILO_SIDECARS_ASR_LANGUAGE", "de")
+	t.Setenv("AUDIOSILO_SIDECARS_ASR_WHISPER_CLI_PATH", "/opt/whisper-cli")
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ASR.Backend != "whisper-cpp" || cfg.ASR.Model != "ggml-tiny.bin" ||
+		cfg.ASR.Language != "de" || cfg.ASR.WhisperCLIPath != "/opt/whisper-cli" {
+		t.Errorf("asr env overrides not applied: %+v", cfg.ASR)
+	}
+}
+
+func TestASRBackendNormalizesEmpty(t *testing.T) {
+	// A config file with an empty asr.backend normalizes to "auto" on Load.
+	dir := t.TempDir()
+	in := Default()
+	in.ASR.Backend = ""
+	in.ASR.Language = ""
+	if err := Save(dir, in); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ASR.Backend != ASRBackendAuto || cfg.ASR.Language != DefaultASRLanguage {
+		t.Errorf("empty asr backend/language did not normalize: %+v", cfg.ASR)
 	}
 }
 
