@@ -79,35 +79,39 @@ const MaxFixAttempts = 3
 // of Next (or an error), so the table doubles as the transition contract that
 // tests assert against.
 type Def struct {
-	Lane        Lane
-	Next        []State
-	Conditional bool // the state may be skipped (a branch can route around it)
-	Agent       bool // runs in an agent (LLM) lane
-	Terminal    bool // no outgoing transitions
-	order       int  // canonical linear position, for reconcile ordering
+	Lane     Lane
+	Next     []State
+	Agent    bool // runs in an agent (LLM) lane
+	Terminal bool // no outgoing transitions
+	order    int  // canonical linear position, for reconcile ordering
 }
 
 // table is the single source of truth for the state machine. order is the
 // canonical linear index used to compare "how far" two stages are (loops reuse
 // the index of the stage they re-enter conceptually, but each state has a unique
 // index here so ordering is total).
+//
+// Conditional states (may be skipped by a branch, or loop back) are the ones
+// shown in [brackets] in the package doc: markers_normalizing, qa_adjudicating,
+// retranscribing, and fixing. The skip/loop routing is encoded directly in
+// NextState's branch rules, so the classification needs no table column.
 var table = map[State]Def{
 	Queued:             {Lane: LaneNone, Next: []State{Inspecting}, order: 0},
 	Inspecting:         {Lane: LaneMechanical, Next: []State{MarkersNormalizing, Splitting}, order: 1},
-	MarkersNormalizing: {Lane: LaneAgent, Next: []State{Splitting}, Conditional: true, Agent: true, order: 2},
+	MarkersNormalizing: {Lane: LaneAgent, Next: []State{Splitting}, Agent: true, order: 2},
 	Splitting:          {Lane: LaneMechanical, Next: []State{ASR}, order: 3},
 	ASR:                {Lane: LaneASR, Next: []State{Sanitizing}, order: 4},
 	Sanitizing:         {Lane: LaneMechanical, Next: []State{QASweep}, order: 5},
 	QASweep:            {Lane: LaneMechanical, Next: []State{QAAdjudicating, SpellingResearch}, order: 6},
-	QAAdjudicating:     {Lane: LaneAgent, Next: []State{Retranscribing, SpellingResearch}, Conditional: true, Agent: true, order: 7},
-	Retranscribing:     {Lane: LaneASR, Next: []State{QASweep}, Conditional: true, order: 8},
+	QAAdjudicating:     {Lane: LaneAgent, Next: []State{Retranscribing, SpellingResearch}, Agent: true, order: 7},
+	Retranscribing:     {Lane: LaneASR, Next: []State{QASweep}, order: 8},
 	SpellingResearch:   {Lane: LaneAgent, Next: []State{Correcting}, Agent: true, order: 9},
 	Correcting:         {Lane: LaneMechanical, Next: []State{FactPass}, order: 10},
 	FactPass:           {Lane: LaneAgent, Next: []State{Synthesizing}, Agent: true, order: 11},
 	Synthesizing:       {Lane: LaneAgent, Next: []State{Validating}, Agent: true, order: 12},
 	Validating:         {Lane: LaneMechanical, Next: []State{Auditing}, order: 13},
 	Auditing:           {Lane: LaneAgent, Next: []State{Fixing, Ready}, Agent: true, order: 14},
-	Fixing:             {Lane: LaneAgent, Next: []State{Validating}, Conditional: true, Agent: true, order: 15},
+	Fixing:             {Lane: LaneAgent, Next: []State{Validating}, Agent: true, order: 15},
 	Ready:              {Lane: LaneNone, Next: []State{Contributing}, order: 16},
 	Contributing:       {Lane: LaneMechanical, Next: []State{Done}, order: 17},
 	Done:               {Lane: LaneNone, Next: nil, Terminal: true, order: 18},
@@ -124,9 +128,6 @@ func All() []State {
 	return out
 }
 
-// Valid reports whether s is a known state.
-func Valid(s State) bool { _, ok := table[s]; return ok }
-
 // LaneOf returns the lane a state runs in (LaneNone for waypoints).
 func LaneOf(s State) Lane { return table[s].Lane }
 
@@ -135,9 +136,6 @@ func IsStage(s State) bool { return table[s].Lane != LaneNone }
 
 // IsAgent reports whether s runs in the agent lane.
 func IsAgent(s State) bool { return table[s].Agent }
-
-// IsConditional reports whether s may be skipped by a branch.
-func IsConditional(s State) bool { return table[s].Conditional }
 
 // IsTerminal reports whether s has no outgoing transitions (Done).
 func IsTerminal(s State) bool { return table[s].Terminal }
@@ -151,6 +149,12 @@ func IsWaypoint(s State) bool {
 
 // Order returns the canonical linear index of s (for reconcile ordering).
 func Order(s State) int { return table[s].order }
+
+// HoldsSeriesLock reports whether a book at state s still holds its series lock:
+// true for every state before Ready. A book that has reached Ready (or beyond)
+// has finished authoring, so it no longer blocks its series' successors from the
+// agent lane. The scheduler uses this to pick each series' lock holder.
+func HoldsSeriesLock(s State) bool { return Order(s) < Order(Ready) }
 
 // legalNext reports whether next is a declared successor of cur.
 func legalNext(cur, next State) bool {

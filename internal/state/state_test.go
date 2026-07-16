@@ -181,6 +181,26 @@ func TestHappyPathToDone(t *testing.T) {
 	}
 }
 
+// TestHoldsSeriesLock asserts the predicate is true for every state before Ready
+// and false from Ready onward (the finished-for-lock-purposes boundary).
+func TestHoldsSeriesLock(t *testing.T) {
+	for _, s := range All() {
+		want := Order(s) < Order(Ready)
+		if HoldsSeriesLock(s) != want {
+			t.Errorf("HoldsSeriesLock(%q) = %v, want %v", s, HoldsSeriesLock(s), want)
+		}
+	}
+	// Spot-check the boundary explicitly.
+	if !HoldsSeriesLock(Auditing) {
+		t.Error("Auditing (pre-Ready) should hold the series lock")
+	}
+	for _, s := range []State{Ready, Contributing, Done} {
+		if HoldsSeriesLock(s) {
+			t.Errorf("%q (Ready or later) must not hold the series lock", s)
+		}
+	}
+}
+
 // TestCanStartGuards covers the status, waypoint, and series-lock gates - the
 // allowed and denied cases for each.
 func TestCanStartGuards(t *testing.T) {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 )
 
 // StageRun is one execution (or attempt) of a stage for a book. Ok is a nullable
@@ -154,6 +153,33 @@ func (db *DB) SucceededStages(ctx context.Context, bookID int64) (map[string]boo
 	return out, rows.Err()
 }
 
+// SucceededStagesAll returns, for every book, the set of stages with at least
+// one ok=1 run, in one grouped query. Reconcile uses it instead of calling
+// SucceededStages per book (an N+1 across the whole catalogue at startup).
+func (db *DB) SucceededStagesAll(ctx context.Context) (map[int64]map[string]bool, error) {
+	rows, err := db.sql.QueryContext(ctx,
+		`SELECT DISTINCT book_id, stage FROM stage_runs WHERE ok=1`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[int64]map[string]bool{}
+	for rows.Next() {
+		var bookID int64
+		var stage string
+		if err := rows.Scan(&bookID, &stage); err != nil {
+			return nil, err
+		}
+		set := out[bookID]
+		if set == nil {
+			set = map[string]bool{}
+			out[bookID] = set
+		}
+		set[stage] = true
+	}
+	return out, rows.Err()
+}
+
 // DeleteStageSuccess removes ok=1 runs of a stage for a book, used by reconcile
 // when a completed stage's sentinel is missing and the stage must re-run.
 func (db *DB) DeleteStageSuccess(ctx context.Context, bookID int64, stage string) error {
@@ -180,23 +206,8 @@ func (db *DB) SetProgress(ctx context.Context, bookID int64, stage string, done,
 	return err
 }
 
-// GetProgress returns the counter for (book, stage), or (Progress{}, false).
-func (db *DB) GetProgress(ctx context.Context, bookID int64, stage string) (Progress, bool, error) {
-	var p Progress
-	p.Stage = stage
-	err := db.sql.QueryRowContext(ctx,
-		`SELECT done, total FROM progress WHERE book_id=? AND stage=?`, bookID, stage).
-		Scan(&p.Done, &p.Total)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Progress{Stage: stage}, false, nil
-	}
-	if err != nil {
-		return Progress{}, false, err
-	}
-	return p, true, nil
-}
-
-// ListProgress returns all progress rows for a book.
+// ListProgress returns all progress rows for a book (used by the book-detail
+// endpoint). The list endpoint uses ListAllProgress to avoid an N+1.
 func (db *DB) ListProgress(ctx context.Context, bookID int64) ([]Progress, error) {
 	rows, err := db.sql.QueryContext(ctx,
 		`SELECT stage, done, total FROM progress WHERE book_id=? ORDER BY stage`, bookID)
@@ -211,6 +222,28 @@ func (db *DB) ListProgress(ctx context.Context, bookID int64) ([]Progress, error
 			return nil, err
 		}
 		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ListAllProgress returns every book's progress rows bucketed by book id, in one
+// query. The list endpoint uses it instead of calling ListProgress per book (an
+// N+1). Books with no progress rows are simply absent from the map.
+func (db *DB) ListAllProgress(ctx context.Context) (map[int64][]Progress, error) {
+	rows, err := db.sql.QueryContext(ctx,
+		`SELECT book_id, stage, done, total FROM progress ORDER BY book_id, stage`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[int64][]Progress{}
+	for rows.Next() {
+		var bookID int64
+		var p Progress
+		if err := rows.Scan(&bookID, &p.Stage, &p.Done, &p.Total); err != nil {
+			return nil, err
+		}
+		out[bookID] = append(out[bookID], p)
 	}
 	return out, rows.Err()
 }

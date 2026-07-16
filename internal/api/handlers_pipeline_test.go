@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -137,7 +138,8 @@ func TestBooksCreateListDedupAndDetail(t *testing.T) {
 	token := env.login(t)
 
 	body := `{"candidates":[
-		{"source_path":"/b/a","title":"A One","series":"S1","series_pos":"1"},
+		{"source_path":"/b/a","title":"A One","series":"S1","series_pos":"1",
+		 "coverage":{"available":true,"known":true},"sources":{"title":"tag","series":"path"}},
 		{"source_path":"/b/b","title":"S1 Two","series":"S1","series_pos":"2"},
 		{"source_path":"/b/c","title":"C Solo","series":"S2","series_pos":"1"}
 	]}`
@@ -159,8 +161,19 @@ func TestBooksCreateListDedupAndDetail(t *testing.T) {
 		if r.Book.State != "queued" {
 			t.Errorf("new book state = %q, want queued", r.Book.State)
 		}
+		// queued is a waypoint, so its served lane is empty.
+		if r.Book.Lane != "" {
+			t.Errorf("queued book lane = %q, want empty", r.Book.Lane)
+		}
 		if r.SourcePath == "/b/a" {
 			firstID = r.Book.ID
+			// The advisory coverage + provenance snapshot round-trips.
+			if string(r.Book.Coverage) != `{"available":true,"known":true}` {
+				t.Errorf("coverage not persisted: %s", r.Book.Coverage)
+			}
+			if r.Book.IdentitySources["title"] != "tag" || r.Book.IdentitySources["series"] != "path" {
+				t.Errorf("identity_sources not persisted: %+v", r.Book.IdentitySources)
+			}
 		}
 	}
 
@@ -182,7 +195,7 @@ func TestBooksCreateListDedupAndDetail(t *testing.T) {
 	}
 
 	// Detail includes a (possibly empty) stage-run ledger.
-	resp = env.do(t, http.MethodGet, "/api/v1/books/"+itoa(firstID), token, "")
+	resp = env.do(t, http.MethodGet, "/api/v1/books/"+strconv.FormatInt(firstID, 10), token, "")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("book detail = %d, want 200", resp.StatusCode)
 	}
@@ -208,7 +221,7 @@ func TestBookControlEndpoints(t *testing.T) {
 	var cr createBooksResponse
 	_ = json.NewDecoder(resp.Body).Decode(&cr)
 	resp.Body.Close()
-	id := itoa(cr.Results[0].Book.ID)
+	id := strconv.FormatInt(cr.Results[0].Book.ID, 10)
 
 	// Pause -> 204, then GET shows paused.
 	if r := env.do(t, http.MethodPost, "/api/v1/books/"+id+"/pause", token, ""); r.StatusCode != http.StatusNoContent {
@@ -276,27 +289,4 @@ func TestPipelineEndpointsRequireAuthAndWiring(t *testing.T) {
 		t.Errorf("unwired /books = %d, want 503", resp.StatusCode)
 	}
 	resp.Body.Close()
-}
-
-// itoa is a tiny int64->string helper (avoids importing strconv per test).
-func itoa(n int64) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
 }

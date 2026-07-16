@@ -45,45 +45,84 @@ type Coverage struct {
 	HasRecaps     bool `json:"has_recaps"`
 }
 
-// Client is the metadata API client with an in-memory TTL cache.
-type Client struct {
-	baseURL string
-	http    *http.Client
-	now     func() time.Time
-
-	mu       sync.Mutex
-	coverage *coverageCacheEntry
-	lookups  map[string]*lookupCacheEntry // key: "asin:<v>" | "isbn:<v>"
-	works    map[string]*workCacheEntry   // key: work id
+// ttlCache is a small mutex-guarded read-through TTL map shared by the three
+// coverage caches (lookup, coverage feed, work detail), so the lock + freshness
+// check lives in one place instead of being hand-rolled three times. Only
+// successful fetches are put; a transport failure simply skips the put and is
+// retried next call.
+type ttlCache[K comparable, V any] struct {
+	mu    sync.Mutex
+	now   func() time.Time
+	ttl   time.Duration
+	items map[K]ttlEntry[V]
 }
 
-type coverageCacheEntry struct {
-	at      time.Time
-	index   map[string]map[string]bool // workID -> {dimension -> missing}
-	present bool                       // coverage response carried a missing[] list
+type ttlEntry[V any] struct {
+	at  time.Time
+	val V
 }
 
-type lookupCacheEntry struct {
-	at     time.Time
+func newTTLCache[K comparable, V any](now func() time.Time, ttl time.Duration) *ttlCache[K, V] {
+	return &ttlCache[K, V]{now: now, ttl: ttl, items: map[K]ttlEntry[V]{}}
+}
+
+// get returns the cached value for key if present and still fresh.
+func (c *ttlCache[K, V]) get(key K) (V, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.items[key]
+	if !ok || c.now().Sub(e.at) >= c.ttl {
+		var zero V
+		return zero, false
+	}
+	return e.val, true
+}
+
+// put stores val for key stamped at now.
+func (c *ttlCache[K, V]) put(key K, val V) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.items[key] = ttlEntry[V]{at: c.now(), val: val}
+}
+
+// The three cached value shapes.
+type lookupVal struct {
 	workID string
 	found  bool
 }
 
-type workCacheEntry struct {
-	at       time.Time
+type coverageVal struct {
+	index   map[string]map[string]bool // workID -> {dimension -> missing}
+	present bool                       // coverage response carried a missing[] list
+}
+
+type workVal struct {
 	hasChars bool
 	hasRecap bool
+}
+
+// coverageCacheKey is the single-slot key for the bulk coverage feed.
+const coverageCacheKey = "coverage"
+
+// Client is the metadata API client with in-memory TTL caches.
+type Client struct {
+	baseURL string
+	http    *http.Client
+
+	lookups  *ttlCache[string, lookupVal]   // key: "asin:<v>" | "isbn:<v>"
+	coverage *ttlCache[string, coverageVal] // single slot (coverageCacheKey)
+	works    *ttlCache[string, workVal]     // key: work id
 }
 
 // NewClient returns a metadata client for baseURL. An empty baseURL yields a
 // client whose CoverageFor always reports Available=false (metadata disabled).
 func NewClient(baseURL string) *Client {
 	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		http:    &http.Client{Timeout: httpTimeout},
-		now:     time.Now,
-		lookups: map[string]*lookupCacheEntry{},
-		works:   map[string]*workCacheEntry{},
+		baseURL:  strings.TrimRight(baseURL, "/"),
+		http:     &http.Client{Timeout: httpTimeout},
+		lookups:  newTTLCache[string, lookupVal](time.Now, coverageTTL),
+		coverage: newTTLCache[string, coverageVal](time.Now, coverageTTL),
+		works:    newTTLCache[string, workVal](time.Now, coverageTTL),
 	}
 }
 
@@ -172,12 +211,9 @@ func (c *Client) lookup(ctx context.Context, asin, isbn string) (workID string, 
 	} else {
 		q.Set("isbn", isbn)
 	}
-	c.mu.Lock()
-	if e, hit := c.lookups[key]; hit && c.now().Sub(e.at) < coverageTTL {
-		c.mu.Unlock()
-		return e.workID, e.found, true
+	if v, hit := c.lookups.get(key); hit {
+		return v.workID, v.found, true
 	}
-	c.mu.Unlock()
 
 	var res struct {
 		Work *struct {
@@ -188,27 +224,21 @@ func (c *Client) lookup(ctx context.Context, asin, isbn string) (workID string, 
 	if !okc {
 		return "", false, false
 	}
-	entry := &lookupCacheEntry{at: c.now()}
+	v := lookupVal{}
 	if f && res.Work != nil {
-		entry.workID = res.Work.ID
-		entry.found = true
+		v.workID = res.Work.ID
+		v.found = true
 	}
-	c.mu.Lock()
-	c.lookups[key] = entry
-	c.mu.Unlock()
-	return entry.workID, entry.found, true
+	c.lookups.put(key, v)
+	return v.workID, v.found, true
 }
 
 // coverageIndex fetches (and caches) the bulk coverage feed. present reports
 // whether the response carried a missing[] list (older servers omit it).
 func (c *Client) coverageIndex(ctx context.Context) (index map[string]map[string]bool, present, ok bool) {
-	c.mu.Lock()
-	if c.coverage != nil && c.now().Sub(c.coverage.at) < coverageTTL {
-		e := c.coverage
-		c.mu.Unlock()
-		return e.index, e.present, true
+	if v, hit := c.coverage.get(coverageCacheKey); hit {
+		return v.index, v.present, true
 	}
-	c.mu.Unlock()
 
 	var res struct {
 		Missing *[]struct {
@@ -220,33 +250,28 @@ func (c *Client) coverageIndex(ctx context.Context) (index map[string]map[string
 	if !okc {
 		return nil, false, false
 	}
-	entry := &coverageCacheEntry{at: c.now(), index: map[string]map[string]bool{}}
+	v := coverageVal{index: map[string]map[string]bool{}}
 	if res.Missing != nil {
-		entry.present = true
+		v.present = true
 		for _, w := range *res.Missing {
 			dims := map[string]bool{}
 			for _, d := range w.Missing {
 				dims[d] = true
 			}
-			entry.index[w.ID] = dims
+			v.index[w.ID] = dims
 		}
 	}
-	c.mu.Lock()
-	c.coverage = entry
-	c.mu.Unlock()
-	return entry.index, entry.present, true
+	c.coverage.put(coverageCacheKey, v)
+	return v.index, v.present, true
 }
 
 // workDetail fetches per-work sidecar presence, cached per work. Used only when
 // the coverage feed lacks a missing[] list. Sidecar keys are omitempty on the
 // wire, so a present, non-empty array means the work carries that sidecar.
 func (c *Client) workDetail(ctx context.Context, workID string) (hasChars, hasRecap, ok bool) {
-	c.mu.Lock()
-	if e, hit := c.works[workID]; hit && c.now().Sub(e.at) < coverageTTL {
-		c.mu.Unlock()
-		return e.hasChars, e.hasRecap, true
+	if v, hit := c.works.get(workID); hit {
+		return v.hasChars, v.hasRecap, true
 	}
-	c.mu.Unlock()
 
 	var res struct {
 		Characters []json.RawMessage `json:"characters"`
@@ -256,11 +281,9 @@ func (c *Client) workDetail(ctx context.Context, workID string) (hasChars, hasRe
 	if !okc || !found {
 		return false, false, false
 	}
-	entry := &workCacheEntry{at: c.now(), hasChars: len(res.Characters) > 0, hasRecap: len(res.Recaps) > 0}
-	c.mu.Lock()
-	c.works[workID] = entry
-	c.mu.Unlock()
-	return entry.hasChars, entry.hasRecap, true
+	v := workVal{hasChars: len(res.Characters) > 0, hasRecap: len(res.Recaps) > 0}
+	c.works.put(workID, v)
+	return v.hasChars, v.hasRecap, true
 }
 
 // ErrDisabled is returned by SearchWork when the client has no base URL.

@@ -60,7 +60,8 @@ type LoggedEvent struct {
 }
 
 // ListEvents returns up to limit most-recent events, optionally filtered to a
-// book (bookID > 0). Newest first.
+// book (bookID > 0). Newest first. Scaffolding for the M6 per-book log view (the
+// SSE hub is the live feed; this reads the durable backlog).
 func (db *DB) ListEvents(ctx context.Context, bookID int64, limit int) ([]LoggedEvent, error) {
 	if limit <= 0 {
 		limit = 200
@@ -111,6 +112,9 @@ func (db *DB) PruneEvents(ctx context.Context, olderThan time.Time) (int64, erro
 }
 
 // --- rates (EWMA seed table; M1 create-only, minimal accessors) ---
+//
+// SetRate/GetRate are scaffolding for the M6 ETA engine (a per-stage EWMA
+// unit-rate feeds the "time remaining" estimate). M1 only creates the table.
 
 // SetRate upserts the unit-rate for a stage (seconds per unit).
 func (db *DB) SetRate(ctx context.Context, stage string, unitRate float64) error {

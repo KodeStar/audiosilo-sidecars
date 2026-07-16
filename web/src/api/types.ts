@@ -120,6 +120,8 @@ export interface CreateScanResponse {
 // --- pipeline: books ---
 
 // BookCandidate is one selected book to enqueue (POST /books body item).
+// coverage + sources are the advisory scan-time snapshot the daemon persists and
+// echoes back on the book view.
 export interface BookCandidate {
   source_path: string;
   title: string;
@@ -128,6 +130,8 @@ export interface BookCandidate {
   series_pos: string;
   asin: string;
   isbn: string;
+  coverage?: Coverage;
+  sources?: Record<string, string>;
 }
 
 export interface CreateBooksRequest {
@@ -150,9 +154,14 @@ export interface BookView {
   asin?: string;
   isbn?: string;
   state: string;
+  // lane is the served lane the current state runs in ('asr' | 'agent' |
+  // 'mechanical' | '' for a waypoint). The daemon computes it (state.LaneOf), so
+  // the web UI no longer mirrors the state->lane table.
+  lane: string;
   status: string;
   error?: string;
   coverage?: Coverage;
+  identity_sources?: Record<string, string>;
   progress: BookProgress[];
   created_at: string;
   updated_at: string;
@@ -179,6 +188,7 @@ export interface ListBooksResponse {
 export interface BookStateEvent {
   book_id: number;
   state: string;
+  lane: string;
   status: string;
 }
 

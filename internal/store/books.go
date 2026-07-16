@@ -51,7 +51,10 @@ type NewBook struct {
 	ASIN            string
 	ISBN            string
 	IdentitySources map[string]string
-	State           string // "" defaults to queued
+	// Coverage is the advisory metadata-coverage snapshot captured at scan time
+	// (empty when unknown). It is stored as-is and returned on the book view.
+	Coverage json.RawMessage
+	State    string // "" defaults to queued
 }
 
 func isUniqueViolation(err error) bool {
@@ -100,9 +103,9 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 		`INSERT INTO books
 		 (source_path, work_dir, title, authors, series, series_pos, asin, isbn,
 		  identity_sources, state, status, error, coverage, created_at, updated_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,'','','',?,?)`,
+		 VALUES (?,?,?,?,?,?,?,?,?,?,'','',?,?,?)`,
 		nb.SourcePath, nb.WorkDir, nb.Title, authors, nb.Series, nb.SeriesPos,
-		nb.ASIN, nb.ISBN, idsrc, st, now, now)
+		nb.ASIN, nb.ISBN, idsrc, st, string(nb.Coverage), now, now)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return Book{}, ErrDuplicate
@@ -146,16 +149,6 @@ func scanBook(sc interface{ Scan(...any) error }) (Book, error) {
 // GetBook returns the book with id, or ErrNotFound.
 func (db *DB) GetBook(ctx context.Context, id int64) (Book, error) {
 	row := db.sql.QueryRowContext(ctx, `SELECT `+bookCols+` FROM books WHERE id = ?`, id)
-	b, err := scanBook(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Book{}, ErrNotFound
-	}
-	return b, err
-}
-
-// GetBookBySourcePath returns the book with source_path, or ErrNotFound.
-func (db *DB) GetBookBySourcePath(ctx context.Context, path string) (Book, error) {
-	row := db.sql.QueryRowContext(ctx, `SELECT `+bookCols+` FROM books WHERE source_path = ?`, path)
 	b, err := scanBook(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Book{}, ErrNotFound

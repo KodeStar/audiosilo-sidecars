@@ -1,31 +1,11 @@
-// Pure presentation logic for a book's pipeline state and status: the lane a
-// state runs in, its human label, and the chip/badge styling. Mirrors the Go
-// state table (internal/state/state.go) by hand - keep them in sync.
+// Pure presentation logic for a book's pipeline state and status: its human
+// label and the chip/badge styling. The lane a state runs in is served by the
+// daemon (bookView.lane / the book.state event), so this module no longer
+// mirrors the Go state->lane table - only the display strings are client-side.
 
+// Lane is the served lane token; '' (a waypoint) normalizes to 'none' for
+// styling. The daemon is authoritative for which state runs in which lane.
 export type Lane = 'asr' | 'agent' | 'mechanical' | 'none';
-
-// LANES mirrors internal/state's table (which lane executes each state).
-const LANES: Record<string, Lane> = {
-  queued: 'none',
-  inspecting: 'mechanical',
-  markers_normalizing: 'agent',
-  splitting: 'mechanical',
-  asr: 'asr',
-  sanitizing: 'mechanical',
-  qa_sweep: 'mechanical',
-  qa_adjudicating: 'agent',
-  retranscribing: 'asr',
-  spelling_research: 'agent',
-  correcting: 'mechanical',
-  fact_pass: 'agent',
-  synthesizing: 'agent',
-  validating: 'mechanical',
-  auditing: 'agent',
-  fixing: 'agent',
-  ready: 'none',
-  contributing: 'mechanical',
-  done: 'none',
-};
 
 const LABELS: Record<string, string> = {
   queued: 'Queued',
@@ -49,10 +29,17 @@ const LABELS: Record<string, string> = {
   done: 'Done',
 };
 
-// laneOf returns the lane a pipeline state runs in ('none' for waypoints and
-// unknown states).
-export function laneOf(state: string): Lane {
-  return LANES[state] ?? 'none';
+// normalizeLane maps a served lane token to the styling key, treating the empty
+// waypoint lane (and anything unrecognized) as 'none'.
+export function normalizeLane(lane: string): Lane {
+  switch (lane) {
+    case 'asr':
+    case 'agent':
+    case 'mechanical':
+      return lane;
+    default:
+      return 'none';
+  }
 }
 
 // stateLabel returns a human label for a pipeline state, falling back to a
@@ -75,12 +62,13 @@ const LANE_CHIP: Record<Lane, string> = {
   none: 'border-edge bg-raised text-dim',
 };
 
-// stateChipClass returns the Tailwind classes for a state chip, coloring by lane
-// with special cases for the ready and done waypoints.
-export function stateChipClass(state: string): string {
+// stateChipClass returns the Tailwind classes for a state chip, coloring by the
+// served lane with special cases for the ready and done waypoints. lane is the
+// daemon-provided lane token (bookView.lane); '' waypoints fall back to 'none'.
+export function stateChipClass(state: string, lane: string): string {
   if (state === 'done') return 'border-success/40 bg-success/10 text-success';
   if (state === 'ready') return 'border-amber-500/40 bg-amber-500/10 text-amber-300';
-  return LANE_CHIP[laneOf(state)];
+  return LANE_CHIP[normalizeLane(lane)];
 }
 
 export interface StatusBadge {

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ApiClient } from '@/lib/apiClient';
 import { ApiError } from '@/lib/apiClient';
 import type { BookCreateResult, ScanJob, ScannedBook } from '@/api/types';
-import { filterCandidates, seriesGapHint, toCandidate } from '@/lib/candidates';
+import { filterCandidates, seriesGapHint, tallyResults, toCandidate } from '@/lib/candidates';
 import { addRecentRoot, loadRecentRoots } from '@/lib/recentRoots';
 import { CandidateRow } from '../library/CandidateRow';
 
@@ -126,9 +126,7 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
     setNote(null);
     try {
       const { results } = await client.createBooks(selectedVisible.map(toCandidate));
-      const created = results.filter((r) => r.created).length;
-      const conflicts = results.filter((r) => r.conflict).length;
-      const failed = results.filter((r) => !r.created && !r.conflict).length;
+      const { created, conflicts, failed } = tallyResults(results);
       setSelected(new Set());
       if (created > 0) {
         onProcessed();
@@ -245,9 +243,7 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
 }
 
 function summarize(results: BookCreateResult[]): string {
-  const created = results.filter((r) => r.created).length;
-  const conflicts = results.filter((r) => r.conflict).length;
-  const failed = results.filter((r) => !r.created && !r.conflict).length;
+  const { created, conflicts, failed } = tallyResults(results);
   const parts: string[] = [];
   if (created > 0) parts.push(`${created} enqueued`);
   if (conflicts > 0) parts.push(`${conflicts} already enqueued`);

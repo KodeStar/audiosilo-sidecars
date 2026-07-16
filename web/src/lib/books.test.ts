@@ -9,6 +9,7 @@ function bk(partial: Partial<BookView>): BookView {
     title: partial.title ?? 'T',
     authors: partial.authors ?? [],
     state: partial.state ?? 'queued',
+    lane: partial.lane ?? '',
     status: partial.status ?? '',
     progress: partial.progress ?? [],
     created_at: partial.created_at ?? '2026-01-01T00:00:00Z',
@@ -18,17 +19,23 @@ function bk(partial: Partial<BookView>): BookView {
 }
 
 describe('applyBookState', () => {
-  it('patches the matching book state + status', () => {
-    const books = [bk({ id: 1, state: 'queued' }), bk({ id: 2, state: 'asr' })];
-    const out = applyBookState(books, { book_id: 2, state: 'sanitizing', status: 'paused' });
+  it('patches the matching book state + lane + status', () => {
+    const books = [bk({ id: 1, state: 'queued' }), bk({ id: 2, state: 'asr', lane: 'asr' })];
+    const out = applyBookState(books, {
+      book_id: 2,
+      state: 'sanitizing',
+      lane: 'mechanical',
+      status: 'paused',
+    });
     expect(out[1].state).toBe('sanitizing');
+    expect(out[1].lane).toBe('mechanical'); // the served lane rides along the patch
     expect(out[1].status).toBe('paused');
     expect(out[0]).toBe(books[0]); // untouched reference
   });
 
   it('returns the same array reference when no book matches', () => {
     const books = [bk({ id: 1 })];
-    const out = applyBookState(books, { book_id: 99, state: 'done', status: '' });
+    const out = applyBookState(books, { book_id: 99, state: 'done', lane: '', status: '' });
     expect(out).toBe(books);
   });
 });

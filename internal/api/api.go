@@ -92,17 +92,18 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/settings", a.requireAuth(a.handleGetSettings))
 	mux.HandleFunc("PUT /api/v1/settings", a.requireAuth(a.handlePutSettings))
 
-	// Pipeline / Library (M1).
-	mux.HandleFunc("POST /api/v1/scans", a.requireAuth(a.handleCreateScan))
-	mux.HandleFunc("GET /api/v1/scans/{id}", a.requireAuth(a.handleGetScan))
-	mux.HandleFunc("POST /api/v1/books", a.requireAuth(a.handleCreateBooks))
-	mux.HandleFunc("GET /api/v1/books", a.requireAuth(a.handleListBooks))
-	mux.HandleFunc("GET /api/v1/books/{id}", a.requireAuth(a.handleGetBook))
-	mux.HandleFunc("POST /api/v1/books/{id}/pause", a.requireAuth(a.bookAction((*scheduler.Scheduler).Pause)))
-	mux.HandleFunc("POST /api/v1/books/{id}/resume", a.requireAuth(a.bookAction((*scheduler.Scheduler).Resume)))
-	mux.HandleFunc("POST /api/v1/books/{id}/retry", a.requireAuth(a.bookAction((*scheduler.Scheduler).Retry)))
-	mux.HandleFunc("POST /api/v1/books/{id}/cancel", a.requireAuth(a.bookAction((*scheduler.Scheduler).Cancel)))
-	mux.HandleFunc("DELETE /api/v1/books/{id}", a.requireAuth(a.handleDeleteBook))
+	// Pipeline / Library (M1). requirePipeline 503s these when the pipeline deps
+	// are not wired, composed here so no handler repeats the guard.
+	mux.HandleFunc("POST /api/v1/scans", a.requireAuth(a.requirePipeline(a.handleCreateScan)))
+	mux.HandleFunc("GET /api/v1/scans/{id}", a.requireAuth(a.requirePipeline(a.handleGetScan)))
+	mux.HandleFunc("POST /api/v1/books", a.requireAuth(a.requirePipeline(a.handleCreateBooks)))
+	mux.HandleFunc("GET /api/v1/books", a.requireAuth(a.requirePipeline(a.handleListBooks)))
+	mux.HandleFunc("GET /api/v1/books/{id}", a.requireAuth(a.requirePipeline(a.handleGetBook)))
+	mux.HandleFunc("POST /api/v1/books/{id}/pause", a.requireAuth(a.requirePipeline(a.bookAction((*scheduler.Scheduler).Pause))))
+	mux.HandleFunc("POST /api/v1/books/{id}/resume", a.requireAuth(a.requirePipeline(a.bookAction((*scheduler.Scheduler).Resume))))
+	mux.HandleFunc("POST /api/v1/books/{id}/retry", a.requireAuth(a.requirePipeline(a.bookAction((*scheduler.Scheduler).Retry))))
+	mux.HandleFunc("POST /api/v1/books/{id}/cancel", a.requireAuth(a.requirePipeline(a.bookAction((*scheduler.Scheduler).Cancel))))
+	mux.HandleFunc("DELETE /api/v1/books/{id}", a.requireAuth(a.requirePipeline(a.handleDeleteBook)))
 
 	// SSE authenticates itself (token in the query, since EventSource cannot set
 	// an Authorization header).

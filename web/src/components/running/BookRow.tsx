@@ -1,6 +1,7 @@
+import { memo } from 'react';
 import type { BookView } from '@/api/types';
 import { availableActions, isDone, type BookAction } from '@/lib/books';
-import { laneOf, stateChipClass, stateLabel, statusBadge } from '@/lib/pipelineState';
+import { normalizeLane, stateChipClass, stateLabel, statusBadge } from '@/lib/pipelineState';
 
 interface BookRowProps {
   book: BookView;
@@ -16,7 +17,10 @@ const ACTION_LABEL: Record<BookAction, string> = {
   delete: 'Delete',
 };
 
-export function BookRow({ book, busy, onAction }: BookRowProps) {
+// BookRow is memoized: the Running list re-renders on every SSE patch, but a row
+// whose props are unchanged (referential equality on the patched book object)
+// should not re-render.
+export const BookRow = memo(function BookRow({ book, busy, onAction }: BookRowProps) {
   const done = isDone(book);
   const badge = statusBadge(book.status);
   const seriesText =
@@ -37,9 +41,9 @@ export function BookRow({ book, busy, onAction }: BookRowProps) {
           <span
             className={
               'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium ' +
-              stateChipClass(book.state)
+              stateChipClass(book.state, book.lane)
             }
-            title={`Lane: ${laneOf(book.state)}`}
+            title={`Lane: ${normalizeLane(book.lane)}`}
           >
             {stateLabel(book.state)}
           </span>
@@ -84,7 +88,7 @@ export function BookRow({ book, busy, onAction }: BookRowProps) {
       </div>
     </div>
   );
-}
+});
 
 // activeProgress returns the counter for the book's current stage, if any.
 function activeProgress(book: BookView): { done: number; total: number } | null {

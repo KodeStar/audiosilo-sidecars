@@ -1,11 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import type { Coverage, ScannedBook } from '@/api/types';
+import type { BookCreateResult, Coverage, ScannedBook } from '@/api/types';
 import {
   coverageState,
   filterCandidates,
   isCovered,
   parsePos,
+  POS_SENTINEL,
   seriesGapHint,
+  tallyResults,
   toCandidate,
 } from './candidates';
 
@@ -60,7 +62,9 @@ describe('isCovered', () => {
 });
 
 describe('toCandidate', () => {
-  it('maps scan fields to the POST /books candidate shape, defaulting missing ones', () => {
+  it('maps scan fields to the POST /books candidate shape, carrying coverage + provenance', () => {
+    const coverage = cov({ known: true, has_characters: true });
+    const sources = { title: 'tag', series: 'path' };
     const c = toCandidate(
       book({
         path: '/lib/b1',
@@ -69,6 +73,8 @@ describe('toCandidate', () => {
         series: 'Saga',
         series_position: '2',
         asin: 'B001',
+        coverage,
+        sources,
       }),
     );
     expect(c).toEqual({
@@ -79,6 +85,8 @@ describe('toCandidate', () => {
       series_pos: '2',
       asin: 'B001',
       isbn: '',
+      coverage,
+      sources,
     });
   });
 });
@@ -97,14 +105,59 @@ describe('filterCandidates', () => {
   });
 });
 
-describe('parsePos', () => {
-  it('extracts the leading number, Infinity for empty/unparseable', () => {
+// parsePos is a contract mirror of the Go parseSeriesPos - these cases are the
+// agreed grammar both sides must produce identically.
+describe('parsePos (mirrors Go parseSeriesPos)', () => {
+  it('parses integers and decimals', () => {
     expect(parsePos('1')).toBe(1);
+    expect(parsePos('12')).toBe(12);
     expect(parsePos('2.5')).toBe(2.5);
+    expect(parsePos('0.5')).toBe(0.5);
+    expect(parsePos('.5')).toBe(0.5); // Go ParseFloat(".5") = 0.5
+    expect(parsePos('1.')).toBe(1); // Go ParseFloat("1.") = 1
+  });
+
+  it('takes the leading number of an omnibus range (stops at the first non-[0-9.])', () => {
     expect(parsePos('1-3.5')).toBe(1);
-    expect(parsePos('')).toBe(Infinity);
-    expect(parsePos(undefined)).toBe(Infinity);
-    expect(parsePos('bonus')).toBe(Infinity);
+    expect(parsePos('3.5-4')).toBe(3.5);
+    expect(parsePos('2 and 3')).toBe(2);
+  });
+
+  it('returns the sentinel for empty, garbage, or multi-dot (Go ParseFloat rejects)', () => {
+    expect(parsePos('')).toBe(POS_SENTINEL);
+    expect(parsePos(undefined)).toBe(POS_SENTINEL);
+    expect(parsePos('bonus')).toBe(POS_SENTINEL);
+    expect(parsePos('.')).toBe(POS_SENTINEL);
+    expect(parsePos('1.2.3')).toBe(POS_SENTINEL); // diverged before: JS returned 1.2
+    expect(parsePos('..5')).toBe(POS_SENTINEL);
+  });
+
+  it('sorts the sentinel last', () => {
+    const positions = ['bonus', '2', '1.2.3', '1'].map(parsePos);
+    expect(Math.min(...positions)).toBe(1);
+    expect(parsePos('bonus')).toBeGreaterThan(parsePos('999'));
+  });
+});
+
+describe('tallyResults', () => {
+  const r = (partial: Partial<BookCreateResult>): BookCreateResult => ({
+    source_path: partial.source_path ?? '/x',
+    created: partial.created ?? false,
+    ...partial,
+  });
+
+  it('buckets created / conflict / failed', () => {
+    const results = [
+      r({ created: true }),
+      r({ created: true }),
+      r({ conflict: true }),
+      r({ error: 'boom' }), // neither created nor conflict => failed
+    ];
+    expect(tallyResults(results)).toEqual({ created: 2, conflicts: 1, failed: 1 });
+  });
+
+  it('is all-zero for an empty list', () => {
+    expect(tallyResults([])).toEqual({ created: 0, conflicts: 0, failed: 0 });
   });
 });
 

@@ -33,6 +33,7 @@ func TestBookCRUDAndDedup(t *testing.T) {
 		SourcePath: "/books/a", WorkDir: "/work/a", Title: "A Title",
 		Authors: []string{"Author One"}, Series: "S", SeriesPos: "1",
 		ASIN: "B01", IdentitySources: map[string]string{"asin": "tag"},
+		Coverage: json.RawMessage(`{"available":true,"known":true}`),
 	}
 	b, err := db.CreateBook(ctx, nb)
 	if err != nil {
@@ -47,6 +48,9 @@ func TestBookCRUDAndDedup(t *testing.T) {
 	if b.IdentitySources["asin"] != "tag" {
 		t.Fatalf("identity_sources round-trip: %+v", b.IdentitySources)
 	}
+	if string(b.Coverage) != `{"available":true,"known":true}` {
+		t.Fatalf("coverage round-trip: %s", b.Coverage)
+	}
 
 	// Dedup on source_path.
 	if _, err := db.CreateBook(ctx, nb); !errors.Is(err, ErrDuplicate) {
@@ -56,10 +60,6 @@ func TestBookCRUDAndDedup(t *testing.T) {
 	got, err := db.GetBook(ctx, b.ID)
 	if err != nil || got.Title != "A Title" {
 		t.Fatalf("GetBook: %+v %v", got, err)
-	}
-	byPath, err := db.GetBookBySourcePath(ctx, "/books/a")
-	if err != nil || byPath.ID != b.ID {
-		t.Fatalf("GetBookBySourcePath: %+v %v", byPath, err)
 	}
 	if _, err := db.GetBook(ctx, 999); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing book: want ErrNotFound, got %v", err)
@@ -136,6 +136,14 @@ func TestStageRunsAndReconcileHelpers(t *testing.T) {
 	if !succ["asr"] {
 		t.Fatalf("SucceededStages = %+v", succ)
 	}
+	// The grouped variant buckets the same success by book id.
+	allSucc, err := db.SucceededStagesAll(ctx)
+	if err != nil {
+		t.Fatalf("SucceededStagesAll: %v", err)
+	}
+	if !allSucc[b.ID]["asr"] {
+		t.Fatalf("SucceededStagesAll = %+v", allSucc)
+	}
 	if err := db.DeleteStageSuccess(ctx, b.ID, "asr"); err != nil {
 		t.Fatal(err)
 	}
@@ -160,16 +168,28 @@ func TestProgress(t *testing.T) {
 	if err := db.SetProgress(ctx, b.ID, "asr", 5, 10); err != nil {
 		t.Fatal(err)
 	}
-	p, ok, _ := db.GetProgress(ctx, b.ID, "asr")
-	if !ok || p.Done != 5 || p.Total != 10 {
-		t.Fatalf("GetProgress: %+v ok=%v", p, ok)
-	}
-	if _, ok, _ := db.GetProgress(ctx, b.ID, "missing"); ok {
-		t.Fatal("missing progress reported present")
-	}
 	all, _ := db.ListProgress(ctx, b.ID)
-	if len(all) != 1 {
-		t.Fatalf("ListProgress = %d", len(all))
+	if len(all) != 1 || all[0].Done != 5 || all[0].Total != 10 {
+		t.Fatalf("ListProgress = %+v", all)
+	}
+
+	// A second book with its own progress, to exercise the bucketed query.
+	b2, _ := db.CreateBook(ctx, NewBook{SourcePath: "/y", WorkDir: "/w2", Title: "Y"})
+	if err := db.SetProgress(ctx, b2.ID, "splitting", 1, 3); err != nil {
+		t.Fatal(err)
+	}
+	byBook, err := db.ListAllProgress(ctx)
+	if err != nil {
+		t.Fatalf("ListAllProgress: %v", err)
+	}
+	if len(byBook) != 2 {
+		t.Fatalf("ListAllProgress buckets = %d, want 2", len(byBook))
+	}
+	if len(byBook[b.ID]) != 1 || byBook[b.ID][0].Stage != "asr" {
+		t.Fatalf("bucket for b = %+v", byBook[b.ID])
+	}
+	if len(byBook[b2.ID]) != 1 || byBook[b2.ID][0].Stage != "splitting" {
+		t.Fatalf("bucket for b2 = %+v", byBook[b2.ID])
 	}
 }
 

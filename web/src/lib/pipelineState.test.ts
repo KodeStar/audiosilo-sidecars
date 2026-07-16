@@ -1,21 +1,16 @@
 import { describe, it, expect } from 'vitest';
-import { laneOf, stateChipClass, stateLabel, statusBadge } from './pipelineState';
+import { normalizeLane, stateChipClass, stateLabel, statusBadge } from './pipelineState';
 
-describe('laneOf', () => {
-  it('maps stages to their lane (mirroring internal/state)', () => {
-    expect(laneOf('asr')).toBe('asr');
-    expect(laneOf('retranscribing')).toBe('asr');
-    expect(laneOf('fact_pass')).toBe('agent');
-    expect(laneOf('auditing')).toBe('agent');
-    expect(laneOf('inspecting')).toBe('mechanical');
-    expect(laneOf('contributing')).toBe('mechanical');
+describe('normalizeLane', () => {
+  it('passes through the real lanes', () => {
+    expect(normalizeLane('asr')).toBe('asr');
+    expect(normalizeLane('agent')).toBe('agent');
+    expect(normalizeLane('mechanical')).toBe('mechanical');
   });
 
-  it('maps waypoints and unknown states to none', () => {
-    expect(laneOf('queued')).toBe('none');
-    expect(laneOf('ready')).toBe('none');
-    expect(laneOf('done')).toBe('none');
-    expect(laneOf('bogus')).toBe('none');
+  it('maps the empty waypoint lane and anything unknown to none', () => {
+    expect(normalizeLane('')).toBe('none');
+    expect(normalizeLane('bogus')).toBe('none');
   });
 });
 
@@ -28,15 +23,19 @@ describe('stateLabel', () => {
 });
 
 describe('stateChipClass', () => {
-  it('gives distinct classes for done and ready waypoints', () => {
-    expect(stateChipClass('done')).toContain('success');
-    expect(stateChipClass('ready')).toContain('amber');
+  it('gives distinct classes for done and ready waypoints (regardless of served lane)', () => {
+    expect(stateChipClass('done', '')).toContain('success');
+    expect(stateChipClass('ready', '')).toContain('amber');
   });
 
-  it('colors by lane for stages', () => {
-    expect(stateChipClass('asr')).toContain('sky');
-    expect(stateChipClass('fact_pass')).toContain('pink');
-    expect(stateChipClass('inspecting')).toContain('slate');
+  it('colors by the served lane for stages', () => {
+    expect(stateChipClass('asr', 'asr')).toContain('sky');
+    expect(stateChipClass('fact_pass', 'agent')).toContain('pink');
+    expect(stateChipClass('inspecting', 'mechanical')).toContain('slate');
+  });
+
+  it('falls back to the none style for an empty/unknown lane', () => {
+    expect(stateChipClass('inspecting', '')).toContain('raised');
   });
 });
 

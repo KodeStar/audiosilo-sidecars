@@ -2,7 +2,7 @@
 // filtering, coverage-badge derivation, and series-gap detection. Kept free of
 // React so it stays exhaustively unit-testable (components call into it).
 
-import type { BookCandidate, Coverage, ScannedBook } from '@/api/types';
+import type { BookCandidate, BookCreateResult, Coverage, ScannedBook } from '@/api/types';
 
 // The two expressive-layer dimensions the tool contributes.
 export type CoverageDimension = 'characters' | 'recaps';
@@ -34,7 +34,8 @@ export function isCovered(book: ScannedBook): boolean {
 }
 
 // toCandidate maps a scanned book to the POST /books candidate shape, carrying
-// the identity/series fields the daemon needs to enqueue it.
+// the identity/series fields the daemon needs to enqueue it plus the advisory
+// coverage + provenance snapshot from the scan (persisted, not re-derived).
 export function toCandidate(book: ScannedBook): BookCandidate {
   return {
     source_path: book.path,
@@ -44,6 +45,8 @@ export function toCandidate(book: ScannedBook): BookCandidate {
     series_pos: book.series_position ?? '',
     asin: book.asin ?? '',
     isbn: book.isbn ?? '',
+    coverage: book.coverage,
+    sources: book.sources,
   };
 }
 
@@ -57,16 +60,51 @@ export function filterCandidates(
   return books.filter((b) => !isCovered(b));
 }
 
-// parsePos extracts the leading numeric part of a series position ("1", "2.5",
-// "1-3.5" -> 1). Empty/unparseable positions sort last (Infinity), mirroring the
-// server's parseSeriesPos so the UI and the scheduler agree on ordering.
+// POS_SENTINEL sorts an empty/unparseable position last. It matches the Go
+// parseSeriesPos sentinel (1e18) exactly so the two implementations are
+// behaviorally identical, not merely both "sort last".
+export const POS_SENTINEL = 1e18;
+
+// parsePos is an exact behavioral mirror of the server's parseSeriesPos
+// (internal/scheduler/scheduler.go): it takes the leading run of digit/dot
+// characters and parses that as a single float, so "1-3.5" -> 1 (stops at '-')
+// and "2.5" -> 2.5, while anything the Go strconv.ParseFloat would reject -
+// empty, garbage ("bonus"), a bare ".", or a multi-dot run ("1.2.3") - yields
+// POS_SENTINEL so it sorts last. Go is the reference; keep them in lockstep.
 export function parsePos(pos: string | undefined): number {
   const s = (pos ?? '').trim();
-  if (s === '') return Infinity;
-  const m = /^[0-9]*\.?[0-9]+/.exec(s);
-  if (!m) return Infinity;
-  const n = Number.parseFloat(m[0]);
-  return Number.isNaN(n) ? Infinity : n;
+  if (s === '') return POS_SENTINEL;
+  // Leading run of [0-9.] only, mirroring Go's byte scan that stops at the first
+  // other character.
+  const run = /^[0-9.]*/.exec(s)?.[0] ?? '';
+  // Go's ParseFloat over that run accepts at most one '.' and needs >= 1 digit;
+  // "" / "." / "1.2.3" all fail there and fall through to the sentinel.
+  const dots = (run.match(/\./g) ?? []).length;
+  if (dots > 1 || !/[0-9]/.test(run)) return POS_SENTINEL;
+  const n = Number.parseFloat(run);
+  return Number.isNaN(n) ? POS_SENTINEL : n;
+}
+
+// ResultTally counts a POST /books response by per-candidate outcome.
+export interface ResultTally {
+  created: number;
+  conflicts: number;
+  failed: number;
+}
+
+// tallyResults buckets create-book results into created / already-enqueued
+// (conflict) / failed. A result is "failed" when it was neither created nor a
+// conflict. One helper so the process handler and the summary line agree.
+export function tallyResults(results: BookCreateResult[]): ResultTally {
+  let created = 0;
+  let conflicts = 0;
+  let failed = 0;
+  for (const r of results) {
+    if (r.created) created++;
+    else if (r.conflict) conflicts++;
+    else failed++;
+  }
+  return { created, conflicts, failed };
 }
 
 // seriesGapHint reports the series for which a selected book skips an earlier

@@ -207,5 +207,4 @@ func TestControlOpErrors(t *testing.T) {
 	if err := sched.Delete(ctx, b.ID); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	_ = time.Now
 }

@@ -13,17 +13,22 @@ import (
 
 	"github.com/kodestar/audiosilo-sidecars/internal/metaops"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
+	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
 
-// pipelineReady reports whether the pipeline dependencies are wired. Tests that
-// only cover the M0 surface leave them nil; those handlers then return 503.
-func (a *API) pipelineReady(w http.ResponseWriter) bool {
-	if a.store == nil || a.sched == nil || a.scans == nil {
-		writeError(w, http.StatusServiceUnavailable, "pipeline not available")
-		return false
+// requirePipeline wraps a pipeline handler so it 503s when the pipeline
+// dependencies are not wired (tests that only cover the M0 auth/settings surface
+// leave them nil). Composed at route registration alongside requireAuth, so no
+// handler repeats the guard.
+func (a *API) requirePipeline(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if a.store == nil || a.sched == nil || a.scans == nil {
+			writeError(w, http.StatusServiceUnavailable, "pipeline not available")
+			return
+		}
+		next(w, r)
 	}
-	return true
 }
 
 // --- scans ---
@@ -37,9 +42,6 @@ type createScanResponse struct {
 }
 
 func (a *API) handleCreateScan(w http.ResponseWriter, r *http.Request) {
-	if !a.pipelineReady(w) {
-		return
-	}
 	var req createScanRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -69,9 +71,6 @@ func (a *API) handleCreateScan(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleGetScan(w http.ResponseWriter, r *http.Request) {
-	if !a.pipelineReady(w) {
-		return
-	}
 	job, ok := a.scans.Get(r.PathValue("id"))
 	if !ok {
 		writeError(w, http.StatusNotFound, "scan not found")
@@ -82,15 +81,20 @@ func (a *API) handleGetScan(w http.ResponseWriter, r *http.Request) {
 
 // --- books ---
 
-// bookCandidate is one selected book to enqueue.
+// bookCandidate is one selected book to enqueue. Coverage and Sources are the
+// advisory scan-time snapshot the Library UI already holds (the metadata-coverage
+// verdict and the per-field provenance); they are persisted as-is and echoed back
+// on the book view.
 type bookCandidate struct {
-	SourcePath string   `json:"source_path"`
-	Title      string   `json:"title"`
-	Authors    []string `json:"authors"`
-	Series     string   `json:"series"`
-	SeriesPos  string   `json:"series_pos"`
-	ASIN       string   `json:"asin"`
-	ISBN       string   `json:"isbn"`
+	SourcePath string            `json:"source_path"`
+	Title      string            `json:"title"`
+	Authors    []string          `json:"authors"`
+	Series     string            `json:"series"`
+	SeriesPos  string            `json:"series_pos"`
+	ASIN       string            `json:"asin"`
+	ISBN       string            `json:"isbn"`
+	Coverage   json.RawMessage   `json:"coverage,omitempty"`
+	Sources    map[string]string `json:"sources,omitempty"`
 }
 
 type createBooksRequest struct {
@@ -111,9 +115,6 @@ type createBooksResponse struct {
 }
 
 func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
-	if !a.pipelineReady(w) {
-		return
-	}
 	var req createBooksRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -133,6 +134,10 @@ func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
 			results = append(results, res)
 			continue
 		}
+		sources := c.Sources
+		if sources == nil {
+			sources = map[string]string{}
+		}
 		nb := store.NewBook{
 			SourcePath:      sp,
 			WorkDir:         a.workDir(sp, c.Title),
@@ -142,7 +147,8 @@ func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
 			SeriesPos:       strings.TrimSpace(c.SeriesPos),
 			ASIN:            strings.TrimSpace(c.ASIN),
 			ISBN:            strings.TrimSpace(c.ISBN),
-			IdentitySources: map[string]string{},
+			IdentitySources: sources,
+			Coverage:        c.Coverage,
 		}
 		b, err := a.store.CreateBook(ctx, nb)
 		switch {
@@ -196,23 +202,27 @@ func slug(s string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-// bookView is the API shape of a book, with live progress merged in.
+// bookView is the API shape of a book, with live progress merged in. Lane is the
+// served lane the current state runs in (state.LaneOf), so the web UI need not
+// mirror the state->lane table.
 type bookView struct {
-	ID         int64            `json:"id"`
-	SourcePath string           `json:"source_path"`
-	Title      string           `json:"title"`
-	Authors    []string         `json:"authors"`
-	Series     string           `json:"series,omitempty"`
-	SeriesPos  string           `json:"series_pos,omitempty"`
-	ASIN       string           `json:"asin,omitempty"`
-	ISBN       string           `json:"isbn,omitempty"`
-	State      string           `json:"state"`
-	Status     string           `json:"status"`
-	Error      string           `json:"error,omitempty"`
-	Coverage   json.RawMessage  `json:"coverage,omitempty"`
-	Progress   []store.Progress `json:"progress"`
-	CreatedAt  string           `json:"created_at"`
-	UpdatedAt  string           `json:"updated_at"`
+	ID              int64             `json:"id"`
+	SourcePath      string            `json:"source_path"`
+	Title           string            `json:"title"`
+	Authors         []string          `json:"authors"`
+	Series          string            `json:"series,omitempty"`
+	SeriesPos       string            `json:"series_pos,omitempty"`
+	ASIN            string            `json:"asin,omitempty"`
+	ISBN            string            `json:"isbn,omitempty"`
+	IdentitySources map[string]string `json:"identity_sources"`
+	State           string            `json:"state"`
+	Lane            string            `json:"lane"`
+	Status          string            `json:"status"`
+	Error           string            `json:"error,omitempty"`
+	Coverage        json.RawMessage   `json:"coverage,omitempty"`
+	Progress        []store.Progress  `json:"progress"`
+	CreatedAt       string            `json:"created_at"`
+	UpdatedAt       string            `json:"updated_at"`
 }
 
 // bookDetail adds the per-execution stage-run ledger.
@@ -221,19 +231,33 @@ type bookDetail struct {
 	StageRuns []store.StageRun `json:"stage_runs"`
 }
 
+// bookToView builds the detail view for one book, fetching its progress. The list
+// endpoint uses buildBookView with a pre-fetched progress slice to avoid an N+1.
 func (a *API) bookToView(ctx context.Context, b store.Book) bookView {
+	progress, _ := a.store.ListProgress(ctx, b.ID)
+	return buildBookView(b, progress)
+}
+
+// buildBookView assembles a bookView from a book and its (possibly nil) progress
+// rows, normalizing the always-present JSON fields.
+func buildBookView(b store.Book, progress []store.Progress) bookView {
 	authors := b.Authors
 	if authors == nil {
 		authors = []string{}
 	}
-	progress, _ := a.store.ListProgress(ctx, b.ID)
+	idsrc := b.IdentitySources
+	if idsrc == nil {
+		idsrc = map[string]string{}
+	}
 	if progress == nil {
 		progress = []store.Progress{}
 	}
 	return bookView{
 		ID: b.ID, SourcePath: b.SourcePath, Title: b.Title, Authors: authors,
 		Series: b.Series, SeriesPos: b.SeriesPos, ASIN: b.ASIN, ISBN: b.ISBN,
-		State: b.State, Status: b.Status, Error: b.Error, Coverage: b.Coverage,
+		IdentitySources: idsrc,
+		State:           b.State, Lane: string(state.LaneOf(state.State(b.State))),
+		Status: b.Status, Error: b.Error, Coverage: b.Coverage,
 		Progress: progress, CreatedAt: b.CreatedAt, UpdatedAt: b.UpdatedAt,
 	}
 }
@@ -243,26 +267,26 @@ type listBooksResponse struct {
 }
 
 func (a *API) handleListBooks(w http.ResponseWriter, r *http.Request) {
-	if !a.pipelineReady(w) {
-		return
-	}
 	ctx := r.Context()
 	books, err := a.store.ListBooks(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not list books")
 		return
 	}
+	// One grouped progress query for the whole list instead of one per book.
+	progressByBook, err := a.store.ListAllProgress(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not list progress")
+		return
+	}
 	views := make([]bookView, 0, len(books))
 	for _, b := range books {
-		views = append(views, a.bookToView(ctx, b))
+		views = append(views, buildBookView(b, progressByBook[b.ID]))
 	}
 	writeJSON(w, http.StatusOK, listBooksResponse{Books: views})
 }
 
 func (a *API) handleGetBook(w http.ResponseWriter, r *http.Request) {
-	if !a.pipelineReady(w) {
-		return
-	}
 	id, ok := parseID(w, r)
 	if !ok {
 		return
@@ -292,9 +316,6 @@ func (a *API) handleGetBook(w http.ResponseWriter, r *http.Request) {
 // to status codes uniformly (pause/resume/retry/cancel share this shape).
 func (a *API) bookAction(fn func(*scheduler.Scheduler, context.Context, int64) error) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !a.pipelineReady(w) {
-			return
-		}
 		id, ok := parseID(w, r)
 		if !ok {
 			return
@@ -305,9 +326,6 @@ func (a *API) bookAction(fn func(*scheduler.Scheduler, context.Context, int64) e
 }
 
 func (a *API) handleDeleteBook(w http.ResponseWriter, r *http.Request) {
-	if !a.pipelineReady(w) {
-		return
-	}
 	id, ok := parseID(w, r)
 	if !ok {
 		return

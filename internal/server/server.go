@@ -75,6 +75,9 @@ func Run(ctx context.Context, opts Options) error {
 	} else if n > 0 {
 		fmt.Fprintf(opts.Out, "[info] pruned %d event(s) older than 30 days\n", n)
 	}
+	// Keep pruning on a daily cadence so a long-running daemon's event log stays
+	// bounded (the startup prune alone would let it grow between restarts).
+	go pruneEventsLoop(ctx, db, opts.Out)
 
 	mgr := auth.New(db.AuthStore())
 	oneTimePassword, err := mgr.EnsureAdmin()
@@ -150,6 +153,31 @@ func Run(ctx context.Context, opts Options) error {
 		return err
 	case <-ctx.Done():
 		return shutdown(srv)
+	}
+}
+
+// pruneDailyInterval is the cadence of the background event-log prune.
+const pruneDailyInterval = 24 * time.Hour
+
+// pruneEventsLoop prunes events older than eventRetention once a day until ctx is
+// cancelled. A prune failure is logged and retried on the next tick, never fatal.
+func pruneEventsLoop(ctx context.Context, db *store.DB, out io.Writer) {
+	ticker := time.NewTicker(pruneDailyInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n, err := db.PruneEvents(ctx, time.Now().Add(-eventRetention))
+			if err != nil {
+				fmt.Fprintf(out, "[warn] daily event prune failed: %v\n", err)
+				continue
+			}
+			if n > 0 {
+				fmt.Fprintf(out, "[info] pruned %d event(s) older than 30 days\n", n)
+			}
+		}
 	}
 }
 

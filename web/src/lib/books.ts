@@ -12,7 +12,7 @@ export function applyBookState(books: BookView[], ev: BookStateEvent): BookView[
   const next = books.map((b) => {
     if (b.id !== ev.book_id) return b;
     changed = true;
-    return { ...b, state: ev.state, status: ev.status };
+    return { ...b, state: ev.state, lane: ev.lane, status: ev.status };
   });
   return changed ? next : books;
 }

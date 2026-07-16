@@ -55,6 +55,18 @@ type Scheduler struct {
 
 	mu       sync.Mutex
 	inflight map[int64]*inflightBook
+
+	// lastStats is the most recently published queue.stats, so an idle tick that
+	// recomputes an identical snapshot skips the SSE frame + durable insert. Only
+	// touched from the single scheduler goroutine (dispatch), so it needs no lock.
+	lastStats queueStats
+	haveStats bool
+}
+
+// queueStats is the published queue.stats snapshot, compared to suppress
+// no-change republishes on idle ticks.
+type queueStats struct {
+	asr, agent, mech, queued int
 }
 
 type inflightBook struct {
@@ -81,6 +93,7 @@ func New(db *store.DB, hub *events.Hub, exec Executor, agentCap int) *Scheduler 
 // cancelled. It blocks until the loop exits and all in-flight workers finish.
 func (s *Scheduler) Start(ctx context.Context) error {
 	s.ctx = ctx
+	s.haveStats = false // force the first pass to publish a fresh queue.stats
 	if err := s.Reconcile(ctx); err != nil {
 		return fmt.Errorf("reconcile: %w", err)
 	}
@@ -135,14 +148,17 @@ func (s *Scheduler) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// One grouped query for every book's succeeded stages (avoids a per-book N+1
+	// across the whole catalogue at startup).
+	succeededByBook, err := s.db.SucceededStagesAll(ctx)
+	if err != nil {
+		return err
+	}
 	for _, b := range books {
 		if state.IsTerminal(state.State(b.State)) {
 			continue
 		}
-		succeeded, err := s.db.SucceededStages(ctx, b.ID)
-		if err != nil {
-			return err
-		}
+		succeeded := succeededByBook[b.ID]
 		var rewind string
 		haveRewind := false
 		for stage := range succeeded {
@@ -182,9 +198,9 @@ func (s *Scheduler) dispatch() {
 	if ctx == nil || ctx.Err() != nil {
 		return
 	}
-	s.advanceWaypoints(ctx)
-
-	books, err := s.db.ListBooks(ctx)
+	// advanceWaypoints promotes queued/ready books until none remain and returns
+	// the resulting fresh list, so dispatch never re-queries.
+	books, err := s.advanceWaypoints(ctx)
 	if err != nil {
 		return
 	}
@@ -232,27 +248,34 @@ func (s *Scheduler) dispatch() {
 	sortByID(agent)
 	sortByID(mech)
 
-	s.fillLane(asr, state.LaneASR, asrCapacity-counts[state.LaneASR])
-	s.fillLane(agent, state.LaneAgent, s.agentCap-counts[state.LaneAgent])
-	s.fillLane(mech, state.LaneMechanical, mechCapacity-counts[state.LaneMechanical])
+	// fillLane returns how many it dispatched, so counts ends the pass holding the
+	// post-dispatch per-lane occupancy - the exact numbers queue.stats publishes,
+	// with no second scan of the inflight set.
+	counts[state.LaneASR] += s.fillLane(asr, state.LaneASR, asrCapacity-counts[state.LaneASR])
+	counts[state.LaneAgent] += s.fillLane(agent, state.LaneAgent, s.agentCap-counts[state.LaneAgent])
+	counts[state.LaneMechanical] += s.fillLane(mech, state.LaneMechanical, mechCapacity-counts[state.LaneMechanical])
 
-	s.publishQueueStats(books)
+	s.publishQueueStats(books, counts)
 }
 
 func sortByID(b []store.Book) {
 	sort.Slice(b, func(i, j int) bool { return b[i].ID < b[j].ID })
 }
 
-// fillLane dispatches up to free candidates into a lane.
-func (s *Scheduler) fillLane(candidates []store.Book, lane state.Lane, free int) {
+// fillLane dispatches up to free candidates into a lane and returns how many it
+// actually started.
+func (s *Scheduler) fillLane(candidates []store.Book, lane state.Lane, free int) int {
+	started := 0
 	for _, b := range candidates {
 		if free <= 0 {
-			return
+			break
 		}
 		if s.startWorker(b, lane) {
 			free--
+			started++
 		}
 	}
+	return started
 }
 
 // startWorker marks a book in-flight and launches its stage worker. It returns
@@ -304,10 +327,10 @@ func (s *Scheduler) runStage(ctx context.Context, b store.Book) {
 		if sn, rerr := ReadSentinel(b.WorkDir, stageName); rerr == nil {
 			result = sn.Result
 		} else {
-			result, err = s.execute(ctx, b, stage, runID)
+			result, err = s.execute(ctx, b, stage)
 		}
 	} else {
-		result, err = s.execute(ctx, b, stage, runID)
+		result, err = s.execute(ctx, b, stage)
 	}
 	if errors.Is(err, context.Canceled) {
 		// Paused/cancelled/shutting down: close the run, leave state for a re-run.
@@ -327,7 +350,7 @@ func (s *Scheduler) runStage(ctx context.Context, b store.Book) {
 
 // execute runs the injected executor with a progress reporter that persists and
 // publishes stage.progress.
-func (s *Scheduler) execute(ctx context.Context, b store.Book, stage state.State, _ int64) (StageResult, error) {
+func (s *Scheduler) execute(ctx context.Context, b store.Book, stage state.State) (StageResult, error) {
 	report := func(done, total int) {
 		_ = s.db.SetProgress(ctx, b.ID, string(stage), done, total)
 		_ = s.hub.Publish("stage.progress", map[string]any{
@@ -377,12 +400,14 @@ func (s *Scheduler) advance(ctx context.Context, b store.Book, stage state.State
 }
 
 // advanceWaypoints promotes queued/ready books (no lane, no executor) to their
-// next state until none remain, so the machine never stalls on a waypoint.
-func (s *Scheduler) advanceWaypoints(ctx context.Context) {
+// next state until none remain, so the machine never stalls on a waypoint. It
+// loops until a pass advances nothing and returns that final, fresh book list so
+// dispatch can act on it without re-querying.
+func (s *Scheduler) advanceWaypoints(ctx context.Context) ([]store.Book, error) {
 	for {
 		books, err := s.db.ListBooks(ctx)
 		if err != nil {
-			return
+			return nil, err
 		}
 		advanced := false
 		for _, b := range books {
@@ -401,7 +426,7 @@ func (s *Scheduler) advanceWaypoints(ctx context.Context) {
 			advanced = true
 		}
 		if !advanced {
-			return
+			return books, nil
 		}
 	}
 }
@@ -417,8 +442,8 @@ func lockHolders(books []store.Book) map[int64]bool {
 	holders := map[int64]bool{}
 	best := map[string]store.Book{}
 	for _, b := range books {
-		if state.Order(state.State(b.State)) >= state.Order(state.Ready) {
-			continue // finished for lock purposes
+		if !state.HoldsSeriesLock(state.State(b.State)) {
+			continue // finished for lock purposes (ready or beyond)
 		}
 		if strings.TrimSpace(b.Series) == "" {
 			holders[b.ID] = true
@@ -470,16 +495,20 @@ func parseSeriesPos(pos string) float64 {
 // --- events ---
 
 func (s *Scheduler) publishState(bookID int64, st, status string) {
-	_ = s.hub.Publish("book.state", map[string]any{"book_id": bookID, "state": st, "status": status})
+	_ = s.hub.Publish("book.state", map[string]any{
+		"book_id": bookID,
+		"state":   st,
+		"lane":    string(state.LaneOf(state.State(st))),
+		"status":  status,
+	})
 }
 
-func (s *Scheduler) publishQueueStats(books []store.Book) {
-	s.mu.Lock()
-	counts := map[state.Lane]int{}
-	for _, ib := range s.inflight {
-		counts[ib.lane]++
-	}
-	s.mu.Unlock()
+// publishQueueStats publishes queue.stats from the counts dispatch already
+// computed. It publishes only when the snapshot differs from the last one it
+// published, so an idle 5s tick that recomputes an identical snapshot does not
+// emit an SSE frame, persist a durable row, or re-render every client. Start
+// resets the dedup so the first pass always publishes.
+func (s *Scheduler) publishQueueStats(books []store.Book, counts map[state.Lane]int) {
 	queued := 0
 	for _, b := range books {
 		st := state.State(b.State)
@@ -487,11 +516,21 @@ func (s *Scheduler) publishQueueStats(books []store.Book) {
 			queued++
 		}
 	}
+	next := queueStats{
+		asr:    counts[state.LaneASR],
+		agent:  counts[state.LaneAgent],
+		mech:   counts[state.LaneMechanical],
+		queued: queued,
+	}
+	if s.haveStats && next == s.lastStats {
+		return
+	}
+	s.lastStats, s.haveStats = next, true
 	_ = s.hub.Publish("queue.stats", map[string]any{
-		"asr_active":        counts[state.LaneASR],
-		"agent_active":      counts[state.LaneAgent],
-		"mechanical_active": counts[state.LaneMechanical],
-		"queued":            queued,
+		"asr_active":        next.asr,
+		"agent_active":      next.agent,
+		"mechanical_active": next.mech,
+		"queued":            next.queued,
 	})
 }
 
