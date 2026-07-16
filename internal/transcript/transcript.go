@@ -34,11 +34,17 @@ import (
 // Schema is the version tag every normalized transcript carries.
 const Schema = "audiosilo-transcript/v1"
 
-// Work-dir subdirectories for the three transcript layers.
+// Work-dir subdirectories for the transcript layers. RepairedDir holds
+// degeneration-repaired chapter text (spliced by the adjudication flow, M5): the
+// QA multi-loop detector and the corrections engine prefer a chapter's repaired
+// copy when one exists. This package never writes it; the name lives here so its
+// consumers (internal/qa, internal/spelling, the future repair writer) share one
+// source of truth for the layer names.
 const (
-	RawDir  = "transcripts-raw"
-	JSONDir = "transcripts-json"
-	TextDir = "transcripts-text"
+	RawDir      = "transcripts-raw"
+	JSONDir     = "transcripts-json"
+	TextDir     = "transcripts-text"
+	RepairedDir = "transcripts-repaired"
 )
 
 // Word is one word (openai/mlx) or token (whisper.cpp) with its timing. P is the

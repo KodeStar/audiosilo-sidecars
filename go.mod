@@ -3,6 +3,7 @@ module github.com/kodestar/audiosilo-sidecars
 go 1.25.3
 
 require (
+	github.com/dlclark/regexp2 v1.12.0
 	github.com/kodestar/audiosilo-meta v0.6.1-0.20260716185935-d09f87ff675c
 	github.com/kodestar/audiosilo-server v1.11.1-0.20260716193339-91486c3e1819
 	github.com/ulikunitz/xz v0.5.15

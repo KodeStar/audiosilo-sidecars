@@ -146,18 +146,43 @@ internal/
             confined to the work root. Manual purge only in M2; auto-purge is M7.
             A purge also invalidates the split sentinel (scheduler.purgeInvalidatedStages)
             so a later retry re-splits rather than skipping into an empty chapters/.
+  qa/       M4: the mechanical transcript-QA degeneration sweep, a faithful Go port
+            of the historical Python detectors (qa_sweep/cross_segment/
+            within_segment/multi_loop/tail_rate scans - thresholds and per-detector
+            chapter-0 asymmetries are CONTRACT, golden-tested against 2 real books).
+            Reads transcripts-json/ (+ transcripts-repaired/ for multi-loop); writes
+            qa_report.json (stable enum contract for the M5 adjudicator/UI) +
+            qa_report.md (byte-compatible with the Python report). Report.Clean()
+            drives the QAClean branch; the retranscribe queue = wph outliers +
+            mid-chapter loops. Loud errors on manifest/transcript divergence,
+            wrong-schema files, and an empty transcript set.
+  spelling/ M4: the corrections/spelling ENGINES ported from apply_corrections/
+            check_corrections/generate_spellings/check_first_use.py. Engine-vs-data
+            split: per-book data is corrections.json + spellings.json in the work
+            dir (M5 agents generate them). Rules apply in array order via regexp2
+            (RE2 lacks the lookbehinds the historical rules need; $1 replacement
+            syntax, validated gate-compatible at load); Occurrences is a lookaround
+            boundary scan, never \b (the d'Daston apostrophe pitfall). Check's four
+            gates guard the historical forgeries (Owalyn gate 3, phantom nobles
+            gate 4, the Book-2 cascade gate 1); GenerateSheets emits the
+            CHUNK_ENDS-gated spoiler-safe sheets. Attestation sources are purely
+            data (reference_files) - nothing implicit. Not yet wired into pipeline
+            stages (spelling_research/correcting stay stubs until M5).
   pipeline/ composite scheduler.Executor: routes inspecting -> audio.Inspect,
             splitting -> audio.Split, asr -> the per-chapter internal/asr loop
             (resumable: skip complete raws, delete+retry malformed, freeze each raw
             0444, write asr.json provenance, account scratch), sanitizing ->
-            internal/transcript normalization; every other stage -> the stub (M4+
-            replaces more; retranscribing is still a stub). Constructed in server.go
-            with the toolfetch-resolved paths and the asr.Select-chosen backend. The
-            sanitizing stage deliberately RE-DERIVES all chapters every run (cheap,
-            idempotent, raw is the source of truth) rather than tracking per-chapter
-            freshness. Missing tools PARK a book needs_attention (ASR unavailable, or
-            ffmpeg/ffprobe unresolved) instead of hard-failing - a human-fixable
-            startup precondition that Retry re-admits.
+            internal/transcript normalization, qa_sweep -> the internal/qa sweep
+            (writes both reports, branches on Report.Clean()); qa_adjudicating
+            deliberately PARKS needs_attention (a dirty book must not skip human
+            adjudication; automatic adjudication is M5); every other stage -> the
+            stub (M5+ replaces more; retranscribing is still a stub). Constructed in
+            server.go with the toolfetch-resolved paths and the asr.Select-chosen
+            backend. The sanitizing stage deliberately RE-DERIVES all chapters every
+            run (cheap, idempotent, raw is the source of truth) rather than tracking
+            per-chapter freshness. Missing tools PARK a book needs_attention (ASR
+            unavailable, or ffmpeg/ffprobe unresolved) instead of hard-failing - a
+            human-fixable startup precondition that Retry re-admits.
   auth/     single admin password (argon2id, generated + printed once on first run),
             opaque SHA-256-hashed session tokens, a per-IP login rate limiter; the
             Store interface is storage-agnostic (MemStore for tests; the SQLite
@@ -381,16 +406,48 @@ Milestones from the workspace plan; each is shippable.
   canonicalization), and an 8/8 headless-Chromium drive (login -> scan ->
   provenance -> tab-switch persistence -> hide/unhide -> match modal -> reload
   reattach -> process). Done-tab cost columns wait for M5/M6 cost capture.
-- **M4-M8 (planned):** QA/spelling ports (M4), the agent runner (claude +
-  codex) with staged context dirs enforcing the invariants, the fact-pass +
-  synthesis + audit loop, contribution (intake/PR/local), and packaging
-  (GoReleaser + Docker matrix). See the plan for the full table.
+- **M4 (done):** the QA/spelling Go ports. `internal/qa` ports the six
+  degeneration detectors (wph |z|>2.5 outliers w/ sample stdev; >=3
+  identical-normalized segment runs split end-fade [>=85% position] vs
+  MID-CHAPTER; low-confidence <0.5 stats; cross-segment 6-gram THRESHOLD=5;
+  within-segment >=8x; multi-loop every-gram w/ word-set dedup +
+  repaired-layer preference; tail-rate TAIL_WORDS=12/MAX_WPS=4.5) - the
+  thresholds, per-detector chapter-0 asymmetries and Python-truthiness quirks
+  are contract, preserved verbatim and documented in code. `internal/spelling`
+  ports the corrections engine (ordered rules via dlclark/regexp2 - stdlib RE2
+  cannot express the historical lookbehinds; `$1` replacement syntax,
+  gate-compatibility validated at load), the four check_corrections gates
+  (LHS-zero, RHS-present, RHS-attested vs the data-driven reference_files
+  union, phantom-noble scan - the Owalyn-forgery and d'Daston regressions are
+  unit tests), the CHUNK_ENDS spoiler-gated spellings sheets (Gate 1
+  zero-occurrence, Gate 2 note-names-later-term), and check_first_use; per-book
+  data is corrections.json/spellings.json in the work dir, which M5 agents will
+  generate. The pipeline's `qa_sweep` stage is REAL (qa_report.json/.md +
+  QAClean branch); `qa_adjudicating` parks needs_attention until M5. Golden
+  tests (env-gated `AUDIOSILO_EXTRACTION_DIR`, skip in CI, ~/extraction strictly
+  read-only via temp copies, numbers-only in-repo expectations) replay 2
+  historical books: qa_report.md byte-prefix-identical for HW05 + RLF03, all 84
+  HW05 corrected chapters byte-identical with per-rule counts matching the
+  historical corrections.log, Check passes, sheet rows/unresolved/cluster
+  gating identical; `scripts/export-extraction-data.py` converts the historical
+  embedded Python data tables to the JSON contracts at test time
+  (sys.dont_write_bytecode - the extraction dir stays untouched). Known
+  pre-release caveat: a work dir whose `qa_sweep` sentinel was written by the
+  pre-M4 STUB replays `qa_clean=true` on resume (only books parked exactly at
+  qa_sweep before the upgrade) - delete + re-enqueue such books.
+- **M5-M8 (planned):** the agent runner (claude + codex) with staged context
+  dirs enforcing the invariants, marker normalization + QA adjudication +
+  retranscription going live, the fact-pass + synthesis + audit loop, per-stage
+  model/tokens/cost capture (feeds the M6 Done board), contribution
+  (intake/PR/local), and packaging (GoReleaser + Docker matrix). See the plan
+  for the full table.
 
 Still **not built**: the **Done** tab (full board is M6), the Running tab's richer
-board (stage timeline / ETA / cost, M6), and the pipeline stages beyond sanitizing
-(QA/agent/contribute) - the scheduler runs the composite executor whose remaining
-non-mechanical stages (including `retranscribing`) are still stubs, and the config
-agent-model section stays a typed stub. Auto-purge/startup-GC of scratch is M7 (M2
-is manual purge only). `/system` reports Library/Running/Settings as `ready` and
-only Done as `planned` (the Go-side tab labels). Keep this file honest as milestones
-land.
+board (stage timeline / ETA / cost, M6), and the pipeline stages beyond `qa_sweep` -
+`qa_adjudicating` deliberately parks (M5), and the agent/contribute stages plus
+`retranscribing` are still stubs; `internal/spelling` is a ported, golden-tested
+engine not yet wired to any stage (spelling_research/correcting go live in M5, when
+agents generate its corrections.json/spellings.json). The config agent-model section
+stays a typed stub. Auto-purge/startup-GC of scratch is M7 (M2 is manual purge
+only). `/system` reports Library/Running/Settings as `ready` and only Done as
+`planned` (the Go-side tab labels). Keep this file honest as milestones land.

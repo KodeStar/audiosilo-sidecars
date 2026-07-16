@@ -2,9 +2,12 @@
 // a composite scheduler.Executor that routes each pipeline stage to its
 // implementation - inspecting -> internal/audio.Inspect, splitting ->
 // internal/audio.Split, asr -> the per-chapter internal/asr loop, sanitizing ->
-// internal/transcript normalization - and falls through to a stub for every stage
-// a later milestone still owns (the agent stages, contribute, retranscribing). The
-// scheduler API is unchanged: it sees one Executor.
+// internal/transcript normalization, qa_sweep -> the internal/qa degeneration sweep -
+// and falls through to a stub for every stage a later milestone still owns (the
+// agent stages, contribute, retranscribing). qa_adjudicating deliberately PARKS
+// needs_attention rather than advancing: a book the sweep flagged as dirty must not
+// silently skip human adjudication, which goes live in M5. The scheduler API is
+// unchanged: it sees one Executor.
 //
 // Each real stage writes its _done/<stage>.json sentinel as its final durable
 // action (the crash-resume contract) and returns the branch decision the state
@@ -29,6 +32,7 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/asr"
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
+	"github.com/kodestar/audiosilo-sidecars/internal/qa"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/scratch"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
@@ -204,6 +208,15 @@ func (e *Executor) Execute(ctx context.Context, book store.Book, stage state.Sta
 		return e.asrStage(ctx, book, report)
 	case state.Sanitizing:
 		return e.sanitize(ctx, book, report)
+	case state.QASweep:
+		return e.qaSweep(ctx, book, report)
+	case state.QAAdjudicating:
+		// A book reaches qa_adjudicating only when the sweep found degeneration that
+		// warrants human/agent judgement. Automatic adjudication is a later milestone
+		// (M5), so park needs_attention rather than let the stub advance it: a dirty book
+		// must NOT silently skip adjudication and carry looped/hallucinated narration into
+		// the fact pass. The qa_report.md the sweep wrote is the human's starting point.
+		return scheduler.StageResult{}, scheduler.Park(QAAdjudicatingMsg)
 	default:
 		return e.fallback.Execute(ctx, book, stage, report)
 	}
@@ -220,6 +233,13 @@ const MarkersNormalizingMsg = "chapter markers need manual mapping - automatic n
 // auto-download), so parking - which Retry re-admits - fits better than a hard
 // failure. Exported so a test (and the UI) can assert/label it exactly.
 const MediaToolsUnavailableMsg = "media tools unavailable: ffmpeg/ffprobe not found - install them or enable auto-download, then retry"
+
+// QAAdjudicatingMsg is the needs_attention reason a book is parked with when the
+// degeneration sweep flagged it (qa_sweep found a non-clean chapter). Automatic
+// adjudication - deciding which flagged chapters to re-transcribe versus hand to a
+// human - is a later milestone (M5), so the book waits rather than advancing with
+// suspect narration. Exported so a test (and the UI) can assert/label it exactly.
+const QAAdjudicatingMsg = "QA found degeneration that needs adjudication - see qa_report.md in the work dir; the automatic adjudication stage arrives in a later milestone (M5)"
 
 // ManifestChangedMsg parks a book whose manifest fingerprint no longer matches the
 // one recorded when transcription began - the existing raw transcripts belong to a
@@ -535,6 +555,71 @@ func (e *Executor) sanitize(ctx context.Context, book store.Book, report schedul
 		Metrics: metrics(map[string]any{"chapter_count": total}),
 	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.Sanitizing), result); err != nil {
+		return scheduler.StageResult{}, err
+	}
+	return result, nil
+}
+
+// qaSweep runs the mechanical degeneration sweep (internal/qa) over the normalized
+// transcripts the sanitize stage wrote, writes qa_report.json + qa_report.md into the
+// work dir, and reports QAClean so the state machine branches to spelling_research
+// (clean) or qa_adjudicating (dirty). It reads chapter durations from the manifest
+// (a wph outlier is words-per-hour, so the sweep needs each chapter's length); a
+// missing manifest or missing transcripts point at an out-of-order run, so they are
+// loud errors naming the stage that must precede this one. The detectors are fast and
+// fully in-memory, so a single ctx check at entry is enough - there is no long inner
+// loop to cancel. No scratch accounting: the two reports are tiny.
+func (e *Executor) qaSweep(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
+	if err := ctx.Err(); err != nil {
+		return scheduler.StageResult{}, err
+	}
+	manifest, err := audio.ReadManifest(book.WorkDir)
+	if err != nil {
+		return scheduler.StageResult{}, fmt.Errorf("qa_sweep: read manifest (inspect must run first): %w", err)
+	}
+	durations := make(map[int]float64, len(manifest.Chapters))
+	for _, ch := range manifest.Chapters {
+		durations[ch.Chapter] = ch.Duration
+	}
+	if report != nil {
+		report(0, 1)
+	}
+	rep, err := qa.Run(qa.Input{WorkDir: book.WorkDir, Durations: durations})
+	if err != nil {
+		// The sweep reads transcripts-json/, which the sanitizing stage produces; a read
+		// failure here means sanitizing has not run (or produced no output) yet.
+		return scheduler.StageResult{}, fmt.Errorf("qa_sweep: degeneration sweep (sanitizing must run first): %w", err)
+	}
+	if err := qa.WriteReport(book.WorkDir, rep); err != nil {
+		return scheduler.StageResult{}, fmt.Errorf("qa_sweep: write report: %w", err)
+	}
+	if report != nil {
+		report(1, 1)
+	}
+
+	midChapterRuns := 0
+	for _, run := range rep.RepeatedRuns {
+		if run.Kind == qa.KindMidChapter {
+			midChapterRuns++
+		}
+	}
+	result := scheduler.StageResult{
+		QAClean: rep.Clean(),
+		Metrics: metrics(map[string]any{
+			// chapter_count keeps the cross-stage meaning (the book's manifest
+			// chapter count, like inspect/split/asr/sanitize) - NOT qa's internal
+			// wph-stats count, which excludes chapter 0 and lives in qa_report.json.
+			"chapter_count":      len(manifest.Chapters),
+			"wph_outliers":       len(rep.WPHOutliers),
+			"mid_chapter_runs":   midChapterRuns,
+			"cross_segment":      len(rep.CrossSegment),
+			"within_segment":     len(rep.WithinSegment),
+			"multi_loop":         len(rep.MultiLoop),
+			"tail_rate":          len(rep.TailRate),
+			"retranscribe_queue": len(rep.RetranscribeQueue),
+		}),
+	}
+	if err := scheduler.WriteSentinel(book.WorkDir, string(state.QASweep), result); err != nil {
 		return scheduler.StageResult{}, err
 	}
 	return result, nil

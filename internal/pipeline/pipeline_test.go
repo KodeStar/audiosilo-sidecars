@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -886,5 +887,174 @@ func TestASREmptyTwiceAccepted(t *testing.T) {
 	}
 	if len(prov.EmptyChapters) != 1 || prov.EmptyChapters[0] != 1 {
 		t.Errorf("empty_chapters = %v, want [1]", prov.EmptyChapters)
+	}
+}
+
+// writeQAManifest writes a markers-style manifest whose chapters carry the supplied
+// per-chapter durations (seconds), so the qa_sweep stage reads real durations for its
+// words-per-hour and mid-chapter-position math. No ffmpeg needed.
+func writeQAManifest(t *testing.T, work string, durations map[int]float64) {
+	t.Helper()
+	nums := make([]int, 0, len(durations))
+	for n := range durations {
+		nums = append(nums, n)
+	}
+	sort.Ints(nums)
+	m := audio.Manifest{Source: "/x/book.m4b", Title: "Book", Style: audio.StyleMarkers, ChapterCount: len(nums)}
+	for _, n := range nums {
+		d := durations[n]
+		m.Chapters = append(m.Chapters, audio.Chapter{Chapter: n, Start: 0, End: d, Duration: d})
+	}
+	if err := audio.WriteManifest(work, m); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+}
+
+// writeQATranscript writes one normalized transcripts-json/chNNN.json with the given
+// segments, so the qa detectors have real input without an ASR/sanitize run.
+func writeQATranscript(t *testing.T, work string, chapter int, segs []transcript.Segment) {
+	t.Helper()
+	tr := transcript.Transcript{
+		Schema: transcript.Schema, Chapter: chapter, Backend: "fake", Model: "m", Language: "en", Segments: segs,
+	}
+	if err := transcript.WriteNormalized(filepath.Join(work, transcript.JSONDir), tr); err != nil {
+		t.Fatalf("write transcript ch%d: %v", chapter, err)
+	}
+}
+
+// cleanSegs is a short, distinct, well-behaved chapter body: three different
+// short segments trip no detector (too few tokens for the 6-gram/tail detectors, no
+// repeated run). Reused across chapters so their words-per-hour is identical (sd 0),
+// which keeps the wph outlier detector quiet too.
+func cleanSegs() []transcript.Segment {
+	return []transcript.Segment{
+		{ID: 0, Start: 0, End: 2, Text: " Hello there reader"},
+		{ID: 1, Start: 2, End: 4, Text: " the story begins now"},
+		{ID: 2, Start: 4, End: 6, Text: " onward we go swiftly"},
+	}
+}
+
+// TestQASweepCleanBranch runs the qa_sweep stage over three clean chapters and
+// asserts it reports QAClean, writes both reports, and records qa_clean in its
+// sentinel. The real artifacts (which the stub never writes) prove the stage is
+// wired, not falling through to the fallback.
+func TestQASweepCleanBranch(t *testing.T) {
+	work := t.TempDir()
+	writeQAManifest(t, work, map[int]float64{1: 600, 2: 600, 3: 600})
+	for _, ch := range []int{1, 2, 3} {
+		writeQATranscript(t, work, ch, cleanSegs())
+	}
+
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: ASRSetup{}, Fallback: scheduler.NewStubExecutor(0, 0)})
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.QASweep, nil)
+	if err != nil {
+		t.Fatalf("qa_sweep stage: %v", err)
+	}
+	if !res.QAClean {
+		t.Errorf("QAClean = false on a clean book, want true")
+	}
+	sn, err := scheduler.ReadSentinel(work, string(state.QASweep))
+	if err != nil {
+		t.Fatalf("read qa_sweep sentinel: %v", err)
+	}
+	if !sn.Result.QAClean {
+		t.Errorf("sentinel qa_clean = false, want true")
+	}
+	for _, name := range []string{"qa_report.json", "qa_report.md"} {
+		if _, err := os.Stat(filepath.Join(work, name)); err != nil {
+			t.Errorf("%s missing after qa_sweep: %v", name, err)
+		}
+	}
+}
+
+// TestQASweepDirtyBranch gives one chapter a mid-chapter repeated-segment loop (four
+// identical segments starting at t=0, far below the 85% end-fade cutoff for a 600s
+// chapter) and asserts the sweep reports QAClean=false and queues the chapter for
+// re-transcription.
+func TestQASweepDirtyBranch(t *testing.T) {
+	work := t.TempDir()
+	writeQAManifest(t, work, map[int]float64{1: 600, 2: 600, 3: 600})
+	writeQATranscript(t, work, 1, cleanSegs())
+	writeQATranscript(t, work, 2, []transcript.Segment{
+		{ID: 0, Start: 0, End: 1, Text: " and then"},
+		{ID: 1, Start: 1, End: 2, Text: " and then"},
+		{ID: 2, Start: 2, End: 3, Text: " and then"},
+		{ID: 3, Start: 3, End: 4, Text: " and then"},
+	})
+	writeQATranscript(t, work, 3, cleanSegs())
+
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: ASRSetup{}, Fallback: scheduler.NewStubExecutor(0, 0)})
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.QASweep, nil)
+	if err != nil {
+		t.Fatalf("qa_sweep stage: %v", err)
+	}
+	if res.QAClean {
+		t.Errorf("QAClean = true on a book with a mid-chapter loop, want false")
+	}
+	raw, err := os.ReadFile(filepath.Join(work, "qa_report.json"))
+	if err != nil {
+		t.Fatalf("read qa_report.json: %v", err)
+	}
+	var rep struct {
+		RetranscribeQueue []int `json:"retranscribe_queue"`
+	}
+	if err := json.Unmarshal(raw, &rep); err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.RetranscribeQueue) == 0 {
+		t.Errorf("retranscribe_queue empty, want the looped chapter queued")
+	}
+}
+
+// TestQASweepMissingTranscriptsErrors asserts qa_sweep is a loud, ordered-run error
+// (naming sanitizing) when the normalized transcripts are absent - a manifest exists
+// but the sanitizing stage never produced transcripts-json/.
+func TestQASweepMissingTranscriptsErrors(t *testing.T) {
+	work := t.TempDir()
+	writeQAManifest(t, work, map[int]float64{1: 600})
+
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: ASRSetup{}, Fallback: scheduler.NewStubExecutor(0, 0)})
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.QASweep, nil)
+	if err == nil {
+		t.Fatal("qa_sweep with no transcripts should error")
+	}
+	if !strings.Contains(err.Error(), "sanitizing") {
+		t.Errorf("error = %q, want it to name the sanitizing stage", err)
+	}
+	var pe *scheduler.ParkError
+	if errors.As(err, &pe) {
+		t.Errorf("a missing-transcripts error must not park; got ParkError %q", pe.Reason)
+	}
+}
+
+// TestQASweepMissingManifestErrors asserts qa_sweep errors (naming inspect) when the
+// manifest is absent - it needs chapter durations, which only inspect produces.
+func TestQASweepMissingManifestErrors(t *testing.T) {
+	work := t.TempDir()
+	// transcripts present but no manifest, so the manifest read is the first failure.
+	writeQATranscript(t, work, 1, cleanSegs())
+
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: ASRSetup{}, Fallback: scheduler.NewStubExecutor(0, 0)})
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.QASweep, nil)
+	if err == nil {
+		t.Fatal("qa_sweep with no manifest should error")
+	}
+	if !strings.Contains(err.Error(), "inspect") {
+		t.Errorf("error = %q, want it to name the inspect stage", err)
+	}
+}
+
+// TestQAAdjudicatingParks asserts the qa_adjudicating stage parks needs_attention
+// with exactly QAAdjudicatingMsg - a dirty book must wait for the M5 adjudicator, not
+// silently advance carrying suspect narration into the fact pass.
+func TestQAAdjudicatingParks(t *testing.T) {
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: ASRSetup{}, Fallback: scheduler.NewStubExecutor(0, 0)})
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: t.TempDir()}, state.QAAdjudicating, nil)
+	var pe *scheduler.ParkError
+	if !errors.As(err, &pe) {
+		t.Fatalf("qa_adjudicating error = %v, want a ParkError", err)
+	}
+	if pe.Reason != QAAdjudicatingMsg {
+		t.Errorf("park reason = %q, want %q", pe.Reason, QAAdjudicatingMsg)
 	}
 }
