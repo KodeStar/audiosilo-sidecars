@@ -12,6 +12,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 )
 
 // mlxVenvDir is the venv subdirectory under <data>/tools.
@@ -19,6 +21,10 @@ const mlxVenvDir = "mlx-venv"
 
 // mlxWhisperVersion is the pinned mlx-whisper release (the validated version).
 const mlxWhisperVersion = "0.4.3"
+
+// versionMarkerName is the file inside the venv recording which mlxWhisperVersion
+// was installed, so a later run can detect a pin change and reinstall in place.
+const versionMarkerName = ".asr-version"
 
 // mlxWhisper is the Apple-Silicon ASR backend. It manages a pinned Python venv and
 // invokes the venv's mlx_whisper console script; the model downloads itself from
@@ -73,15 +79,18 @@ func (m *mlxWhisper) Detect(_ context.Context) (Capability, error) {
 	return cap, nil
 }
 
-// EnsureReady builds the pinned venv if it is not already present. It is
-// idempotent: an existing venv with an mlx_whisper script is left alone.
+// EnsureReady builds the pinned venv if it is not already present, and otherwise
+// enforces the pinned version on an existing venv (see ensurePinnedVersion). It is
+// idempotent: a venv already at mlxWhisperVersion is left alone.
 func (m *mlxWhisper) EnsureReady(ctx context.Context, dataDir string) error {
 	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
 		return errors.New("mlx-whisper requires macOS on Apple Silicon (darwin/arm64)")
 	}
 	whisper := m.venvBin(dataDir, "mlx_whisper")
-	if fileExists(whisper) {
-		return nil // venv already provisioned
+	if fsutil.IsFile(whisper) {
+		// The venv exists; make sure it holds the pinned version (a bumped pin, or a
+		// venv predating the marker, reinstalls in place rather than rebuilding).
+		return m.ensurePinnedVersion(ctx, dataDir)
 	}
 	py, err := exec.LookPath("python3")
 	if err != nil {
@@ -100,11 +109,51 @@ func (m *mlxWhisper) EnsureReady(ctx context.Context, dataDir string) error {
 	if out, err := runTool(ctx, 15*time.Minute, pip, "install", "mlx-whisper=="+mlxWhisperVersion); err != nil {
 		return fmt.Errorf("pip install mlx-whisper: %w: %s", err, out)
 	}
-	if !fileExists(whisper) {
+	if !fsutil.IsFile(whisper) {
 		return fmt.Errorf("mlx-whisper install did not produce %s", whisper)
+	}
+	if err := m.writeVersionMarker(dataDir); err != nil {
+		return err
 	}
 	m.log.Info("mlx-whisper: venv ready", "venv", venv)
 	return nil
+}
+
+// ensurePinnedVersion enforces mlxWhisperVersion on an already-provisioned venv:
+// when the recorded marker matches the pin it is a no-op, otherwise (a bumped pin,
+// or a venv that predates the marker) it pip-installs the pinned version IN PLACE
+// and rewrites the marker - it never rebuilds the whole venv, which would waste the
+// expensive interpreter+deps that are unaffected by a mlx-whisper version bump.
+func (m *mlxWhisper) ensurePinnedVersion(ctx context.Context, dataDir string) error {
+	if m.readVersionMarker(dataDir) == mlxWhisperVersion {
+		return nil
+	}
+	pip := m.venvBin(dataDir, "pip")
+	m.log.Info("mlx-whisper: pinned version changed; reinstalling in venv", "version", mlxWhisperVersion)
+	if out, err := runTool(ctx, 15*time.Minute, pip, "install", "mlx-whisper=="+mlxWhisperVersion); err != nil {
+		return fmt.Errorf("pip install mlx-whisper: %w: %s", err, out)
+	}
+	return m.writeVersionMarker(dataDir)
+}
+
+// versionMarkerPath is the pinned-version marker file inside the venv.
+func (m *mlxWhisper) versionMarkerPath(dataDir string) string {
+	return filepath.Join(m.venvPath(dataDir), versionMarkerName)
+}
+
+// readVersionMarker returns the trimmed version recorded in the venv's marker, or
+// "" when it is missing/unreadable (which forces a reinstall).
+func (m *mlxWhisper) readVersionMarker(dataDir string) string {
+	raw, err := os.ReadFile(m.versionMarkerPath(dataDir)) //nolint:gosec // path derives from the data dir
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+// writeVersionMarker records mlxWhisperVersion in the venv's marker file.
+func (m *mlxWhisper) writeVersionMarker(dataDir string) error {
+	return fsutil.WriteFileAtomic(m.versionMarkerPath(dataDir), []byte(mlxWhisperVersion+"\n"), 0o644)
 }
 
 // Transcribe runs one chapter FLAC through the venv's mlx_whisper, writing raw
@@ -113,7 +162,7 @@ func (m *mlxWhisper) EnsureReady(ctx context.Context, dataDir string) error {
 // audio_extract.py - a seeded guess makes a wrong spelling recur.
 func (m *mlxWhisper) Transcribe(ctx context.Context, job Job) error {
 	whisper := m.venvBin(m.dataDir, "mlx_whisper")
-	if !fileExists(whisper) {
+	if !fsutil.IsFile(whisper) {
 		return fmt.Errorf("mlx-whisper venv not provisioned (%s missing); run EnsureReady", whisper)
 	}
 	lang := job.Language
@@ -166,9 +215,4 @@ func runTool(ctx context.Context, timeout time.Duration, name string, args ...st
 	cmd.Stderr = &buf
 	err := cmd.Run()
 	return strings.TrimSpace(buf.String()), err
-}
-
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
 }

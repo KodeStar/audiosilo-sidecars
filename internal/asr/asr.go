@@ -18,6 +18,7 @@ package asr
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"path/filepath"
 	"runtime"
@@ -119,9 +120,7 @@ type SelectConfig struct {
 // auto = mlx-whisper on darwin/arm64 when python3 is present, else whisper-cpp
 // when a whisper-cli binary is found, else unavailable.
 func Select(ctx context.Context, cfg SelectConfig) (Backend, Capability, error) {
-	if cfg.Log == nil {
-		cfg.Log = slog.New(slog.NewTextHandler(nopWriter{}, nil))
-	}
+	cfg.Log = orDiscard(cfg.Log)
 	switch normalizeBackend(cfg.Backend) {
 	case "mlx-whisper":
 		b := newMLXWhisper(cfg)
@@ -176,15 +175,10 @@ func normalizeBackend(b string) string {
 func toolsDir(dataDir string) string { return filepath.Join(dataDir, "tools") }
 
 // orDiscard returns log, or a discard logger when log is nil, so a directly
-// constructed backend never nil-panics on a log call.
+// constructed backend (and Select) never nil-panics on a log call.
 func orDiscard(log *slog.Logger) *slog.Logger {
 	if log != nil {
 		return log
 	}
-	return slog.New(slog.NewTextHandler(nopWriter{}, nil))
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
-
-// nopWriter is a no-op io.Writer for a discard logger (avoids importing io here).
-type nopWriter struct{}
-
-func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }

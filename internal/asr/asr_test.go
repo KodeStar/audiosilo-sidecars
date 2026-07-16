@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 )
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -149,6 +151,70 @@ while [ $# -gt 0 ]; do
 done
 printf '{"result":{"language":"en"},"transcription":[{"offsets":{"from":0,"to":1000},"text":" fake","tokens":[{"text":" fake","offsets":{"from":0,"to":500},"p":0.9}]}]}\n' > "$OF.json"
 `)
+}
+
+// TestMLXEnsurePinnedVersion exercises the in-place version-pin enforcement on an
+// existing venv (no platform guard, so it runs on any unix): a matching marker is
+// a no-op, while a missing or mismatched marker triggers a pip reinstall of the
+// pinned version and rewrites the marker - without rebuilding the venv.
+func TestMLXEnsurePinnedVersion(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fake pip is unix-only")
+	}
+	newFakeVenv := func(t *testing.T) (*mlxWhisper, string, string) {
+		t.Helper()
+		dataDir := t.TempDir()
+		b := newMLXWhisper(SelectConfig{DataDir: dataDir, Log: discardLogger()})
+		invocations := filepath.Join(dataDir, "pip-invocations")
+		// A fake pip that records that it ran (and its args) into a sentinel file.
+		writeScript(t, b.venvBin(dataDir, "pip"), fmt.Sprintf(`#!/bin/sh
+echo "$@" >> %q
+`, invocations))
+		return b, dataDir, invocations
+	}
+	ran := func(sentinel string) bool { _, err := os.Stat(sentinel); return err == nil }
+
+	t.Run("matching marker is a no-op", func(t *testing.T) {
+		b, dataDir, sentinel := newFakeVenv(t)
+		if err := b.writeVersionMarker(dataDir); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.ensurePinnedVersion(context.Background(), dataDir); err != nil {
+			t.Fatalf("ensurePinnedVersion: %v", err)
+		}
+		if ran(sentinel) {
+			t.Error("pip should NOT run when the marker already matches the pin")
+		}
+	})
+
+	t.Run("missing marker triggers reinstall", func(t *testing.T) {
+		b, dataDir, sentinel := newFakeVenv(t)
+		if err := b.ensurePinnedVersion(context.Background(), dataDir); err != nil {
+			t.Fatalf("ensurePinnedVersion: %v", err)
+		}
+		if !ran(sentinel) {
+			t.Error("pip should run to install the pin when no marker exists")
+		}
+		if got := b.readVersionMarker(dataDir); got != mlxWhisperVersion {
+			t.Errorf("marker after reinstall = %q, want %q", got, mlxWhisperVersion)
+		}
+	})
+
+	t.Run("mismatched marker triggers reinstall", func(t *testing.T) {
+		b, dataDir, sentinel := newFakeVenv(t)
+		if err := fsutil.WriteFileAtomic(b.versionMarkerPath(dataDir), []byte("0.0.1\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.ensurePinnedVersion(context.Background(), dataDir); err != nil {
+			t.Fatalf("ensurePinnedVersion: %v", err)
+		}
+		if !ran(sentinel) {
+			t.Error("pip should run to install the pin when the marker is stale")
+		}
+		if got := b.readVersionMarker(dataDir); got != mlxWhisperVersion {
+			t.Errorf("marker after reinstall = %q, want %q", got, mlxWhisperVersion)
+		}
+	})
 }
 
 func TestWhisperCppDetectAndTranscribe(t *testing.T) {

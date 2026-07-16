@@ -24,10 +24,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 )
 
 // Schema is the version tag every normalized transcript carries.
@@ -91,19 +92,19 @@ const (
 	formatWhisperCpp
 )
 
-// Name is the shared chapter stem ("ch%03d"), matching the FLAC/raw naming so the
+// name is the shared chapter stem ("ch%03d"), matching the FLAC/raw naming so the
 // three transcript layers line up per chapter.
-func Name(chapter int) string { return fmt.Sprintf("ch%03d", chapter) }
+func name(chapter int) string { return fmt.Sprintf("ch%03d", chapter) }
 
 // JSONName is the normalized-transcript filename for a chapter.
-func JSONName(chapter int) string { return Name(chapter) + ".json" }
+func JSONName(chapter int) string { return name(chapter) + ".json" }
 
 // TextName is the plain-text filename for a chapter.
-func TextName(chapter int) string { return Name(chapter) + ".txt" }
+func TextName(chapter int) string { return name(chapter) + ".txt" }
 
 // RawName is the raw-output filename a backend writes for a chapter (a backend's
 // own output naming derives from the input FLAC stem, which is this same stem).
-func RawName(chapter int) string { return Name(chapter) + ".json" }
+func RawName(chapter int) string { return name(chapter) + ".json" }
 
 // ParseChapter extracts the chapter number from a "chNNN.<ext>" filename, or
 // ok=false when the name is not a chapter file. It is the inverse of Name, used by
@@ -339,30 +340,37 @@ func PlainText(t Transcript) string {
 }
 
 // WriteNormalized writes t to jsonDir/chNNN.json (indented, trailing newline)
-// atomically. jsonDir is created if absent.
+// atomically. jsonDir is created if absent. It refuses to write into the immutable
+// raw layer (see guardNotRaw).
 func WriteNormalized(jsonDir string, t Transcript) error {
+	if err := guardNotRaw(jsonDir); err != nil {
+		return err
+	}
 	out, err := json.MarshalIndent(t, "", "  ")
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(filepath.Join(jsonDir, JSONName(t.Chapter)), append(out, '\n'))
+	return fsutil.WriteFileAtomic(filepath.Join(jsonDir, JSONName(t.Chapter)), append(out, '\n'), 0o644)
 }
 
 // WriteText writes the plain chapter text to textDir/chNNN.txt (trailing newline)
-// atomically. textDir is created if absent.
+// atomically. textDir is created if absent. It refuses to write into the immutable
+// raw layer (see guardNotRaw).
 func WriteText(textDir string, chapter int, text string) error {
-	return writeFileAtomic(filepath.Join(textDir, TextName(chapter)), []byte(text+"\n"))
+	if err := guardNotRaw(textDir); err != nil {
+		return err
+	}
+	return fsutil.WriteFileAtomic(filepath.Join(textDir, TextName(chapter)), []byte(text+"\n"), 0o644)
 }
 
-// writeFileAtomic writes data via a sibling temp file + rename so a crash never
-// leaves a half-written artifact a later run would trust.
-func writeFileAtomic(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		return err
+// guardNotRaw rejects an output directory whose base is the raw layer's directory
+// name (transcripts-raw). The raw backend output is durable audit evidence that
+// must stay byte-for-byte immutable; this is a cheap structural guard so a
+// derived-layer writer (sanitize today, the M4 correction/retranscribe writers
+// tomorrow) can never clobber it by being handed the wrong dir.
+func guardNotRaw(dir string) error {
+	if filepath.Base(filepath.Clean(dir)) == RawDir {
+		return fmt.Errorf("refusing to write into the immutable raw transcript layer %q", RawDir)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil { //nolint:gosec // non-secret artifact
-		return err
-	}
-	return os.Rename(tmp, path)
+	return nil
 }

@@ -75,7 +75,6 @@ func TestEnvOverrides(t *testing.T) {
 	t.Setenv("AUDIOSILO_SIDECARS_LISTEN", "127.0.0.1:7777")
 	t.Setenv("AUDIOSILO_SIDECARS_CORS_ORIGINS", "http://a.example, https://b.example ")
 	t.Setenv("AUDIOSILO_SIDECARS_AGENT_CONCURRENCY", "3")
-	t.Setenv("AUDIOSILO_SIDECARS_ASR_DEVICE", "cuda")
 	cfg, err := Load(dir)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -88,9 +87,6 @@ func TestEnvOverrides(t *testing.T) {
 	}
 	if cfg.Agent.Concurrency != 3 {
 		t.Errorf("concurrency = %d", cfg.Agent.Concurrency)
-	}
-	if cfg.ASR.Device != "cuda" {
-		t.Errorf("device = %q", cfg.ASR.Device)
 	}
 }
 

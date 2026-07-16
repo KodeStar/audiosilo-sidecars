@@ -50,16 +50,38 @@ func EnsureModel(ctx context.Context, url, destPath string, minBytes int64, log 
 		return "", err
 	}
 	log.Info("downloading ASR model (one time)", "url", url, "into", destPath)
-	if err := downloadModel(ctx, url, destPath, minBytes); err != nil {
+	if err := downloadModel(ctx, url, destPath, minBytes, log); err != nil {
 		return "", err
 	}
 	log.Info("ASR model ready", "path", destPath)
 	return destPath, nil
 }
 
+// progressStep is how much must download between progress log lines (~100 MiB), so
+// a multi-GiB first-run fetch reports steadily instead of going silent for minutes.
+const progressStep = 100 << 20
+
+// progressWriter is an io.Writer that logs cumulative download progress every
+// progressStep bytes. It counts only; the bytes flow to the real sink alongside it
+// (io.MultiWriter). Total exposes the final byte count for a completion log.
+type progressWriter struct {
+	log     *slog.Logger
+	Total   int64
+	nextLog int64
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	p.Total += int64(len(b))
+	if p.Total >= p.nextLog {
+		p.log.Info("downloading ASR model", "downloaded_mb", p.Total>>20)
+		p.nextLog += progressStep
+	}
+	return len(b), nil
+}
+
 // downloadModel streams url into a temp file beside destPath, enforces the size
-// floor and cap, and renames it into place on success.
-func downloadModel(ctx context.Context, url, destPath string, minBytes int64) error {
+// floor and cap, logs progress as it goes, and renames it into place on success.
+func downloadModel(ctx context.Context, url, destPath string, minBytes int64, log *slog.Logger) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -81,7 +103,8 @@ func downloadModel(ctx context.Context, url, destPath string, minBytes int64) er
 	tmpName := tmp.Name()
 	defer func() { _ = os.Remove(tmpName) }() // no-op once renamed
 
-	n, err := io.Copy(tmp, io.LimitReader(resp.Body, maxModelBytes+1))
+	pw := &progressWriter{log: log, nextLog: progressStep}
+	n, err := io.Copy(io.MultiWriter(tmp, pw), io.LimitReader(resp.Body, maxModelBytes+1))
 	if err != nil {
 		_ = tmp.Close()
 		return err
@@ -95,5 +118,6 @@ func downloadModel(ctx context.Context, url, destPath string, minBytes int64) er
 	if n < minBytes {
 		return fmt.Errorf("model %s is only %d bytes (< %d floor); likely truncated or an error page", url, n, minBytes)
 	}
+	log.Info("ASR model download complete", "downloaded_mb", n>>20, "bytes", n)
 	return os.Rename(tmpName, destPath)
 }

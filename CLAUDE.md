@@ -99,8 +99,12 @@ internal/
             {ffmpeg_path,ffprobe_path,auto_download} - the SINGLE source of truth for
             tool paths (the ffprobe knob lives under tools.*; the folder scan uses
             the resolved path). M3a made asr.* live: backend
-            (auto|mlx-whisper|whisper-cpp), model, language, whisper_cli_path (device
-            informational). agent-model routing stays a typed stub.
+            (auto|mlx-whisper|whisper-cpp), model, language, whisper_cli_path. There
+            is no asr.device knob (no backend honors an override yet; /system reports
+            the DETECTED device). Changing asr.backend or the tool paths takes effect
+            only on a daemon RESTART (the backend is resolved once at startup, unlike
+            cors_origins, which the API re-reads live per request). agent-model
+            routing stays a typed stub.
   toolfetch/ resolve ffmpeg/ffprobe (explicit path -> next to the binary -> $PATH ->
             HTTPS download from pinned hosts into <data>/tools when auto_download,
             extracted fully in-process (archive/zip + archive/tar over an xz decoder,
@@ -139,7 +143,12 @@ internal/
             0444, write asr.json provenance, account scratch), sanitizing ->
             internal/transcript normalization; every other stage -> the stub (M4+
             replaces more; retranscribing is still a stub). Constructed in server.go
-            with the toolfetch-resolved paths and the asr.Select-chosen backend.
+            with the toolfetch-resolved paths and the asr.Select-chosen backend. The
+            sanitizing stage deliberately RE-DERIVES all chapters every run (cheap,
+            idempotent, raw is the source of truth) rather than tracking per-chapter
+            freshness. Missing tools PARK a book needs_attention (ASR unavailable, or
+            ffmpeg/ffprobe unresolved) instead of hard-failing - a human-fixable
+            startup precondition that Retry re-admits.
   auth/     single admin password (argon2id, generated + printed once on first run),
             opaque SHA-256-hashed session tokens, a per-IP login rate limiter; the
             Store interface is storage-agnostic (MemStore for tests; the SQLite

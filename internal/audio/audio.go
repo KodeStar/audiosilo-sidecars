@@ -21,6 +21,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 )
 
 // Artifact filenames inside a book's work dir.
@@ -131,7 +133,7 @@ func WriteManifest(workDir string, m Manifest) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(filepath.Join(workDir, ManifestName), append(out, '\n'))
+	return fsutil.WriteFileAtomic(filepath.Join(workDir, ManifestName), append(out, '\n'), 0o644)
 }
 
 // ReadManifest loads workDir/manifest.json.
@@ -145,17 +147,4 @@ func ReadManifest(workDir string) (Manifest, error) {
 		return Manifest{}, err
 	}
 	return m, nil
-}
-
-// writeFileAtomic writes data to path via a sibling temp file + rename, so a
-// crash never leaves a half-written artifact a later run would trust.
-func writeFileAtomic(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil { //nolint:gosec // non-secret artifact
-		return err
-	}
-	return os.Rename(tmp, path)
 }

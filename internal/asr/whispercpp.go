@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 	"github.com/kodestar/audiosilo-sidecars/internal/toolfetch"
 )
 
@@ -107,7 +108,7 @@ func (w *whisperCpp) Transcribe(ctx context.Context, job Job) error {
 		return fmt.Errorf("whisper-cli not found; cannot transcribe")
 	}
 	model := w.modelPath(w.dataDir)
-	if !fileExists(model) {
+	if !fsutil.IsFile(model) {
 		return fmt.Errorf("whisper.cpp model not present (%s); run EnsureReady", model)
 	}
 	lang := job.Language

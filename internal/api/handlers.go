@@ -134,7 +134,6 @@ func (a *API) handleSystem(w http.ResponseWriter, r *http.Request) {
 
 type asrView struct {
 	Backend string `json:"backend"`
-	Device  string `json:"device"`
 }
 
 type agentView struct {
@@ -170,7 +169,7 @@ func (a *API) settingsView() (settingsResponse, error) {
 		Listen:      cfg.Listen,
 		CORSOrigins: origins,
 		Secrets:     pres,
-		ASR:         asrView{Backend: cfg.ASR.Backend, Device: cfg.ASR.Device},
+		ASR:         asrView{Backend: cfg.ASR.Backend},
 		Agent:       agentView{Backend: cfg.Agent.Backend, Concurrency: cfg.Agent.Concurrency},
 	}, nil
 }

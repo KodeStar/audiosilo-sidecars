@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -26,10 +27,11 @@ import (
 // to observe/block a chapter (for cancel/resume tests). It never touches a real
 // model or the network.
 type fakeBackend struct {
-	mu          sync.Mutex
-	transcribed map[int]int // chapter -> transcribe count
-	before      func(chapter int)
-	block       chan struct{} // when non-nil, Transcribe waits on it (or ctx)
+	mu            sync.Mutex
+	transcribed   map[int]int // chapter -> transcribe count
+	before        func(chapter int)
+	block         chan struct{} // when non-nil, Transcribe waits on it (or ctx)
+	transcribeErr error         // when non-nil, Transcribe returns it (a real failure)
 }
 
 func newFakeBackend() *fakeBackend { return &fakeBackend{transcribed: map[int]int{}} }
@@ -52,6 +54,9 @@ func (f *fakeBackend) Transcribe(ctx context.Context, job asr.Job) error {
 			return ctx.Err()
 		case <-f.block:
 		}
+	}
+	if f.transcribeErr != nil {
+		return f.transcribeErr
 	}
 	f.mu.Lock()
 	f.transcribed[job.Chapter]++
@@ -422,19 +427,61 @@ func TestASRStageResumesSkippingCompleted(t *testing.T) {
 	}
 }
 
-// TestASRStageUnavailableFails asserts a book fails clearly when no ASR backend is
-// available, rather than silently advancing.
-func TestASRStageUnavailableFails(t *testing.T) {
+// TestASRStageUnavailableParks asserts a book PARKS needs_attention (not a hard
+// failure) when no ASR backend is available, carrying the capability detail so a
+// human knows what to fix before retrying.
+func TestASRStageUnavailableParks(t *testing.T) {
 	work := t.TempDir()
 	writeManifest(t, work, 1)
 	seedFLACs(t, work, 1)
 	exe := NewExecutor(nil, "", "", t.TempDir(), ASRSetup{Backend: nil, Cap: asr.Capability{Available: false, Detail: "no python3"}}, scheduler.NewStubExecutor(0, 0))
 	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil)
-	if err == nil {
-		t.Fatal("asr stage should fail when the backend is unavailable")
+	var pe *scheduler.ParkError
+	if !errors.As(err, &pe) {
+		t.Fatalf("asr stage error = %v, want a ParkError (needs_attention)", err)
 	}
-	if !strings.Contains(err.Error(), "no python3") {
-		t.Errorf("error = %v, want it to carry the unavailability detail", err)
+	if !strings.Contains(pe.Reason, "no python3") {
+		t.Errorf("park reason = %q, want it to carry the unavailability detail", pe.Reason)
+	}
+}
+
+// TestASRStageTranscribeFailureFails asserts a genuine transcription error (an
+// available backend whose Transcribe fails) is a HARD failure, not a park - only a
+// missing precondition parks.
+func TestASRStageTranscribeFailureFails(t *testing.T) {
+	work := t.TempDir()
+	writeManifest(t, work, 1)
+	seedFLACs(t, work, 1)
+	fake := newFakeBackend()
+	fake.transcribeErr = errors.New("model exploded")
+	exe := NewExecutor(nil, "", "", t.TempDir(), fakeASR(fake), scheduler.NewStubExecutor(0, 0))
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil)
+	if err == nil {
+		t.Fatal("a transcription failure should fail the stage")
+	}
+	var pe *scheduler.ParkError
+	if errors.As(err, &pe) {
+		t.Errorf("a transcription failure must not park; got ParkError %q", pe.Reason)
+	}
+}
+
+// TestStagesParkWhenMediaToolsMissing asserts inspect (no ffprobe) and split (no
+// ffmpeg) PARK needs_attention with the media-tools message, rather than
+// hard-failing, since a missing tool is a human-fixable startup precondition.
+func TestStagesParkWhenMediaToolsMissing(t *testing.T) {
+	work := t.TempDir()
+	// Empty ffmpeg/ffprobe paths => unresolved tools.
+	exe := NewExecutor(nil, "", "", t.TempDir(), fakeASR(newFakeBackend()), scheduler.NewStubExecutor(0, 0))
+	book := store.Book{ID: 1, WorkDir: work, SourcePath: filepath.Join(work, "book.m4b")}
+	for _, stage := range []state.State{state.Inspecting, state.Splitting} {
+		_, err := exe.Execute(context.Background(), book, stage, nil)
+		var pe *scheduler.ParkError
+		if !errors.As(err, &pe) {
+			t.Fatalf("stage %s error = %v, want a ParkError", stage, err)
+		}
+		if pe.Reason != MediaToolsUnavailableMsg {
+			t.Errorf("stage %s park reason = %q, want %q", stage, pe.Reason, MediaToolsUnavailableMsg)
+		}
 	}
 }
 

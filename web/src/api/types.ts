@@ -43,7 +43,6 @@ export interface SecretsPresence {
 
 export interface AsrConfig {
   backend: string;
-  device: string;
 }
 
 export interface AgentConfig {

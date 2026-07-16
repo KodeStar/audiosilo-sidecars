@@ -193,6 +193,31 @@ func TestFiniteHelper(t *testing.T) {
 	}
 }
 
+func TestWritersRejectRawLayer(t *testing.T) {
+	root := t.TempDir()
+	rawDir := filepath.Join(root, RawDir)
+
+	if err := WriteNormalized(rawDir, Transcript{Schema: Schema, Chapter: 1}); err == nil {
+		t.Error("WriteNormalized into transcripts-raw should be refused")
+	}
+	if err := WriteText(rawDir, 1, "text"); err == nil {
+		t.Error("WriteText into transcripts-raw should be refused")
+	}
+	// Nothing was written into the guarded dir.
+	if _, err := os.Stat(rawDir); err == nil {
+		t.Error("refused write must not create the raw dir")
+	}
+
+	// A normal derived dir is accepted.
+	jsonDir := filepath.Join(root, JSONDir)
+	if err := WriteNormalized(jsonDir, Transcript{Schema: Schema, Chapter: 1}); err != nil {
+		t.Errorf("WriteNormalized into %s: %v", JSONDir, err)
+	}
+	if err := WriteText(filepath.Join(root, TextDir), 1, "text"); err != nil {
+		t.Errorf("WriteText into %s: %v", TextDir, err)
+	}
+}
+
 func readFixture(t *testing.T, name string) []byte {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("testdata", name))

@@ -56,11 +56,15 @@ const (
 // selects/forces an ASR backend; Model/Language fall back to each backend's
 // default when empty (mlx-community/whisper-large-v3-turbo or
 // ggml-large-v3-turbo.bin; "en"). WhisperCLIPath explicitly locates the
-// whisper.cpp binary. Device is informational for now (the backend reports the
-// real device it detected on /system).
+// whisper.cpp binary. The device is NOT a config knob (no backend honors an
+// override yet) - /system reports the device the resolved backend actually
+// detected; a device override can return here once a backend honors it.
+//
+// Changing asr.backend (or the tool paths) takes effect only on a daemon RESTART:
+// the backend is resolved once at startup (asr.Select in server.go). This is unlike
+// cors_origins, which the API re-reads live per request.
 type ASRConfig struct {
 	Backend        string `yaml:"backend"`          // "auto" | "mlx-whisper" | "whisper-cpp"
-	Device         string `yaml:"device"`           // informational: metal|cuda|vulkan|cpu
 	Model          string `yaml:"model"`            // "" defaults per backend
 	Language       string `yaml:"language"`         // "" defaults to "en"
 	WhisperCLIPath string `yaml:"whisper_cli_path"` // explicit whisper-cli location
@@ -207,9 +211,6 @@ func applyEnv(cfg *Config) {
 	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_ASR_BACKEND"); ok {
 		cfg.ASR.Backend = strings.TrimSpace(v)
-	}
-	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_ASR_DEVICE"); ok {
-		cfg.ASR.Device = v
 	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_ASR_MODEL"); ok {
 		cfg.ASR.Model = strings.TrimSpace(v)

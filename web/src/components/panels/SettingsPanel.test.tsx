@@ -8,7 +8,7 @@ const settings: Settings = {
   listen: '127.0.0.1:8090',
   cors_origins: [],
   secrets: { anthropic_api_key: false, openai_api_key: false, github_pat: false },
-  asr: { backend: '', device: '' },
+  asr: { backend: '' },
   agent: { backend: '', concurrency: 2 },
 };
 

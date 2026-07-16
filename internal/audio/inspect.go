@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 )
 
 // probeTimeout bounds a single ffprobe invocation.
@@ -162,7 +164,7 @@ func inspectMarkers(ctx context.Context, bookFile, workDir, ffprobePath string) 
 	if err != nil {
 		return Manifest{}, false, fmt.Errorf("ffprobe %s: %w", bookFile, err)
 	}
-	if err := writeFileAtomic(filepath.Join(workDir, ProbeName), raw); err != nil {
+	if err := fsutil.WriteFileAtomic(filepath.Join(workDir, ProbeName), raw, 0o644); err != nil {
 		return Manifest{}, false, err
 	}
 
@@ -229,7 +231,7 @@ func inspectFiles(ctx context.Context, files []string, workDir, ffprobePath stri
 	if err != nil {
 		return Manifest{}, false, err
 	}
-	if err := writeFileAtomic(filepath.Join(workDir, ProbeName), append(rawSummary, '\n')); err != nil {
+	if err := fsutil.WriteFileAtomic(filepath.Join(workDir, ProbeName), append(rawSummary, '\n'), 0o644); err != nil {
 		return Manifest{}, false, err
 	}
 	m := Manifest{

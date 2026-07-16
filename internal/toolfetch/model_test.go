@@ -1,7 +1,9 @@
 package toolfetch
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -49,6 +51,33 @@ func TestEnsureModelDownloadsAndCaches(t *testing.T) {
 	}
 	if hits != 1 {
 		t.Errorf("server hits = %d, want 1 (second call should be cached)", hits)
+	}
+}
+
+func TestEnsureModelLogsCompletion(t *testing.T) {
+	body := strings.Repeat("M", 8192)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	restore := http.DefaultTransport
+	http.DefaultTransport = srv.Client().Transport
+	defer func() { http.DefaultTransport = restore }()
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "ggml.bin")
+	if _, err := EnsureModel(context.Background(), srv.URL+"/x", dest, int64(len(body)), log); err != nil {
+		t.Fatalf("EnsureModel: %v", err)
+	}
+	// The download still works and the completion line is logged (progress lines fire
+	// only past the 100 MiB step, so a small body just gets the completion log).
+	if got, err := os.ReadFile(dest); err != nil || len(got) != len(body) {
+		t.Fatalf("downloaded file wrong: err=%v len=%d", err, len(got))
+	}
+	if !strings.Contains(buf.String(), "ASR model download complete") {
+		t.Errorf("expected a completion log line, got:\n%s", buf.String())
 	}
 }
 

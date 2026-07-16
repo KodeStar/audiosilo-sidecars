@@ -23,6 +23,7 @@ import (
 
 	"github.com/kodestar/audiosilo-sidecars/internal/asr"
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
+	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/scratch"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
@@ -41,8 +42,10 @@ type ASRSetup struct {
 }
 
 // Executor is the composite stage executor. ffmpeg/ffprobe are the resolved tool
-// paths ("" when unavailable, in which case the audio stages fail their book with
-// a clear error while the rest of the daemon keeps working). dataDir is the daemon
+// paths ("" when unavailable, in which case the audio stages PARK their book
+// needs_attention with a clear, human-fixable message while the rest of the daemon
+// keeps working - a missing tool is a startup precondition a person can fix and
+// retry, not a hard failure). dataDir is the daemon
 // data dir the ASR backend derives its venv/model cache from. fallback runs every
 // stage the real executors don't yet implement. db is used to account a book's
 // scratch size once a stage has written durable artifacts.
@@ -90,6 +93,13 @@ func (e *Executor) Execute(ctx context.Context, book store.Book, stage state.Sta
 // test (and later the UI) can assert/label it exactly.
 const MarkersNormalizingMsg = "chapter markers need manual mapping - automatic normalization arrives in a later milestone (M5)"
 
+// MediaToolsUnavailableMsg is the needs_attention reason the audio stages park a
+// book with when ffmpeg/ffprobe could not be resolved at startup. It is a
+// known-at-startup, human-fixable precondition (install the tools or enable
+// auto-download), so parking - which Retry re-admits - fits better than a hard
+// failure. Exported so a test (and the UI) can assert/label it exactly.
+const MediaToolsUnavailableMsg = "media tools unavailable: ffmpeg/ffprobe not found - install them or enable auto-download, then retry"
+
 // asrInfoName is the provenance sidecar the asr stage writes (backend/model/
 // language) and the sanitize stage reads to stamp normalized transcripts.
 const asrInfoName = "asr.json"
@@ -105,6 +115,9 @@ type asrProvenance struct {
 // records whether the chapter markers are contiguous (drives the
 // markers_normalizing skip). It writes the stage sentinel as its final action.
 func (e *Executor) inspect(ctx context.Context, book store.Book) (scheduler.StageResult, error) {
+	if e.ffprobe == "" {
+		return scheduler.StageResult{}, scheduler.Park(MediaToolsUnavailableMsg)
+	}
 	manifest, contiguous, err := audio.Inspect(ctx, book.SourcePath, book.WorkDir, e.ffprobe)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("inspect: %w", err)
@@ -127,6 +140,9 @@ func (e *Executor) inspect(ctx context.Context, book store.Book) (scheduler.Stag
 // split converts each manifest chapter into a mono/16 kHz FLAC, reporting progress
 // per chapter, then writes the stage sentinel.
 func (e *Executor) split(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
+	if e.ffmpeg == "" {
+		return scheduler.StageResult{}, scheduler.Park(MediaToolsUnavailableMsg)
+	}
 	manifest, err := audio.ReadManifest(book.WorkDir)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("split: read manifest (inspect must run first): %w", err)
@@ -161,7 +177,10 @@ func (e *Executor) split(ctx context.Context, book store.Book, report scheduler.
 // separate stage (sanitizing) so the raw layer stays untouched.
 func (e *Executor) asrStage(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
 	if e.asr.Backend == nil || !e.asr.Cap.Available {
-		return scheduler.StageResult{}, fmt.Errorf("asr: no speech-recognition backend available: %s", asrUnavailableDetail(e.asr.Cap))
+		// A missing ASR backend is a known-at-startup, human-fixable precondition
+		// (install python3+mlx-whisper or a whisper-cli binary), so park the book
+		// needs_attention - which Retry re-admits - rather than hard-fail it.
+		return scheduler.StageResult{}, scheduler.Park("ASR unavailable: " + asrUnavailableDetail(e.asr.Cap) + " - fix this, then retry")
 	}
 	manifest, err := audio.ReadManifest(book.WorkDir)
 	if err != nil {
@@ -200,7 +219,7 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, report schedul
 		}
 		_ = os.Remove(rawPath) // clear any malformed/partial output before retrying
 		flac := filepath.Join(book.WorkDir, audio.ChaptersDir, audio.ChapterFileName(ch.Chapter))
-		if !fileExists(flac) {
+		if !fsutil.IsFile(flac) {
 			return scheduler.StageResult{}, fmt.Errorf("asr: chapter %d FLAC missing (%s); split must run first", ch.Chapter, flac)
 		}
 		// InitialPrompt is intentionally empty in M3a: verified spellings come from the
@@ -246,8 +265,11 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, report schedul
 
 // sanitize derives transcripts-json/ (normalized audiosilo-transcript/v1, NaN->null)
 // and transcripts-text/ (concatenated segment text) from the immutable
-// transcripts-raw/ layer. It is idempotent (each derived file is rewritten) and
-// respects ctx cancellation. It never writes into transcripts-raw/.
+// transcripts-raw/ layer. It respects ctx cancellation and never writes into
+// transcripts-raw/. It deliberately re-derives EVERY chapter on each run (the
+// derivation is cheap and idempotent) rather than tracking per-chapter freshness -
+// the raw layer is the single source of truth, so a full re-derive is always
+// correct and avoids a staleness-tracking bug class for no measurable cost.
 func (e *Executor) sanitize(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
 	rawDir := filepath.Join(book.WorkDir, transcript.RawDir)
 	entries, err := os.ReadDir(rawDir)
@@ -342,12 +364,7 @@ func writeASRProvenance(workDir string, p asrProvenance) error {
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(workDir, asrInfoName)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(out, '\n'), 0o644); err != nil { //nolint:gosec // non-secret artifact
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fsutil.WriteFileAtomic(filepath.Join(workDir, asrInfoName), append(out, '\n'), 0o644)
 }
 
 // readASRProvenance loads the asr.json provenance, returning a zero value (blank
@@ -369,12 +386,6 @@ func asrUnavailableDetail(cap asr.Capability) string {
 		return cap.Detail
 	}
 	return "no backend configured"
-}
-
-// fileExists reports whether path is an existing regular file.
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
 }
 
 // metrics marshals a stage's metrics map, tolerating a marshal failure (metrics
