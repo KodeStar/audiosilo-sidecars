@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/api"
+	"github.com/kodestar/audiosilo-sidecars/internal/asr"
 	"github.com/kodestar/audiosilo-sidecars/internal/auth"
 	"github.com/kodestar/audiosilo-sidecars/internal/config"
 	"github.com/kodestar/audiosilo-sidecars/internal/events"
@@ -117,15 +118,43 @@ func Run(ctx context.Context, opts Options) error {
 	fmt.Fprintf(opts.Out, "[info] media tools: ffmpeg=%s ffprobe=%s\n",
 		toolDisplay(tools.FFmpeg), toolDisplay(tools.FFprobe))
 
+	// Resolve the ASR backend once at startup (auto/mlx-whisper/whisper-cpp). Detect
+	// is cheap and side-effect-free; the expensive EnsureReady (venv build / model
+	// download) runs lazily on the first book's asr stage. An unavailable backend is
+	// surfaced on /system and fails a book's asr stage with a clear message while the
+	// rest of the daemon works.
+	asrBackend, asrCap, err := asr.Select(ctx, asr.SelectConfig{
+		Backend:        cfg.ASR.Backend,
+		Model:          cfg.ASR.Model,
+		Language:       cfg.ASR.Language,
+		WhisperCLIPath: cfg.ASR.WhisperCLIPath,
+		DataDir:        opts.DataDir,
+		Log:            toolLog,
+	})
+	if err != nil {
+		return fmt.Errorf("select asr backend: %w", err)
+	}
+	asrModel := cfg.ASR.Model
+	if asrModel == "" {
+		asrModel = asr.DefaultModelFor(asrCap.Backend)
+	}
+	fmt.Fprintf(opts.Out, "[info] asr backend: %s (available=%v device=%s)%s\n",
+		asrCap.Backend, asrCap.Available, asrCap.Device, asrDetailSuffix(asrCap))
+
 	// Pipeline wiring: the metadata client, the async scan manager (using the
 	// resolved ffprobe), and the three-lane scheduler over the composite executor
-	// (real inspect/split from internal/pipeline, stubs beyond). The scheduler runs
-	// its own goroutine (under a child context so it can be stopped independently)
-	// and reconciles crash state on start.
+	// (real inspect/split/asr/sanitize from internal/pipeline, stubs beyond). The
+	// scheduler runs its own goroutine (under a child context so it can be stopped
+	// independently) and reconciles crash state on start.
 	metaClient := metaops.NewClient(cfg.Metadata.BaseURL)
 	scanMgr := metaops.NewScanManager(ctx, metaClient, tools.FFprobe)
 	workRoot := filepath.Join(opts.DataDir, "work")
-	exec := pipeline.NewExecutor(db, tools.FFmpeg, tools.FFprobe, scheduler.NewStubExecutor(0, 0))
+	exec := pipeline.NewExecutor(db, tools.FFmpeg, tools.FFprobe, opts.DataDir, pipeline.ASRSetup{
+		Backend:  asrBackend,
+		Cap:      asrCap,
+		Model:    asrModel,
+		Language: cfg.ASR.Language,
+	}, scheduler.NewStubExecutor(0, 0))
 	sched := scheduler.New(db, hub, exec, cfg.Agent.Concurrency, workRoot)
 	schedCtx, cancelSched := context.WithCancel(ctx)
 	defer cancelSched()
@@ -151,6 +180,13 @@ func Run(ctx context.Context, opts Options) error {
 		Save:        func(c config.Config) error { return config.Save(opts.DataDir, c) },
 		FFmpegPath:  tools.FFmpeg,
 		FFprobePath: tools.FFprobe,
+		ASR: api.ASRInfo{
+			Backend:   asrCap.Backend,
+			Available: asrCap.Available,
+			Device:    asrCap.Device,
+			Version:   asrCap.Version,
+			Detail:    asrCap.Detail,
+		},
 	}).Handler()
 
 	root := http.NewServeMux()
@@ -294,6 +330,15 @@ func shutdown(srv *http.Server) error {
 // dataFile returns the config file path used to detect a first run.
 func dataFile(dir string) string {
 	return dir + string(os.PathSeparator) + config.FileName
+}
+
+// asrDetailSuffix appends the ASR unavailability reason to the startup log line
+// when the backend is not ready, so the operator sees why immediately.
+func asrDetailSuffix(cap asr.Capability) string {
+	if cap.Available || cap.Detail == "" {
+		return ""
+	}
+	return " - " + cap.Detail
 }
 
 // toolDisplay renders a resolved tool path for the startup log, marking an

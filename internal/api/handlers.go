@@ -94,6 +94,9 @@ type systemResponse struct {
 	Listen  string    `json:"listen"`
 	Tabs    []tabInfo `json:"tabs"`
 	Tools   toolsInfo `json:"tools"`
+	// ASR is the resolved speech-recognition backend capability (whether ASR will
+	// run and on what device).
+	ASR ASRInfo `json:"asr"`
 	// ScratchBytes is the daemon-total on-disk scratch (the sum of every book's
 	// work dir under <data>/work), the disk gauge the UI shows.
 	ScratchBytes int64 `json:"scratch_bytes"`
@@ -122,6 +125,7 @@ func (a *API) handleSystem(w http.ResponseWriter, r *http.Request) {
 		Listen:       cfg.Listen,
 		Tabs:         tabs,
 		Tools:        toolsInfo{FFmpeg: a.ffmpeg, FFprobe: a.ffprobe},
+		ASR:          a.asr,
 		ScratchBytes: scratchTotal,
 	})
 }

@@ -42,6 +42,18 @@ type Deps struct {
 	// can see which media tools the audio stages will use.
 	FFmpegPath  string
 	FFprobePath string
+	// ASR is the speech-recognition backend resolved at startup, surfaced read-only
+	// on /system so the UI/operator can see whether ASR will run and on what device.
+	ASR ASRInfo
+}
+
+// ASRInfo is the resolved ASR backend capability shown on /system.
+type ASRInfo struct {
+	Backend   string `json:"backend"`
+	Available bool   `json:"available"`
+	Device    string `json:"device"`
+	Version   string `json:"version"`
+	Detail    string `json:"detail"`
 }
 
 // API is the HTTP transport.
@@ -57,6 +69,7 @@ type API struct {
 	scans   *metaops.ScanManager
 	ffmpeg  string
 	ffprobe string
+	asr     ASRInfo
 
 	mu   sync.Mutex // guards cfg
 	cfg  config.Config
@@ -81,6 +94,7 @@ func New(d Deps) *API {
 		scans:   d.Scans,
 		ffmpeg:  d.FFmpegPath,
 		ffprobe: d.FFprobePath,
+		asr:     d.ASR,
 		cfg:     d.Config,
 		save:    save,
 	}

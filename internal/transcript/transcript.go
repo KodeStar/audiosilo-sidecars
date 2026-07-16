@@ -26,6 +26,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -103,6 +104,21 @@ func TextName(chapter int) string { return Name(chapter) + ".txt" }
 // RawName is the raw-output filename a backend writes for a chapter (a backend's
 // own output naming derives from the input FLAC stem, which is this same stem).
 func RawName(chapter int) string { return Name(chapter) + ".json" }
+
+// ParseChapter extracts the chapter number from a "chNNN.<ext>" filename, or
+// ok=false when the name is not a chapter file. It is the inverse of Name, used by
+// the sanitize stage to enumerate raw transcripts.
+func ParseChapter(name string) (int, bool) {
+	base := strings.TrimSuffix(name, filepath.Ext(name))
+	if !strings.HasPrefix(base, "ch") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(base, "ch"))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
 
 // Complete reports whether raw is a structurally complete transcript for either
 // recognized format: a parseable document whose primary array (segments /

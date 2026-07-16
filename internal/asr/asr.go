@@ -48,6 +48,20 @@ const (
 // empty.
 const DefaultLanguage = "en"
 
+// DefaultModelFor returns the default model identifier a backend uses when config
+// leaves asr.model empty, so a caller can record accurate provenance without
+// asking the backend. An unknown backend id returns "".
+func DefaultModelFor(backendID string) string {
+	switch backendID {
+	case IDMLXWhisper:
+		return DefaultMLXModel
+	case IDWhisperCpp:
+		return DefaultWhisperCppModel
+	default:
+		return ""
+	}
+}
+
 // Capability describes a backend's readiness, surfaced on /system so the operator
 // can see whether ASR will run and on what device. Detail carries a human message
 // when Available is false (e.g. "python3 not found").

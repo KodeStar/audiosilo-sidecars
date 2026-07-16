@@ -41,6 +41,7 @@ func newTestEnv(t *testing.T) *testEnv {
 		Version: "test",
 		DataDir: "/tmp/data",
 		Config:  config.Default(),
+		ASR:     ASRInfo{Backend: "mlx-whisper", Available: true, Device: "metal", Version: "Python 3.13"},
 		Save: func(c config.Config) error {
 			cp := c
 			env.saved = &cp
@@ -145,6 +146,9 @@ func TestSystemRequiresAuth(t *testing.T) {
 	}
 	if len(sys.Tabs) != 4 {
 		t.Errorf("tabs = %d, want 4", len(sys.Tabs))
+	}
+	if sys.ASR.Backend != "mlx-whisper" || !sys.ASR.Available || sys.ASR.Device != "metal" {
+		t.Errorf("asr info = %+v, want mlx-whisper/available/metal", sys.ASR)
 	}
 }
 
