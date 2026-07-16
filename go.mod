@@ -3,7 +3,7 @@ module github.com/kodestar/audiosilo-sidecars
 go 1.25.0
 
 require (
-	github.com/kodestar/audiosilo-meta v0.6.1-0.20260716160322-398615678e6e
+	github.com/kodestar/audiosilo-meta v0.6.1-0.20260716163951-388caf6c0473
 	github.com/ulikunitz/xz v0.5.15
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/crypto v0.54.0

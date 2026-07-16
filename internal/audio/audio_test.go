@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/kodestar/audiosilo-meta/pkg/scan"
 )
 
 // --- pure marker parsing / contiguity (no ffmpeg) ---
@@ -117,10 +119,17 @@ func TestCompleteNearZeroDuration(t *testing.T) {
 	}
 }
 
-func TestNaturalLess(t *testing.T) {
+// TestNaturalOrder is this repo's CONSUMER-LEVEL regression for the multi-file
+// ordering contract: the comparator now lives upstream (audiosilo-meta
+// pkg/scan.NaturalLess - one shared implementation, no local copy to drift), and
+// this test guards both the import wiring and the ordering this package depends
+// on, since the split order determines chapter numbers that spoiler-gate
+// community sidecars (position.chapter). Upstream's natsort_test owns the
+// exhaustive comparator cases.
+func TestNaturalOrder(t *testing.T) {
 	order := func(in []string) []string {
 		out := append([]string(nil), in...)
-		sort.SliceStable(out, func(i, j int) bool { return naturalLess(out[i], out[j]) })
+		sort.SliceStable(out, func(i, j int) bool { return scan.NaturalLess(out[i], out[j]) })
 		return out
 	}
 	cases := []struct {
@@ -142,6 +151,27 @@ func TestNaturalLess(t *testing.T) {
 	dup := order([]string{"track 3", "track 3", "track 1"})
 	if !reflect.DeepEqual(dup, []string{"track 1", "track 3", "track 3"}) {
 		t.Errorf("stable tie order = %v", dup)
+	}
+
+	// And the real consumer path: audioFilesIn returns a folder's audio files in
+	// that same order ("Chapter 2" before "Chapter 10", non-audio ignored).
+	dir := t.TempDir()
+	for _, name := range []string{"Chapter 10.mp3", "Chapter 2.mp3", "Chapter 1.mp3", "cover.jpg"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil { //nolint:gosec // test artifact
+			t.Fatal(err)
+		}
+	}
+	files, err := audioFilesIn(dir)
+	if err != nil {
+		t.Fatalf("audioFilesIn: %v", err)
+	}
+	var bases []string
+	for _, f := range files {
+		bases = append(bases, filepath.Base(f))
+	}
+	want := []string{"Chapter 1.mp3", "Chapter 2.mp3", "Chapter 10.mp3"}
+	if !reflect.DeepEqual(bases, want) {
+		t.Errorf("audioFilesIn order = %v, want %v", bases, want)
 	}
 }
 
