@@ -27,9 +27,17 @@ const FileName = "config.yaml"
 // exposed to the network unless the operator opts in.
 const DefaultListen = "127.0.0.1:8090"
 
-// DefaultConcurrency is the default number of parallel agent slots (Lane B). It
-// is a stub for M0 - the scheduler that honours it lands in a later milestone.
+// DefaultConcurrency is the default number of parallel agent slots (Lane B),
+// honoured by the scheduler's agent lane (M1).
 const DefaultConcurrency = 2
+
+// DefaultMetadataBaseURL is the community metadata API the coverage/lookup client
+// queries. Overridable (env / config) so tests can point at a local httptest.
+const DefaultMetadataBaseURL = "https://meta.audiosilo.app"
+
+// DefaultFFprobePath is the ffprobe binary the folder scan uses for
+// runtime/chapter enrichment. "" disables enrichment; "ffprobe" resolves on PATH.
+const DefaultFFprobePath = "ffprobe"
 
 // ASRConfig holds automatic-speech-recognition settings. It is a typed stub for
 // M0: the fields are wired through so the Settings UI and later milestones share
@@ -50,6 +58,20 @@ type AgentConfig struct {
 	OpenAI      map[string]string `yaml:"openai"`      // stage -> model (M5)
 }
 
+// MetadataConfig points the coverage/lookup client at the community metadata API.
+type MetadataConfig struct {
+	// BaseURL is the metadata API root. Must be an absolute http(s) URL. Empty
+	// disables coverage lookups (the scan still runs; books are marked unknown).
+	BaseURL string `yaml:"base_url"`
+}
+
+// ScanConfig tunes the folder scan.
+type ScanConfig struct {
+	// FFprobePath is the ffprobe binary for runtime/chapter enrichment. ""
+	// disables it; "ffprobe" resolves on PATH.
+	FFprobePath string `yaml:"ffprobe_path"`
+}
+
 // Config is the daemon configuration.
 type Config struct {
 	// Listen is the HTTP bind address (host:port). Defaults to loopback.
@@ -58,7 +80,17 @@ type Config struct {
 	// cross-origin (for a separately-deployed UI container). Empty = same-origin
 	// only, which is the secure default.
 	CORSOrigins []string `yaml:"cors_origins"`
-	// ASR and Agent are typed stubs consumed by later milestones.
+	// LibraryRoots restricts which local directories a scan may target. Empty =
+	// allow any local path (the loopback trust model); when non-empty, a scan
+	// path must be inside one of these absolute roots. Each entry must be an
+	// absolute path.
+	LibraryRoots []string `yaml:"library_roots"`
+	// Metadata configures the community metadata API client.
+	Metadata MetadataConfig `yaml:"metadata"`
+	// Scan tunes the folder scan.
+	Scan ScanConfig `yaml:"scan"`
+	// ASR and Agent are typed stubs consumed by later milestones (Agent.Concurrency
+	// is live in M1).
 	ASR   ASRConfig   `yaml:"asr"`
 	Agent AgentConfig `yaml:"agent"`
 }
@@ -66,10 +98,13 @@ type Config struct {
 // Default returns a Config with secure defaults.
 func Default() Config {
 	return Config{
-		Listen:      DefaultListen,
-		CORSOrigins: []string{},
-		ASR:         ASRConfig{},
-		Agent:       AgentConfig{Concurrency: DefaultConcurrency},
+		Listen:       DefaultListen,
+		CORSOrigins:  []string{},
+		LibraryRoots: []string{},
+		Metadata:     MetadataConfig{BaseURL: DefaultMetadataBaseURL},
+		Scan:         ScanConfig{FFprobePath: DefaultFFprobePath},
+		ASR:          ASRConfig{},
+		Agent:        AgentConfig{Concurrency: DefaultConcurrency},
 	}
 }
 
@@ -96,6 +131,9 @@ func Load(dataDir string) (Config, error) {
 	if cfg.CORSOrigins == nil {
 		cfg.CORSOrigins = []string{}
 	}
+	if cfg.LibraryRoots == nil {
+		cfg.LibraryRoots = []string{}
+	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -109,6 +147,15 @@ func applyEnv(cfg *Config) {
 	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CORS_ORIGINS"); ok {
 		cfg.CORSOrigins = splitList(v)
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_LIBRARY_ROOTS"); ok {
+		cfg.LibraryRoots = splitList(v)
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_METADATA_BASE_URL"); ok {
+		cfg.Metadata.BaseURL = strings.TrimSpace(v)
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_SCAN_FFPROBE_PATH"); ok {
+		cfg.Scan.FFprobePath = v
 	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_ASR_BACKEND"); ok {
 		cfg.ASR.Backend = v
@@ -149,6 +196,17 @@ func (c Config) Validate() error {
 	for _, o := range c.CORSOrigins {
 		if err := validateOrigin(o); err != nil {
 			return err
+		}
+	}
+	for _, root := range c.LibraryRoots {
+		if !filepath.IsAbs(root) {
+			return fmt.Errorf("library_roots entry %q must be an absolute path", root)
+		}
+	}
+	if c.Metadata.BaseURL != "" {
+		u, err := url.Parse(c.Metadata.BaseURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("metadata.base_url %q must be an absolute http(s) URL", c.Metadata.BaseURL)
 		}
 	}
 	return nil

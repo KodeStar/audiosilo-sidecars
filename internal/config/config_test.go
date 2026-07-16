@@ -118,3 +118,70 @@ func TestValidateAcceptsGoodOrigins(t *testing.T) {
 		t.Errorf("Validate() = %v, want nil", err)
 	}
 }
+
+func TestDefaultsForNewFields(t *testing.T) {
+	cfg := Default()
+	if cfg.Metadata.BaseURL != DefaultMetadataBaseURL {
+		t.Errorf("metadata base_url = %q, want %q", cfg.Metadata.BaseURL, DefaultMetadataBaseURL)
+	}
+	if cfg.Scan.FFprobePath != DefaultFFprobePath {
+		t.Errorf("ffprobe = %q, want %q", cfg.Scan.FFprobePath, DefaultFFprobePath)
+	}
+	if cfg.LibraryRoots == nil {
+		t.Error("library_roots should be non-nil empty slice")
+	}
+}
+
+func TestNewFieldsRoundTripAndEnv(t *testing.T) {
+	dir := t.TempDir()
+	in := Default()
+	in.LibraryRoots = []string{"/srv/audiobooks"}
+	in.Metadata.BaseURL = "http://localhost:9999"
+	in.Scan.FFprobePath = ""
+	if err := Save(dir, in); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	out, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(out.LibraryRoots) != 1 || out.LibraryRoots[0] != "/srv/audiobooks" {
+		t.Errorf("library_roots = %v", out.LibraryRoots)
+	}
+	if out.Metadata.BaseURL != "http://localhost:9999" || out.Scan.FFprobePath != "" {
+		t.Errorf("metadata/scan round-trip: %+v %+v", out.Metadata, out.Scan)
+	}
+
+	// Env overrides.
+	t.Setenv("AUDIOSILO_SIDECARS_LIBRARY_ROOTS", "/a, /b ")
+	t.Setenv("AUDIOSILO_SIDECARS_METADATA_BASE_URL", "https://meta.example")
+	t.Setenv("AUDIOSILO_SIDECARS_SCAN_FFPROBE_PATH", "/usr/bin/ffprobe")
+	env, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load env: %v", err)
+	}
+	if len(env.LibraryRoots) != 2 || env.LibraryRoots[1] != "/b" {
+		t.Errorf("env library_roots = %v", env.LibraryRoots)
+	}
+	if env.Metadata.BaseURL != "https://meta.example" || env.Scan.FFprobePath != "/usr/bin/ffprobe" {
+		t.Errorf("env metadata/scan: %+v %+v", env.Metadata, env.Scan)
+	}
+}
+
+func TestValidateRejectsBadNewFields(t *testing.T) {
+	rel := Default()
+	rel.LibraryRoots = []string{"relative/path"}
+	if err := rel.Validate(); err == nil {
+		t.Error("relative library_roots entry should be rejected")
+	}
+	bad := Default()
+	bad.Metadata.BaseURL = "not-a-url"
+	if err := bad.Validate(); err == nil {
+		t.Error("non-absolute metadata.base_url should be rejected")
+	}
+	off := Default()
+	off.Metadata.BaseURL = "" // disabled is valid
+	if err := off.Validate(); err != nil {
+		t.Errorf("empty metadata.base_url should be valid (disabled): %v", err)
+	}
+}
