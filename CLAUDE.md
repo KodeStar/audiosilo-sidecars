@@ -94,9 +94,25 @@ This mirrors audiosilo-server's `-tags embedplayer`. Do not commit
 cmd/audiosilo-sidecars/   entrypoint: `serve` (default) + `version`; flags --data, --listen
 internal/
   config/   config.yaml in <data>/ + AUDIOSILO_SIDECARS_* env overrides; Load/Save/Validate.
-            M1 added library_roots (scan allow-list), metadata.base_url, scan.ffprobe_path;
-            agent.concurrency is now live (scheduler agent lane). asr/agent-model routing
-            stay typed stubs for later milestones.
+            M1 added library_roots (scan allow-list), metadata.base_url;
+            agent.concurrency is now live (scheduler agent lane). M2 added tools.
+            {ffmpeg_path,ffprobe_path,auto_download} - the SINGLE source of truth for
+            tool paths (the legacy scan.ffprobe_path config/env key is migrated into
+            tools.ffprobe_path on load). asr/agent-model routing stay typed stubs.
+  toolfetch/ resolve ffmpeg/ffprobe (explicit path -> next to the binary -> $PATH ->
+            checksummed HTTPS download into <data>/tools when auto_download); ported
+            from audiosilo-server. Resolve() runs once at startup; a missing tool
+            degrades gracefully (the audio stage fails that book, daemon keeps working).
+  audio/    the mechanical audio stages: Inspect (ffprobe -> probe.json + normalized
+            manifest.json; marker parsing + contiguity ported from audio_extract.py;
+            single-file marker books AND multi-file "files" books) and Split (ffmpeg
+            each chapter -> mono/16k FLAC under chapters/, resumable via temp+rename,
+            per-chapter progress, ctx-cancel clean). Pure/tool-driven, no scheduler deps.
+  scratch/  per-book DirSize gauge + Purge (removes chapters/, keeps durables),
+            confined to the work root. Manual purge only in M2; auto-purge is M7.
+  pipeline/ composite scheduler.Executor: routes inspecting -> audio.Inspect,
+            splitting -> audio.Split, every other stage -> the stub (M3+ replaces
+            more). Constructed in server.go with the toolfetch-resolved paths.
   auth/     single admin password (argon2id, generated + printed once on first run),
             opaque SHA-256-hashed session tokens, a per-IP login rate limiter; the
             Store interface is storage-agnostic (MemStore for tests; the SQLite
@@ -110,9 +126,11 @@ internal/
   state/    per-book pipeline state machine: table-driven states/lanes/transitions,
             CanStart/NextState guards, the audit fix-loop cap. Pure, no I/O.
   scheduler/ one wake-on-event goroutine over three lanes (ASR cap 1 / agent cap =
-            config, series-locked / mechanical cap 2) with StubExecutor + _done/<stage>.json
-            sentinels (the CONTENT truth) and crash reconcile. Pause/resume/retry/cancel/
-            delete. Publishes book.state/stage.progress/queue.stats.
+            config, series-locked / mechanical cap 2) over an injected Executor +
+            _done/<stage>.json sentinels (the CONTENT truth) and crash reconcile.
+            Pause/resume/retry/cancel/delete + PurgeScratch (reclaim chapters/ when
+            done/paused/failed). Publishes book.state/stage.progress/queue.stats.
+            M2 runs the pipeline composite executor (real inspect/split, stubs beyond).
   metaops/  meta.audiosilo.app client (coverage/lookup, 1h TTL cache, graceful
             degrade) + async folder-scan job manager over audiosilo-meta pkg/scan +
             the library_roots PathAllowed check. stdlib HTTP + the meta module only.
@@ -195,16 +213,31 @@ Milestones from the workspace plan; each is shippable.
   coverage badges -> select 2 -> Process -> Running tab advancing to done live via
   SSE), plus the earlier Go smoke (pause/resume, kill -9 + resume with no
   duplicated stages, live coverage check against meta.audiosilo.app).
-- **M2-M8 (planned):** toolfetch + audio (ffmpeg split), ASR backends
-  (mlx-whisper + whisper.cpp), QA/spelling ports, the agent runner (claude +
-  codex) with staged context dirs enforcing the invariants, the fact-pass +
-  synthesis + audit loop, contribution (intake/PR/local), and packaging
-  (GoReleaser + Docker matrix). See the plan for the full table.
+- **M2 (done):** the real mechanical audio stages. `internal/toolfetch` resolves
+  ffmpeg/ffprobe (config path -> next to the binary -> `$PATH` -> checksummed
+  download into `<data>/tools`); `internal/audio` does ffprobe **inspect** (marker
+  normalization + contiguity check ported from `audio_extract.py`, writing
+  `probe.json`/`manifest.json`; single-file marker books and multi-file "files"
+  books) and ffmpeg **split** to mono/16k FLAC (resumable, per-chapter progress).
+  `internal/pipeline` wires a composite executor (inspecting -> audio.Inspect,
+  splitting -> audio.Split, everything else -> the stub) into the scheduler.
+  `internal/scratch` tracks per-book disk usage and reclaims `chapters/`
+  (`PurgeScratch` + `POST /books/{id}/purge-scratch`, allowed only when
+  done/paused/failed); `scratch_bytes` rides on the book view and a daemon-total
+  gauge + resolved tool paths surface on `/system`. Non-contiguous markers set
+  `MarkersContiguous=false` and defer to the (still-stubbed) markers_normalizing
+  stage. Gate verified: full Go + web gates green, plus a live smoke (real 3-chapter
+  m4b through inspecting -> splitting -> done, mid-split kill + resume without
+  redoing chapters, purge drops the gauge).
+- **M3-M8 (planned):** ASR backends (mlx-whisper + whisper.cpp), QA/spelling ports,
+  the agent runner (claude + codex) with staged context dirs enforcing the
+  invariants, the fact-pass + synthesis + audit loop, contribution (intake/PR/local),
+  and packaging (GoReleaser + Docker matrix). See the plan for the full table.
 
-M1 is built end to end (Library tab + a minimal Running tab over the stub
-scheduler). Still **not built**: the **Done** tab (full board is M6), the Running
-tab's richer board (stage timeline / ETA / cost, M6), and the pipeline's real
-executors (audio/ASR/QA/agent/contribute) - the scheduler runs stub executors,
-and the config `asr`/agent-model sections stay typed stubs. `/system` reports
-Library/Running/Settings as `ready` and only Done as `planned` (the Go-side tab
-labels). Keep this file honest as milestones land.
+Still **not built**: the **Done** tab (full board is M6), the Running tab's richer
+board (stage timeline / ETA / cost, M6), and the pipeline stages beyond split
+(ASR/QA/agent/contribute) - the scheduler runs the composite executor whose
+non-mechanical stages are still stubs, and the config `asr`/agent-model sections
+stay typed stubs. Auto-purge/startup-GC of scratch is M7 (M2 is manual purge only).
+`/system` reports Library/Running/Settings as `ready` and only Done as `planned`
+(the Go-side tab labels). Keep this file honest as milestones land.
