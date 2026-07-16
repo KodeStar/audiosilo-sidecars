@@ -4,19 +4,16 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"bufio"
-	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -29,6 +26,17 @@ import (
 // stamped with a different tag as stale and re-downloads. The build variant is
 // baked into the pinned build, hence the trailing "-1" revision.
 const WhisperCLIReleaseTag = "whisper-cpp-v1.9.1-1"
+
+// Device names the informational accelerator a whisper-cli build targets. The
+// vocabulary lives here because the release asset table (WhisperCLIAssetFor) is
+// keyed on it; the asr package aliases these constants for its capability
+// reporting.
+const (
+	DeviceMetal  = "metal"
+	DeviceCUDA   = "cuda"
+	DeviceVulkan = "vulkan"
+	DeviceCPU    = "cpu"
+)
 
 // whisperSubdir is the directory under <data>/tools that holds the extracted
 // whisper.cpp distribution (the whisper-cli binary plus any shared libraries the
@@ -66,21 +74,23 @@ type whisperMeta struct {
 	SHA256 string `json:"sha256"`
 }
 
-// whisperAssetFor maps a platform+device to the release asset that carries a
-// matching whisper-cli build, or ok=false when this repo publishes no asset for it
-// (darwin/amd64, windows/arm64, exotic OS/arch). A false result is a graceful
-// "unavailable", never an error. device is the informational accelerator the ASR
-// backend detected (metal/cuda/vulkan/cpu); it only differentiates the linux/amd64
-// variants (which ship separate CUDA/Vulkan/CPU builds).
-func whisperAssetFor(goos, goarch, device string) (name string, ok bool) {
+// WhisperCLIAssetFor maps a platform+device to the pinned release asset that
+// carries a matching whisper-cli build, or ok=false when this repo publishes no
+// asset for it (darwin/amd64, windows/arm64, exotic OS/arch). A false result is a
+// graceful "unavailable", never an error. device is the informational accelerator
+// the ASR backend detected (the Device* constants); it only differentiates the
+// linux/amd64 variants, which ship separate CUDA/Vulkan/CPU builds. The ASR
+// backend also uses this pure table check to advertise "will be downloaded on
+// first use" before any network I/O.
+func WhisperCLIAssetFor(goos, goarch, device string) (name string, ok bool) {
 	switch goos + "/" + goarch {
 	case "darwin/arm64":
 		return "whisper-cli-darwin-arm64-metal.tar.gz", true
 	case "linux/amd64":
 		switch device {
-		case "cuda":
+		case DeviceCUDA:
 			return "whisper-cli-linux-amd64-cuda.tar.gz", true
-		case "vulkan":
+		case DeviceVulkan:
 			return "whisper-cli-linux-amd64-vulkan.tar.gz", true
 		default:
 			return "whisper-cli-linux-amd64-cpu.tar.gz", true
@@ -94,18 +104,6 @@ func whisperAssetFor(goos, goarch, device string) (name string, ok bool) {
 		return "", false
 	}
 }
-
-// WhisperCLIAvailableFor reports whether an auto-downloadable whisper-cli asset
-// exists for a platform+device (the pure asset-table check). The ASR backend uses
-// it to advertise "will be downloaded on first use" in its capability before any
-// network I/O.
-func WhisperCLIAvailableFor(goos, goarch, device string) (asset string, ok bool) {
-	return whisperAssetFor(goos, goarch, device)
-}
-
-// whisperMetaPath is the sidecar location for a binary path (mirrors model.go's
-// metaPath convention: <binary>.meta).
-func whisperMetaPath(binPath string) string { return binPath + ".meta" }
 
 // CachedWhisperCLI returns the path to an already-installed whisper-cli under
 // toolsDir, or "" if absent. It is the resolution step the ASR backend tries after
@@ -139,9 +137,13 @@ func CachedWhisperCLI(toolsDir string) string {
 // verified byte-for-byte while streaming - a mismatch adopts nothing. Extraction
 // runs into a TEMP dir with per-entry name sanitization and size caps; the binary
 // is self-checked (`--help` must exit 0) before the temp dir is atomically moved
-// into place; the .meta is written LAST. A missing asset for this platform, an
-// offline host, or any failure returns "", err - the caller degrades gracefully and
-// retries next run.
+// into place; the .meta is written LAST.
+//
+// Degradation: a failed refresh (offline, a broken release) with a previously-
+// installed binary still present returns that stale binary with a warning - the
+// stale .meta keeps failing the tag gate, so the refresh is retried on a later
+// run. Only when nothing is usable does it return "", err (the caller degrades
+// gracefully and retries next run).
 //
 // CPU fallback: when an ACCELERATED asset downloads and verifies fine but fails the
 // self-check on this machine (an NVIDIA driver too old for the CUDA build, a broken
@@ -163,23 +165,45 @@ func EnsureWhisperCLI(ctx context.Context, toolsDir, device string, log *slog.Lo
 // so tests can exercise the asset selection + CPU fallback for platforms other than
 // the test host (production always passes runtime.GOOS/GOARCH).
 func ensureWhisperCLIPlatform(ctx context.Context, toolsDir, goos, goarch, device string, log *slog.Logger) (string, error) {
-	asset, ok := whisperAssetFor(goos, goarch, device)
-	if !ok {
-		return "", fmt.Errorf("no whisper-cli release asset for %s/%s", goos, goarch)
-	}
-	finalDir := filepath.Join(toolsDir, whisperSubdir)
-	binPath := filepath.Join(finalDir, binName(whisperCLIBase))
+	binPath := filepath.Join(toolsDir, whisperSubdir, binName(whisperCLIBase))
 
 	// Cache hit: the sidecar's tag matches the pin and the binary is present. The
 	// .meta is written last, so its presence proves a complete prior install.
-	if meta, ok := readWhisperMeta(whisperMetaPath(binPath)); ok && meta.Tag == WhisperCLIReleaseTag {
+	if meta, ok := readJSONSidecar[whisperMeta](metaPath(binPath)); ok && meta.Tag == WhisperCLIReleaseTag {
 		if info, err := os.Stat(binPath); err == nil && !info.IsDir() {
 			return binPath, nil
 		}
 	}
 
-	if err := os.MkdirAll(toolsDir, 0o750); err != nil {
+	if err := refreshWhisperCLI(ctx, toolsDir, goos, goarch, device, log); err != nil {
+		// Offline/stale degrade (matching ffmpeg's ensure): a failed refresh with a
+		// previously-installed binary still present proceeds on the stale binary
+		// rather than leaving the caller with nothing. The untouched stale .meta
+		// keeps failing the tag gate, so a later run retries the refresh.
+		if cached := CachedWhisperCLI(toolsDir); cached != "" {
+			log.Warn("whisper-cli refresh failed; proceeding with the previously-installed binary",
+				"path", cached, "err", err)
+			return cached, nil
+		}
 		return "", err
+	}
+	return binPath, nil
+}
+
+// refreshWhisperCLI downloads and installs the pinned release's asset for the
+// platform - retrying once with the CPU asset when an accelerated build fails its
+// self-check - and writes the .meta LAST, so only a complete install is ever
+// trusted by the cache-hit gate.
+func refreshWhisperCLI(ctx context.Context, toolsDir, goos, goarch, device string, log *slog.Logger) error {
+	asset, ok := WhisperCLIAssetFor(goos, goarch, device)
+	if !ok {
+		return fmt.Errorf("no whisper-cli release asset for %s/%s", goos, goarch)
+	}
+	finalDir := filepath.Join(toolsDir, whisperSubdir)
+	binPath := filepath.Join(finalDir, binName(whisperCLIBase))
+
+	if err := os.MkdirAll(toolsDir, 0o750); err != nil {
+		return err
 	}
 
 	sum, err := installWhisperAsset(ctx, toolsDir, finalDir, asset, log)
@@ -187,25 +211,25 @@ func ensureWhisperCLIPlatform(ctx context.Context, toolsDir, goos, goarch, devic
 		// Only a SELF-CHECK failure (binary verified + extracted but won't run here)
 		// falls back to the CPU build; checksum/network/extract failures do not - they
 		// would fail identically for any asset and must surface as-is.
-		cpuAsset, cpuOK := whisperAssetFor(goos, goarch, "cpu")
+		cpuAsset, cpuOK := WhisperCLIAssetFor(goos, goarch, DeviceCPU)
 		if !errors.Is(err, errWhisperSelfCheck) || !cpuOK || cpuAsset == asset {
-			return "", err
+			return err
 		}
 		log.Warn("whisper-cli accelerated build failed its self-check on this machine; falling back to the CPU build",
 			"asset", asset, "cpu_asset", cpuAsset, "err", err)
 		asset = cpuAsset
 		if sum, err = installWhisperAsset(ctx, toolsDir, finalDir, asset, log); err != nil {
-			return "", err
+			return err
 		}
 	}
 
 	// Write the sidecar LAST: only now is the final dir a complete, trusted install.
 	// It records the asset actually adopted (the CPU one after a fallback).
-	if err := writeWhisperMeta(whisperMetaPath(binPath), whisperMeta{Tag: WhisperCLIReleaseTag, Asset: asset, SHA256: sum}); err != nil {
-		return "", err
+	if err := writeJSONSidecar(metaPath(binPath), whisperMeta{Tag: WhisperCLIReleaseTag, Asset: asset, SHA256: sum}); err != nil {
+		return err
 	}
 	log.Info("whisper-cli ready", "path", binPath, "asset", asset, "tag", WhisperCLIReleaseTag)
-	return binPath, nil
+	return nil
 }
 
 // installWhisperAsset runs one asset through the full download -> checksum-verify ->
@@ -278,8 +302,8 @@ func downloadWhisperAsset(ctx context.Context, tag, asset, destPath string, log 
 	}
 
 	url := whisperAssetURL(tag, asset)
-	if !strings.HasPrefix(strings.ToLower(url), "https://") {
-		return "", fmt.Errorf("whisper-cli url must be https: %q", url)
+	if err := requireHTTPS(url, "whisper-cli"); err != nil {
+		return "", err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -326,8 +350,8 @@ func downloadWhisperAsset(ctx context.Context, tag, asset, destPath string, log 
 // (a missing checksum is a DENY: we never adopt an unverifiable download).
 func fetchWhisperChecksum(ctx context.Context, tag, asset string) (string, error) {
 	url := whisperChecksumsURL(tag)
-	if !strings.HasPrefix(strings.ToLower(url), "https://") {
-		return "", fmt.Errorf("whisper-cli checksums url must be https: %q", url)
+	if err := requireHTTPS(url, "whisper-cli checksums"); err != nil {
+		return "", err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -387,7 +411,16 @@ func extractWhisperArchive(asset, archivePath, destDir string) error {
 	}
 	defer func() { _ = f.Close() }()
 	if strings.HasSuffix(strings.ToLower(asset), ".zip") {
-		return extractAllZip(f, destDir)
+		// The archive is already on disk (and its download was capped), so read the
+		// central directory straight off the file instead of buffering it in memory.
+		info, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		if info.Size() > maxWhisperArchiveBytes {
+			return fmt.Errorf("zip exceeds %d bytes", maxWhisperArchiveBytes)
+		}
+		return extractAllZip(f, info.Size(), destDir)
 	}
 	return extractAllTarGz(f, destDir)
 }
@@ -431,19 +464,11 @@ func extractAllTarGz(r io.Reader, destDir string) error {
 	return nil
 }
 
-// extractAllZip extracts every regular file from a zip stream into destDir by
+// extractAllZip extracts every regular file from an on-disk zip into destDir by
 // basename, with the same safety (basename-only, per-file cap, executable bit
-// preserved) as the tar path. It buffers the (bounded) archive to read the central
-// directory.
-func extractAllZip(r io.Reader, destDir string) error {
-	buf, err := io.ReadAll(io.LimitReader(r, maxWhisperArchiveBytes+1))
-	if err != nil {
-		return err
-	}
-	if int64(len(buf)) > maxWhisperArchiveBytes {
-		return fmt.Errorf("zip exceeds %d bytes", maxWhisperArchiveBytes)
-	}
-	zr, err := zip.NewReader(bytes.NewReader(buf), int64(len(buf)))
+// preserved) as the tar path. The caller enforces the archive size cap.
+func extractAllZip(ra io.ReaderAt, size int64, destDir string) error {
+	zr, err := zip.NewReader(ra, size)
 	if err != nil {
 		return err
 	}
@@ -487,105 +512,28 @@ func archiveEntryPerm(executable bool) os.FileMode {
 // failure (checksum, network, extract) would repeat identically for any asset.
 var errWhisperSelfCheck = errors.New("whisper-cli self-check (--help) failed")
 
-// whisperSelfCheck runs `<path> --help` with a timeout and requires exit 0, the same
-// belt-and-braces sanity gate ffmpeg's verified() applies (a partial/corrupt or
-// wrong-arch binary fails here, so it is never adopted). Failures wrap
-// errWhisperSelfCheck so the caller can distinguish "won't run here" from a
+// whisperSelfCheck runs the shared self-check with `--help` before a staged binary
+// is adopted. Unlike verified(), it does NOT remove the failing binary - it lives
+// in a staged temp dir the caller discards - and it wraps errWhisperSelfCheck so
+// the caller can distinguish "won't run here" (CPU-fallback eligible) from a
 // download/extract problem.
 func whisperSelfCheck(ctx context.Context, path string, log *slog.Logger) error {
-	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	if err := exec.CommandContext(cctx, path, "--help").Run(); err != nil {
-		log.Warn("downloaded whisper-cli failed its self-check; discarding", "path", path, "err", err)
+	if err := runSelfCheck(ctx, path, []string{"--help"}, 30*time.Second, log); err != nil {
 		return fmt.Errorf("%w: %v", errWhisperSelfCheck, err)
 	}
 	return nil
 }
 
 // installWhisperDir atomically replaces finalDir with extractDir: it removes any
-// prior install, then renames the staged dir into place (a same-parent rename under
-// toolsDir). If the rename fails (e.g. a cross-device edge or a leftover), it falls
-// back to a recursive copy so a supported platform still ends up with a usable
-// install rather than none.
+// prior install, then renames the staged dir into place. The two are same-parent
+// siblings under toolsDir by construction, so the rename cannot cross filesystems -
+// a failure is a real error to surface, not one to paper over.
 func installWhisperDir(extractDir, finalDir string) error {
 	if err := os.RemoveAll(finalDir); err != nil {
 		return err
 	}
-	if err := os.Rename(extractDir, finalDir); err == nil {
-		return nil
-	}
-	// Fallback: copy the tree file by file (the deferred RemoveAll(extractDir) still
-	// cleans the staged dir up afterwards).
-	if err := copyTree(extractDir, finalDir); err != nil {
+	if err := os.Rename(extractDir, finalDir); err != nil {
 		return fmt.Errorf("install whisper-cli dir: %w", err)
 	}
 	return nil
-}
-
-// copyTree recursively copies src into dst, preserving each file's permission bits.
-// It is the rename fallback in installWhisperDir; src is our own extract temp dir.
-func copyTree(src, dst string) error {
-	return filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(src, p)
-		if err != nil {
-			return err
-		}
-		target := filepath.Join(dst, rel)
-		if d.IsDir() {
-			return os.MkdirAll(target, 0o750)
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		in, err := os.Open(p) //nolint:gosec // p is inside our own extract temp dir
-		if err != nil {
-			return err
-		}
-		defer func() { _ = in.Close() }()
-		if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
-			return err
-		}
-		return writeMode(target, io.LimitReader(in, maxWhisperArchiveBytes), info.Mode().Perm())
-	})
-}
-
-// readWhisperMeta reads and parses a whisper sidecar. ok=false when it is absent or
-// unparseable, so the caller treats the cache as needing a (re)download.
-func readWhisperMeta(path string) (whisperMeta, bool) {
-	data, err := os.ReadFile(path) //nolint:gosec // path is our own <binary>.meta under toolsDir
-	if err != nil {
-		return whisperMeta{}, false
-	}
-	var m whisperMeta
-	if err := json.Unmarshal(data, &m); err != nil {
-		return whisperMeta{}, false
-	}
-	return m, true
-}
-
-// writeWhisperMeta writes the sidecar via temp+rename. It is written only after the
-// binary is fully in place, so its presence is the cache-hit trust signal.
-func writeWhisperMeta(path string, m whisperMeta) error {
-	data, err := json.Marshal(m)
-	if err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".meta-"+filepath.Base(path)+"-")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer func() { _ = os.Remove(tmpName) }() // no-op once renamed
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
 }

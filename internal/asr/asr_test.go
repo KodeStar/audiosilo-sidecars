@@ -337,7 +337,7 @@ func TestWhisperCppUnavailableWithoutCLI(t *testing.T) {
 func TestWhisperCppDetectAutoDownload(t *testing.T) {
 	nope := filepath.Join(t.TempDir(), "nope") // explicit-but-missing: no PATH fallback
 	device := detectWhisperDevice()
-	_, supported := toolfetch.WhisperCLIAvailableFor(runtime.GOOS, runtime.GOARCH, device)
+	_, supported := toolfetch.WhisperCLIAssetFor(runtime.GOOS, runtime.GOARCH, device)
 
 	// auto-download ON, no binary.
 	on := newWhisperCpp(SelectConfig{AutoDownload: true, WhisperCLIPath: nope, DataDir: t.TempDir(), Log: discardLogger()})
@@ -444,9 +444,10 @@ func TestWhisperCppEnsureReadyNoAutoDownload(t *testing.T) {
 	}
 }
 
-// TestWhisperCppEnsureReadyDownloadErrorPropagates: a failing download with NO
-// cached binary to fall back on surfaces as an EnsureReady error (the book then
-// parks, not silently proceeds).
+// TestWhisperCppEnsureReadyDownloadErrorPropagates: an ensure error surfaces as an
+// EnsureReady error (the book then parks, not silently proceeds). toolfetch itself
+// degrades a failed refresh to a still-present cached binary, so by contract an
+// error from it means nothing is usable.
 func TestWhisperCppEnsureReadyDownloadErrorPropagates(t *testing.T) {
 	b := newWhisperCpp(SelectConfig{AutoDownload: true, WhisperCLIPath: filepath.Join(t.TempDir(), "nope"), DataDir: t.TempDir(), Log: discardLogger()})
 	restore := ensureWhisperCLI
@@ -521,36 +522,11 @@ func TestWhisperCppEnsureReadyRefreshesExistingCache(t *testing.T) {
 	}
 }
 
-// TestWhisperCppEnsureReadyOfflineKeepsStaleCache: a failing refresh (offline) with
-// a cached binary still present proceeds on the stale binary instead of failing the
-// book, and logs a warning.
-func TestWhisperCppEnsureReadyOfflineKeepsStaleCache(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell-script stub is unix-only")
-	}
-	dataDir := t.TempDir()
-	var logBuf strings.Builder
-	log := slog.New(slog.NewTextHandler(&logBuf, nil))
-	b := newWhisperCpp(SelectConfig{AutoDownload: true, WhisperCLIPath: filepath.Join(t.TempDir(), "nope"), DataDir: dataDir, Log: log})
-	cached := seedWhisperCache(t, dataDir)
-	seedWhisperModel(t, b, dataDir)
-
-	restore := ensureWhisperCLI
-	ensureWhisperCLI = func(context.Context, string, string, *slog.Logger) (string, error) {
-		return "", errors.New("offline")
-	}
-	defer func() { ensureWhisperCLI = restore }()
-
-	if err := b.EnsureReady(context.Background(), dataDir); err != nil {
-		t.Fatalf("EnsureReady must degrade to the cached binary when offline: %v", err)
-	}
-	if got := b.cliPath(); got != cached {
-		t.Errorf("cliPath after offline degrade = %q, want the cached %q", got, cached)
-	}
-	if !strings.Contains(logBuf.String(), "proceeding with the cached binary") {
-		t.Errorf("expected a stale-cache warning, got:\n%s", logBuf.String())
-	}
-}
+// (The offline/stale-cache degrade lives in toolfetch now - EnsureWhisperCLI
+// itself falls back to a previously-installed binary when a refresh fails, tested
+// by toolfetch's TestEnsureWhisperCLIOfflineKeepsStaleCache - so an error from the
+// ensure seam here means nothing is usable and must propagate; see
+// TestWhisperCppEnsureReadyDownloadErrorPropagates.)
 
 // TestWhisperCppEnsureReadyNoAutoDownloadKeepsCache: with auto-download off, a
 // pre-existing cache keeps working (no downloader call, no error).

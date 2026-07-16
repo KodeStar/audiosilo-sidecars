@@ -70,12 +70,21 @@ func newWhisperCpp(cfg SelectConfig) *whisperCpp {
 
 func (w *whisperCpp) ID() string { return IDWhisperCpp }
 
-// cliPath resolves the whisper-cli binary (explicit -> beside daemon -> PATH ->
-// the toolfetch auto-download cache under <data>/tools/whisper-cpp), or "" if not
-// found anywhere. A binary EnsureReady auto-downloaded lands in the cache, so a
-// later Transcribe finds it here without re-resolving.
+// localCLIPath resolves a user-owned LOCAL whisper-cli install (explicit config
+// path -> beside the daemon binary -> $PATH), or "" when none exists. A local
+// install is used as-is and never managed; everything else goes through the
+// toolfetch auto-download cache. This is the single local-vs-managed distinction
+// cliPath and EnsureReady share.
+func (w *whisperCpp) localCLIPath() string {
+	return toolfetch.LocateBinary(whisperCLIName, w.cliExplicit)
+}
+
+// cliPath resolves the whisper-cli binary to invoke: the local install, else the
+// toolfetch auto-download cache under <data>/tools/whisper-cpp, else "". A binary
+// EnsureReady auto-downloaded lands in the cache, so a later Transcribe finds it
+// here without re-resolving.
 func (w *whisperCpp) cliPath() string {
-	if p := toolfetch.LocateBinary(whisperCLIName, w.cliExplicit); p != "" {
+	if p := w.localCLIPath(); p != "" {
 		return p
 	}
 	return toolfetch.CachedWhisperCLI(toolsDir(w.dataDir))
@@ -99,7 +108,7 @@ func (w *whisperCpp) Detect(_ context.Context) (Capability, error) {
 		return cap, nil
 	}
 	if w.autoDownload {
-		if asset, ok := toolfetch.WhisperCLIAvailableFor(runtime.GOOS, runtime.GOARCH, device); ok {
+		if asset, ok := toolfetch.WhisperCLIAssetFor(runtime.GOOS, runtime.GOARCH, device); ok {
 			// A binary will be fetched on first use; Version stays empty until it is.
 			cap.Available = true
 			cap.Detail = "whisper-cli will be downloaded on first use (" + asset + ")"
@@ -113,34 +122,28 @@ func (w *whisperCpp) Detect(_ context.Context) (Capability, error) {
 // EnsureReady makes the backend runnable: it settles the whisper-cli binary, then
 // downloads the ggml model if it is missing. Both steps are idempotent + logged.
 //
-// Binary policy: a LOCAL install (explicit path, beside the daemon, $PATH) is the
-// user's own - used as-is, never touched. Otherwise the auto-download cache is OURS
-// to manage: when auto-download is on, ensureWhisperCLI ALWAYS runs, even if a
-// cached binary already resolves - its cache-hit path is a cheap .meta read with
-// zero network I/O when the pinned tag matches, and it is the only place a tag bump
-// (upgrade) or a meta-less partial install gets repaired; gating it on "no binary
-// resolves" would leave a stale cache in place forever. Graceful degrade: if the
-// refresh fails (offline) but a cached binary is still present, proceed on the
-// stale binary with a warning rather than failing the book; fail only when nothing
-// is usable. With auto-download off, a pre-existing cache keeps working as before.
+// Binary policy: a LOCAL install (localCLIPath) is the user's own - used as-is,
+// never touched. Otherwise the auto-download cache is OURS to manage: when
+// auto-download is on, ensureWhisperCLI ALWAYS runs, even if a cached binary
+// already resolves - its cache-hit path is a cheap .meta read with zero network
+// I/O when the pinned tag matches, and it is the only place a tag bump (upgrade)
+// or a meta-less partial install gets repaired; gating it on "no binary resolves"
+// would leave a stale cache in place forever. toolfetch itself degrades a failed
+// refresh to the previously-installed cached binary, so an error from it means
+// nothing is usable. With auto-download off, a pre-existing cache keeps working.
 func (w *whisperCpp) EnsureReady(ctx context.Context, dataDir string) error {
-	if toolfetch.LocateBinary(whisperCLIName, w.cliExplicit) == "" {
+	if w.localCLIPath() == "" {
 		// No user-owned local install: resolve through the managed cache.
-		switch {
-		case w.autoDownload:
+		if w.autoDownload {
 			if _, err := ensureWhisperCLI(ctx, toolsDir(dataDir), detectWhisperDevice(), w.log); err != nil {
-				cached := toolfetch.CachedWhisperCLI(toolsDir(dataDir))
-				if cached == "" {
-					return fmt.Errorf("whisper-cli download: %w", err)
-				}
-				w.log.Warn("whisper-cli refresh failed; proceeding with the cached binary",
-					"path", cached, "err", err)
+				return fmt.Errorf("whisper-cli download: %w", err)
 			}
-		case toolfetch.CachedWhisperCLI(toolsDir(dataDir)) == "":
-			return fmt.Errorf("whisper-cli not found; install whisper.cpp or enable tools.auto_download to enable the %s backend", IDWhisperCpp)
 		}
-		if w.cliPath() == "" {
-			return fmt.Errorf("whisper-cli still unresolved after auto-download")
+		// A successful ensure and a pre-existing cache both resolve here (the local
+		// half is already known empty, so only the cache needs checking); a bare miss
+		// (auto-download off and nothing cached) is the clear install-or-enable error.
+		if toolfetch.CachedWhisperCLI(toolsDir(dataDir)) == "" {
+			return fmt.Errorf("whisper-cli not found; install whisper.cpp or enable tools.auto_download to enable the %s backend", IDWhisperCpp)
 		}
 	}
 	dest := w.modelPath(dataDir)

@@ -23,6 +23,8 @@ import (
 	"log/slog"
 	"path/filepath"
 	"runtime"
+
+	"github.com/kodestar/audiosilo-sidecars/internal/toolfetch"
 )
 
 // Backend IDs (also the config values and the transcript provenance strings).
@@ -31,13 +33,15 @@ const (
 	IDWhisperCpp = "whisper-cpp"
 )
 
-// Device is the informational accelerator a backend runs on. It is diagnostic in
-// M3a (asr.device is not yet a real control knob).
+// Device is the informational accelerator a backend runs on, diagnostic in M3a
+// (asr.device is not yet a real control knob). The vocabulary is owned by
+// toolfetch - its whisper-cli release asset table is keyed on it - so these are
+// aliases keeping asr call sites short.
 const (
-	DeviceMetal  = "metal"
-	DeviceCUDA   = "cuda"
-	DeviceVulkan = "vulkan"
-	DeviceCPU    = "cpu"
+	DeviceMetal  = toolfetch.DeviceMetal
+	DeviceCUDA   = toolfetch.DeviceCUDA
+	DeviceVulkan = toolfetch.DeviceVulkan
+	DeviceCPU    = toolfetch.DeviceCPU
 )
 
 // Default models for each backend when config leaves asr.model empty.

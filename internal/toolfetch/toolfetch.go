@@ -209,15 +209,37 @@ func ensure(ctx context.Context, dir string, log *slog.Logger) (ffmpeg, ffprobe 
 	return ffmpeg, ffprobe
 }
 
+// runSelfCheck runs `<path> <args...>` with a timeout and requires exit 0 - the
+// shared sanity gate every downloaded binary must pass before it is adopted (a
+// truncated, corrupt, or wrong-arch download fails here). Wrappers decide what a
+// failure means: verified() removes the cached file; whisperSelfCheck leaves the
+// staged file for its caller to discard.
+func runSelfCheck(ctx context.Context, path string, args []string, timeout time.Duration, log *slog.Logger) error {
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := exec.CommandContext(cctx, path, args...).Run(); err != nil { //nolint:gosec // our own downloaded tool path + fixed argv
+		log.Warn("downloaded tool failed its self-check; discarding", "path", path, "err", err)
+		return err
+	}
+	return nil
+}
+
+// requireHTTPS rejects a non-https download URL. Every artifact this package
+// fetches (tool binaries, ASR models, release checksums) must ride TLS; what names
+// the artifact in the error message.
+func requireHTTPS(url, what string) error {
+	if !strings.HasPrefix(strings.ToLower(url), "https://") {
+		return fmt.Errorf("%s url must be https: %q", what, url)
+	}
+	return nil
+}
+
 // verified returns path if `<path> -version` runs, else "" (and removes the file).
 func verified(ctx context.Context, path string, log *slog.Logger) string {
 	if path == "" {
 		return ""
 	}
-	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	if err := exec.CommandContext(cctx, path, "-version").Run(); err != nil {
-		log.Warn("downloaded tool failed its self-check; discarding", "path", path, "err", err)
+	if runSelfCheck(ctx, path, []string{"-version"}, 15*time.Second, log) != nil {
 		_ = os.Remove(path)
 		return ""
 	}

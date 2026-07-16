@@ -42,9 +42,9 @@ func TestWhisperAssetFor(t *testing.T) {
 		{"plan9", "mips", "", "", false},
 	}
 	for _, c := range cases {
-		got, ok := whisperAssetFor(c.goos, c.goarch, c.device)
+		got, ok := WhisperCLIAssetFor(c.goos, c.goarch, c.device)
 		if ok != c.ok || got != c.want {
-			t.Errorf("whisperAssetFor(%s/%s, %q) = %q,%v want %q,%v", c.goos, c.goarch, c.device, got, ok, c.want, c.ok)
+			t.Errorf("WhisperCLIAssetFor(%s/%s, %q) = %q,%v want %q,%v", c.goos, c.goarch, c.device, got, ok, c.want, c.ok)
 		}
 	}
 }
@@ -89,7 +89,7 @@ func whisperTestAsset(t *testing.T) (asset, device string) {
 		t.Skip("whisper-cli stub is a shell script; skip on Windows")
 	}
 	device = "cpu"
-	asset, ok := whisperAssetFor(runtime.GOOS, runtime.GOARCH, device)
+	asset, ok := WhisperCLIAssetFor(runtime.GOOS, runtime.GOARCH, device)
 	if !ok {
 		t.Skipf("no whisper-cli asset for %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
@@ -181,7 +181,7 @@ func TestEnsureWhisperCLIHappyPath(t *testing.T) {
 		t.Errorf("bundled lib not extracted: err=%v body=%q", err, lib)
 	}
 	// The .meta sidecar records the pinned tag.
-	meta, ok := readWhisperMeta(whisperMetaPath(wantPath))
+	meta, ok := readJSONSidecar[whisperMeta](metaPath(wantPath))
 	if !ok || meta.Tag != WhisperCLIReleaseTag || meta.Asset != asset {
 		t.Errorf("meta = %+v ok=%v, want tag %q asset %q", meta, ok, WhisperCLIReleaseTag, asset)
 	}
@@ -307,7 +307,7 @@ func TestEnsureWhisperCLICPUFallback(t *testing.T) {
 	if got != wantPath {
 		t.Fatalf("path = %q, want %q", got, wantPath)
 	}
-	meta, ok := readWhisperMeta(whisperMetaPath(wantPath))
+	meta, ok := readJSONSidecar[whisperMeta](metaPath(wantPath))
 	if !ok || meta.Asset != cpuAsset || meta.Tag != WhisperCLIReleaseTag {
 		t.Errorf("meta = %+v ok=%v, want the adopted CPU asset %q at tag %q", meta, ok, cpuAsset, WhisperCLIReleaseTag)
 	}
@@ -346,7 +346,7 @@ func TestEnsureWhisperCLICPUFallbackAlsoFails(t *testing.T) {
 	if CachedWhisperCLI(toolsDir) != "" {
 		t.Error("nothing must be adopted when both assets fail their self-check")
 	}
-	if _, ok := readWhisperMeta(whisperMetaPath(filepath.Join(toolsDir, whisperSubdir, binName(whisperCLIBase)))); ok {
+	if _, ok := readJSONSidecar[whisperMeta](metaPath(filepath.Join(toolsDir, whisperSubdir, binName(whisperCLIBase)))); ok {
 		t.Error("no .meta must be written when nothing was adopted")
 	}
 }
@@ -361,7 +361,25 @@ func TestEnsureWhisperCLITagUpgrade(t *testing.T) {
 	serveWhisperRelease(t, asset, archive, checksums, &hits)
 
 	toolsDir := t.TempDir()
-	// Pre-populate a stale install: a bare binary + a .meta stamped with an old tag.
+	binPath := seedStaleWhisperInstall(t, toolsDir, asset)
+
+	if _, err := EnsureWhisperCLI(context.Background(), toolsDir, device, discard()); err != nil {
+		t.Fatalf("EnsureWhisperCLI (upgrade): %v", err)
+	}
+	if hits != 2 {
+		t.Errorf("tag upgrade hits = %d, want 2 (should re-download)", hits)
+	}
+	meta, _ := readJSONSidecar[whisperMeta](metaPath(binPath))
+	if meta.Tag != WhisperCLIReleaseTag {
+		t.Errorf("meta tag after upgrade = %q, want %q", meta.Tag, WhisperCLIReleaseTag)
+	}
+}
+
+// seedStaleWhisperInstall pre-populates toolsDir with a prior install: an
+// executable whisper-cli stub plus a .meta stamped with an OLD tag (so the
+// cache-hit gate misses and a refresh is attempted). Returns the binary path.
+func seedStaleWhisperInstall(t *testing.T, toolsDir, asset string) string {
+	t.Helper()
 	dir := filepath.Join(toolsDir, whisperSubdir)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		t.Fatal(err)
@@ -371,19 +389,36 @@ func TestEnsureWhisperCLITagUpgrade(t *testing.T) {
 		t.Fatal(err)
 	}
 	stale, _ := json.Marshal(whisperMeta{Tag: "whisper-cpp-v0.0.0-old", Asset: asset, SHA256: "deadbeef"})
-	if err := os.WriteFile(whisperMetaPath(binPath), stale, 0o600); err != nil {
+	if err := os.WriteFile(metaPath(binPath), stale, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	return binPath
+}
 
-	if _, err := EnsureWhisperCLI(context.Background(), toolsDir, device, discard()); err != nil {
-		t.Fatalf("EnsureWhisperCLI (upgrade): %v", err)
+// TestEnsureWhisperCLIOfflineKeepsStaleCache: a failed refresh (here a release
+// whose checksums.txt lacks the asset, standing in for offline/broken) with a
+// previously-installed binary still present degrades to that stale binary instead
+// of erroring - and leaves the stale .meta untouched, so the tag gate keeps
+// missing and a later run retries the refresh. ALLOWED. (The DENIED counterpart -
+// a failed refresh with NO cache errors - is TestEnsureWhisperCLIMissingChecksumLine.)
+func TestEnsureWhisperCLIOfflineKeepsStaleCache(t *testing.T) {
+	asset, device := whisperTestAsset(t)
+	// Empty checksums.txt: every refresh fails at the verification step.
+	serveWhisperRelease(t, asset, nil, "", nil)
+
+	toolsDir := t.TempDir()
+	binPath := seedStaleWhisperInstall(t, toolsDir, asset)
+
+	got, err := EnsureWhisperCLI(context.Background(), toolsDir, device, discard())
+	if err != nil {
+		t.Fatalf("a failed refresh with a cached binary must degrade, not error: %v", err)
 	}
-	if hits != 2 {
-		t.Errorf("tag upgrade hits = %d, want 2 (should re-download)", hits)
+	if got != binPath {
+		t.Errorf("path = %q, want the stale cached %q", got, binPath)
 	}
-	meta, _ := readWhisperMeta(whisperMetaPath(binPath))
-	if meta.Tag != WhisperCLIReleaseTag {
-		t.Errorf("meta tag after upgrade = %q, want %q", meta.Tag, WhisperCLIReleaseTag)
+	meta, ok := readJSONSidecar[whisperMeta](metaPath(binPath))
+	if !ok || meta.Tag == WhisperCLIReleaseTag {
+		t.Errorf("stale .meta must survive untouched (retry next run), got %+v ok=%v", meta, ok)
 	}
 }
 
