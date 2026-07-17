@@ -12,7 +12,9 @@ import {
   overridePayload,
   parsePos,
   POS_SENTINEL,
+  searchCandidates,
   seriesGapHint,
+  sortBySeries,
   summarizeTally,
   tallyResults,
   toCandidate,
@@ -326,6 +328,123 @@ describe('tallyResults', () => {
 
   it('is all-zero for an empty list', () => {
     expect(tallyResults([])).toEqual({ created: 0, conflicts: 0, failed: 0 });
+  });
+});
+
+describe('searchCandidates', () => {
+  const dune = book({
+    path: '/d',
+    title: 'Dune',
+    authors: ['Frank Herbert'],
+    series: 'Dune Chronicles',
+    narrators: ['Scott Brick'],
+    asin: 'B0011',
+  });
+  const hobbit = book({
+    path: '/h',
+    title: 'The Hobbit',
+    authors: ['J.R.R. Tolkien'],
+    narrators: ['Rob Inglis'],
+    isbn: '9780261102217',
+  });
+  const books = [dune, hobbit];
+
+  it('returns the same array reference for a blank / whitespace query', () => {
+    expect(searchCandidates(books, '')).toBe(books);
+    expect(searchCandidates(books, '   ')).toBe(books);
+  });
+
+  it('matches case-insensitively against the title', () => {
+    expect(searchCandidates(books, 'dUnE')).toEqual([dune]);
+  });
+
+  it('matches on author, narrator, series, asin, and isbn', () => {
+    expect(searchCandidates(books, 'herbert')).toEqual([dune]);
+    expect(searchCandidates(books, 'brick')).toEqual([dune]);
+    expect(searchCandidates(books, 'chronicles')).toEqual([dune]);
+    expect(searchCandidates(books, 'b0011')).toEqual([dune]);
+    expect(searchCandidates(books, '9780261102217')).toEqual([hobbit]);
+  });
+
+  it('requires ALL tokens to match somewhere (AND semantics)', () => {
+    // Both tokens appear in Dune (title + narrator), so it matches...
+    expect(searchCandidates(books, 'dune brick')).toEqual([dune]);
+    // ...but a token that matches no book drops it.
+    expect(searchCandidates(books, 'dune tolkien')).toEqual([]);
+  });
+
+  it('preserves input order and returns [] when nothing matches', () => {
+    const a = book({ path: '/a', title: 'Alpha', series: 'Common' });
+    const b = book({ path: '/b', title: 'Beta', series: 'Common' });
+    expect(searchCandidates([b, a], 'common')).toEqual([b, a]);
+    expect(searchCandidates(books, 'zzzznope')).toEqual([]);
+  });
+
+  it('tolerates books with missing optional fields', () => {
+    const bare = book({ path: '/bare', title: 'Bare', authors: undefined, narrators: undefined });
+    expect(searchCandidates([bare], 'bare')).toEqual([bare]);
+    expect(searchCandidates([bare], 'nope')).toEqual([]);
+  });
+});
+
+describe('sortBySeries', () => {
+  it('groups by series then orders by parsed position, with title as tiebreak', () => {
+    const s1 = book({ path: '/s1', title: 'First', series: 'Saga', series_position: '1' });
+    const s25 = book({ path: '/s25', title: 'Interlude', series: 'Saga', series_position: '2.5' });
+    const s2 = book({ path: '/s2', title: 'Second', series: 'Saga', series_position: '2' });
+    // Input deliberately out of order.
+    const out = sortBySeries([s25, s2, s1]);
+    expect(out.map((b) => b.path)).toEqual(['/s1', '/s2', '/s25']);
+  });
+
+  it('does not mutate the input array', () => {
+    const input = [
+      book({ path: '/b', title: 'B', series: 'X', series_position: '2' }),
+      book({ path: '/a', title: 'A', series: 'X', series_position: '1' }),
+    ];
+    const snapshot = input.map((b) => b.path);
+    sortBySeries(input);
+    expect(input.map((b) => b.path)).toEqual(snapshot);
+  });
+
+  it('places seriesless books after all series-grouped books, ordered by title', () => {
+    const s = book({ path: '/s', title: 'In A Series', series: 'Saga', series_position: '1' });
+    const loose2 = book({ path: '/l2', title: 'Zephyr' });
+    const loose1 = book({ path: '/l1', title: 'Apple' });
+    const out = sortBySeries([loose2, s, loose1]);
+    expect(out.map((b) => b.path)).toEqual(['/s', '/l1', '/l2']);
+  });
+
+  it('groups series names case-insensitively', () => {
+    const upper = book({ path: '/u', title: 'U', series: 'Saga', series_position: '2' });
+    const lower = book({ path: '/l', title: 'L', series: 'saga', series_position: '1' });
+    const out = sortBySeries([upper, lower]);
+    // Both belong to one (case-insensitive) group, ordered by position.
+    expect(out.map((b) => b.path)).toEqual(['/l', '/u']);
+  });
+
+  it('sorts a blank / unparseable position last within its series', () => {
+    const noPos = book({ path: '/np', title: 'Bonus', series: 'Saga', series_position: '' });
+    const p1 = book({ path: '/p1', title: 'One', series: 'Saga', series_position: '1' });
+    const out = sortBySeries([noPos, p1]);
+    expect(out.map((b) => b.path)).toEqual(['/p1', '/np']);
+  });
+
+  it('handles omnibus ranges by their leading number', () => {
+    const omni = book({ path: '/o', title: 'Omnibus', series: 'Saga', series_position: '1-3' });
+    const four = book({ path: '/4', title: 'Four', series: 'Saga', series_position: '4' });
+    // "1-3" parses to 1, so it sorts before position 4.
+    expect(sortBySeries([four, omni]).map((b) => b.path)).toEqual(['/o', '/4']);
+  });
+
+  it('orders distinct series alphabetically (case-insensitive)', () => {
+    const zed = book({ path: '/z', title: 'Z', series: 'Zed', series_position: '1' });
+    const alp = book({ path: '/a', title: 'A', series: 'alpha', series_position: '1' });
+    expect(sortBySeries([zed, alp]).map((b) => b.path)).toEqual(['/a', '/z']);
+  });
+
+  it('is a no-op-shaped total order on an empty list', () => {
+    expect(sortBySeries([])).toEqual([]);
   });
 });
 

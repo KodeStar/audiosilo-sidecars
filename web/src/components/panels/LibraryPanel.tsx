@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ApiClient } from '@/lib/apiClient';
 import type { MetaSearchResult, ScanJob, ScannedBook } from '@/api/types';
-import { filterCandidates, hiddenBooks, seriesGapHint, toCandidate } from '@/lib/candidates';
+import {
+  filterCandidates,
+  hiddenBooks,
+  searchCandidates,
+  seriesGapHint,
+  sortBySeries,
+  toCandidate,
+} from '@/lib/candidates';
 import { scanStore, useScanStore } from '@/lib/scanStore';
 import { addRecentRoot, loadRecentRoots } from '@/lib/recentRoots';
 import { CandidateRow } from '../library/CandidateRow';
@@ -20,8 +27,17 @@ const noopToggle = () => {};
 
 export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
   const state = useScanStore();
-  const { job, scanError, starting, excludeCovered, showHidden, selected, processing, note } =
-    state;
+  const {
+    job,
+    scanError,
+    starting,
+    excludeCovered,
+    showHidden,
+    search,
+    selected,
+    processing,
+    note,
+  } = state;
 
   const [path, setPath] = useState('');
   const [recent, setRecent] = useState<string[]>(() => loadRecentRoots());
@@ -49,11 +65,18 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
   );
 
   const books = useMemo<ScannedBook[]>(() => job?.books ?? [], [job]);
+  // The visible list: exclude-covered filter -> free-text search -> series order.
   const visible = useMemo(
-    () => filterCandidates(books, { excludeCovered }),
-    [books, excludeCovered],
+    () => sortBySeries(searchCandidates(filterCandidates(books, { excludeCovered }), search)),
+    [books, excludeCovered, search],
   );
+  // The full hidden set (drives the "Show hidden (n)" count + the toolbar totals),
+  // and its search-narrowed, series-ordered slice for the dimmed hidden section.
   const hidden = useMemo(() => hiddenBooks(books), [books]);
+  const hiddenVisible = useMemo(
+    () => sortBySeries(searchCandidates(hidden, search)),
+    [hidden, search],
+  );
   const selectedVisible = useMemo(
     () => visible.filter((b) => selected.has(b.path)),
     [visible, selected],
@@ -164,6 +187,8 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
             onExcludeChange={(v) => scanStore.setExcludeCovered(v)}
             showHidden={showHidden}
             onShowHiddenChange={(v) => scanStore.setShowHidden(v)}
+            search={search}
+            onSearchChange={(v) => scanStore.setSearch(v)}
           />
 
           {running && (
@@ -221,15 +246,15 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
             </table>
           </div>
 
-          {showHidden && hidden.length > 0 && (
+          {showHidden && hiddenVisible.length > 0 && (
             <div className="flex flex-col gap-2">
               <h3 className="text-xs font-medium uppercase tracking-wide text-dim">
-                Hidden ({hidden.length})
+                Hidden ({hiddenVisible.length})
               </h3>
               <div className="overflow-x-auto rounded-xl border border-edge bg-surface">
                 <table className="w-full text-left text-sm">
                   <tbody>
-                    {hidden.map((b) => (
+                    {hiddenVisible.map((b) => (
                       <CandidateRow
                         key={b.path}
                         book={b}
@@ -372,6 +397,8 @@ interface ToolbarProps {
   onExcludeChange: (v: boolean) => void;
   showHidden: boolean;
   onShowHiddenChange: (v: boolean) => void;
+  search: string;
+  onSearchChange: (v: string) => void;
 }
 
 function Toolbar({
@@ -382,6 +409,8 @@ function Toolbar({
   onExcludeChange,
   showHidden,
   onShowHiddenChange,
+  search,
+  onSearchChange,
 }: ToolbarProps) {
   return (
     <div className="flex flex-wrap items-center justify-between gap-3">
@@ -389,6 +418,14 @@ function Toolbar({
         Showing {visibleCount} of {totalCount}
       </span>
       <div className="flex flex-wrap items-center gap-4">
+        <input
+          type="search"
+          value={search}
+          onChange={(e) => onSearchChange(e.target.value)}
+          placeholder="Search books..."
+          aria-label="Search books"
+          className="w-48 rounded-md border border-edge bg-raised px-3 py-1.5 text-sm text-body placeholder:text-dim"
+        />
         {hiddenCount > 0 && (
           <button
             type="button"

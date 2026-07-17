@@ -95,6 +95,40 @@ export function hiddenBooks(books: ScannedBook[]): ScannedBook[] {
   return books.filter((b) => b.hidden);
 }
 
+// searchHaystack joins a book's searchable text (title, authors, series,
+// narrators, asin, isbn) into one lowercased string. Kept private so both the
+// query build and the match share one field list.
+function searchHaystack(b: ScannedBook): string {
+  return [
+    b.title,
+    ...(b.authors ?? []),
+    b.series ?? '',
+    ...(b.narrators ?? []),
+    b.asin ?? '',
+    b.isbn ?? '',
+  ]
+    .join(' ')
+    .toLowerCase();
+}
+
+// searchCandidates filters books to those matching a free-text query. The query
+// is trimmed and lowercased, then split on whitespace into tokens; a book matches
+// only when EVERY token appears somewhere in its searchable text (AND semantics).
+// A blank query returns the input array unchanged (same reference) so the common
+// no-filter path allocates nothing. Order is preserved.
+export function searchCandidates(books: ScannedBook[], query: string): ScannedBook[] {
+  const tokens = query
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((t) => t !== '');
+  if (tokens.length === 0) return books;
+  return books.filter((b) => {
+    const hay = searchHaystack(b);
+    return tokens.every((t) => hay.includes(t));
+  });
+}
+
 // POS_SENTINEL sorts an empty/unparseable position last. It matches the Go
 // scheduler.ParseSeriesPos sentinel (1e18) exactly so the two implementations are
 // behaviorally identical, not merely both "sort last".
@@ -118,6 +152,36 @@ export function parsePos(pos: string | undefined): number {
   if (dots > 1 || !/[0-9]/.test(run)) return POS_SENTINEL;
   const n = Number.parseFloat(run);
   return Number.isNaN(n) ? POS_SENTINEL : n;
+}
+
+// sortBySeries returns a NEW array (the input is never mutated) ordered for
+// series-first browsing: books that belong to a series come first, grouped by
+// series name (case-insensitive), and within a group ordered by parsed series
+// position ascending (a blank/unparseable position sorts last via POS_SENTINEL),
+// with the title as a final tiebreak. Books with NO series follow, ordered by
+// title. The comparator is a total order over stable keys, so the result is
+// deterministic regardless of the input order.
+export function sortBySeries(books: ScannedBook[]): ScannedBook[] {
+  return [...books].sort((a, b) => {
+    const sa = (a.series ?? '').trim();
+    const sb = (b.series ?? '').trim();
+    const aHas = sa !== '';
+    const bHas = sb !== '';
+    // Books in a series sort before seriesless books.
+    if (aHas !== bHas) return aHas ? -1 : 1;
+    if (aHas && bHas) {
+      const byName = sa.toLowerCase().localeCompare(sb.toLowerCase());
+      if (byName !== 0) return byName;
+      const pa = parsePos(a.series_position);
+      const pb = parsePos(b.series_position);
+      if (pa !== pb) return pa - pb;
+    }
+    // Final tiebreak (and the whole order for seriesless books): title, then the
+    // stable path key so the order stays total even when titles are identical.
+    const byTitle = a.title.localeCompare(b.title);
+    if (byTitle !== 0) return byTitle;
+    return a.path.localeCompare(b.path);
+  });
 }
 
 // ResultTally counts a POST /books response by per-candidate outcome.

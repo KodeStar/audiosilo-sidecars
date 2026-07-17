@@ -30,6 +30,7 @@ export interface ScanState {
   starting: boolean;
   excludeCovered: boolean;
   showHidden: boolean;
+  search: string;
   selected: ReadonlySet<string>;
   processing: boolean;
   note: ScanNote | null;
@@ -99,6 +100,7 @@ const INITIAL: ScanState = {
   starting: false,
   excludeCovered: false,
   showHidden: false,
+  search: '',
   selected: new Set(),
   processing: false,
   note: null,
@@ -151,6 +153,10 @@ export class ScanStore {
 
   setShowHidden(v: boolean): void {
     this.set({ showHidden: v });
+  }
+
+  setSearch(q: string): void {
+    this.set({ search: q });
   }
 
   // --- selection ---

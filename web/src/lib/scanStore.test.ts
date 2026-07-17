@@ -262,6 +262,7 @@ describe('ScanStore reset', () => {
     } as unknown as ApiClient;
 
     store.setExcludeCovered(true);
+    store.setSearch('dune');
     await store.startScan(client, '/root');
     await flush();
     // The once-per-session reattach latch is now set.
@@ -273,6 +274,7 @@ describe('ScanStore reset', () => {
     // State is back to INITIAL (job cleared, preferences reset).
     expect(store.getSnapshot().job).toBeNull();
     expect(store.getSnapshot().excludeCovered).toBe(false);
+    expect(store.getSnapshot().search).toBe('');
 
     // reattach works again after a reset (the latch was re-armed).
     await store.reattach(client);
@@ -446,6 +448,13 @@ describe('ScanStore selection + preferences', () => {
     store.setShowHidden(true);
     expect(store.getSnapshot().excludeCovered).toBe(true);
     expect(store.getSnapshot().showHidden).toBe(true);
+  });
+
+  it('tracks the search query and defaults to empty', () => {
+    const { store } = makeStore();
+    expect(store.getSnapshot().search).toBe('');
+    store.setSearch('dune');
+    expect(store.getSnapshot().search).toBe('dune');
   });
 
   it('clearForNewScan resets the scan state but keeps preferences', async () => {
