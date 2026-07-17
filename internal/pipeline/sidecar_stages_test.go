@@ -114,7 +114,7 @@ func TestSynthesizeHappyPath(t *testing.T) {
 		return agent.Result{Usage: agent.Usage{Model: "opus", Input: 300, Output: 200, CostUSD: 0.1}}, nil
 	}
 	exe := NewExecutor(withSidecarAgent(t.TempDir(), fake))
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Synthesizing, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Synthesizing, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("synthesize: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestSynthesizeStagedDirIsNotesOnly(t *testing.T) {
 		return agent.Result{}, nil
 	}
 	exe := NewExecutor(withSidecarAgent(t.TempDir(), fake))
-	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Synthesizing, nil); err != nil {
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Synthesizing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("synthesize: %v", err)
 	}
 	req, _ := fake.lastRequest(string(state.Synthesizing))
@@ -185,7 +185,7 @@ func TestSynthesizeCapViolationRetriesThenParks(t *testing.T) {
 		return agent.Result{}, nil
 	}
 	exe := NewExecutor(withSidecarAgent(t.TempDir(), fake))
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Synthesizing, nil)
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Synthesizing, scheduler.StageReport{})
 	var pe *scheduler.ParkError
 	if !errors.As(err, &pe) {
 		t.Fatalf("error = %v, want a ParkError after validation exhaustion", err)
@@ -210,7 +210,7 @@ func TestValidateCleanSidecars(t *testing.T) {
 	seedTranscriptsText(t, work, "wholly unrelated narration alpha", "distinct beta gamma delta")
 
 	exe := NewExecutor(Config{DataDir: t.TempDir(), Fallback: scheduler.NewStubExecutor(0, 0)})
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Validating, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Validating, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("validating: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestValidateNgramCatchesVerbatim(t *testing.T) {
 	seedTranscriptsText(t, work, "before it "+stolen+" after it", "unrelated text here")
 
 	exe := NewExecutor(Config{DataDir: t.TempDir(), Fallback: scheduler.NewStubExecutor(0, 0)})
-	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Validating, nil); err != nil {
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Validating, scheduler.StageReport{}); err != nil {
 		t.Fatalf("validating: %v", err)
 	}
 	rep := readValidationReport(t, work)
@@ -263,7 +263,7 @@ func TestValidateFlagsEmDash(t *testing.T) {
 	seedTranscriptsText(t, work, "unrelated one", "unrelated two")
 
 	exe := NewExecutor(Config{DataDir: t.TempDir(), Fallback: scheduler.NewStubExecutor(0, 0)})
-	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Validating, nil); err != nil {
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Validating, scheduler.StageReport{}); err != nil {
 		t.Fatalf("validating: %v", err)
 	}
 	rep := readValidationReport(t, work)
@@ -298,7 +298,7 @@ func TestAuditPassPath(t *testing.T) {
 		return agent.Result{Usage: agent.Usage{Model: "opus", Input: 80, Output: 40}}, nil
 	}
 	exe := NewExecutor(withSidecarAgent(t.TempDir(), fake))
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Auditing, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Auditing, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("auditing: %v", err)
 	}
@@ -321,7 +321,7 @@ func TestAuditBlockerFails(t *testing.T) {
 		return agent.Result{}, nil
 	}
 	exe := NewExecutor(withSidecarAgent(t.TempDir(), fake))
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Auditing, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Auditing, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("auditing: %v", err)
 	}
@@ -348,7 +348,7 @@ func TestAuditInconsistentPassOverridden(t *testing.T) {
 		return agent.Result{}, nil
 	}
 	exe := NewExecutor(withSidecarAgent(t.TempDir(), fake))
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Auditing, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Auditing, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("auditing: %v", err)
 	}
@@ -408,7 +408,7 @@ func TestValidateWarningRidesToAuditPass(t *testing.T) {
 	exe := NewExecutor(cfg)
 
 	// validating: a warning, no error -> the report is clean.
-	if _, err := exe.Execute(context.Background(), book, state.Validating, nil); err != nil {
+	if _, err := exe.Execute(context.Background(), book, state.Validating, scheduler.StageReport{}); err != nil {
 		t.Fatalf("validating: %v", err)
 	}
 	rep := readValidationReport(t, work)
@@ -427,7 +427,7 @@ func TestValidateWarningRidesToAuditPass(t *testing.T) {
 	if _, err := db.StartStageRun(context.Background(), book.ID, string(state.Auditing), 1); err != nil {
 		t.Fatal(err)
 	}
-	res, err := exe.Execute(context.Background(), book, state.Auditing, nil)
+	res, err := exe.Execute(context.Background(), book, state.Auditing, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("auditing: %v", err)
 	}
@@ -452,7 +452,7 @@ func TestAuditPassOverriddenByUncleanValidation(t *testing.T) {
 		return agent.Result{}, nil
 	}
 	exe := NewExecutor(withSidecarAgent(t.TempDir(), fake))
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Auditing, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Auditing, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("auditing: %v", err)
 	}
@@ -483,7 +483,7 @@ func TestFixReplacesSidecars(t *testing.T) {
 		return agent.Result{Usage: agent.Usage{Model: "opus", Input: 50, Output: 25}}, nil
 	}
 	exe := NewExecutor(withSidecarAgent(t.TempDir(), fake))
-	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Fixing, nil); err != nil {
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Fixing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("fixing: %v", err)
 	}
 	chars, _, err := loadWorkSidecars(work)

@@ -36,9 +36,9 @@ type synthesisPromptData struct {
 // authoring contract and facts/. Outputs are validated against the full structural
 // contract (errors only; the missing-book-2-recap warning is tolerated here and
 // surfaced by validating) and harvested under sidecars/.
-func (e *Executor) synthesize(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
-	if report != nil {
-		report(0, 1)
+func (e *Executor) synthesize(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
+	if r.Progress != nil {
+		r.Progress(0, 1)
 	}
 	manifest, seriesOpener, ledger, err := e.sidecarStageInputs(ctx, book)
 	if err != nil {
@@ -81,15 +81,15 @@ func (e *Executor) synthesize(ctx context.Context, book store.Book, report sched
 		IsSeriesOpener: seriesOpener,
 		VerifiedLedger: ledger,
 	}
-	usage, err := e.runAgent(ctx, book, state.Synthesizing, st, "synthesis.md", data, false, validate)
+	usage, err := e.runAgent(ctx, book, state.Synthesizing, r, st, "synthesis.md", data, false, validate)
 	if err != nil {
 		return scheduler.StageResult{}, err
 	}
 	if err := harvestSidecars(st); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("synthesizing: harvest sidecars: %w", err)
 	}
-	if report != nil {
-		report(1, 1)
+	if r.Progress != nil {
+		r.Progress(1, 1)
 	}
 
 	m := usage.metricsMap()

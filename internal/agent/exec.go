@@ -15,16 +15,21 @@ import (
 // process group is killed before it is returned. errors.Is-able.
 var errTimeout = errors.New("agent: cli timed out")
 
+// heartbeatInterval is how often runCLI invokes cliSpec.heartbeat while the child
+// process is running. It is a package var (not a const) so a test can lower it.
+var heartbeatInterval = 60 * time.Second
+
 // cliSpec fully describes one CLI invocation. Prompt is fed on stdin. Env is the
 // COMPLETE child environment (parent env plus any injected keys); it never appears
 // in argv. Timeout 0 means no timeout.
 type cliSpec struct {
-	path    string
-	args    []string
-	dir     string
-	env     []string
-	stdin   string
-	timeout time.Duration
+	path      string
+	args      []string
+	dir       string
+	env       []string
+	stdin     string
+	timeout   time.Duration
+	heartbeat func(elapsed time.Duration) // optional; called every heartbeatInterval while the child runs
 }
 
 // runCLI starts the process (never via a shell - argv only), feeds stdin, and
@@ -60,6 +65,7 @@ func runCLI(ctx context.Context, spec cliSpec) (stdout, stderr string, err error
 	cmd.Stderr = &errBuf
 	setProcGroup(cmd)
 
+	start := time.Now()
 	if serr := cmd.Start(); serr != nil {
 		return "", "", fmt.Errorf("start %s: %w", spec.path, serr)
 	}
@@ -67,18 +73,33 @@ func runCLI(ctx context.Context, spec cliSpec) (stdout, stderr string, err error
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 
-	select {
-	case <-runCtx.Done():
-		killProcGroup(cmd)
-		<-done // reap the killed child
-		if ctx.Err() != nil {
-			// The PARENT context was cancelled (shutdown / stage cancel).
-			return outBuf.String(), errBuf.String(), ctx.Err()
+	// A liveness ticker fires ONLY between cmd.Start and cmd.Wait returning, so a
+	// heartbeat proves the child is genuinely alive. It naturally stays silent during
+	// rate-limit backoff (that sleep is in RunWithBackoff, outside this call). A nil
+	// heartbeat gets a stopped ticker whose channel never fires.
+	var beat <-chan time.Time
+	if spec.heartbeat != nil {
+		ticker := time.NewTicker(heartbeatInterval)
+		defer ticker.Stop()
+		beat = ticker.C
+	}
+
+	for {
+		select {
+		case <-runCtx.Done():
+			killProcGroup(cmd)
+			<-done // reap the killed child
+			if ctx.Err() != nil {
+				// The PARENT context was cancelled (shutdown / stage cancel).
+				return outBuf.String(), errBuf.String(), ctx.Err()
+			}
+			// Only the per-invocation deadline fired.
+			return outBuf.String(), errBuf.String(), fmt.Errorf("%w after %s", errTimeout, spec.timeout)
+		case <-beat:
+			spec.heartbeat(time.Since(start))
+		case werr := <-done:
+			return outBuf.String(), errBuf.String(), werr
 		}
-		// Only the per-invocation deadline fired.
-		return outBuf.String(), errBuf.String(), fmt.Errorf("%w after %s", errTimeout, spec.timeout)
-	case werr := <-done:
-		return outBuf.String(), errBuf.String(), werr
 	}
 }
 

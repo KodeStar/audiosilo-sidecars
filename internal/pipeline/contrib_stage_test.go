@@ -369,7 +369,7 @@ func TestContributeIssueHappyPath(t *testing.T) {
 	cfg := contribConfig(t, db, contribModeIssue, gh.srv.URL, meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
 	exe := NewExecutor(cfg)
 
-	res, err := exe.Execute(context.Background(), b, state.Contributing, nil)
+	res, err := exe.Execute(context.Background(), b, state.Contributing, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("contribute: %v", err)
 	}
@@ -437,7 +437,7 @@ func TestContributeIssueLabelsDropped(t *testing.T) {
 
 	b := contribBook(t, db, store.NewBook{WorkID: "reacher-01"}, baseChars("x"), baseRecaps("x"))
 	cfg := contribConfig(t, db, contribModeIssue, gh.srv.URL, "", "", fakeTokenResolver{token: "ghp_x"})
-	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, nil); err != nil {
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("contribute: %v", err)
 	}
 	rows := rowsByKind(t, db, b.ID)
@@ -454,7 +454,7 @@ func TestContributeIssueOversizePayloadUsesGist(t *testing.T) {
 	huge.Characters[0].Description = strings.Repeat("word ", 15000) // ~75 KB > 60 KB body limit
 	b := contribBook(t, db, store.NewBook{WorkID: "reacher-01"}, huge, baseRecaps("x"))
 	cfg := contribConfig(t, db, contribModeIssue, gh.srv.URL, "", "", fakeTokenResolver{token: "ghp_x"})
-	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, nil); err != nil {
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("contribute: %v", err)
 	}
 	if gh.gists != 1 {
@@ -484,7 +484,7 @@ func TestContributeSkipsCoveredDimension(t *testing.T) {
 
 	b := contribBook(t, db, store.NewBook{WorkID: "reacher-01"}, baseChars("x"), baseRecaps("x"))
 	cfg := contribConfig(t, db, contribModeIssue, gh.srv.URL, meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
-	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, nil); err != nil {
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("contribute: %v", err)
 	}
 	if gh.issueCount() != 1 {
@@ -505,7 +505,7 @@ func TestContributePRMode(t *testing.T) {
 
 	b := contribBook(t, db, store.NewBook{WorkID: "reacher-01"}, baseChars("x"), baseRecaps("x"))
 	cfg := contribConfig(t, db, contribModePR, gh.srv.URL, "", "", fakeTokenResolver{token: "ghp_x"})
-	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, nil); err != nil {
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("contribute: %v", err)
 	}
 	if gh.forks != 1 || gh.pulls != 1 || len(gh.puts) != 2 {
@@ -532,7 +532,7 @@ func TestContributeLocalMode(t *testing.T) {
 
 	b := contribBook(t, db, store.NewBook{WorkID: "reacher-01"}, baseChars("x"), baseRecaps("x"))
 	cfg := contribConfig(t, db, contribModeLocal, "", "", export, nil)
-	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, nil); err != nil {
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("contribute: %v", err)
 	}
 	shard := model.Shard("reacher-01")
@@ -555,7 +555,7 @@ func TestContributeLocalModeUnresolvedSlugUsesPlaceholder(t *testing.T) {
 	// No WorkID and no meta => local mode falls back to a title-derived placeholder slug.
 	b := contribBook(t, db, store.NewBook{Title: "Some Unknown Book"}, baseChars("x"), baseRecaps("x"))
 	cfg := contribConfig(t, db, contribModeLocal, "", "", export, nil)
-	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, nil); err != nil {
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("contribute: %v", err)
 	}
 	slug := "some-unknown-book"
@@ -580,7 +580,7 @@ func TestContributeStaleWorkIDFallsToAsinLookup(t *testing.T) {
 
 	b := contribBook(t, db, store.NewBook{WorkID: "stale-slug", ASIN: "B01"}, baseChars("x"), baseRecaps("x"))
 	cfg := contribConfig(t, db, contribModeIssue, gh.srv.URL, meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
-	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, nil); err != nil {
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("contribute: %v", err)
 	}
 	// The resolved work id is persisted back onto the book.
@@ -607,7 +607,7 @@ func TestContributeNoMatchParksCoreNeeded(t *testing.T) {
 	}
 	cfg := contribConfig(t, db, contribModeIssue, "", meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
 
-	_, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, nil)
+	_, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{})
 	assertPark(t, err, state.ParkCoreNeeded)
 
 	// A prefilled proposal is written with the language + runtime.
@@ -638,7 +638,7 @@ func TestContributeCorePendingWhenProposalSubmitted(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := contribConfig(t, db, contribModeIssue, "", "", "", fakeTokenResolver{token: "ghp_x"})
-	_, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, nil)
+	_, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{})
 	assertPark(t, err, state.ParkCorePending)
 }
 
@@ -649,7 +649,7 @@ func TestContributeNoCredentialParks(t *testing.T) {
 
 	// Denied: no credential parks contrib_unavailable, no issue created.
 	cfg := contribConfig(t, db, contribModeIssue, gh.srv.URL, "", "", fakeTokenResolver{err: contrib.ErrNoCredential})
-	_, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, nil)
+	_, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{})
 	assertPark(t, err, state.ParkContribUnavailable)
 	if gh.issueCount() != 0 {
 		t.Errorf("issues created = %d, want 0 when uncredentialed", gh.issueCount())
@@ -658,7 +658,7 @@ func TestContributeNoCredentialParks(t *testing.T) {
 	// Allowed: a PAT proceeds.
 	b2 := contribBook(t, db, store.NewBook{WorkID: "reacher-01"}, baseChars("x"), baseRecaps("x"))
 	cfg2 := contribConfig(t, db, contribModeIssue, gh.srv.URL, "", "", fakeTokenResolver{token: "ghp_ok"})
-	if _, err := NewExecutor(cfg2).Execute(context.Background(), b2, state.Contributing, nil); err != nil {
+	if _, err := NewExecutor(cfg2).Execute(context.Background(), b2, state.Contributing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("contribute with PAT: %v", err)
 	}
 	if gh.issueCount() != 2 {
@@ -680,7 +680,7 @@ func TestContributeResumeSkipsAlreadyPostedRows(t *testing.T) {
 		}
 	}
 	cfg := contribConfig(t, db, contribModeIssue, gh.srv.URL, "", "", fakeTokenResolver{token: "ghp_x"})
-	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, nil); err != nil {
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("contribute: %v", err)
 	}
 	if gh.issueCount() != 0 {
@@ -695,7 +695,7 @@ func TestContributeRateLimitIsTransientNotPark(t *testing.T) {
 	b := contribBook(t, db, store.NewBook{WorkID: "reacher-01"}, baseChars("x"), baseRecaps("x"))
 	cfg := contribConfig(t, db, contribModeIssue, gh.srv.URL, "", "", fakeTokenResolver{token: "ghp_x"})
 
-	_, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, nil)
+	_, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{})
 	if err == nil {
 		t.Fatal("expected a rate-limit error")
 	}
@@ -722,7 +722,7 @@ func TestContributePRResumeReusesBranchAndPR(t *testing.T) {
 	// contribution rows (the crash window).
 	cfg1 := contribConfig(t, db, contribModePR, gh.srv.URL, "", "", fakeTokenResolver{token: "ghp_x"})
 	cfg1.DB = nil
-	if _, err := NewExecutor(cfg1).Execute(context.Background(), b, state.Contributing, nil); err != nil {
+	if _, err := NewExecutor(cfg1).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("first run: %v", err)
 	}
 	if gh.forks == 0 || gh.pulls != 1 || gh.refs != 1 {
@@ -735,7 +735,7 @@ func TestContributePRResumeReusesBranchAndPR(t *testing.T) {
 	// Second run WITH the db: it must reuse the existing branch (no new ref) and the
 	// existing open PR (no new pull), and persist both rows pointing at that PR.
 	cfg2 := contribConfig(t, db, contribModePR, gh.srv.URL, "", "", fakeTokenResolver{token: "ghp_x"})
-	if _, err := NewExecutor(cfg2).Execute(context.Background(), b, state.Contributing, nil); err != nil {
+	if _, err := NewExecutor(cfg2).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("second run: %v", err)
 	}
 	if gh.refs != 1 {
@@ -771,7 +771,7 @@ func TestContributeSettledRowNotOverwrittenByCovered(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := contribConfig(t, db, contribModeIssue, gh.srv.URL, meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
-	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, nil); err != nil {
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("contribute: %v", err)
 	}
 	rows := rowsByKind(t, db, b.ID)
@@ -798,7 +798,7 @@ func TestContributeMergedCoreTrustsWorkIDOn404(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := contribConfig(t, db, contribModeIssue, gh.srv.URL, meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
-	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, nil); err != nil {
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("contribute should proceed on the merged-core slug, got: %v", err)
 	}
 	if gh.issueCount() != 2 {

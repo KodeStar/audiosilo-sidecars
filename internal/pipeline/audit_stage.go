@@ -26,9 +26,9 @@ type auditPromptData struct {
 // honored only when it reports no BLOCKER/FIX finding AND validation_report is clean,
 // so an over-optimistic Pass=true is overridden to false and drives another fix
 // round. The fix-loop cap is scheduler-owned (CountStageSuccesses("fixing")).
-func (e *Executor) audit(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
-	if report != nil {
-		report(0, 1)
+func (e *Executor) audit(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
+	if r.Progress != nil {
+		r.Progress(0, 1)
 	}
 	manifest, seriesOpener, ledger, err := e.sidecarStageInputs(ctx, book)
 	if err != nil {
@@ -60,7 +60,7 @@ func (e *Executor) audit(ctx context.Context, book store.Book, report scheduler.
 		IsSeriesOpener: seriesOpener,
 		VerifiedLedger: ledger,
 	}
-	usage, err := e.runAgent(ctx, book, state.Auditing, st, "audit.md", data, false, validate)
+	usage, err := e.runAgent(ctx, book, state.Auditing, r, st, "audit.md", data, false, validate)
 	if err != nil {
 		return scheduler.StageResult{}, err
 	}
@@ -78,8 +78,8 @@ func (e *Executor) audit(ctx context.Context, book store.Book, report scheduler.
 		e.log.Warn("auditing: overriding agent pass=true (inconsistent with findings/validation)",
 			"book", book.ID, "blocker", blocker, "fix", fix, "validation_clean", valRep.Clean)
 	}
-	if report != nil {
-		report(1, 1)
+	if r.Progress != nil {
+		r.Progress(1, 1)
 	}
 	m := usage.metricsMap()
 	m["blocker"] = blocker

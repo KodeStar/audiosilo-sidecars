@@ -300,42 +300,42 @@ func (e *Executor) ensureTools() (ffmpeg, ffprobe string) {
 // Execute routes a stage to its implementation. As of M7 every pipeline stage is
 // handled here (contributing landed in M7); the fallback runs only an unrecognized
 // state, which the state machine never produces.
-func (e *Executor) Execute(ctx context.Context, book store.Book, stage state.State, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
+func (e *Executor) Execute(ctx context.Context, book store.Book, stage state.State, r scheduler.StageReport) (scheduler.StageResult, error) {
 	switch stage {
 	case state.Inspecting:
 		return e.inspect(ctx, book)
 	case state.MarkersNormalizing:
-		return e.markersNormalize(ctx, book, report)
+		return e.markersNormalize(ctx, book, r)
 	case state.Splitting:
-		return e.split(ctx, book, report)
+		return e.split(ctx, book, r)
 	case state.ASR:
-		return e.asrStage(ctx, book, report)
+		return e.asrStage(ctx, book, r)
 	case state.Sanitizing:
-		return e.sanitize(ctx, book, report)
+		return e.sanitize(ctx, book, r)
 	case state.QASweep:
-		return e.qaSweep(ctx, book, report)
+		return e.qaSweep(ctx, book, r)
 	case state.QAAdjudicating:
-		return e.qaAdjudicate(ctx, book, report)
+		return e.qaAdjudicate(ctx, book, r)
 	case state.Retranscribing:
-		return e.retranscribe(ctx, book, report)
+		return e.retranscribe(ctx, book, r)
 	case state.SpellingResearch:
-		return e.spellingResearch(ctx, book, report)
+		return e.spellingResearch(ctx, book, r)
 	case state.Correcting:
-		return e.correcting(ctx, book, report)
+		return e.correcting(ctx, book, r)
 	case state.FactPass:
-		return e.factPass(ctx, book, report)
+		return e.factPass(ctx, book, r)
 	case state.Synthesizing:
-		return e.synthesize(ctx, book, report)
+		return e.synthesize(ctx, book, r)
 	case state.Validating:
-		return e.validateSidecarsStage(ctx, book, report)
+		return e.validateSidecarsStage(ctx, book, r)
 	case state.Auditing:
-		return e.audit(ctx, book, report)
+		return e.audit(ctx, book, r)
 	case state.Fixing:
-		return e.fixSidecars(ctx, book, report)
+		return e.fixSidecars(ctx, book, r)
 	case state.Contributing:
-		return e.contribute(ctx, book, report)
+		return e.contribute(ctx, book, r)
 	default:
-		return e.fallback.Execute(ctx, book, stage, report)
+		return e.fallback.Execute(ctx, book, stage, r)
 	}
 }
 
@@ -406,7 +406,7 @@ func (e *Executor) inspect(ctx context.Context, book store.Book) (scheduler.Stag
 
 // split converts each manifest chapter into a mono/16 kHz FLAC, reporting progress
 // per chapter, then writes the stage sentinel.
-func (e *Executor) split(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
+func (e *Executor) split(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
 	ffmpeg, _ := e.ensureTools()
 	if ffmpeg == "" {
 		return scheduler.StageResult{}, scheduler.ParkWithCode(state.ParkMediaToolsUnavailable, MediaToolsUnavailableMsg)
@@ -434,8 +434,8 @@ func (e *Executor) split(ctx context.Context, book store.Book, report scheduler.
 			firstDone, haveFirst = done, true
 		}
 		lastDone = done
-		if report != nil {
-			report(done, total)
+		if r.Progress != nil {
+			r.Progress(done, total)
 		}
 	}); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("split: %w", err)
@@ -468,7 +468,7 @@ func (e *Executor) split(ctx context.Context, book store.Book, report scheduler.
 // recorded fingerprint no longer matches (the source/chapter layout changed since
 // transcription began) it parks rather than silently reusing raws for a different
 // edition.
-func (e *Executor) asrStage(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
+func (e *Executor) asrStage(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
 	// Ensure the backend is selected AND prepared (or park needs_attention). A missing
 	// backend is a known, human-fixable precondition (install python3+mlx-whisper or a
 	// whisper-cli binary); the fetch/venv build behind EnsureReady is likewise an
@@ -521,8 +521,8 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, report schedul
 		}
 	}
 	done := completed
-	if report != nil {
-		report(done, total)
+	if r.Progress != nil {
+		r.Progress(done, total)
 	}
 	// Time only the transcription loop (backend selection, model/binary download via
 	// readyASR, and the provenance write are excluded), and count only chapters this run
@@ -566,8 +566,8 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, report schedul
 			e.log.Warn("asr: could not freeze raw transcript", "path", rawPath, "err", err)
 		}
 		done++
-		if report != nil {
-			report(done, total)
+		if r.Progress != nil {
+			r.Progress(done, total)
 		}
 	}
 	asrSeconds := time.Since(asrStart).Seconds()
@@ -656,7 +656,7 @@ func deriveChapterLayers(workDir string, raw []byte, meta transcript.Meta) error
 // derivation is cheap and idempotent) rather than tracking per-chapter freshness -
 // the raw layer is the single source of truth, so a full re-derive is always
 // correct and avoids a staleness-tracking bug class for no measurable cost.
-func (e *Executor) sanitize(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
+func (e *Executor) sanitize(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
 	rawDir := filepath.Join(book.WorkDir, transcript.RawDir)
 	entries, err := os.ReadDir(rawDir)
 	if err != nil {
@@ -678,8 +678,8 @@ func (e *Executor) sanitize(ctx context.Context, book store.Book, report schedul
 
 	prov := readASRProvenance(book.WorkDir)
 	total := len(chapters)
-	if report != nil {
-		report(0, total)
+	if r.Progress != nil {
+		r.Progress(0, total)
 	}
 	// sanitize re-derives EVERY chapter each run, so its units are the whole chapter
 	// count; time just the derive loop.
@@ -696,8 +696,8 @@ func (e *Executor) sanitize(ctx context.Context, book store.Book, report schedul
 		if err := deriveChapterLayers(book.WorkDir, raw, meta); err != nil {
 			return scheduler.StageResult{}, fmt.Errorf("sanitize: %w", err)
 		}
-		if report != nil {
-			report(i+1, total)
+		if r.Progress != nil {
+			r.Progress(i+1, total)
 		}
 	}
 	deriveSeconds := time.Since(deriveStart).Seconds()
@@ -722,7 +722,7 @@ func (e *Executor) sanitize(ctx context.Context, book store.Book, report schedul
 // loud errors naming the stage that must precede this one. The detectors are fast and
 // fully in-memory, so a single ctx check at entry is enough - there is no long inner
 // loop to cancel. No scratch accounting: the two reports are tiny.
-func (e *Executor) qaSweep(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
+func (e *Executor) qaSweep(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
 	if err := ctx.Err(); err != nil {
 		return scheduler.StageResult{}, err
 	}
@@ -734,8 +734,8 @@ func (e *Executor) qaSweep(ctx context.Context, book store.Book, report schedule
 	for _, ch := range manifest.Chapters {
 		durations[ch.Chapter] = ch.Duration
 	}
-	if report != nil {
-		report(0, 1)
+	if r.Progress != nil {
+		r.Progress(0, 1)
 	}
 	start := time.Now()
 	rep, err := qa.Run(qa.Input{WorkDir: book.WorkDir, Durations: durations})
@@ -748,8 +748,8 @@ func (e *Executor) qaSweep(ctx context.Context, book store.Book, report schedule
 		return scheduler.StageResult{}, fmt.Errorf("qa_sweep: write report: %w", err)
 	}
 	sweepSeconds := time.Since(start).Seconds()
-	if report != nil {
-		report(1, 1)
+	if r.Progress != nil {
+		r.Progress(1, 1)
 	}
 
 	midChapterRuns := 0

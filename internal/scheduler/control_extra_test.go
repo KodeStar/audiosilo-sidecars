@@ -22,7 +22,7 @@ type hookExecutor struct {
 	after func(b store.Book, stage state.State)
 }
 
-func (e *hookExecutor) Execute(_ context.Context, b store.Book, stage state.State, _ ProgressFunc) (StageResult, error) {
+func (e *hookExecutor) Execute(_ context.Context, b store.Book, stage state.State, _ StageReport) (StageResult, error) {
 	res := happyPath()
 	if err := WriteSentinel(b.WorkDir, string(stage), res); err != nil {
 		return StageResult{}, err
@@ -37,7 +37,7 @@ func (e *hookExecutor) Execute(_ context.Context, b store.Book, stage state.Stat
 // stage-implementation bug the scheduler must catch loudly rather than spin on.
 type noSentinelExecutor struct{}
 
-func (noSentinelExecutor) Execute(_ context.Context, _ store.Book, _ state.State, _ ProgressFunc) (StageResult, error) {
+func (noSentinelExecutor) Execute(_ context.Context, _ store.Book, _ state.State, _ StageReport) (StageResult, error) {
 	return happyPath(), nil
 }
 
@@ -316,7 +316,7 @@ func TestDeleteRemovesWorkDirWithinRoot(t *testing.T) {
 // sentinel), so a test can assert the scheduler persists and publishes the code.
 type parkCodeExecutor struct{ code state.ParkCode }
 
-func (e parkCodeExecutor) Execute(_ context.Context, _ store.Book, _ state.State, _ ProgressFunc) (StageResult, error) {
+func (e parkCodeExecutor) Execute(_ context.Context, _ store.Book, _ state.State, _ StageReport) (StageResult, error) {
 	return StageResult{}, ParkWithCode(e.code, "needs a human")
 }
 

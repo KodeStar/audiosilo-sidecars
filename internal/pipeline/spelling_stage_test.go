@@ -59,7 +59,7 @@ func TestSpellingResearchHappyPath(t *testing.T) {
 	fake := newFakeRunner()
 	fake.act = validSpellingAct(t, "Book", []string{"marker_titles.txt"})
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.SpellingResearch, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.SpellingResearch, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("spelling_research: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestSpellingResearchStagesCarryoverRefs(t *testing.T) {
 	cfg := withAgentConfig(t.TempDir(), fake)
 	cfg.DB = db
 	exe := NewExecutor(cfg)
-	if _, err := exe.Execute(context.Background(), book, state.SpellingResearch, nil); err != nil {
+	if _, err := exe.Execute(context.Background(), book, state.SpellingResearch, scheduler.StageReport{}); err != nil {
 		t.Fatalf("spelling_research: %v", err)
 	}
 
@@ -150,7 +150,7 @@ func TestSpellingResearchForbiddenReferenceFileParks(t *testing.T) {
 	// Every attempt cites a file the agent authored - the gate-3 integrity boundary.
 	fake.act = validSpellingAct(t, "Book", []string{"my-own-notes.txt"})
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.SpellingResearch, nil)
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.SpellingResearch, scheduler.StageReport{})
 	var pe *scheduler.ParkError
 	if !errors.As(err, &pe) {
 		t.Fatalf("error = %v, want a ParkError after validation exhaustion", err)
@@ -183,7 +183,7 @@ func TestSpellingResearchDryRunCheckFailureRetries(t *testing.T) {
 		return agent.Result{}, nil
 	}
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.SpellingResearch, nil)
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.SpellingResearch, scheduler.StageReport{})
 	var pe *scheduler.ParkError
 	if !errors.As(err, &pe) {
 		t.Fatalf("error = %v, want a ParkError", err)
@@ -205,7 +205,7 @@ func TestSpellingResearchChunkEndsMismatchRetries(t *testing.T) {
 		return agent.Result{}, nil
 	}
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.SpellingResearch, nil)
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.SpellingResearch, scheduler.StageReport{})
 	var pe *scheduler.ParkError
 	if !errors.As(err, &pe) {
 		t.Fatalf("error = %v, want a ParkError", err)
@@ -272,7 +272,7 @@ func TestCorrectingHappyPath(t *testing.T) {
 		spelling.Spellings{Title: "Book", ChunkEnds: plan.ChunkEnds, Ledger: []spelling.LedgerEntry{}})
 
 	exe := NewExecutor(Config{DataDir: t.TempDir(), Fallback: scheduler.NewStubExecutor(0, 0)})
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Correcting, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Correcting, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("correcting: %v", err)
 	}
@@ -313,7 +313,7 @@ func TestCorrectingCheckFailureParks(t *testing.T) {
 		spelling.Spellings{Title: "Book", ChunkEnds: plan.ChunkEnds, Ledger: []spelling.LedgerEntry{}})
 
 	exe := NewExecutor(Config{DataDir: t.TempDir(), Fallback: scheduler.NewStubExecutor(0, 0)})
-	_, err = exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Correcting, nil)
+	_, err = exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Correcting, scheduler.StageReport{})
 	var pe *scheduler.ParkError
 	if !errors.As(err, &pe) {
 		t.Fatalf("error = %v, want a ParkError on a gate failure", err)

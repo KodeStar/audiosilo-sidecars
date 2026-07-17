@@ -112,6 +112,13 @@ type Request struct {
 	Model   string        // "" = the backend CLI's default model
 	Web     bool          // allow the web search/fetch tools
 	Timeout time.Duration // per-invocation wall-clock cap; 0 = no timeout
+	// Heartbeat, when non-nil, is called periodically (every heartbeatInterval) WHILE
+	// the CLI subprocess is genuinely running - between cmd.Start and cmd.Wait
+	// returning - with the elapsed wall-time since the process started. It is a real
+	// liveness signal: it does not fire during rate-limit backoff (that sleep happens
+	// in RunWithBackoff, outside the subprocess) or before/after the process runs. The
+	// pipeline uses it to emit an "agent still running" note on long agent stages.
+	Heartbeat func(elapsed time.Duration)
 }
 
 // Usage is the token/cost accounting for one invocation. CostUSD is 0 when the

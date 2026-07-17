@@ -90,12 +90,13 @@ func (c *claudeRunner) Run(ctx context.Context, req Request) (Result, error) {
 	env := childEnv(map[string]string{"ANTHROPIC_API_KEY": key})
 
 	stdout, stderr, runErr := runCLI(ctx, cliSpec{
-		path:    p,
-		args:    c.buildArgs(req),
-		dir:     req.Dir,
-		env:     env,
-		stdin:   req.Prompt,
-		timeout: req.Timeout,
+		path:      p,
+		args:      c.buildArgs(req),
+		dir:       req.Dir,
+		env:       env,
+		stdin:     req.Prompt,
+		timeout:   req.Timeout,
+		heartbeat: req.Heartbeat,
 	})
 
 	if errors.Is(runErr, errTimeout) {

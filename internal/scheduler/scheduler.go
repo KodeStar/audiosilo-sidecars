@@ -482,13 +482,23 @@ func (s *Scheduler) runStage(ctx context.Context, b store.Book) {
 // publishes stage.progress. Progress is display-only now (the learned rate comes from
 // the stage's StageResult.RateSample), so the reporter no longer tracks a span.
 func (s *Scheduler) execute(ctx context.Context, b store.Book, stage state.State) (StageResult, error) {
-	report := func(done, total int) {
-		_ = s.db.SetProgress(ctx, b.ID, string(stage), done, total)
-		_ = s.hub.PublishBook("stage.progress", b.ID, map[string]any{
-			"book_id": b.ID, "stage": string(stage), "done": done, "total": total,
-		})
+	r := StageReport{
+		Progress: func(done, total int) {
+			_ = s.db.SetProgress(ctx, b.ID, string(stage), done, total)
+			_ = s.hub.PublishBook("stage.progress", b.ID, map[string]any{
+				"book_id": b.ID, "stage": string(stage), "done": done, "total": total,
+			})
+		},
+		// Note emits a human-readable line into the book's durable log (a stage.note
+		// event on the same PublishBook -> persister -> store.events path as
+		// stage.progress, so GET /books/{id}/events returns it).
+		Note: func(msg string) {
+			_ = s.hub.PublishBook("stage.note", b.ID, map[string]any{
+				"book_id": b.ID, "stage": string(stage), "msg": msg,
+			})
+		},
 	}
-	return s.exec.Execute(ctx, b, stage, report)
+	return s.exec.Execute(ctx, b, stage, r)
 }
 
 // recordRate folds one successful stage run's RateSample into the per-stage EWMA rate

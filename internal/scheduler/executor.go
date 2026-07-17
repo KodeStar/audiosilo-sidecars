@@ -22,6 +22,24 @@ import (
 // that ticks through skipped units affects only the bar, never the rate.
 type ProgressFunc func(done, total int)
 
+// StageReport is the reporting channel every executor stage receives. It carries two
+// independent signals:
+//
+//   - Progress reports numeric within-stage progress (the existing stage.progress
+//     behavior; see ProgressFunc for the resume-baseline convention).
+//   - Note emits a human-readable line into the book's durable log (a stage.note
+//     event): a descriptive stage-entry line ("re-transcribing 3 chapters: 5, 12, 18")
+//     and the agent liveness heartbeat ("still running (6m elapsed)"). It is a real
+//     signal, not decoration - the heartbeat fires only while an agent subprocess is
+//     genuinely running.
+//
+// Either field may be nil (a stage guards each call); the zero StageReport is a valid
+// no-op reporter for tests.
+type StageReport struct {
+	Progress ProgressFunc
+	Note     func(msg string)
+}
+
 // RateSample is a stage's own report of how much work it did in ONE run, used to update
 // the per-stage EWMA seconds-per-unit rate. Units is how many units the stage actually
 // processed this run (chapters split, chunks completed, or 1 for a whole-book stage);
@@ -39,7 +57,7 @@ type RateSample struct {
 // action - that is the content-truth marker the scheduler's crash-resume relies
 // on. It returns an error (and writes no sentinel) on failure or cancellation.
 type Executor interface {
-	Execute(ctx context.Context, book store.Book, stage state.State, report ProgressFunc) (StageResult, error)
+	Execute(ctx context.Context, book store.Book, stage state.State, r StageReport) (StageResult, error)
 }
 
 // ParkError is an executor error that asks the scheduler to park the book
@@ -106,7 +124,7 @@ func happyPath() StageResult {
 // Execute sleeps, reports progress, and writes the sentinel. It respects ctx
 // cancellation (returning ctx.Err() without writing a sentinel) so a paused/
 // cancelled/shutting-down daemon leaves the stage re-runnable.
-func (e *StubExecutor) Execute(ctx context.Context, book store.Book, stage state.State, report ProgressFunc) (StageResult, error) {
+func (e *StubExecutor) Execute(ctx context.Context, book store.Book, stage state.State, r StageReport) (StageResult, error) {
 	span := e.MaxDelay - e.MinDelay
 	total := e.MinDelay
 	if span > 0 {
@@ -115,8 +133,8 @@ func (e *StubExecutor) Execute(ctx context.Context, book store.Book, stage state
 		total += time.Duration(rand.Int64N(int64(span))) //nolint:gosec // stub delay jitter, not security-sensitive
 	}
 	const ticks = 2
-	if report != nil {
-		report(0, ticks)
+	if r.Progress != nil {
+		r.Progress(0, ticks)
 	}
 	for i := 1; i <= ticks; i++ {
 		select {
@@ -124,8 +142,8 @@ func (e *StubExecutor) Execute(ctx context.Context, book store.Book, stage state
 			return StageResult{}, ctx.Err()
 		case <-time.After(total / ticks):
 		}
-		if report != nil {
-			report(i, ticks)
+		if r.Progress != nil {
+			r.Progress(i, ticks)
 		}
 	}
 

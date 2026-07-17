@@ -151,7 +151,7 @@ func (e *validationError) Error() string { return e.msg }
 // Errors are translated: a rate-limited backend and an unavailable backend PARK
 // (actionable, Retry-able); an exhausted output validator PARKS naming why; any other
 // error (render, transport, timeout) is returned as a plain error (StatusFailed).
-func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.State, st *agent.Staging, promptName string, promptData any, web bool, validate func(agent.Result, *agent.Staging) error) (agentUsage, error) {
+func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.State, r scheduler.StageReport, st *agent.Staging, promptName string, promptData any, web bool, validate func(agent.Result, *agent.Staging) error) (agentUsage, error) {
 	runner, av := e.ensureAgent(ctx)
 	if runner == nil || !av.Available {
 		return agentUsage{}, scheduler.ParkWithCode(state.ParkAgentUnavailable, AgentUnavailableMsg)
@@ -183,14 +183,22 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 		Model:   model,
 		Web:     web,
 		Timeout: e.agentTimeout,
+		// Liveness heartbeat: while the agent subprocess runs, emit a durable note so a
+		// long stage (a 6-minute qa_adjudicating) visibly proves the daemon is alive. It
+		// fires only while the child is running (never during rate-limit backoff).
+		Heartbeat: func(elapsed time.Duration) {
+			if r.Note != nil {
+				r.Note(fmt.Sprintf("%s: still running (%s elapsed)", stage, humanDuration(elapsed)))
+			}
+		},
 	}
 	backoff := e.backoff
 	if backoff == nil {
 		backoff = agent.DefaultBackoff()
 	}
 	start := time.Now()
-	_, slept, err := agent.RunWithBackoff(ctx, runner, req, func(r agent.Result) error {
-		if verr := validate(r, st); verr != nil {
+	_, slept, err := agent.RunWithBackoff(ctx, runner, req, func(res agent.Result) error {
+		if verr := validate(res, st); verr != nil {
 			return &validationError{msg: verr.Error()}
 		}
 		return nil
@@ -217,6 +225,31 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 		return total, fmt.Errorf("%s: agent run: %w", stage, err)
 	}
 	return total, nil
+}
+
+// humanDuration renders d as a compact whole-unit elapsed string for a liveness note:
+// "45s" under a minute, "6m" for whole minutes, "1h2m" past an hour. Precision beyond
+// whole minutes/seconds is noise for a "still running" heartbeat.
+func humanDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	h := int(d / time.Hour)
+	m := int((d % time.Hour) / time.Minute)
+	return fmt.Sprintf("%dh%dm", h, m)
+}
+
+// countNoun renders a count with a naively pluralized noun for a human note:
+// countNoun(1, "chunk") -> "1 chunk", countNoun(3, "chunk") -> "3 chunks". Adequate
+// for the pipeline's simple nouns (chapter/chunk); it does not handle irregulars.
+func countNoun(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }
 
 // stageAttempt is a per-stage attempt number used only to name the staged dir
@@ -259,13 +292,16 @@ type markerVerdict struct {
 // chapters via the agent, replacing manifest.json with a validated contiguous map. A
 // not-confident verdict parks the book needs_attention (a human decision point, not a
 // failure); an unavailable agent parks with AgentUnavailableMsg.
-func (e *Executor) markersNormalize(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
-	if report != nil {
-		report(0, 1)
+func (e *Executor) markersNormalize(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
+	if r.Progress != nil {
+		r.Progress(0, 1)
 	}
 	draft, err := audio.ReadManifest(book.WorkDir)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("markers_normalizing: read manifest (inspect must run first): %w", err)
+	}
+	if r.Note != nil {
+		r.Note(fmt.Sprintf("normalizing markers over %s", countNoun(draft.ChapterCount, "chapter")))
 	}
 	st, err := agent.New(book.WorkDir, string(state.MarkersNormalizing), e.stageAttempt(ctx, book, state.MarkersNormalizing))
 	if err != nil {
@@ -308,7 +344,7 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, report
 		Duration:     draft.Duration,
 		ChapterCount: draft.ChapterCount,
 	}
-	usage, err := e.runAgent(ctx, book, state.MarkersNormalizing, st, "markers.md", data, false, validate)
+	usage, err := e.runAgent(ctx, book, state.MarkersNormalizing, r, st, "markers.md", data, false, validate)
 	if err != nil {
 		return scheduler.StageResult{}, err
 	}
@@ -331,8 +367,8 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, report
 	if err := agent.Harvest(st, []agent.HarvestSpec{{From: audio.ManifestName, To: audio.ManifestName}}); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("markers_normalizing: harvest manifest: %w", err)
 	}
-	if report != nil {
-		report(1, 1)
+	if r.Progress != nil {
+		r.Progress(1, 1)
 	}
 	result := scheduler.StageResult{Metrics: metrics(usage.metricsMap()), RateSample: usage.rateSample()}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.MarkersNormalizing), result); err != nil {
@@ -425,9 +461,9 @@ const autoAcceptTailReason = "already repaired via tail_clip - splice present in
 // tail_clip forever would park the book at the round cap despite it being repaired.
 // The auto-accept is decided in the STAGE (never in the golden-tested qa detectors).
 // When every flagged chapter is auto-accepted, the agent is not invoked at all.
-func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
-	if report != nil {
-		report(0, 1)
+func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
+	if r.Progress != nil {
+		r.Progress(0, 1)
 	}
 	// Round cap FIRST: CountStageSuccesses is completed rounds (the current run is still
 	// open, so not counted). 3 completed rounds without convergence -> park.
@@ -445,6 +481,9 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, report sch
 	rep, err := qa.LoadReport(book.WorkDir)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("qa_adjudicating: load report (qa_sweep must run first): %w", err)
+	}
+	if r.Note != nil {
+		r.Note(fmt.Sprintf("adjudicating round %d: %s", round, countNoun(len(qa.FlaggedChapters(rep)), "flagged chapter")))
 	}
 
 	autoEntries := e.autoAcceptRepairedTails(rep, book.WorkDir)
@@ -466,7 +505,7 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, report sch
 		// all-accept plan with no agent invocation.
 		plan = &qa.Plan{Entries: autoEntries}
 	} else {
-		p, u, aerr := e.runQAAdjudicateAgent(ctx, book, rep, round, autoEntries, autoSet)
+		p, u, aerr := e.runQAAdjudicateAgent(ctx, book, r, rep, round, autoEntries, autoSet)
 		if aerr != nil {
 			return scheduler.StageResult{}, aerr
 		}
@@ -476,8 +515,8 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, report sch
 	if err := qa.WritePlan(book.WorkDir, plan); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("qa_adjudicating: write plan: %w", err)
 	}
-	if report != nil {
-		report(1, 1)
+	if r.Progress != nil {
+		r.Progress(1, 1)
 	}
 	m := usage.metricsMap()
 	m["auto_accepted"] = len(autoEntries)
@@ -499,7 +538,7 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, report sch
 // dispositions for the remaining chapters) validated against the report. The merge is
 // what lets the plan validator require the agent to cover only the non-auto chapters
 // while the persisted plan still covers every flagged chapter.
-func (e *Executor) runQAAdjudicateAgent(ctx context.Context, book store.Book, rep *qa.Report, round int, autoEntries []qa.PlanEntry, autoSet map[int]bool) (*qa.Plan, agentUsage, error) {
+func (e *Executor) runQAAdjudicateAgent(ctx context.Context, book store.Book, r scheduler.StageReport, rep *qa.Report, round int, autoEntries []qa.PlanEntry, autoSet map[int]bool) (*qa.Plan, agentUsage, error) {
 	st, err := agent.New(book.WorkDir, string(state.QAAdjudicating), e.stageAttempt(ctx, book, state.QAAdjudicating))
 	if err != nil {
 		return nil, agentUsage{}, err
@@ -544,7 +583,7 @@ func (e *Executor) runQAAdjudicateAgent(ctx context.Context, book store.Book, re
 		return nil
 	}
 	data := adjudicatePromptData{Title: book.Title, Round: round, AutoAccepted: chaptersCSV(autoEntries)}
-	usage, err := e.runAgent(ctx, book, state.QAAdjudicating, st, "adjudicate.md", data, false, validate)
+	usage, err := e.runAgent(ctx, book, state.QAAdjudicating, r, st, "adjudicate.md", data, false, validate)
 	if err != nil {
 		return nil, usage, err
 	}
@@ -653,10 +692,13 @@ func (e *Executor) stageIfPresent(st *agent.Staging, workDir, srcRel, dstRel str
 // and internal/repair for the adopt/splice decisions. Re-entering qa_sweep afterwards
 // re-runs the sweep (advance() clears that sentinel), so a still-dirty book loops back
 // to adjudication.
-func (e *Executor) retranscribe(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
+func (e *Executor) retranscribe(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
 	plan, err := qa.LoadPlan(book.WorkDir)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("retranscribing: load plan (qa_adjudicating must run first): %w", err)
+	}
+	if r.Note != nil {
+		r.Note(retranscribeNote(plan))
 	}
 	manifest, err := audio.ReadManifest(book.WorkDir)
 	if err != nil {
@@ -698,8 +740,8 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, report sch
 		}
 	}
 	done := completed
-	if report != nil {
-		report(done, total)
+	if r.Progress != nil {
+		r.Progress(done, total)
 	}
 
 	// Time only the repair loop (backend selection, model fetch via readyASR and the
@@ -746,8 +788,8 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, report sch
 		}
 		if !wasDone {
 			done++
-			if report != nil {
-				report(done, total)
+			if r.Progress != nil {
+				r.Progress(done, total)
 			}
 		}
 	}
@@ -769,6 +811,22 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, report sch
 		return scheduler.StageResult{}, err
 	}
 	return result, nil
+}
+
+// retranscribeNote renders the descriptive stage-entry line for retranscribing: which
+// chapters this run will re-transcribe or tail-clip (the non-accept plan entries). An
+// all-accept plan (or empty plan) says so plainly rather than naming an empty set.
+func retranscribeNote(plan *qa.Plan) string {
+	var work []qa.PlanEntry
+	for _, en := range plan.Entries {
+		if en.Action != qa.ActionAccept {
+			work = append(work, en)
+		}
+	}
+	if len(work) == 0 {
+		return "re-transcribing: no chapters queued (all accepted)"
+	}
+	return fmt.Sprintf("re-transcribing %s: %s", countNoun(len(work), "chapter"), chaptersCSV(work))
 }
 
 // planHasAction reports whether any plan entry carries the given action.

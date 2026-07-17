@@ -23,9 +23,9 @@ type fixPromptData struct {
 // re-enters validating (advance clears the validating sentinel so it re-runs). The
 // fix-loop cap is scheduler-owned (CountStageSuccesses("fixing") >= 3 parks at
 // auditing), so this stage does no round accounting of its own.
-func (e *Executor) fixSidecars(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
-	if report != nil {
-		report(0, 1)
+func (e *Executor) fixSidecars(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
+	if r.Progress != nil {
+		r.Progress(0, 1)
 	}
 	manifest, seriesOpener, ledger, err := e.sidecarStageInputs(ctx, book)
 	if err != nil {
@@ -49,15 +49,15 @@ func (e *Executor) fixSidecars(ctx context.Context, book store.Book, report sche
 		ChapterCount:   manifest.ChapterCount,
 		VerifiedLedger: ledger,
 	}
-	usage, err := e.runAgent(ctx, book, state.Fixing, st, "fix.md", data, false, validate)
+	usage, err := e.runAgent(ctx, book, state.Fixing, r, st, "fix.md", data, false, validate)
 	if err != nil {
 		return scheduler.StageResult{}, err
 	}
 	if err := harvestSidecars(st); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("fixing: harvest sidecars: %w", err)
 	}
-	if report != nil {
-		report(1, 1)
+	if r.Progress != nil {
+		r.Progress(1, 1)
 	}
 	result := scheduler.StageResult{Metrics: metrics(usage.metricsMap()), RateSample: usage.rateSample()}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.Fixing), result); err != nil {

@@ -60,13 +60,16 @@ type factPassPromptData struct {
 // rolling sheet, and harvests them into facts/. A chunk whose outputs already exist is
 // skipped (crash/park resume), so a re-entry only runs the chunks that remain. Usage
 // accumulates across chunk invocations.
-func (e *Executor) factPass(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
+func (e *Executor) factPass(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
 	plan, err := loadChunkPlan(book.WorkDir)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("fact_pass: load chunk plan (spelling_research must run first): %w", err)
 	}
 	if len(plan.Chunks) == 0 {
 		return scheduler.StageResult{}, fmt.Errorf("fact_pass: chunk plan has no chunks")
+	}
+	if r.Note != nil {
+		r.Note(fmt.Sprintf("fact pass over %s", countNoun(len(plan.Chunks), "chunk")))
 	}
 	pred, hasCarryover, err := findSeriesPredecessor(ctx, e.db, book)
 	if err != nil {
@@ -75,8 +78,8 @@ func (e *Executor) factPass(ctx context.Context, book store.Book, report schedul
 
 	totalChunks := len(plan.Chunks)
 	completed := countCompleteChunks(book.WorkDir, plan)
-	if report != nil {
-		report(completed, totalChunks)
+	if r.Progress != nil {
+		r.Progress(completed, totalChunks)
 	}
 
 	var usageTotal agentUsage
@@ -90,7 +93,7 @@ func (e *Executor) factPass(ctx context.Context, book store.Book, report schedul
 		if chunkComplete(book.WorkDir, plan.Chunks[i], isLast) {
 			continue
 		}
-		usage, chunkReview, cerr := e.factPassChunk(ctx, book, plan, i, hasCarryover, pred)
+		usage, chunkReview, cerr := e.factPassChunk(ctx, book, r, plan, i, hasCarryover, pred)
 		usageTotal.add(usage.Usage)
 		usageTotal.Invocations += usage.Invocations
 		usageTotal.Seconds += usage.Seconds
@@ -100,8 +103,8 @@ func (e *Executor) factPass(ctx context.Context, book store.Book, report schedul
 		}
 		completed++
 		chunksThisRun++
-		if report != nil {
-			report(completed, totalChunks)
+		if r.Progress != nil {
+			r.Progress(completed, totalChunks)
 		}
 	}
 
@@ -134,7 +137,7 @@ func (e *Executor) factPass(ctx context.Context, book store.Book, report schedul
 // the prior knowledge sheet (the previous chunk's cumulative sheet, or the series
 // predecessor's final sheet renamed knowledge-inherited.md for a later book's opening
 // chunk, or nothing for a series opener's first chunk).
-func (e *Executor) factPassChunk(ctx context.Context, book store.Book, plan chunkPlan, idx int, hasCarryover bool, pred *store.Book) (agentUsage, int, error) {
+func (e *Executor) factPassChunk(ctx context.Context, book store.Book, r scheduler.StageReport, plan chunkPlan, idx int, hasCarryover bool, pred *store.Book) (agentUsage, int, error) {
 	chunk := plan.Chunks[idx]
 	isFirst := idx == 0
 	isLast := idx == len(plan.Chunks)-1
@@ -213,7 +216,7 @@ func (e *Executor) factPassChunk(ctx context.Context, book store.Book, plan chun
 		needsReview = n
 		return nil
 	}
-	usage, err := e.runAgent(ctx, book, state.FactPass, st, "factpass.md", data, false, validate)
+	usage, err := e.runAgent(ctx, book, state.FactPass, r, st, "factpass.md", data, false, validate)
 	if err != nil {
 		return usage, 0, err
 	}

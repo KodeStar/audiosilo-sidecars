@@ -43,6 +43,46 @@ func oneWordTranscript(chapter int) transcript.Transcript {
 	}
 }
 
+// TestRetranscribeEmitsStageEntryNote: retranscribing emits a descriptive stage-entry
+// note naming the chapters it will re-transcribe (the non-accept plan entries), and
+// excludes accepted chapters.
+func TestRetranscribeEmitsStageEntryNote(t *testing.T) {
+	work := t.TempDir()
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: 1, ChapterCount: 3, Chapters: []audio.Chapter{
+		{Chapter: 1, Start: 0, End: 1, Duration: 1},
+		{Chapter: 2, Start: 1, End: 2, Duration: 1},
+		{Chapter: 3, Start: 2, End: 3, Duration: 1},
+	}})
+	seedNormalized(t, work, oneWordTranscript(2))
+	seedNormalized(t, work, oneWordTranscript(3))
+	seedFLACs(t, work, 3)
+	seedPlan(t, work,
+		qa.PlanEntry{Chapter: 1, Action: qa.ActionAccept, Reason: "fine"},
+		qa.PlanEntry{Chapter: 2, Action: qa.ActionRetranscribe, Reason: "collapse"},
+		qa.PlanEntry{Chapter: 3, Action: qa.ActionRetranscribe, Reason: "collapse"},
+	)
+
+	var notes []string
+	rep := scheduler.StageReport{Note: func(msg string) { notes = append(notes, msg) }}
+
+	fake := newFakeBackend()
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, rep); err != nil {
+		t.Fatalf("retranscribing: %v", err)
+	}
+
+	want := "re-transcribing 2 chapters: 2, 3"
+	found := false
+	for _, n := range notes {
+		if n == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("stage-entry note %q not emitted; got %v", want, notes)
+	}
+}
+
 // TestRetranscribeAdoptsPlausibleFresh: a collapsed original (1 word / 1s) is replaced
 // by a plausible fresh run (the fake backend's 3-word transcript / 1s), the raw is
 // re-frozen 0444, and the derived layers are re-derived.
@@ -55,7 +95,7 @@ func TestRetranscribeAdoptsPlausibleFresh(t *testing.T) {
 
 	fake := newFakeBackend()
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("retranscribing: %v", err)
 	}
@@ -90,7 +130,7 @@ func TestRetranscribeKeepsCollapsedFresh(t *testing.T) {
 
 	fake := newFakeBackend()
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("retranscribing: %v", err)
 	}
@@ -122,7 +162,7 @@ func TestRetranscribeTailClipSplices(t *testing.T) {
 	exe.clipCutter = func(_ context.Context, _, dstFlac string, _, _ float64) error {
 		return os.WriteFile(dstFlac, []byte("clip"), 0o644) //nolint:gosec // test artifact
 	}
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("retranscribing: %v", err)
 	}
@@ -147,7 +187,7 @@ func TestRetranscribeAcceptSkips(t *testing.T) {
 
 	fake := newFakeBackend()
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("retranscribing: %v", err)
 	}
@@ -197,7 +237,7 @@ func TestRetranscribeTailClipResumeIdempotent(t *testing.T) {
 	}
 	exe1 := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(b1), Fallback: scheduler.NewStubExecutor(0, 0)})
 	exe1.clipCutter = fakeCutter
-	if _, err := exe1.Execute(ctx, store.Book{ID: 1, WorkDir: work}, state.Retranscribing, nil); !errors.Is(err, context.Canceled) {
+	if _, err := exe1.Execute(ctx, store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("run 1 error = %v, want context.Canceled (interrupted after ch2)", err)
 	}
 	if !fileExistsT(filepath.Join(work, transcript.RepairedDir, transcript.TextName(2))) {
@@ -212,7 +252,7 @@ func TestRetranscribeTailClipResumeIdempotent(t *testing.T) {
 	b2 := newFakeBackend()
 	exe2 := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(b2), Fallback: scheduler.NewStubExecutor(0, 0)})
 	exe2.clipCutter = fakeCutter
-	res, err := exe2.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, nil)
+	res, err := exe2.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("run 2 (resume): %v", err)
 	}

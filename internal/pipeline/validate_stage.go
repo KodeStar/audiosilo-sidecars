@@ -34,12 +34,12 @@ const ngramShingle = 8
 // missing-book-2-recap is a WARNING (context for the auditor, never a blocker).
 // Neither errors nor warnings park or fail the stage (they ride into auditing) - only
 // an IO error fails it.
-func (e *Executor) validateSidecarsStage(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
+func (e *Executor) validateSidecarsStage(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
 	if err := ctx.Err(); err != nil {
 		return scheduler.StageResult{}, err
 	}
-	if report != nil {
-		report(0, 1)
+	if r.Progress != nil {
+		r.Progress(0, 1)
 	}
 	start := time.Now()
 	manifest, seriesOpener, _, err := e.sidecarStageInputs(ctx, book)
@@ -87,8 +87,8 @@ func (e *Executor) validateSidecarsStage(ctx context.Context, book store.Book, r
 		return scheduler.StageResult{}, fmt.Errorf("validating: write report: %w", err)
 	}
 	valSeconds := time.Since(start).Seconds()
-	if report != nil {
-		report(1, 1)
+	if r.Progress != nil {
+		r.Progress(1, 1)
 	}
 	result := scheduler.StageResult{
 		Metrics:    metrics(map[string]any{"errors": len(errs), "warnings": len(warns)}),

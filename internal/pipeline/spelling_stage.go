@@ -55,9 +55,9 @@ type spellingPromptData struct {
 // staged dir and validates its output with the strongest validator in M5 - including
 // a dry-run Apply+Check so a rule that would forge a name is rejected before it ever
 // touches the real work dir.
-func (e *Executor) spellingResearch(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
-	if report != nil {
-		report(0, 1)
+func (e *Executor) spellingResearch(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
+	if r.Progress != nil {
+		r.Progress(0, 1)
 	}
 	// 1) marker_titles.txt from the manifest (if an earlier stage did not write it).
 	if err := ensureMarkerTitles(book.WorkDir); err != nil {
@@ -142,7 +142,7 @@ func (e *Executor) spellingResearch(ctx context.Context, book store.Book, report
 		rules, ledgerEntries = r, l
 		return nil
 	}
-	usage, err := e.runAgent(ctx, book, state.SpellingResearch, st, "spelling.md", data, true, validate)
+	usage, err := e.runAgent(ctx, book, state.SpellingResearch, r, st, "spelling.md", data, true, validate)
 	if err != nil {
 		return scheduler.StageResult{}, err
 	}
@@ -154,8 +154,8 @@ func (e *Executor) spellingResearch(ctx context.Context, book store.Book, report
 		return scheduler.StageResult{}, fmt.Errorf("spelling_research: harvest: %w", err)
 	}
 
-	if report != nil {
-		report(1, 1)
+	if r.Progress != nil {
+		r.Progress(1, 1)
 	}
 	m := usage.metricsMap()
 	m["rules"] = rules
@@ -357,7 +357,7 @@ func dryRunCorrections(dryRunDir string, corr *spelling.Corrections) error {
 // layer, verifies it against the four gates (a failure parks - it should be rare given
 // spelling_research's dry run), and generates the spoiler-gated per-chunk spelling
 // sheets. It is mechanical: no agent.
-func (e *Executor) correcting(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
+func (e *Executor) correcting(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
 	if err := ctx.Err(); err != nil {
 		return scheduler.StageResult{}, err
 	}
@@ -369,8 +369,11 @@ func (e *Executor) correcting(ctx context.Context, book store.Book, report sched
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("correcting: load spellings (spelling_research must run first): %w", err)
 	}
-	if report != nil {
-		report(0, 1)
+	if r.Note != nil {
+		r.Note(fmt.Sprintf("applying %s to the transcripts", countNoun(len(corr.Rules), "correction rule")))
+	}
+	if r.Progress != nil {
+		r.Progress(0, 1)
 	}
 	start := time.Now()
 	applyRes, err := spelling.Apply(book.WorkDir, corr)
@@ -399,8 +402,8 @@ func (e *Executor) correcting(ctx context.Context, book store.Book, report sched
 	// where the roster the check needs is available.
 
 	e.accountScratch(ctx, book)
-	if report != nil {
-		report(1, 1)
+	if r.Progress != nil {
+		r.Progress(1, 1)
 	}
 	result := scheduler.StageResult{
 		Metrics: metrics(map[string]any{

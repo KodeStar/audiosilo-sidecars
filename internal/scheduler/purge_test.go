@@ -138,7 +138,7 @@ type signalExecutor struct {
 	once        sync.Once
 }
 
-func (e *signalExecutor) Execute(ctx context.Context, b store.Book, stage state.State, report ProgressFunc) (StageResult, error) {
+func (e *signalExecutor) Execute(ctx context.Context, b store.Book, stage state.State, _ StageReport) (StageResult, error) {
 	if stage == e.signalStage {
 		e.once.Do(func() { close(e.started) })
 	}
@@ -212,9 +212,9 @@ type splitReExecExecutor struct {
 	splits int
 }
 
-func (e *splitReExecExecutor) Execute(ctx context.Context, b store.Book, stage state.State, report ProgressFunc) (StageResult, error) {
+func (e *splitReExecExecutor) Execute(ctx context.Context, b store.Book, stage state.State, r StageReport) (StageResult, error) {
 	if stage != state.Splitting {
-		return e.stub.Execute(ctx, b, stage, report)
+		return e.stub.Execute(ctx, b, stage, r)
 	}
 	e.mu.Lock()
 	e.splits++

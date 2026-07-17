@@ -102,7 +102,7 @@ func TestFactPassTwoChunkHappyPath(t *testing.T) {
 	fake := newFakeRunner()
 	fake.act = factPassAct(t)
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.FactPass, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.FactPass, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("fact_pass: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestFactPassResumesSkippingCompleteChunks(t *testing.T) {
 	fake := newFakeRunner()
 	fake.act = factPassAct(t)
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
-	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.FactPass, nil); err != nil {
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.FactPass, scheduler.StageReport{}); err != nil {
 		t.Fatalf("fact_pass: %v", err)
 	}
 	// Only chunk 2 ran.
@@ -171,7 +171,7 @@ func TestFactPassHeadingValidationRetries(t *testing.T) {
 		return agent.Result{}, nil
 	}
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.FactPass, nil)
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.FactPass, scheduler.StageReport{})
 	var pe *scheduler.ParkError
 	if !errors.As(err, &pe) {
 		t.Fatalf("error = %v, want a ParkError after validation exhaustion", err)
@@ -191,7 +191,7 @@ func TestFactPassChunkStagingInvariant(t *testing.T) {
 	fake := newFakeRunner()
 	fake.act = factPassAct(t)
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
-	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.FactPass, nil); err != nil {
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.FactPass, scheduler.StageReport{}); err != nil {
 		t.Fatalf("fact_pass: %v", err)
 	}
 	// The first chunk's staged dir must hold ONLY chapters 1-2 of the corrected layer.
@@ -230,7 +230,7 @@ func TestFactPassStagesInheritedSheetForPredecessor(t *testing.T) {
 	cfg := withAgentConfig(t.TempDir(), fake)
 	cfg.DB = db
 	exe := NewExecutor(cfg)
-	if _, err := exe.Execute(context.Background(), book, state.FactPass, nil); err != nil {
+	if _, err := exe.Execute(context.Background(), book, state.FactPass, scheduler.StageReport{}); err != nil {
 		t.Fatalf("fact_pass: %v", err)
 	}
 	// The predecessor's knowledge-final.md was staged as knowledge-inherited.md.

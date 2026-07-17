@@ -72,7 +72,7 @@ func TestMarkersNormalizeHappyPath(t *testing.T) {
 		return agent.Result{Usage: agent.Usage{Model: "sonnet", Input: 120, Output: 60, CostUSD: 0.02, Turns: 2}}, nil
 	}
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.MarkersNormalizing, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.MarkersNormalizing, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("markers_normalize: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestAgentStageRateSampleExcludesBackoff(t *testing.T) {
 	}
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
 	exe.backoff = []time.Duration{backoff} // tiny schedule so the test does not sleep for minutes
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.MarkersNormalizing, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.MarkersNormalizing, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("markers_normalize: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestMarkersNormalizeNotConfidentParks(t *testing.T) {
 		return agent.Result{}, nil
 	}
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.MarkersNormalizing, nil)
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.MarkersNormalizing, scheduler.StageReport{})
 	var pe *scheduler.ParkError
 	if !errors.As(err, &pe) {
 		t.Fatalf("error = %v, want a ParkError", err)
@@ -183,7 +183,7 @@ func TestMarkersNormalizeNotConfidentNoManifestParksOnce(t *testing.T) {
 		return agent.Result{Usage: agent.Usage{Model: "sonnet"}}, nil
 	}
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.MarkersNormalizing, nil)
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.MarkersNormalizing, scheduler.StageReport{})
 	var pe *scheduler.ParkError
 	if !errors.As(err, &pe) {
 		t.Fatalf("error = %v, want a ParkError", err)
@@ -212,7 +212,7 @@ func TestMarkersNormalizeInvalidManifestExhaustsAndParks(t *testing.T) {
 		return agent.Result{Usage: agent.Usage{Model: "sonnet"}}, nil
 	}
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.MarkersNormalizing, nil)
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.MarkersNormalizing, scheduler.StageReport{})
 	var pe *scheduler.ParkError
 	if !errors.As(err, &pe) {
 		t.Fatalf("error = %v, want a ParkError after validation exhaustion", err)
@@ -240,7 +240,7 @@ func TestMarkersNormalizeAgentUnavailableParks(t *testing.T) {
 	exe.redetectAgent = func(context.Context) (agent.Runner, agent.Availability) {
 		return nil, agent.Availability{Detail: "no agent CLI found"}
 	}
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.MarkersNormalizing, nil)
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.MarkersNormalizing, scheduler.StageReport{})
 	var pe *scheduler.ParkError
 	if !errors.As(err, &pe) {
 		t.Fatalf("error = %v, want a ParkError", err)
@@ -274,7 +274,7 @@ func TestQAAdjudicateAcceptAll(t *testing.T) {
 		return agent.Result{Usage: agent.Usage{Model: "sonnet"}}, nil
 	}
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.QAAdjudicating, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.QAAdjudicating, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("qa_adjudicating: %v", err)
 	}
@@ -298,7 +298,7 @@ func TestQAAdjudicateRetranscribePlan(t *testing.T) {
 		return agent.Result{}, nil
 	}
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.QAAdjudicating, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.QAAdjudicating, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("qa_adjudicating: %v", err)
 	}
@@ -317,7 +317,7 @@ func TestQAAdjudicateInvalidPlanRetries(t *testing.T) {
 		return agent.Result{}, nil
 	}
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.QAAdjudicating, nil)
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.QAAdjudicating, scheduler.StageReport{})
 	var pe *scheduler.ParkError
 	if !errors.As(err, &pe) {
 		t.Fatalf("error = %v, want a ParkError after validation exhaustion", err)
@@ -359,7 +359,7 @@ func TestQAAdjudicateRoundCapParks(t *testing.T) {
 	cfg := withAgentConfig(t.TempDir(), fake)
 	cfg.DB = db
 	exe := NewExecutor(cfg)
-	_, err = exe.Execute(context.Background(), book, state.QAAdjudicating, nil)
+	_, err = exe.Execute(context.Background(), book, state.QAAdjudicating, scheduler.StageReport{})
 	var pe *scheduler.ParkError
 	if !errors.As(err, &pe) {
 		t.Fatalf("error = %v, want a ParkError (round cap)", err)
@@ -399,7 +399,7 @@ func TestQAAdjudicateAutoAcceptsRepairedTails(t *testing.T) {
 		return agent.Result{}, nil
 	}
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.QAAdjudicating, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.QAAdjudicating, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("qa_adjudicating: %v", err)
 	}
@@ -453,7 +453,7 @@ func TestQAAdjudicateRecordsUsage(t *testing.T) {
 	cfg := withAgentConfig(t.TempDir(), fake)
 	cfg.DB = db
 	exe := NewExecutor(cfg)
-	if _, err := exe.Execute(context.Background(), book, state.QAAdjudicating, nil); err != nil {
+	if _, err := exe.Execute(context.Background(), book, state.QAAdjudicating, scheduler.StageReport{}); err != nil {
 		t.Fatalf("qa_adjudicating: %v", err)
 	}
 	runs, err := db.ListStageRuns(context.Background(), book.ID)
@@ -488,7 +488,7 @@ func TestAgentStagedDirsHoldOnlyContractedInputs(t *testing.T) {
 		return agent.Result{}, nil
 	}
 	mexe := NewExecutor(withAgentConfig(t.TempDir(), markersFake))
-	if _, err := mexe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.MarkersNormalizing, nil); err != nil {
+	if _, err := mexe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.MarkersNormalizing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("markers: %v", err)
 	}
 	mReq, _ := markersFake.lastRequest(string(state.MarkersNormalizing))
@@ -507,7 +507,7 @@ func TestAgentStagedDirsHoldOnlyContractedInputs(t *testing.T) {
 		return agent.Result{}, nil
 	}
 	aexe := NewExecutor(withAgentConfig(t.TempDir(), adjFake))
-	if _, err := aexe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work2}, state.QAAdjudicating, nil); err != nil {
+	if _, err := aexe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work2}, state.QAAdjudicating, scheduler.StageReport{}); err != nil {
 		t.Fatalf("adjudicating: %v", err)
 	}
 	aReq, _ := adjFake.lastRequest(string(state.QAAdjudicating))

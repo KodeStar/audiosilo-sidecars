@@ -100,9 +100,9 @@ type contribArtifact struct {
 // that does not exist upstream parks ParkCoreNeeded (after prefilling a proposal) or
 // ParkCorePending (a proposal already in flight). A GitHub rate limit returns a plain
 // (transient) stage error rather than a park.
-func (e *Executor) contribute(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
-	if report != nil {
-		report(0, 1)
+func (e *Executor) contribute(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
+	if r.Progress != nil {
+		r.Progress(0, 1)
 	}
 	start := time.Now()
 
@@ -164,8 +164,8 @@ func (e *Executor) contribute(ctx context.Context, book store.Book, report sched
 	}
 
 	// 6. Sentinel + a whole-book rate sample.
-	if report != nil {
-		report(1, 1)
+	if r.Progress != nil {
+		r.Progress(1, 1)
 	}
 	submitted, covered := 0, 0
 	for _, a := range artifacts {

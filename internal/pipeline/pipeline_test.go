@@ -385,7 +385,7 @@ func TestSplitRejectsNonContiguousManifest(t *testing.T) {
 	work := t.TempDir()
 	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: 6, ChapterCount: 3, Chapters: markerChapters(1, 2, 4)})
 	exe := NewExecutor(Config{FFmpeg: "/usr/bin/true", DataDir: t.TempDir(), Fallback: scheduler.NewStubExecutor(0, 0)})
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Splitting, nil)
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Splitting, scheduler.StageReport{})
 	if err == nil {
 		t.Fatal("split accepted a non-contiguous manifest, want a loud error")
 	}
@@ -443,9 +443,9 @@ func TestASRStageResumesSkippingCompleted(t *testing.T) {
 	book := store.Book{ID: 1, WorkDir: work}
 
 	var lastDone, lastTotal int
-	res, err := exe.Execute(context.Background(), book, state.ASR, func(done, total int) {
+	res, err := exe.Execute(context.Background(), book, state.ASR, scheduler.StageReport{Progress: func(done, total int) {
 		lastDone, lastTotal = done, total
-	})
+	}})
 	if err != nil {
 		t.Fatalf("asr stage: %v", err)
 	}
@@ -493,7 +493,7 @@ func TestASRStageResumeRateSampleUnits(t *testing.T) {
 
 	fake := newFakeBackend()
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, func(int, int) {})
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, scheduler.StageReport{Progress: func(int, int) {}})
 	if err != nil {
 		t.Fatalf("asr stage: %v", err)
 	}
@@ -521,7 +521,7 @@ func TestASRStageUnavailableParks(t *testing.T) {
 	exe.redetectASR = func(context.Context) (asr.Backend, asr.Capability, string) {
 		return nil, asr.Capability{}, ""
 	}
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil)
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, scheduler.StageReport{})
 	var pe *scheduler.ParkError
 	if !errors.As(err, &pe) {
 		t.Fatalf("asr stage error = %v, want a ParkError (needs_attention)", err)
@@ -544,7 +544,7 @@ func TestASRStageEnsureReadyFailureParks(t *testing.T) {
 	fake := newFakeBackend()
 	fake.ensureErr = errors.New("whisper-cli download: dial tcp: no route to host")
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil)
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, scheduler.StageReport{})
 	var pe *scheduler.ParkError
 	if !errors.As(err, &pe) {
 		t.Fatalf("asr stage error = %v, want a ParkError (needs_attention)", err)
@@ -566,7 +566,7 @@ func TestASRStageTranscribeFailureFails(t *testing.T) {
 	fake := newFakeBackend()
 	fake.transcribeErr = errors.New("model exploded")
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil)
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, scheduler.StageReport{})
 	if err == nil {
 		t.Fatal("a transcription failure should fail the stage")
 	}
@@ -594,7 +594,7 @@ func TestStagesParkWhenMediaToolsMissing(t *testing.T) {
 	})
 	book := store.Book{ID: 1, WorkDir: work, SourcePath: filepath.Join(work, "book.m4b")}
 	for _, stage := range []state.State{state.Inspecting, state.Splitting} {
-		_, err := exe.Execute(context.Background(), book, stage, nil)
+		_, err := exe.Execute(context.Background(), book, stage, scheduler.StageReport{})
 		var pe *scheduler.ParkError
 		if !errors.As(err, &pe) {
 			t.Fatalf("stage %s error = %v, want a ParkError", stage, err)
@@ -618,7 +618,7 @@ func TestSanitizeStageDerivesLayers(t *testing.T) {
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: ASRSetup{}, Fallback: scheduler.NewStubExecutor(0, 0)})
 	book := store.Book{ID: 1, WorkDir: work}
 	for pass := range 2 { // idempotent: run twice
-		if _, err := exe.Execute(context.Background(), book, state.Sanitizing, nil); err != nil {
+		if _, err := exe.Execute(context.Background(), book, state.Sanitizing, scheduler.StageReport{}); err != nil {
 			t.Fatalf("sanitize pass %d: %v", pass, err)
 		}
 	}
@@ -752,7 +752,7 @@ func TestASRReDetectsBackendOnRetry(t *testing.T) {
 	book := store.Book{ID: 1, WorkDir: work}
 
 	// No backend yet -> park, and nothing transcribed.
-	_, err := exe.Execute(context.Background(), book, state.ASR, nil)
+	_, err := exe.Execute(context.Background(), book, state.ASR, scheduler.StageReport{})
 	var pe *scheduler.ParkError
 	if !errors.As(err, &pe) {
 		t.Fatalf("first run error = %v, want a ParkError", err)
@@ -763,7 +763,7 @@ func TestASRReDetectsBackendOnRetry(t *testing.T) {
 
 	// A backend appears; the same executor now runs to completion without a restart.
 	available = true
-	if _, err := exe.Execute(context.Background(), book, state.ASR, nil); err != nil {
+	if _, err := exe.Execute(context.Background(), book, state.ASR, scheduler.StageReport{}); err != nil {
 		t.Fatalf("second run after backend appeared: %v", err)
 	}
 	if fake.count(1) != 1 {
@@ -818,7 +818,7 @@ func TestASRResumesOnMatchingFingerprint(t *testing.T) {
 
 	fake := newFakeBackend()
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
-	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil); err != nil {
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, scheduler.StageReport{}); err != nil {
 		t.Fatalf("asr stage: %v", err)
 	}
 	if fake.count(1) != 0 || fake.count(2) != 0 {
@@ -843,7 +843,7 @@ func TestASRParksOnManifestMismatch(t *testing.T) {
 
 	fake := newFakeBackend()
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil)
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, scheduler.StageReport{})
 	var pe *scheduler.ParkError
 	if !errors.As(err, &pe) {
 		t.Fatalf("error = %v, want a ParkError", err)
@@ -875,7 +875,7 @@ func TestASRResumeReFreezesRaw(t *testing.T) {
 
 	fake := newFakeBackend()
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
-	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil); err != nil {
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, scheduler.StageReport{}); err != nil {
 		t.Fatalf("asr stage: %v", err)
 	}
 	if fake.count(1) != 0 {
@@ -901,7 +901,7 @@ func TestASREmptyThenNonEmptyRetried(t *testing.T) {
 	fake := newFakeBackend()
 	fake.emptyMode = "once"
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
-	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil); err != nil {
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, scheduler.StageReport{}); err != nil {
 		t.Fatalf("asr stage: %v", err)
 	}
 	if fake.count(1) != 2 {
@@ -930,7 +930,7 @@ func TestASREmptyTwiceAccepted(t *testing.T) {
 	fake := newFakeBackend()
 	fake.emptyMode = "always"
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
-	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, nil); err != nil {
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, scheduler.StageReport{}); err != nil {
 		t.Fatalf("asr stage (empty accepted): %v", err)
 	}
 	if fake.count(1) != 2 {
@@ -1015,7 +1015,7 @@ func TestQASweepCleanBranch(t *testing.T) {
 	}
 
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: ASRSetup{}, Fallback: scheduler.NewStubExecutor(0, 0)})
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.QASweep, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.QASweep, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("qa_sweep stage: %v", err)
 	}
@@ -1053,7 +1053,7 @@ func TestQASweepDirtyBranch(t *testing.T) {
 	writeQATranscript(t, work, 3, cleanSegs())
 
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: ASRSetup{}, Fallback: scheduler.NewStubExecutor(0, 0)})
-	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.QASweep, nil)
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.QASweep, scheduler.StageReport{})
 	if err != nil {
 		t.Fatalf("qa_sweep stage: %v", err)
 	}
@@ -1083,7 +1083,7 @@ func TestQASweepMissingTranscriptsErrors(t *testing.T) {
 	writeQAManifest(t, work, map[int]float64{1: 600})
 
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: ASRSetup{}, Fallback: scheduler.NewStubExecutor(0, 0)})
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.QASweep, nil)
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.QASweep, scheduler.StageReport{})
 	if err == nil {
 		t.Fatal("qa_sweep with no transcripts should error")
 	}
@@ -1104,7 +1104,7 @@ func TestQASweepMissingManifestErrors(t *testing.T) {
 	writeQATranscript(t, work, 1, cleanSegs())
 
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: ASRSetup{}, Fallback: scheduler.NewStubExecutor(0, 0)})
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.QASweep, nil)
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.QASweep, scheduler.StageReport{})
 	if err == nil {
 		t.Fatal("qa_sweep with no manifest should error")
 	}
@@ -1130,12 +1130,12 @@ func TestASRStageResumeProgressBaseline(t *testing.T) {
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(newFakeBackend()), Fallback: scheduler.NewStubExecutor(0, 0)})
 
 	var reports []int
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, func(done, total int) {
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, scheduler.StageReport{Progress: func(done, total int) {
 		if total != n {
 			t.Errorf("total = %d, want %d", total, n)
 		}
 		reports = append(reports, done)
-	})
+	}})
 	if err != nil {
 		t.Fatalf("asr stage: %v", err)
 	}
