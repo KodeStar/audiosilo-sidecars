@@ -208,6 +208,40 @@ func TestWriteNormalizedAndText(t *testing.T) {
 	}
 }
 
+func TestReadNormalizedRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	jsonDir := filepath.Join(dir, JSONDir)
+	tr := Transcript{
+		Schema: Schema, Chapter: 7, Backend: "mlx-whisper", Model: "large-v3", Language: "en",
+		Segments: []Segment{{ID: 0, Start: 0, End: 1, Text: " Hi", Words: []Word{{W: " Hi", Start: 0, End: 1}}}},
+	}
+	if err := WriteNormalized(jsonDir, tr); err != nil {
+		t.Fatalf("WriteNormalized: %v", err)
+	}
+	got, err := ReadNormalized(jsonDir, 7)
+	if err != nil {
+		t.Fatalf("ReadNormalized: %v", err)
+	}
+	if got.Chapter != 7 || got.Model != "large-v3" || len(got.Segments) != 1 || got.Segments[0].Text != " Hi" {
+		t.Errorf("round-trip = %+v", got)
+	}
+}
+
+func TestReadNormalizedRejectsWrongSchema(t *testing.T) {
+	dir := t.TempDir()
+	// A document with a foreign schema must be refused, not read as v1.
+	if err := os.WriteFile(filepath.Join(dir, JSONName(2)), []byte(`{"schema":"other/v9","chapter":2}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadNormalized(dir, 2); err == nil {
+		t.Fatal("ReadNormalized should reject a non-v1 schema")
+	}
+	// A missing file surfaces its read error.
+	if _, err := ReadNormalized(dir, 99); err == nil {
+		t.Fatal("ReadNormalized should error on a missing file")
+	}
+}
+
 func TestFiniteHelper(t *testing.T) {
 	nan := math.NaN()
 	inf := math.Inf(1)
@@ -252,4 +286,37 @@ func readFixture(t *testing.T, name string) []byte {
 		t.Fatalf("read fixture %s: %v", name, err)
 	}
 	return raw
+}
+
+func TestChapterTextPath(t *testing.T) {
+	work := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(work, TextDir), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(work, RepairedDir), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// Neither layer present -> not found.
+	if p, ok := ChapterTextPath(work, 1); ok {
+		t.Errorf("ChapterTextPath(no layers) = (%q, true), want not found", p)
+	}
+
+	// Base text only -> the text path.
+	textPath := filepath.Join(work, TextDir, TextName(1))
+	if err := os.WriteFile(textPath, []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if p, ok := ChapterTextPath(work, 1); !ok || p != textPath {
+		t.Errorf("ChapterTextPath(text only) = (%q, %v), want (%q, true)", p, ok, textPath)
+	}
+
+	// Repaired present -> prefer it over the base text.
+	repPath := filepath.Join(work, RepairedDir, TextName(1))
+	if err := os.WriteFile(repPath, []byte("repaired\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if p, ok := ChapterTextPath(work, 1); !ok || p != repPath {
+		t.Errorf("ChapterTextPath(both) = (%q, %v), want (%q, true) [repaired preferred]", p, ok, repPath)
+	}
 }

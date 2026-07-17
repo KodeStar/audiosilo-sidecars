@@ -70,6 +70,10 @@ func Apply(workDir string, data *Corrections) (*ApplyResult, error) {
 	total := 0
 
 	for _, n := range names {
+		// Prefer the repaired layer over the base text, per chapter. This mirrors
+		// transcript.ChapterTextPath's preference but is kept inline: the loop is driven
+		// by the enumerated text-dir filenames (n) and also needs the "text"/"repaired"
+		// source LABEL, which the (path, bool) resolver does not carry.
 		srcPath := filepath.Join(textDir, n)
 		source := "text"
 		if repPath := filepath.Join(repDir, n); fsutil.IsFile(repPath) {

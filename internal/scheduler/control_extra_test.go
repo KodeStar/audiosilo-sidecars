@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -30,6 +31,45 @@ func (e *hookExecutor) Execute(_ context.Context, b store.Book, stage state.Stat
 		e.after(b, stage)
 	}
 	return res, nil
+}
+
+// noSentinelExecutor returns success but never writes the stage sentinel - a
+// stage-implementation bug the scheduler must catch loudly rather than spin on.
+type noSentinelExecutor struct{}
+
+func (noSentinelExecutor) Execute(_ context.Context, _ store.Book, _ state.State, _ ProgressFunc) (StageResult, error) {
+	return happyPath(), nil
+}
+
+// TestStageSuccessWithoutSentinelFails is the item-8 regression: a stage that returns
+// success without writing its sentinel is turned into a terminal failure (with a
+// descriptive message) instead of looping forever through reconcile's rewind.
+func TestStageSuccessWithoutSentinelFails(t *testing.T) {
+	h := newHarness(t)
+	db := h.openDB(t)
+	b := h.addBook(t, db, "nosentinel", "", "")
+
+	books := runUntil(t, db, h.hub, noSentinelExecutor{}, 1, func(bs []store.Book) bool {
+		for _, bk := range bs {
+			if bk.Status == string(state.StatusFailed) {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second)
+
+	var got store.Book
+	for _, bk := range books {
+		if bk.ID == b.ID {
+			got = bk
+		}
+	}
+	if got.Status != string(state.StatusFailed) {
+		t.Fatalf("book status = %q, want failed", got.Status)
+	}
+	if !strings.Contains(got.Error, "without writing its sentinel") {
+		t.Errorf("book error = %q, want the sentinel-bug message", got.Error)
+	}
 }
 
 // TestPauseAfterSentinelBeforeAdvanceStaysPaused is the F1 regression: a pause

@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { ApiClient } from '@/lib/apiClient';
 import { ApiError } from '@/lib/apiClient';
-import type { AsrInfo, SecretsPresence, Settings, ToolsInfo } from '@/api/types';
+import type { AgentInfo, AsrInfo, SecretsPresence, Settings, ToolsInfo } from '@/api/types';
 import { ChangePasswordForm } from './settings/ChangePasswordForm';
 import { SecretRow } from './settings/SecretRow';
+import { AgentSettingsForm } from './settings/AgentSettingsForm';
 
 interface SettingsPanelProps {
   client: ApiClient;
@@ -19,6 +20,7 @@ export function SettingsPanel({ client }: SettingsPanelProps) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [tools, setTools] = useState<ToolsInfo | null>(null);
   const [asr, setAsr] = useState<AsrInfo | null>(null);
+  const [agentInfo, setAgentInfo] = useState<AgentInfo | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -44,6 +46,7 @@ export function SettingsPanel({ client }: SettingsPanelProps) {
         if (!cancelled) {
           setTools(info.tools);
           setAsr(info.asr);
+          setAgentInfo(info.agent);
         }
       })
       .catch(() => {
@@ -138,9 +141,7 @@ export function SettingsPanel({ client }: SettingsPanelProps) {
 
       <Card>
         <SectionTitle>Agent configuration</SectionTitle>
-        <ComingSoon>
-          Agent backend and concurrency settings bind here in a later milestone.
-        </ComingSoon>
+        <AgentSettingsForm client={client} initial={settings.agent} info={agentInfo} />
       </Card>
     </div>
   );

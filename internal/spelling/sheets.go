@@ -21,6 +21,11 @@ const (
 	nonMergesHead   = "## Deliberate non-merges (carryover pairs the ASR blurs)"
 )
 
+// SheetName is the filename of the spoiler-gated spelling sheet covering chapters
+// through end: "spellings-through-ch<end>.md". Exported so the fact-pass stage names
+// the same file GenerateSheets writes.
+func SheetName(end int) string { return fmt.Sprintf("spellings-through-ch%d.md", end) }
+
 // SheetStat reports one generated sheet.
 type SheetStat struct {
 	Chapter    int
@@ -201,7 +206,7 @@ func generateSheet(workDir string, data *Spellings, end int, fu func(string) (in
 	}
 
 	content := strings.Join(lines, "\n") + "\n"
-	path := filepath.Join(workDir, FactsDir, fmt.Sprintf("spellings-through-ch%d.md", end))
+	path := filepath.Join(workDir, FactsDir, SheetName(end))
 	if err := fsutil.WriteFileAtomic(path, []byte(content), 0o644); err != nil {
 		return SheetStat{}, fmt.Errorf("write %s: %w", path, err)
 	}

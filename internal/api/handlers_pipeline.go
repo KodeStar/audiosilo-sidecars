@@ -219,9 +219,13 @@ type bookView struct {
 	// ScratchBytes is the current on-disk size of the book's work dir (chapters +
 	// durables), so the UI can show disk usage and offer a purge. 0 when the work
 	// dir does not exist yet (or was purged).
-	ScratchBytes int64  `json:"scratch_bytes"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
+	ScratchBytes int64 `json:"scratch_bytes"`
+	// TotalCostUSD is the summed agent spend across the book's stage runs (0 for a
+	// book that has run only mechanical/ASR stages or none yet), attached on both the
+	// list and detail views so the Running/Done UI can show a per-book cost.
+	TotalCostUSD float64 `json:"total_cost_usd"`
+	CreatedAt    string  `json:"created_at"`
+	UpdatedAt    string  `json:"updated_at"`
 }
 
 // bookDetail adds the per-execution stage-run ledger.
@@ -230,18 +234,20 @@ type bookDetail struct {
 	StageRuns []store.StageRun `json:"stage_runs"`
 }
 
-// bookToView builds the detail view for one book, fetching its progress. The list
-// endpoint uses buildBookView with a pre-fetched progress slice to avoid an N+1.
+// bookToView builds the detail view for one book, fetching its progress and summed
+// agent cost. The list endpoint uses buildBookView with pre-fetched progress + totals
+// to avoid an N+1.
 func (a *API) bookToView(ctx context.Context, b store.Book) bookView {
 	progress, _ := a.store.ListProgress(ctx, b.ID)
-	return buildBookView(b, progress)
+	totalCost, _ := a.store.SumStageRunCost(ctx, b.ID)
+	return buildBookView(b, progress, totalCost)
 }
 
-// buildBookView assembles a bookView from a book and its (possibly nil) progress
-// rows, normalizing the always-present JSON fields. scratch_bytes is served from
-// the persisted column (written by the split stage / PurgeScratch), so no read
-// walks the work dir.
-func buildBookView(b store.Book, progress []store.Progress) bookView {
+// buildBookView assembles a bookView from a book, its (possibly nil) progress rows, and
+// its summed agent cost, normalizing the always-present JSON fields. scratch_bytes is
+// served from the persisted column (written by the split stage / PurgeScratch), so no
+// read walks the work dir.
+func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64) bookView {
 	authors := b.Authors
 	if authors == nil {
 		authors = []string{}
@@ -259,7 +265,7 @@ func buildBookView(b store.Book, progress []store.Progress) bookView {
 		IdentitySources: idsrc, WorkID: b.WorkID,
 		State: b.State, Lane: string(state.LaneOf(state.State(b.State))),
 		Status: b.Status, Error: b.Error, Coverage: b.Coverage,
-		Progress: progress, ScratchBytes: b.ScratchBytes,
+		Progress: progress, ScratchBytes: b.ScratchBytes, TotalCostUSD: totalCostUSD,
 		CreatedAt: b.CreatedAt, UpdatedAt: b.UpdatedAt,
 	}
 }
@@ -281,9 +287,15 @@ func (a *API) handleListBooks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not list progress")
 		return
 	}
+	// One grouped cost-rollup query for the whole list (no N+1).
+	costByBook, err := a.store.StageRunTotals(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not list costs")
+		return
+	}
 	views := make([]bookView, 0, len(books))
 	for _, b := range books {
-		views = append(views, buildBookView(b, progressByBook[b.ID]))
+		views = append(views, buildBookView(b, progressByBook[b.ID], costByBook[b.ID]))
 	}
 	writeJSON(w, http.StatusOK, listBooksResponse{Books: views})
 }

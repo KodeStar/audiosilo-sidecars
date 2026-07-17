@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -107,6 +108,24 @@ func JSONName(chapter int) string { return name(chapter) + ".json" }
 
 // TextName is the plain-text filename for a chapter.
 func TextName(chapter int) string { return name(chapter) + ".txt" }
+
+// ChapterTextPath resolves the preferred plain-text path for a chapter: the repaired
+// layer (transcripts-repaired/chNNN.txt) when present, else the base text layer
+// (transcripts-text/chNNN.txt). It returns (path, true) when one exists, or ("", false)
+// when neither does. As the layer owner, transcript is the single home of the "prefer
+// repaired over text" preference the chunk planner and spelling.Apply share. (qa's
+// multi-loop scan keeps its own copy: its fallback is an already-loaded in-memory
+// document text, not a text-dir read, so it is not this pure path resolver.)
+func ChapterTextPath(workDir string, chapter int) (string, bool) {
+	nm := TextName(chapter)
+	if repaired := filepath.Join(workDir, RepairedDir, nm); fsutil.IsFile(repaired) {
+		return repaired, true
+	}
+	if text := filepath.Join(workDir, TextDir, nm); fsutil.IsFile(text) {
+		return text, true
+	}
+	return "", false
+}
 
 // RawName is the raw-output filename a backend writes for a chapter (a backend's
 // own output naming derives from the input FLAC stem, which is this same stem).
@@ -353,6 +372,24 @@ func WriteNormalized(jsonDir string, t Transcript) error {
 		return err
 	}
 	return fsutil.WriteFileAtomic(filepath.Join(jsonDir, JSONName(t.Chapter)), append(out, '\n'), 0o644)
+}
+
+// ReadNormalized reads jsonDir/chNNN.json into a Transcript. It is the inverse of
+// WriteNormalized and rejects a document whose Schema is not the current Schema const
+// (a stale or foreign layer must not be silently read as audiosilo-transcript/v1).
+func ReadNormalized(jsonDir string, chapter int) (Transcript, error) {
+	raw, err := os.ReadFile(filepath.Join(jsonDir, JSONName(chapter))) //nolint:gosec // path derives from the book's own work dir
+	if err != nil {
+		return Transcript{}, err
+	}
+	var t Transcript
+	if err := json.Unmarshal(raw, &t); err != nil {
+		return Transcript{}, fmt.Errorf("parse %s: %w", JSONName(chapter), err)
+	}
+	if t.Schema != Schema {
+		return Transcript{}, fmt.Errorf("transcript %s: schema %q, want %q", JSONName(chapter), t.Schema, Schema)
+	}
+	return t, nil
 }
 
 // WriteText writes the plain chapter text to textDir/chNNN.txt (trailing newline)

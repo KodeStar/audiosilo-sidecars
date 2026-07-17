@@ -42,6 +42,9 @@ func newTestEnv(t *testing.T) *testEnv {
 		DataDir: "/tmp/data",
 		Config:  config.Default(),
 		ASR:     ASRInfo{Backend: "mlx-whisper", Available: true, Device: "metal", Version: "Python 3.13"},
+		AgentStatus: func() AgentInfo {
+			return AgentInfo{Backend: "claude", Available: true, Version: "2.1.211"}
+		},
 		Save: func(c config.Config) error {
 			cp := c
 			env.saved = &cp
@@ -150,6 +153,57 @@ func TestSystemRequiresAuth(t *testing.T) {
 	if sys.ASR.Backend != "mlx-whisper" || !sys.ASR.Available || sys.ASR.Device != "metal" {
 		t.Errorf("asr info = %+v, want mlx-whisper/available/metal", sys.ASR)
 	}
+	if sys.Agent.Backend != "claude" || !sys.Agent.Available || sys.Agent.Version != "2.1.211" {
+		t.Errorf("agent info = %+v, want claude/available/2.1.211", sys.Agent)
+	}
+}
+
+// TestSystemAgentNilStatus asserts a nil AgentStatus provider yields a zero
+// AgentInfo (no backend, unavailable) rather than panicking.
+func TestSystemAgentNilStatus(t *testing.T) {
+	mem := auth.NewMemStore()
+	mgr := auth.New(mem)
+	pw, err := mgr.EnsureAdmin()
+	if err != nil {
+		t.Fatalf("EnsureAdmin: %v", err)
+	}
+	a := New(Deps{
+		Auth:    mgr,
+		Limiter: auth.NewRateLimiter(100, 100),
+		Secrets: secrets.NewMemStore(),
+		Events:  events.NewHub(0),
+		Version: "test",
+		DataDir: "/tmp/data",
+		Config:  config.Default(),
+		// AgentStatus deliberately omitted (nil).
+	})
+	srv := httptest.NewServer(a.Handler())
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Post(srv.URL+"/api/v1/auth/login", "application/json", strings.NewReader(`{"password":"`+pw+`"}`))
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	var lr loginResponse
+	if err := json.NewDecoder(resp.Body).Decode(&lr); err != nil {
+		t.Fatalf("decode login: %v", err)
+	}
+	resp.Body.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/system", nil)
+	req.Header.Set("Authorization", "Bearer "+lr.Token)
+	sysResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("system: %v", err)
+	}
+	defer sysResp.Body.Close()
+	var sys systemResponse
+	if err := json.NewDecoder(sysResp.Body).Decode(&sys); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if sys.Agent.Backend != "" || sys.Agent.Available {
+		t.Errorf("agent = %+v, want zero value for nil provider", sys.Agent)
+	}
 }
 
 func TestLogoutRevokesToken(t *testing.T) {
@@ -232,6 +286,108 @@ func TestSettingsNeverEchoesSecrets(t *testing.T) {
 	clearBody := readAll(t, resp)
 	if strings.Contains(clearBody, `"anthropic_api_key":true`) {
 		t.Errorf("secret not cleared: %s", clearBody)
+	}
+}
+
+// TestSettingsAgentGET asserts the GET view carries the agent config: backend,
+// concurrency, timeout, and both model maps (emitted as {} not null).
+func TestSettingsAgentGET(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.login(t)
+
+	resp := env.do(t, http.MethodGet, "/api/v1/settings", token, "")
+	body := readAll(t, resp)
+	// Empty openai map must serialize as {} not null.
+	if !strings.Contains(body, `"openai_models":{}`) {
+		t.Errorf("openai_models not emitted as {}: %s", body)
+	}
+	var view settingsResponse
+	if err := json.Unmarshal([]byte(body), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if view.Agent.Concurrency != config.DefaultConcurrency {
+		t.Errorf("concurrency = %d, want %d", view.Agent.Concurrency, config.DefaultConcurrency)
+	}
+	if view.Agent.TimeoutMinutes != config.DefaultTimeoutMinutes {
+		t.Errorf("timeout_minutes = %d, want %d", view.Agent.TimeoutMinutes, config.DefaultTimeoutMinutes)
+	}
+	if view.Agent.ClaudeModels["synthesizing"] != "opus" {
+		t.Errorf("claude_models[synthesizing] = %q, want opus (default seed)", view.Agent.ClaudeModels["synthesizing"])
+	}
+	if view.Agent.OpenAIModels == nil {
+		t.Error("openai_models should be non-nil (empty map)")
+	}
+}
+
+// TestSettingsAgentPUT updates the backend + model maps + timeout and asserts they
+// validate, persist through Save, and read back on GET.
+func TestSettingsAgentPUT(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.login(t)
+
+	body := `{"agent":{"backend":"codex","concurrency":3,"timeout_minutes":30,` +
+		`"claude_models":{"fact_pass":"haiku"},"openai_models":{"auditing":"gpt-x"}}}`
+	resp := env.do(t, http.MethodPut, "/api/v1/settings", token, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("put agent = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Persisted through Save with the new values.
+	if env.saved == nil {
+		t.Fatal("config not persisted")
+	}
+	if env.saved.Agent.Backend != "codex" || env.saved.Agent.Concurrency != 3 ||
+		env.saved.Agent.TimeoutMinutes != 30 {
+		t.Errorf("saved agent scalars = %+v", env.saved.Agent)
+	}
+	if env.saved.Agent.Claude["fact_pass"] != "haiku" || len(env.saved.Agent.Claude) != 1 {
+		t.Errorf("saved claude map not replaced wholesale: %v", env.saved.Agent.Claude)
+	}
+	if env.saved.Agent.OpenAI["auditing"] != "gpt-x" {
+		t.Errorf("saved openai map = %v", env.saved.Agent.OpenAI)
+	}
+
+	// GET reflects the update.
+	resp = env.do(t, http.MethodGet, "/api/v1/settings", token, "")
+	var view settingsResponse
+	if err := json.Unmarshal([]byte(readAll(t, resp)), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if view.Agent.Backend != "codex" || view.Agent.ClaudeModels["fact_pass"] != "haiku" {
+		t.Errorf("GET after PUT = %+v", view.Agent)
+	}
+}
+
+// TestSettingsAgentPUTRejectsInvalid asserts a bad backend and a non-agent-stage
+// model key are both rejected with 400 carrying the validation message.
+func TestSettingsAgentPUTRejectsInvalid(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.login(t)
+
+	// Bad backend.
+	resp := env.do(t, http.MethodPut, "/api/v1/settings", token, `{"agent":{"backend":"gemini"}}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("bad backend = %d, want 400", resp.StatusCode)
+	}
+	badBody := readAll(t, resp)
+	if !strings.Contains(badBody, "agent.backend") {
+		t.Errorf("400 body missing validation message: %s", badBody)
+	}
+
+	// Non-agent-stage model key.
+	resp = env.do(t, http.MethodPut, "/api/v1/settings", token, `{"agent":{"claude_models":{"splitting":"sonnet"}}}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("non-agent key = %d, want 400", resp.StatusCode)
+	}
+	keyBody := readAll(t, resp)
+	if !strings.Contains(keyBody, "splitting") {
+		t.Errorf("400 body missing offending key: %s", keyBody)
+	}
+
+	// The rejected updates must not have persisted.
+	if env.saved != nil {
+		t.Errorf("invalid PUT persisted config: %+v", env.saved)
 	}
 }
 
@@ -363,9 +519,8 @@ func TestEventsStreamHeartbeatAndAuth(t *testing.T) {
 	go func() {
 		sc := bufio.NewScanner(resp.Body)
 		for sc.Scan() {
-			line := sc.Text()
-			if strings.HasPrefix(line, "event: ") {
-				done <- strings.TrimPrefix(line, "event: ")
+			if ev, ok := strings.CutPrefix(sc.Text(), "event: "); ok {
+				done <- ev
 				return
 			}
 		}

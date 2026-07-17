@@ -259,9 +259,9 @@ describe('summarizeTally', () => {
   });
 });
 
-// parsePos is a contract mirror of the Go parseSeriesPos - these cases are the
+// parsePos is a contract mirror of the Go scheduler.ParseSeriesPos - these cases are the
 // agreed grammar both sides must produce identically.
-describe('parsePos (mirrors Go parseSeriesPos)', () => {
+describe('parsePos (mirrors Go scheduler.ParseSeriesPos)', () => {
   it('parses integers and decimals', () => {
     expect(parsePos('1')).toBe(1);
     expect(parsePos('12')).toBe(12);

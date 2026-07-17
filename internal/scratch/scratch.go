@@ -14,9 +14,11 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 
+	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
+	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
+	"github.com/kodestar/audiosilo-sidecars/internal/repair"
 )
 
 // DirSize returns the total size in bytes of the regular files under path
@@ -71,28 +73,33 @@ func Confined(workRoot, workDir string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	if wd == root || !within(wd, root) {
+	if wd == root || !fsutil.Within(root, wd) {
 		return "", false
 	}
 	return wd, true
 }
 
-func within(path, root string) bool {
-	rel, err := filepath.Rel(root, path)
-	if err != nil {
-		return false
-	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
-}
+// reclaimable names the work-dir subdirectories a purge removes: the split
+// chapters/, the agent staged-context dirs under _runs/, and the M5 tail-clip /
+// full-chapter re-transcription scratch (clips/, retranscribe/). None is a durable
+// (transcripts, facts, sidecars, reports) and none is a stage INPUT (so removing them
+// invalidates no sentinel), so a purge can reclaim them freely.
+var reclaimable = []string{audio.ChaptersDir, agent.RunsDir, repair.ClipsDir, repair.RetranscribeDir}
 
-// Purge deletes a book's reclaimable scratch - the split chapters/ directory (and,
-// once M-later copies sources locally, the copied source) - while KEEPING the
-// durables (probe.json, manifest.json, transcripts, facts, sidecars). It is a
-// no-op when the work dir is absent. The deletion is confined to workRoot.
+// Purge deletes a book's reclaimable scratch - the split chapters/ directory, the
+// agent staged-context dirs (_runs/), and the tail-clip/re-transcription scratch
+// (clips/, retranscribe/) - while KEEPING the durables (probe.json, manifest.json,
+// transcripts, facts, sidecars). It is a no-op when the work dir is absent. The
+// deletion is confined to workRoot.
 func Purge(workRoot, workDir string) error {
 	wd, ok := Confined(workRoot, workDir)
 	if !ok {
 		return nil // nothing safe to remove
 	}
-	return os.RemoveAll(filepath.Join(wd, audio.ChaptersDir))
+	for _, dir := range reclaimable {
+		if err := os.RemoveAll(filepath.Join(wd, dir)); err != nil {
+			return err
+		}
+	}
+	return nil
 }

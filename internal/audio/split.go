@@ -75,31 +75,52 @@ func Split(ctx context.Context, m Manifest, workDir, ffmpegPath string, report P
 
 // splitChapter converts one chapter to a FLAC at out, via a temp file + rename.
 func splitChapter(ctx context.Context, m Manifest, ch Chapter, ffmpegPath, out string) error {
+	var inputArgs []string
+	if m.Style == StyleFiles {
+		// One whole file becomes one chapter.
+		inputArgs = []string{"-i", ch.FilePath}
+	} else {
+		// Seek within the single book file (input seeking: -ss before -i).
+		inputArgs = []string{"-ss", ftoa(ch.Start), "-i", m.Source, "-t", ftoa(ch.Duration)}
+	}
+	return encodeFLAC(ctx, ffmpegPath, inputArgs, out, fmt.Sprintf("chapter %d", ch.Chapter))
+}
+
+// CutClip cuts [startSec, startSec+durSec] of srcFlac into dstFlac as a mono/16 kHz
+// FLAC - parameter-identical to the chapter FLACs Split produces, through the same
+// atomic temp+rename encode path (encodeFLAC). Input seeking (-ss before -i) matches
+// the historical tail_clip_check.py. Shared by internal/repair's clip cutter so clip
+// audio stays bit-comparable to chapter audio.
+func CutClip(ctx context.Context, ffmpegPath, srcFlac, dstFlac string, startSec, durSec float64) error {
+	inputArgs := []string{"-ss", ftoa(startSec), "-i", srcFlac, "-t", ftoa(durSec)}
+	return encodeFLAC(ctx, ffmpegPath, inputArgs, dstFlac, "clip")
+}
+
+// flacEncodeTail is the shared ffmpeg output selection: mono/16 kHz FLAC with the
+// muxer forced (the temp .part extension gives ffmpeg no extension to infer from).
+var flacEncodeTail = []string{"-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "flac", "-f", "flac"}
+
+// encodeFLAC runs ffmpeg with the given input args (input selection + optional
+// -ss/-t seeking) and encodes to out as a mono/16 kHz FLAC via a temp file + atomic
+// rename, capturing stderr for the error. label names the unit in the error message.
+// It is the single ffmpeg-to-FLAC path both chapter splitting and clip cutting share.
+func encodeFLAC(ctx context.Context, ffmpegPath string, inputArgs []string, out, label string) error {
+	if ffmpegPath == "" {
+		return fmt.Errorf("ffmpeg unavailable; cannot encode %s", label)
+	}
 	tmp := out + ".part"
 	_ = os.Remove(tmp) // clear any stale partial from a prior interrupted run
 
-	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
-	if m.Style == StyleFiles {
-		// One whole file becomes one chapter.
-		args = append(args, "-i", ch.FilePath)
-	} else {
-		// Seek within the single book file (input seeking: -ss before -i).
-		args = append(args,
-			"-ss", ftoa(ch.Start),
-			"-i", m.Source,
-			"-t", ftoa(ch.Duration),
-		)
-	}
-	// -f flac is required because the temp output has a .part extension, from which
-	// ffmpeg cannot infer the muxer.
-	args = append(args, "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "flac", "-f", "flac", tmp)
+	args := append([]string{"-hide_banner", "-loglevel", "error", "-y"}, inputArgs...)
+	args = append(args, flacEncodeTail...)
+	args = append(args, tmp)
 
-	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
+	cmd := exec.CommandContext(ctx, ffmpegPath, args...) //nolint:gosec // ffmpegPath is operator-resolved (config -> $PATH -> cache); args are fixed flags + work-dir paths
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("ffmpeg chapter %d: %w: %s", ch.Chapter, err, strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("ffmpeg %s: %w: %s", label, err, strings.TrimSpace(stderr.String()))
 	}
 	return os.Rename(tmp, out)
 }

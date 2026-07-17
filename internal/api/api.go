@@ -54,6 +54,11 @@ type Deps struct {
 	// paths (which a stage may have re-detected after a retry), so /system reflects them
 	// without a restart. nil falls back to the boot-time ASR/FFmpegPath/FFprobePath.
 	LiveStatus func() (ASRInfo, string, string)
+	// AgentStatus, when set, supplies the CURRENT agent-runner availability (backend
+	// resolved at startup, re-detectable after a CLI install), surfaced read-only on
+	// /system. nil -> a zero AgentInfo (no backend, unavailable), mirroring the ASR
+	// LiveStatus pattern.
+	AgentStatus func() AgentInfo
 }
 
 // ASRInfo is the resolved ASR backend capability shown on /system.
@@ -65,23 +70,33 @@ type ASRInfo struct {
 	Detail    string `json:"detail"`
 }
 
+// AgentInfo is the resolved agent-runner capability shown on /system: which backend
+// (claude/codex/"") will run the agent stages and whether it is usable.
+type AgentInfo struct {
+	Backend   string `json:"backend"`
+	Available bool   `json:"available"`
+	Version   string `json:"version,omitempty"`
+	Detail    string `json:"detail,omitempty"`
+}
+
 // API is the HTTP transport.
 type API struct {
-	auth       *auth.Manager
-	limiter    *auth.RateLimiter
-	secrets    secrets.Store
-	events     *events.Hub
-	version    string
-	dataDir    string
-	store      *store.DB
-	sched      *scheduler.Scheduler
-	scans      *metaops.ScanManager
-	meta       *metaops.Client
-	overrides  *metaops.OverrideService
-	ffmpeg     string
-	ffprobe    string
-	asr        ASRInfo
-	liveStatus func() (ASRInfo, string, string)
+	auth        *auth.Manager
+	limiter     *auth.RateLimiter
+	secrets     secrets.Store
+	events      *events.Hub
+	version     string
+	dataDir     string
+	store       *store.DB
+	sched       *scheduler.Scheduler
+	scans       *metaops.ScanManager
+	meta        *metaops.Client
+	overrides   *metaops.OverrideService
+	ffmpeg      string
+	ffprobe     string
+	asr         ASRInfo
+	liveStatus  func() (ASRInfo, string, string)
+	agentStatus func() AgentInfo
 
 	mu   sync.Mutex // guards cfg
 	cfg  config.Config
@@ -95,22 +110,23 @@ func New(d Deps) *API {
 		save = func(config.Config) error { return nil }
 	}
 	a := &API{
-		auth:       d.Auth,
-		limiter:    d.Limiter,
-		secrets:    d.Secrets,
-		events:     d.Events,
-		version:    d.Version,
-		dataDir:    d.DataDir,
-		store:      d.Store,
-		sched:      d.Scheduler,
-		scans:      d.Scans,
-		meta:       d.Meta,
-		ffmpeg:     d.FFmpegPath,
-		ffprobe:    d.FFprobePath,
-		asr:        d.ASR,
-		liveStatus: d.LiveStatus,
-		cfg:        d.Config,
-		save:       save,
+		auth:        d.Auth,
+		limiter:     d.Limiter,
+		secrets:     d.Secrets,
+		events:      d.Events,
+		version:     d.Version,
+		dataDir:     d.DataDir,
+		store:       d.Store,
+		sched:       d.Scheduler,
+		scans:       d.Scans,
+		meta:        d.Meta,
+		ffmpeg:      d.FFmpegPath,
+		ffprobe:     d.FFprobePath,
+		asr:         d.ASR,
+		liveStatus:  d.LiveStatus,
+		agentStatus: d.AgentStatus,
+		cfg:         d.Config,
+		save:        save,
 	}
 	// The override-upsert workflow lives in metaops (transport-only handler over
 	// it). It needs the store + scan manager; requirePipeline gates the handler

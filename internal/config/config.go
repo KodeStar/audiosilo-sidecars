@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/kodestar/audiosilo-sidecars/internal/agent"
+	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"gopkg.in/yaml.v3"
 )
 
@@ -30,6 +32,19 @@ const DefaultListen = "127.0.0.1:8090"
 // DefaultConcurrency is the default number of parallel agent slots (Lane B),
 // honoured by the scheduler's agent lane (M1).
 const DefaultConcurrency = 2
+
+// DefaultTimeoutMinutes is the default per-invocation agent timeout (M5): the wall
+// clock any single agent CLI run (claude/codex) is allowed before the runner kills
+// it. Applied per invocation, not per stage or per book.
+const DefaultTimeoutMinutes = 60
+
+// Agent backend selector values. An empty backend means "auto" (claude when
+// detectable, else codex, else unavailable); the two explicit values force one
+// runner.
+const (
+	AgentBackendClaude = agent.IDClaude
+	AgentBackendCodex  = agent.IDCodex
+)
 
 // DefaultMetadataBaseURL is the community metadata API the coverage/lookup client
 // queries. Overridable (env / config) so tests can point at a local httptest.
@@ -73,14 +88,25 @@ type ASRConfig struct {
 	WhisperCLIPath string `yaml:"whisper_cli_path"` // explicit whisper-cli location
 }
 
-// AgentConfig holds the agent-runner settings. Typed stub for M0; the runner that
-// consumes it lands in a later milestone. Model routing is config, never
-// hardcoded: Claude/OpenAI map a pipeline stage name to a model name.
+// AgentConfig holds the agent-runner settings (live as of M5). Backend selects the
+// headless CLI runner; empty = auto. ClaudePath/CodexPath explicitly locate the CLI
+// binaries (empty = $PATH lookup). TimeoutMinutes bounds a single invocation. Model
+// routing is config, never hardcoded: Claude/OpenAI map a pipeline stage name to a
+// model name, so no vendor model id ever appears in code. An empty OpenAI map is
+// intentional - an unset codex model means "use the codex CLI's default model"; we
+// never invent an OpenAI model id.
+//
+// Changing any agent field takes effect only on a daemon RESTART (the runner is
+// resolved once at startup, like asr.backend), unlike cors_origins which the API
+// re-reads live per request.
 type AgentConfig struct {
-	Backend     string            `yaml:"backend"`     // "" | "claude" | "codex" (M5)
-	Concurrency int               `yaml:"concurrency"` // parallel agent slots (M6)
-	Claude      map[string]string `yaml:"claude"`      // stage -> model (M5)
-	OpenAI      map[string]string `yaml:"openai"`      // stage -> model (M5)
+	Backend        string            `yaml:"backend"`         // "" (auto) | "claude" | "codex"
+	Concurrency    int               `yaml:"concurrency"`     // parallel agent slots (Lane B)
+	ClaudePath     string            `yaml:"claude_path"`     // explicit claude CLI location; "" = $PATH
+	CodexPath      string            `yaml:"codex_path"`      // explicit codex CLI location; "" = $PATH
+	TimeoutMinutes int               `yaml:"timeout_minutes"` // per-invocation wall-clock cap
+	Claude         map[string]string `yaml:"claude"`          // agent-stage name -> model
+	OpenAI         map[string]string `yaml:"openai"`          // agent-stage name -> model (empty = codex default)
 }
 
 // MetadataConfig points the coverage/lookup client at the community metadata API.
@@ -146,7 +172,29 @@ func Default() Config {
 		Metadata:     MetadataConfig{BaseURL: DefaultMetadataBaseURL},
 		Tools:        ToolsConfig{AutoDownload: DefaultAutoDownload},
 		ASR:          ASRConfig{Backend: DefaultASRBackend, Language: DefaultASRLanguage},
-		Agent:        AgentConfig{Concurrency: DefaultConcurrency},
+		Agent: AgentConfig{
+			Concurrency:    DefaultConcurrency,
+			TimeoutMinutes: DefaultTimeoutMinutes,
+			Claude:         defaultClaudeModels(),
+			OpenAI:         map[string]string{},
+		},
+	}
+}
+
+// defaultClaudeModels seeds the claude model routing map: which model runs each
+// agent stage under the claude backend. Cheap stages get sonnet; the load-bearing
+// synthesis/audit/fix stages get opus. Model aliases ("sonnet"/"opus"/"haiku") are
+// what the claude CLI accepts - never a pinned vendor model id. The openai map is
+// intentionally empty (an unset codex model = the codex CLI's default model).
+func defaultClaudeModels() map[string]string {
+	return map[string]string{
+		"markers_normalizing": "sonnet",
+		"qa_adjudicating":     "sonnet",
+		"spelling_research":   "sonnet",
+		"fact_pass":           "sonnet",
+		"synthesizing":        "opus",
+		"auditing":            "opus",
+		"fixing":              "opus",
 	}
 }
 
@@ -169,6 +217,9 @@ func Load(dataDir string) (Config, error) {
 	applyEnv(&cfg)
 	if cfg.Agent.Concurrency == 0 {
 		cfg.Agent.Concurrency = DefaultConcurrency
+	}
+	if cfg.Agent.TimeoutMinutes == 0 {
+		cfg.Agent.TimeoutMinutes = DefaultTimeoutMinutes
 	}
 	// Normalize ASR defaults so an older/partial config.yaml (or one predating M3a)
 	// resolves to a working backend without an explicit edit.
@@ -235,6 +286,17 @@ func applyEnv(cfg *Config) {
 			cfg.Agent.Concurrency = n
 		}
 	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_AGENT_CLAUDE_PATH"); ok {
+		cfg.Agent.ClaudePath = v
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_AGENT_CODEX_PATH"); ok {
+		cfg.Agent.CodexPath = v
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_AGENT_TIMEOUT_MINUTES"); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			cfg.Agent.TimeoutMinutes = n
+		}
+	}
 }
 
 // splitList parses a comma-separated env value into a trimmed, non-empty slice.
@@ -256,6 +318,26 @@ func (c Config) Validate() error {
 	}
 	if c.Agent.Concurrency < 1 {
 		return fmt.Errorf("agent.concurrency must be >= 1, got %d", c.Agent.Concurrency)
+	}
+	switch c.Agent.Backend {
+	case "", AgentBackendClaude, AgentBackendCodex:
+	default:
+		return fmt.Errorf("agent.backend %q must be %q, %q, or empty (auto)",
+			c.Agent.Backend, AgentBackendClaude, AgentBackendCodex)
+	}
+	if c.Agent.TimeoutMinutes < 1 {
+		return fmt.Errorf("agent.timeout_minutes must be >= 1, got %d", c.Agent.TimeoutMinutes)
+	}
+	// Model-map keys must name agent-lane stages; a typo would silently never route.
+	for key := range c.Agent.Claude {
+		if !state.IsAgent(state.State(key)) {
+			return fmt.Errorf("agent.claude has key %q, which is not an agent stage", key)
+		}
+	}
+	for key := range c.Agent.OpenAI {
+		if !state.IsAgent(state.State(key)) {
+			return fmt.Errorf("agent.openai has key %q, which is not an agent stage", key)
+		}
 	}
 	for _, o := range c.CORSOrigins {
 		if err := validateOrigin(o); err != nil {

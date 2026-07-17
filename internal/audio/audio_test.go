@@ -344,22 +344,27 @@ func TestInspectMultiFileStyle(t *testing.T) {
 	}
 }
 
-func TestInspectNonContiguousLeavesNoManifest(t *testing.T) {
+func TestInspectNonContiguousWritesDraftManifest(t *testing.T) {
 	ffmpeg, ffprobe := requireFFmpeg(t)
 	dir := t.TempDir()
-	// A gap (1,2,4) is non-contiguous -> no manifest, contiguous=false.
+	// A gap (1,2,4) is non-contiguous -> contiguous=false, but a DRAFT manifest is
+	// written for the markers_normalizing agent stage to correct.
 	book := genChapteredM4B(t, ffmpeg, dir,
 		[]string{"Chapter 1", "Chapter 2", "Chapter 4"}, 2)
 	work := filepath.Join(dir, "work")
-	_, contig, err := Inspect(context.Background(), book, work, ffprobe)
+	m, contig, err := Inspect(context.Background(), book, work, ffprobe)
 	if err != nil {
 		t.Fatalf("Inspect: %v", err)
 	}
 	if contig {
 		t.Error("gap markers should not be contiguous")
 	}
-	if _, err := os.Stat(filepath.Join(work, ManifestName)); err == nil {
-		t.Error("non-contiguous inspect should write no manifest")
+	// The draft manifest is written (non-contiguous chapters preserved as-seen).
+	if _, err := os.Stat(filepath.Join(work, ManifestName)); err != nil {
+		t.Errorf("non-contiguous inspect should write a draft manifest: %v", err)
+	}
+	if len(m.Chapters) != 3 || Contiguous(m.Chapters) {
+		t.Errorf("draft manifest should carry the 3 non-contiguous chapters, got %+v", m.Chapters)
 	}
 	// probe.json is still written (the record of what we saw).
 	if _, err := os.Stat(filepath.Join(work, ProbeName)); err != nil {

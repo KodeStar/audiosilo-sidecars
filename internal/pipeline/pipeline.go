@@ -1,19 +1,26 @@
-// Package pipeline wires the real stage executors into the scheduler. It provides
-// a composite scheduler.Executor that routes each pipeline stage to its
-// implementation - inspecting -> internal/audio.Inspect, splitting ->
-// internal/audio.Split, asr -> the per-chapter internal/asr loop, sanitizing ->
-// internal/transcript normalization, qa_sweep -> the internal/qa degeneration sweep -
-// and falls through to a stub for every stage a later milestone still owns (the
-// agent stages, contribute, retranscribing). qa_adjudicating deliberately PARKS
-// needs_attention rather than advancing: a book the sweep flagged as dirty must not
-// silently skip human adjudication, which goes live in M5. The scheduler API is
-// unchanged: it sees one Executor.
+// Package pipeline wires the real stage executors into the scheduler. It provides a
+// composite scheduler.Executor that routes each pipeline stage to its implementation.
+// As of M5 EVERY pipeline stage is real; only contributing (M7) still falls through to
+// the stub fallback. The mechanical stages are inspecting -> internal/audio.Inspect,
+// splitting -> internal/audio.Split, asr -> the per-chapter internal/asr loop,
+// sanitizing -> internal/transcript normalization, qa_sweep -> the internal/qa
+// degeneration sweep, retranscribing -> internal/repair (tail-clip + adoption),
+// correcting -> the internal/spelling engine, and validating -> canonicalize +
+// audiosilo-meta n-gram. The AGENT stages (markers_normalizing, qa_adjudicating,
+// spelling_research, fact_pass, synthesizing, auditing, fixing) run internal/agent
+// through the shared runAgent driver. The scheduler API is unchanged: it sees one
+// Executor.
 //
-// Each real stage writes its _done/<stage>.json sentinel as its final durable
-// action (the crash-resume contract) and returns the branch decision the state
-// machine consults. The composite lives here, not in the scheduler, so the
-// scheduler stays free of audio/ASR/tool concerns; server.go constructs it with
-// the resolved ffmpeg/ffprobe paths and the selected ASR backend.
+// A stage that cannot proceed on a human-fixable precondition (media tools or an agent
+// backend unavailable, a not-confident marker verdict, a spelling gate failure, a
+// non-converging QA/fix loop) PARKS the book needs_attention (Retry re-admits it)
+// rather than failing; only a genuine error fails a book.
+//
+// Each real stage writes its _done/<stage>.json sentinel as its final durable action
+// (the crash-resume contract) and returns the branch decision the state machine
+// consults. The composite lives here, not in the scheduler, so the scheduler stays
+// free of audio/ASR/agent/tool concerns; server.go constructs it with the resolved
+// ffmpeg/ffprobe paths, the selected ASR backend, and the selected agent runner.
 package pipeline
 
 import (
@@ -28,13 +35,17 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
+	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/asr"
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 	"github.com/kodestar/audiosilo-sidecars/internal/qa"
+	"github.com/kodestar/audiosilo-sidecars/internal/repair"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/scratch"
+	"github.com/kodestar/audiosilo-sidecars/internal/secrets"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 	"github.com/kodestar/audiosilo-sidecars/internal/toolfetch"
@@ -59,10 +70,26 @@ type ToolConfig struct {
 	FFprobePath string
 }
 
+// AgentModels routes each agent stage to a model per backend. Claude keys the claude
+// backend, OpenAI the codex backend; a missing key means the backend CLI's default
+// model. It is a plain-map view of config.AgentConfig.Claude/.OpenAI so the pipeline
+// package never imports internal/config.
+type AgentModels struct {
+	Claude map[string]string
+	OpenAI map[string]string
+}
+
 // Config configures a composite Executor. FFmpeg/FFprobe are the tool paths
 // resolved at startup ("" when unresolved); Tools carries the explicit config
 // paths honored on a later re-resolution. ASR is the backend chosen at startup and
 // ASRSelect lets a stage re-run asr.Select when that backend was unavailable.
+//
+// The Agent* fields drive the agent stages. Agent is the runner chosen at startup
+// (nil when no CLI was available); AgentAvail is its availability (surfaced on
+// /system); AgentSelect lets a stage re-run agent.Select when the runner was
+// unavailable at startup (the operator installs a CLI, then Retry); AgentModels is
+// the per-stage model routing; AgentTimeout bounds one invocation; Secrets is
+// threaded so a lazy re-Select can inject an API key into the child env.
 type Config struct {
 	DB        *store.DB
 	FFmpeg    string
@@ -73,6 +100,13 @@ type Config struct {
 	ASRSelect asr.SelectConfig
 	Log       *slog.Logger
 	Fallback  scheduler.Executor
+
+	Agent        agent.Runner
+	AgentAvail   agent.Availability
+	AgentSelect  agent.SelectConfig
+	AgentModels  AgentModels
+	AgentTimeout time.Duration
+	Secrets      secrets.Store
 }
 
 // Executor is the composite stage executor. ffmpeg/ffprobe are the resolved tool
@@ -90,22 +124,36 @@ type Config struct {
 type Executor struct {
 	db *store.DB
 
-	mu      sync.Mutex // guards ffmpeg, ffprobe, asr
-	ffmpeg  string
-	ffprobe string
-	asr     ASRSetup
+	mu         sync.Mutex // guards ffmpeg, ffprobe, asr, agentRunner, agentAvail
+	ffmpeg     string
+	ffprobe    string
+	asr        ASRSetup
+	agentRun   agent.Runner
+	agentAvail agent.Availability
 
-	ffmpegCfg  string
-	ffprobeCfg string
-	dataDir    string
-	asrSelect  asr.SelectConfig
-	log        *slog.Logger
-	fallback   scheduler.Executor
+	ffmpegCfg    string
+	ffprobeCfg   string
+	dataDir      string
+	asrSelect    asr.SelectConfig
+	agentSelect  agent.SelectConfig
+	agentModels  AgentModels
+	agentTimeout time.Duration
+	secrets      secrets.Store
+	log          *slog.Logger
+	fallback     scheduler.Executor
 
 	// redetectASR re-selects an ASR backend when the frozen one is unavailable. It is
 	// a field so a test can inject a scripted result; NewExecutor sets it to
 	// defaultRedetectASR (a real asr.Select).
 	redetectASR func(context.Context) (asr.Backend, asr.Capability, string)
+	// redetectAgent re-selects an agent runner when the frozen one is unavailable,
+	// mirroring redetectASR. A test injects a scripted result; NewExecutor sets it to
+	// defaultRedetectAgent (a real agent.Select).
+	redetectAgent func(context.Context) (agent.Runner, agent.Availability)
+	// clipCutter, when non-nil, overrides the ffmpeg-based tail-clip cutter (tests
+	// inject a fake so the retranscribing tail-clip path needs no real ffmpeg). nil in
+	// production - the retranscribing stage builds repair.FFmpegClipCutter.
+	clipCutter repair.ClipCutter
 }
 
 // NewExecutor builds a composite executor from cfg, delegating unimplemented stages
@@ -117,18 +165,25 @@ func NewExecutor(cfg Config) *Executor {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	e := &Executor{
-		db:         cfg.DB,
-		ffmpeg:     cfg.FFmpeg,
-		ffprobe:    cfg.FFprobe,
-		asr:        cfg.ASR,
-		ffmpegCfg:  cfg.Tools.FFmpegPath,
-		ffprobeCfg: cfg.Tools.FFprobePath,
-		dataDir:    cfg.DataDir,
-		asrSelect:  cfg.ASRSelect,
-		log:        log,
-		fallback:   cfg.Fallback,
+		db:           cfg.DB,
+		ffmpeg:       cfg.FFmpeg,
+		ffprobe:      cfg.FFprobe,
+		asr:          cfg.ASR,
+		agentRun:     cfg.Agent,
+		agentAvail:   cfg.AgentAvail,
+		ffmpegCfg:    cfg.Tools.FFmpegPath,
+		ffprobeCfg:   cfg.Tools.FFprobePath,
+		dataDir:      cfg.DataDir,
+		asrSelect:    cfg.ASRSelect,
+		agentSelect:  cfg.AgentSelect,
+		agentModels:  cfg.AgentModels,
+		agentTimeout: cfg.AgentTimeout,
+		secrets:      cfg.Secrets,
+		log:          log,
+		fallback:     cfg.Fallback,
 	}
 	e.redetectASR = e.defaultRedetectASR
+	e.redetectAgent = e.defaultRedetectAgent
 	return e
 }
 
@@ -162,6 +217,26 @@ func (e *Executor) ensureASR(ctx context.Context) ASRSetup {
 	return e.asr
 }
 
+// readyASR is the shared ensure-ASR-or-park preamble the asr and retranscribing
+// stages both open with: re-select a backend (adopting one installed after startup),
+// park needs_attention when none is available, then prepare it (fetch the binary/
+// model, build the venv) - an EnsureReady failure is an environment precondition, so
+// it parks (ctx cancellation propagates cleanly). The park strings are the exact ones
+// tests assert; keep them byte-identical.
+func (e *Executor) readyASR(ctx context.Context) (ASRSetup, error) {
+	setup := e.ensureASR(ctx)
+	if setup.Backend == nil || !setup.Cap.Available {
+		return setup, scheduler.Park("ASR unavailable: " + asrUnavailableDetail(setup.Cap) + " - fix this, then retry")
+	}
+	if err := setup.Backend.EnsureReady(ctx); err != nil {
+		if ctx.Err() != nil {
+			return setup, ctx.Err()
+		}
+		return setup, scheduler.Park("ASR setup failed (" + setup.Backend.ID() + "): " + err.Error() + " - fix this, then retry")
+	}
+	return setup, nil
+}
+
 // defaultRedetectASR re-runs asr.Select and reports a usable backend, or nil when
 // none is available. It is the production redetectASR.
 func (e *Executor) defaultRedetectASR(ctx context.Context) (asr.Backend, asr.Capability, string) {
@@ -190,18 +265,14 @@ func (e *Executor) ensureTools() (ffmpeg, ffprobe string) {
 	return e.ffmpeg, e.ffprobe
 }
 
-// Execute routes a stage to its implementation. Inspecting, splitting, asr, and
-// sanitizing are real; everything else falls through to the stub.
+// Execute routes a stage to its implementation. As of M5 every pipeline stage is
+// handled here; only contributing (M7) falls through to the stub fallback.
 func (e *Executor) Execute(ctx context.Context, book store.Book, stage state.State, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
 	switch stage {
 	case state.Inspecting:
 		return e.inspect(ctx, book)
 	case state.MarkersNormalizing:
-		// A book whose chapter markers are not a clean contiguous run (or that has no
-		// usable markers at all) lands here. Automatic marker normalization is a later
-		// milestone (M5), so rather than let the stub advance it into a split with no
-		// manifest, park it needs_attention with a clear, human-facing reason.
-		return scheduler.StageResult{}, scheduler.Park(MarkersNormalizingMsg)
+		return e.markersNormalize(ctx, book, report)
 	case state.Splitting:
 		return e.split(ctx, book, report)
 	case state.ASR:
@@ -211,21 +282,27 @@ func (e *Executor) Execute(ctx context.Context, book store.Book, stage state.Sta
 	case state.QASweep:
 		return e.qaSweep(ctx, book, report)
 	case state.QAAdjudicating:
-		// A book reaches qa_adjudicating only when the sweep found degeneration that
-		// warrants human/agent judgement. Automatic adjudication is a later milestone
-		// (M5), so park needs_attention rather than let the stub advance it: a dirty book
-		// must NOT silently skip adjudication and carry looped/hallucinated narration into
-		// the fact pass. The qa_report.md the sweep wrote is the human's starting point.
-		return scheduler.StageResult{}, scheduler.Park(QAAdjudicatingMsg)
+		return e.qaAdjudicate(ctx, book, report)
+	case state.Retranscribing:
+		return e.retranscribe(ctx, book, report)
+	case state.SpellingResearch:
+		return e.spellingResearch(ctx, book, report)
+	case state.Correcting:
+		return e.correcting(ctx, book, report)
+	case state.FactPass:
+		return e.factPass(ctx, book, report)
+	case state.Synthesizing:
+		return e.synthesize(ctx, book, report)
+	case state.Validating:
+		return e.validateSidecarsStage(ctx, book, report)
+	case state.Auditing:
+		return e.audit(ctx, book, report)
+	case state.Fixing:
+		return e.fixSidecars(ctx, book, report)
 	default:
 		return e.fallback.Execute(ctx, book, stage, report)
 	}
 }
-
-// MarkersNormalizingMsg is the needs_attention reason a book is parked with when
-// its chapter markers cannot be normalized automatically yet (M5). Exported so a
-// test (and later the UI) can assert/label it exactly.
-const MarkersNormalizingMsg = "chapter markers need manual mapping - automatic normalization arrives in a later milestone (M5)"
 
 // MediaToolsUnavailableMsg is the needs_attention reason the audio stages park a
 // book with when ffmpeg/ffprobe could not be resolved at startup. It is a
@@ -233,13 +310,6 @@ const MarkersNormalizingMsg = "chapter markers need manual mapping - automatic n
 // auto-download), so parking - which Retry re-admits - fits better than a hard
 // failure. Exported so a test (and the UI) can assert/label it exactly.
 const MediaToolsUnavailableMsg = "media tools unavailable: ffmpeg/ffprobe not found - install them or enable auto-download, then retry"
-
-// QAAdjudicatingMsg is the needs_attention reason a book is parked with when the
-// degeneration sweep flagged it (qa_sweep found a non-clean chapter). Automatic
-// adjudication - deciding which flagged chapters to re-transcribe versus hand to a
-// human - is a later milestone (M5), so the book waits rather than advancing with
-// suspect narration. Exported so a test (and the UI) can assert/label it exactly.
-const QAAdjudicatingMsg = "QA found degeneration that needs adjudication - see qa_report.md in the work dir; the automatic adjudication stage arrives in a later milestone (M5)"
 
 // ManifestChangedMsg parks a book whose manifest fingerprint no longer matches the
 // one recorded when transcription began - the existing raw transcripts belong to a
@@ -300,6 +370,14 @@ func (e *Executor) split(ctx context.Context, book store.Book, report scheduler.
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("split: read manifest (inspect must run first): %w", err)
 	}
+	// Fail closed: inspect now writes a draft manifest even for non-contiguous markers
+	// (so markers_normalizing has something to correct), so a routing regression could
+	// otherwise let split cut FLACs straight through a book at its credit/sample
+	// boundaries. A non-contiguous manifest here means markers_normalizing did not run
+	// (or did not replace the draft) - a loud error, never a silent bad split.
+	if !audio.Contiguous(manifest.Chapters) {
+		return scheduler.StageResult{}, fmt.Errorf("split: manifest is not contiguous - markers_normalizing must run first")
+	}
 	if err := audio.Split(ctx, manifest, book.WorkDir, ffmpeg, func(done, total int) {
 		if report != nil {
 			report(done, total)
@@ -335,12 +413,14 @@ func (e *Executor) split(ctx context.Context, book store.Book, report scheduler.
 // transcription began) it parks rather than silently reusing raws for a different
 // edition.
 func (e *Executor) asrStage(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
-	setup := e.ensureASR(ctx)
-	if setup.Backend == nil || !setup.Cap.Available {
-		// A missing ASR backend is a known, human-fixable precondition (install
-		// python3+mlx-whisper or a whisper-cli binary), so park the book
-		// needs_attention - which Retry re-admits - rather than hard-fail it.
-		return scheduler.StageResult{}, scheduler.Park("ASR unavailable: " + asrUnavailableDetail(setup.Cap) + " - fix this, then retry")
+	// Ensure the backend is selected AND prepared (or park needs_attention). A missing
+	// backend is a known, human-fixable precondition (install python3+mlx-whisper or a
+	// whisper-cli binary); the fetch/venv build behind EnsureReady is likewise an
+	// environment precondition, never a book-content error - Retry re-admits the book
+	// once the human fixes it.
+	setup, err := e.readyASR(ctx)
+	if err != nil {
+		return scheduler.StageResult{}, err
 	}
 	manifest, err := audio.ReadManifest(book.WorkDir)
 	if err != nil {
@@ -372,21 +452,6 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, report schedul
 	}); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("asr: write provenance: %w", err)
 	}
-	// Prepare the backend once per book run (fetch the binary/model, build the
-	// venv). Idempotent + logged inside the backend. A failure here is an
-	// environment/tooling precondition (offline first run, a misconfigured
-	// whisper_cli_path), never a book-content error - with auto-download on,
-	// Detect is optimistic (no network I/O), so a fresh offline box only trips at
-	// this step. Park needs_attention so Retry re-admits the book once the human
-	// fixes the environment, rather than hard-failing it.
-	if err := setup.Backend.EnsureReady(ctx); err != nil {
-		if ctx.Err() != nil {
-			return scheduler.StageResult{}, ctx.Err()
-		}
-		return scheduler.StageResult{}, scheduler.Park(
-			"ASR setup failed (" + setup.Backend.ID() + "): " + err.Error() + " - fix this, then retry")
-	}
-
 	total := len(manifest.Chapters)
 	if report != nil {
 		report(0, total)
@@ -464,7 +529,7 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, report schedul
 func (e *Executor) transcribeChapter(ctx context.Context, setup ASRSetup, flac, rawDir, rawPath string, chapter int) (empty bool, err error) {
 	// InitialPrompt is intentionally empty in M3a: verified spellings come from the
 	// spelling stage (M4). Seeding a guess would make a wrong spelling recur.
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := range 2 {
 		job := asr.Job{Audio: flac, OutDir: rawDir, Chapter: chapter, Language: setup.Language}
 		if terr := setup.Backend.Transcribe(ctx, job); terr != nil {
 			if ctx.Err() != nil {
@@ -489,6 +554,25 @@ func (e *Executor) transcribeChapter(ctx context.Context, setup ASRSetup, flac, 
 	}
 	e.log.Warn("asr: chapter produced an empty transcript; accepting", "chapter", chapter)
 	return true, nil
+}
+
+// deriveChapterLayers derives a chapter's normalized JSON + plain-text layers from its
+// raw ASR bytes: Normalize -> WriteNormalized -> WriteText. It is the single owner of
+// that sequence, shared by the sanitize loop and the retranscribe adopt path so the two
+// cannot drift. meta.Chapter selects the output file names; the raw layer is never
+// touched (it is the immutable source).
+func deriveChapterLayers(workDir string, raw []byte, meta transcript.Meta) error {
+	tr, err := transcript.Normalize(raw, meta)
+	if err != nil {
+		return fmt.Errorf("normalize chapter %d: %w", meta.Chapter, err)
+	}
+	if err := transcript.WriteNormalized(filepath.Join(workDir, transcript.JSONDir), tr); err != nil {
+		return fmt.Errorf("write normalized chapter %d: %w", meta.Chapter, err)
+	}
+	if err := transcript.WriteText(filepath.Join(workDir, transcript.TextDir), meta.Chapter, transcript.PlainText(tr)); err != nil {
+		return fmt.Errorf("write text chapter %d: %w", meta.Chapter, err)
+	}
+	return nil
 }
 
 // sanitize derives transcripts-json/ (normalized audiosilo-transcript/v1, NaN->null)
@@ -519,8 +603,6 @@ func (e *Executor) sanitize(ctx context.Context, book store.Book, report schedul
 	sort.Ints(chapters)
 
 	prov := readASRProvenance(book.WorkDir)
-	jsonDir := filepath.Join(book.WorkDir, transcript.JSONDir)
-	textDir := filepath.Join(book.WorkDir, transcript.TextDir)
 	total := len(chapters)
 	if report != nil {
 		report(0, total)
@@ -533,17 +615,9 @@ func (e *Executor) sanitize(ctx context.Context, book store.Book, report schedul
 		if err != nil {
 			return scheduler.StageResult{}, fmt.Errorf("sanitize: read chapter %d: %w", chNum, err)
 		}
-		tr, err := transcript.Normalize(raw, transcript.Meta{
-			Chapter: chNum, Backend: prov.Backend, Model: prov.Model, Language: prov.Language,
-		})
-		if err != nil {
-			return scheduler.StageResult{}, fmt.Errorf("sanitize: normalize chapter %d: %w", chNum, err)
-		}
-		if err := transcript.WriteNormalized(jsonDir, tr); err != nil {
-			return scheduler.StageResult{}, fmt.Errorf("sanitize: write normalized chapter %d: %w", chNum, err)
-		}
-		if err := transcript.WriteText(textDir, chNum, transcript.PlainText(tr)); err != nil {
-			return scheduler.StageResult{}, fmt.Errorf("sanitize: write text chapter %d: %w", chNum, err)
+		meta := transcript.Meta{Chapter: chNum, Backend: prov.Backend, Model: prov.Model, Language: prov.Language}
+		if err := deriveChapterLayers(book.WorkDir, raw, meta); err != nil {
+			return scheduler.StageResult{}, fmt.Errorf("sanitize: %w", err)
 		}
 		if report != nil {
 			report(i+1, total)

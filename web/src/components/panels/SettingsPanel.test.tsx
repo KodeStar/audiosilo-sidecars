@@ -2,15 +2,17 @@ import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { SettingsPanel } from './SettingsPanel';
 import type { ApiClient } from '@/lib/apiClient';
-import type { AsrInfo, Settings, SystemInfo, ToolsInfo } from '@/api/types';
+import type { AgentInfo, AsrInfo, Settings, SystemInfo, ToolsInfo } from '@/api/types';
 
 const settings: Settings = {
   listen: '127.0.0.1:8090',
   cors_origins: [],
   secrets: { anthropic_api_key: false, openai_api_key: false, github_pat: false },
   asr: { backend: '' },
-  agent: { backend: '', concurrency: 2 },
+  agent: { backend: '', concurrency: 2, timeout_minutes: 60, claude_models: {}, openai_models: {} },
 };
+
+const defaultAgent: AgentInfo = { backend: 'claude', available: true, version: '1.0.0' };
 
 const defaultAsr: AsrInfo = {
   backend: 'mlx-whisper',
@@ -28,6 +30,7 @@ function systemWith(tools: ToolsInfo, asr: AsrInfo = defaultAsr): SystemInfo {
     tabs: [],
     tools,
     asr,
+    agent: defaultAgent,
     scratch_bytes: 0,
   };
 }

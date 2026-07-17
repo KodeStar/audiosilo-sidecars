@@ -68,6 +68,10 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
 
   useEventStream(apiBase, token, { onEvent });
 
+  // Stable callback for a row to lazily fetch its detail (with the stage-run cost
+  // ledger) when expanded.
+  const getDetail = useCallback((id: number) => client.getBook(id), [client]);
+
   // Stable across renders (deps: client, load) so the memoized BookRow only
   // re-renders when its own props change, not on every parent render.
   const handleAction = useCallback(
@@ -163,7 +167,13 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
       ) : (
         <div className="flex flex-col gap-2">
           {books.map((b) => (
-            <BookRow key={b.id} book={b} busy={busyId === b.id} onAction={handleAction} />
+            <BookRow
+              key={b.id}
+              book={b}
+              busy={busyId === b.id}
+              onAction={handleAction}
+              getDetail={getDetail}
+            />
           ))}
         </div>
       )}

@@ -31,7 +31,11 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	in.ASR.Backend = "whisper-cpp"
 	in.Agent.Backend = "claude"
 	in.Agent.Concurrency = 4
-	in.Agent.Claude = map[string]string{"fact_pass": "sonnet", "synthesis": "opus"}
+	in.Agent.Claude = map[string]string{"fact_pass": "sonnet", "synthesizing": "opus"}
+	in.Agent.OpenAI = map[string]string{"auditing": "gpt-x"}
+	in.Agent.TimeoutMinutes = 90
+	in.Agent.ClaudePath = "/opt/claude"
+	in.Agent.CodexPath = "/opt/codex"
 	if err := Save(dir, in); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -51,8 +55,17 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if out.Agent.Concurrency != 4 {
 		t.Errorf("concurrency = %d", out.Agent.Concurrency)
 	}
-	if out.Agent.Claude["synthesis"] != "opus" {
-		t.Errorf("claude synthesis = %q", out.Agent.Claude["synthesis"])
+	if out.Agent.Claude["synthesizing"] != "opus" || out.Agent.Claude["fact_pass"] != "sonnet" {
+		t.Errorf("claude map round-trip = %v", out.Agent.Claude)
+	}
+	if out.Agent.OpenAI["auditing"] != "gpt-x" {
+		t.Errorf("openai map round-trip = %v", out.Agent.OpenAI)
+	}
+	if out.Agent.TimeoutMinutes != 90 {
+		t.Errorf("timeout_minutes = %d, want 90", out.Agent.TimeoutMinutes)
+	}
+	if out.Agent.ClaudePath != "/opt/claude" || out.Agent.CodexPath != "/opt/codex" {
+		t.Errorf("agent paths = %q,%q", out.Agent.ClaudePath, out.Agent.CodexPath)
 	}
 }
 
@@ -105,6 +118,89 @@ func TestValidateRejectsBadValues(t *testing.T) {
 				t.Errorf("Validate() = nil, want error for %s", name)
 			}
 		})
+	}
+}
+
+func TestValidateAgentFields(t *testing.T) {
+	// Each violation (built on a valid Default base) must be rejected.
+	bad := map[string]func(*Config){
+		"bad backend":          func(c *Config) { c.Agent.Backend = "gemini" },
+		"zero timeout":         func(c *Config) { c.Agent.TimeoutMinutes = 0 },
+		"negative timeout":     func(c *Config) { c.Agent.TimeoutMinutes = -1 },
+		"non-agent claude key": func(c *Config) { c.Agent.Claude = map[string]string{"splitting": "sonnet"} },
+		"non-agent openai key": func(c *Config) { c.Agent.OpenAI = map[string]string{"asr": "gpt-x"} },
+		"unknown claude key":   func(c *Config) { c.Agent.Claude = map[string]string{"not_a_stage": "sonnet"} },
+	}
+	for name, mutate := range bad {
+		t.Run(name, func(t *testing.T) {
+			cfg := Default()
+			mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Errorf("Validate() = nil, want error for %s", name)
+			}
+		})
+	}
+
+	// Valid: explicit backend, agent-stage model keys, positive timeout.
+	good := Default()
+	good.Agent.Backend = AgentBackendClaude
+	good.Agent.TimeoutMinutes = 1
+	good.Agent.Claude = map[string]string{"fact_pass": "sonnet", "auditing": "opus"}
+	good.Agent.OpenAI = map[string]string{"synthesizing": "gpt-x"}
+	if err := good.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil for valid agent config", err)
+	}
+}
+
+func TestDefaultSeedsClaudeModels(t *testing.T) {
+	cfg := Default()
+	if cfg.Agent.TimeoutMinutes != DefaultTimeoutMinutes {
+		t.Errorf("timeout_minutes default = %d, want %d", cfg.Agent.TimeoutMinutes, DefaultTimeoutMinutes)
+	}
+	want := map[string]string{
+		"markers_normalizing": "sonnet",
+		"qa_adjudicating":     "sonnet",
+		"spelling_research":   "sonnet",
+		"fact_pass":           "sonnet",
+		"synthesizing":        "opus",
+		"auditing":            "opus",
+		"fixing":              "opus",
+	}
+	for k, v := range want {
+		if cfg.Agent.Claude[k] != v {
+			t.Errorf("claude[%q] = %q, want %q", k, cfg.Agent.Claude[k], v)
+		}
+	}
+	if len(cfg.Agent.Claude) != len(want) {
+		t.Errorf("claude map size = %d, want %d", len(cfg.Agent.Claude), len(want))
+	}
+	if cfg.Agent.OpenAI == nil || len(cfg.Agent.OpenAI) != 0 {
+		t.Errorf("openai map = %v, want empty non-nil", cfg.Agent.OpenAI)
+	}
+	// Every seeded key must be an agent stage (validation would reject otherwise).
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Default() config invalid: %v", err)
+	}
+}
+
+func TestAgentEnvOverrides(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AUDIOSILO_SIDECARS_AGENT_BACKEND", "codex")
+	t.Setenv("AUDIOSILO_SIDECARS_AGENT_CLAUDE_PATH", "/usr/local/bin/claude")
+	t.Setenv("AUDIOSILO_SIDECARS_AGENT_CODEX_PATH", "/usr/local/bin/codex")
+	t.Setenv("AUDIOSILO_SIDECARS_AGENT_TIMEOUT_MINUTES", "45")
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Agent.Backend != "codex" {
+		t.Errorf("backend = %q, want codex", cfg.Agent.Backend)
+	}
+	if cfg.Agent.ClaudePath != "/usr/local/bin/claude" || cfg.Agent.CodexPath != "/usr/local/bin/codex" {
+		t.Errorf("agent paths = %q,%q", cfg.Agent.ClaudePath, cfg.Agent.CodexPath)
+	}
+	if cfg.Agent.TimeoutMinutes != 45 {
+		t.Errorf("timeout_minutes = %d, want 45", cfg.Agent.TimeoutMinutes)
 	}
 }
 

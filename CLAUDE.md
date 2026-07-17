@@ -103,8 +103,11 @@ internal/
             is no asr.device knob (no backend honors an override yet; /system reports
             the DETECTED device). Changing asr.backend or the tool paths takes effect
             only on a daemon RESTART (the backend is resolved once at startup, unlike
-            cors_origins, which the API re-reads live per request). agent-model
-            routing stays a typed stub.
+            cors_origins, which the API re-reads live per request). M5 made agent.*
+            LIVE: backend (""|claude|codex), concurrency, claude_path/codex_path,
+            timeout_minutes, and the per-stage claude/openai model maps (keys are agent
+            stage names). Validate rejects an unknown backend, an unknown model-map key,
+            or timeout_minutes < 1; Default() seeds the claude map.
   toolfetch/ fetches the three external artifact families, all gated by
             tools.auto_download and confined to <data>/tools: ffmpeg/ffprobe static
             builds (explicit path -> next to the binary -> $PATH -> HTTPS download,
@@ -166,23 +169,48 @@ internal/
             gates guard the historical forgeries (Owalyn gate 3, phantom nobles
             gate 4, the Book-2 cascade gate 1); GenerateSheets emits the
             CHUNK_ENDS-gated spoiler-safe sheets. Attestation sources are purely
-            data (reference_files) - nothing implicit. Not yet wired into pipeline
-            stages (spelling_research/correcting stay stubs until M5).
+            data (reference_files) - nothing implicit. Wired into the pipeline in M5:
+            the spelling_research agent generates corrections.json/spellings.json and
+            the correcting stage runs Apply/Check/GenerateSheets over them.
+  agent/    M5: the agent-runner abstraction (Runner{ID,Detect,Run} over a normalized
+            Request/Result/Usage) + claude and codex headless-CLI backends (prompt on
+            STDIN never argv, --output-format json / codex --json JSONL, usage capture,
+            typed RateLimitError/NotAvailableError), Select (auto|claude|codex, explicit
+            path knobs, loud on an unresolvable explicit path), ModelFor per-stage
+            routing, RunWithRetry (invalid-output <= 2 retries appending the validator
+            error; rate-limit backoff), staging.go (per-attempt staged dir under
+            _runs/, 0444 copied inputs + out/, Harvest with traversal + size-cap guards),
+            and go:embed prompts/ (one template per stage + a vendored authoring.md from
+            audiosilo-meta). The child env injects an API key from secrets that NEVER
+            appears in argv/logs/errors (tested).
+  repair/   M5: the mechanical tail-clip + adoption machinery (ports the historical
+            tail_clip_check/adjudicate_tails/build_repairs): ClipAndSplice (locate the
+            tail loop, cut+re-transcribe the window prompt-free, health-check, rotation-
+            adjudicate FABRICATED/BENIGN/CLIP-REDEGENERATED, splice into
+            transcripts-repaired/ + repairs.log/tail_verdicts.json) and AdoptFresh
+            (never-blindly-adopt full-chapter plausibility). No agent; injected a
+            ClipCutter (ffmpeg) + a Transcribe func so it stays unit-testable.
   pipeline/ composite scheduler.Executor: routes inspecting -> audio.Inspect,
             splitting -> audio.Split, asr -> the per-chapter internal/asr loop
             (resumable: skip complete raws, delete+retry malformed, freeze each raw
             0444, write asr.json provenance, account scratch), sanitizing ->
             internal/transcript normalization, qa_sweep -> the internal/qa sweep
-            (writes both reports, branches on Report.Clean()); qa_adjudicating
-            deliberately PARKS needs_attention (a dirty book must not skip human
-            adjudication; automatic adjudication is M5); every other stage -> the
-            stub (M5+ replaces more; retranscribing is still a stub). Constructed in
-            server.go with the toolfetch-resolved paths and the asr.Select-chosen
-            backend. The sanitizing stage deliberately RE-DERIVES all chapters every
-            run (cheap, idempotent, raw is the source of truth) rather than tracking
-            per-chapter freshness. Missing tools PARK a book needs_attention (ASR
-            unavailable, or ffmpeg/ffprobe unresolved) instead of hard-failing - a
-            human-fixable startup precondition that Retry re-admits.
+            (writes both reports, branches on Report.Clean()). M5 made EVERY remaining
+            stage real: markers_normalizing/qa_adjudicating/spelling_research/fact_pass/
+            synthesizing/auditing/fixing are AGENT stages (staged dir + rendered prompt
+            + validated outputs via the shared runAgent driver, usage recorded onto the
+            open stage_run after every invocation), while retranscribing/correcting/
+            validating are MECHANICAL (ASR+repair / spelling engine / canonicalize+ngram).
+            Only contributing remains a stub (M7). The load-bearing invariants live in
+            the staging (synthesizing/auditing dirs hold NO transcripts, fact_pass chunk
+            dirs hold no chapter beyond the chunk's end, spelling reference_files are
+            restricted to the daemon-staged carryover). Constructed in server.go with the
+            toolfetch-resolved paths, the asr.Select-chosen backend, and the
+            agent.Select-chosen runner (nil when no CLI resolved). The sanitizing stage
+            deliberately RE-DERIVES all chapters every run (cheap, idempotent, raw is the
+            source of truth) rather than tracking per-chapter freshness. Missing tools or
+            an unavailable agent backend PARK a book needs_attention (a human-fixable
+            precondition Retry re-admits) instead of hard-failing.
   auth/     single admin password (argon2id, generated + printed once on first run),
             opaque SHA-256-hashed session tokens, a per-IP login rate limiter; the
             Store interface is storage-agnostic (MemStore for tests; the SQLite
@@ -191,8 +219,11 @@ internal/
             (go-keyring) with a 0600 secrets.json fallback; read API is presence-only
   store/    SQLite (modernc, pure Go; single writer + WAL) + append-only migrations:
             books, stage_runs, progress, events (durable log, 30-day prune), rates
-            (EWMA seed, create-only in M1), settings KV, sessions. Plain tested CRUD;
-            AuthStore adapts it to auth.Store. Holds the SCHEDULING truth.
+            (EWMA seed, create-only in M1), settings KV, sessions. M5's migration 0004
+            added stage_runs.{model,input_tokens,output_tokens,cost_usd} +
+            AddOpenStageRunUsage (accumulates per agent invocation onto the open run) so
+            per-stage cost rides on the book view. Plain tested CRUD; AuthStore adapts it
+            to auth.Store. Holds the SCHEDULING truth.
   state/    per-book pipeline state machine: table-driven states/lanes/transitions,
             CanStart/NextState guards, the audit fix-loop cap. Pure, no I/O.
   scheduler/ one wake-on-event goroutine over three lanes (ASR cap 1 / agent cap =
@@ -246,8 +277,11 @@ Dockerfile             multi-stage: node build -> go build (embedui) -> debian-s
 ```
 
 **Dependency direction** (transport-only rule): `server -> {api, auth, secrets,
-events, config, store, scheduler, metaops, web}`; `api -> {auth, secrets, events,
-config, store, scheduler, metaops}`; `scheduler -> {store, state, events}`;
+events, config, store, scheduler, metaops, pipeline, web}`; `api -> {auth, secrets,
+events, config, store, scheduler, metaops}`; `scheduler -> {store, state, events}`;
+`pipeline -> {audio, asr, transcript, qa, spelling, agent, repair, toolfetch, scratch,
+secrets, fsutil, store, state, scheduler}`; `agent`/`repair` are leaf helpers (no
+scheduler/store deps; `repair -> qa` for the shared Python-compat gram/repr helpers);
 `state` is pure. Handlers marshal DTOs and call into the injected packages; they
 hold no logic (state transitions live in `state`, dispatch in `scheduler`).
 
@@ -435,19 +469,46 @@ Milestones from the workspace plan; each is shippable.
   pre-release caveat: a work dir whose `qa_sweep` sentinel was written by the
   pre-M4 STUB replays `qa_clean=true` on resume (only books parked exactly at
   qa_sweep before the upgrade) - delete + re-enqueue such books.
-- **M5-M8 (planned):** the agent runner (claude + codex) with staged context
-  dirs enforcing the invariants, marker normalization + QA adjudication +
-  retranscription going live, the fact-pass + synthesis + audit loop, per-stage
-  model/tokens/cost capture (feeds the M6 Done board), contribution
-  (intake/PR/local), and packaging (GoReleaser + Docker matrix). See the plan
+- **M5 (done):** the agent runner and every remaining pipeline stage. `internal/agent`
+  is the runner abstraction over headless **claude** and **codex** CLIs (prompt on
+  STDIN, `--output-format json` / codex JSONL, usage capture, typed rate-limit/
+  not-available errors, `Select` auto|claude|codex with explicit path knobs, `ModelFor`
+  per-stage routing, `RunWithRetry` invalid-output + rate-limit policy), a per-attempt
+  **staged context dir** (`_runs/<stage>-a<n>/`, 0444 copied inputs + `out/`, `Harvest`
+  with traversal + size-cap guards) that enforces the process invariants, and
+  `go:embed` **prompts** (one template per stage, each vendoring the forbidden-source /
+  own-words / hyphens-only rules, plus a vendored audiosilo-meta `AUTHORING.md`).
+  `internal/repair` is the mechanical tail-clip + full-chapter adoption machinery.
+  Every stage is now real: markers_normalizing / qa_adjudicating / spelling_research /
+  fact_pass / synthesizing / auditing / fixing run the agent through a shared `runAgent`
+  driver; retranscribing / correcting / validating are mechanical (ASR+repair / the
+  spelling engine / canonicalize + audiosilo-meta n-gram). Cost is captured per agent
+  invocation (migration 0004 columns + `AddOpenStageRunUsage`) and surfaced on `/system`
+  (agent block), settings GET/PUT (agent config, restart-to-apply), the web Settings
+  **Agent** card, and the Running-tab book detail cost line. **Park conditions** (all
+  Retry-re-admittable, mirroring the media-tools park): the agent backend is unavailable
+  (`AgentUnavailableMsg`); markers_normalizing gets a not-confident verdict; qa_adjudicating
+  does not converge after 3 rounds; correcting's spelling Check fails a gate; an agent's
+  output fails validation after the retry budget; the audit->fix loop hits `MaxFixAttempts`
+  (3). **Stub-sentinel caveat**: the pre-M5 `markers_normalizing`/`qa_adjudicating` stages
+  PARKED needs_attention and wrote NO sentinel, so a book parked at either re-runs the real
+  stage on resume - the replay risk does NOT apply to them. The caveat is only for a book
+  that advanced THROUGH the generic pre-M5 STUB at a stage that is now real (a book taken to
+  `done` via stubs, or the M4 `qa_sweep` case its own note documents): its stub
+  `_done/<stage>.json` makes the now-real stage skip on resume, so delete + re-enqueue such a
+  book. Gate verified: full Go race + lint green, the
+  full web gate green, a full-machine integration test (a real non-contiguous m4b through
+  markers_normalizing -> a dirty-QA -> adjudicate-retranscribe -> clean re-sweep ->
+  spelling/fact/synthesis -> an audit-fail fix loop -> done, asserting the cleared-sentinel
+  re-runs and per-stage usage) plus the focused per-stage/invariant/loop tests.
+- **M6-M8 (planned):** the **Done** board (M6), the Running-tab richer board (stage
+  timeline / ETA, M6), contribution (intake issue / PR / keep-local, M7), auto-purge /
+  startup-GC of scratch (M7), and packaging (GoReleaser + Docker matrix, M8). See the plan
   for the full table.
 
 Still **not built**: the **Done** tab (full board is M6), the Running tab's richer
-board (stage timeline / ETA / cost, M6), and the pipeline stages beyond `qa_sweep` -
-`qa_adjudicating` deliberately parks (M5), and the agent/contribute stages plus
-`retranscribing` are still stubs; `internal/spelling` is a ported, golden-tested
-engine not yet wired to any stage (spelling_research/correcting go live in M5, when
-agents generate its corrections.json/spellings.json). The config agent-model section
-stays a typed stub. Auto-purge/startup-GC of scratch is M7 (M2 is manual purge
-only). `/system` reports Library/Running/Settings as `ready` and only Done as
-`planned` (the Go-side tab labels). Keep this file honest as milestones land.
+board (stage timeline / ETA, M6), and the `contributing` stage (M7) - the only pipeline
+stage still a stub, so a `ready` book advances straight to `done` without opening an
+intake issue/PR yet. Auto-purge/startup-GC of scratch is M7 (M2 is manual purge only).
+`/system` reports Library/Running/Settings as `ready` and only Done as `planned` (the
+Go-side tab labels). Keep this file honest as milestones land.

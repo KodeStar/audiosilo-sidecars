@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"maps"
 	"net/http"
 	"strconv"
 
@@ -97,6 +98,9 @@ type systemResponse struct {
 	// ASR is the resolved speech-recognition backend capability (whether ASR will
 	// run and on what device).
 	ASR ASRInfo `json:"asr"`
+	// Agent is the resolved agent-runner capability (which backend runs the agent
+	// stages and whether it is usable).
+	Agent AgentInfo `json:"agent"`
 	// ScratchBytes is the daemon-total on-disk scratch (the sum of every book's
 	// work dir under <data>/work), the disk gauge the UI shows.
 	ScratchBytes int64 `json:"scratch_bytes"`
@@ -125,6 +129,12 @@ func (a *API) handleSystem(w http.ResponseWriter, r *http.Request) {
 	if a.liveStatus != nil {
 		asrInfo, ffmpeg, ffprobe = a.liveStatus()
 	}
+	// Agent availability is injected like ASR; a nil provider yields a zero
+	// AgentInfo (no backend, unavailable).
+	var agentInfo AgentInfo
+	if a.agentStatus != nil {
+		agentInfo = a.agentStatus()
+	}
 	writeJSON(w, http.StatusOK, systemResponse{
 		Version:      a.version,
 		DataDir:      a.dataDir,
@@ -132,6 +142,7 @@ func (a *API) handleSystem(w http.ResponseWriter, r *http.Request) {
 		Tabs:         tabs,
 		Tools:        toolsInfo{FFmpeg: ffmpeg, FFprobe: ffprobe},
 		ASR:          asrInfo,
+		Agent:        agentInfo,
 		ScratchBytes: scratchTotal,
 	})
 }
@@ -143,8 +154,11 @@ type asrView struct {
 }
 
 type agentView struct {
-	Backend     string `json:"backend"`
-	Concurrency int    `json:"concurrency"`
+	Backend        string            `json:"backend"`
+	Concurrency    int               `json:"concurrency"`
+	TimeoutMinutes int               `json:"timeout_minutes"`
+	ClaudeModels   map[string]string `json:"claude_models"`
+	OpenAIModels   map[string]string `json:"openai_models"`
 }
 
 type settingsResponse struct {
@@ -176,8 +190,22 @@ func (a *API) settingsView() (settingsResponse, error) {
 		CORSOrigins: origins,
 		Secrets:     pres,
 		ASR:         asrView{Backend: cfg.ASR.Backend},
-		Agent:       agentView{Backend: cfg.Agent.Backend, Concurrency: cfg.Agent.Concurrency},
+		Agent: agentView{
+			Backend:        cfg.Agent.Backend,
+			Concurrency:    cfg.Agent.Concurrency,
+			TimeoutMinutes: cfg.Agent.TimeoutMinutes,
+			ClaudeModels:   copyStringMap(cfg.Agent.Claude),
+			OpenAIModels:   copyStringMap(cfg.Agent.OpenAI),
+		},
 	}, nil
+}
+
+// copyStringMap returns a defensive copy of m, never nil - the settings view emits
+// {} rather than null for the model maps so the UI can index them unconditionally.
+func copyStringMap(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	maps.Copy(out, m)
+	return out
 }
 
 func (a *API) handleGetSettings(w http.ResponseWriter, _ *http.Request) {
@@ -192,9 +220,45 @@ func (a *API) handleGetSettings(w http.ResponseWriter, _ *http.Request) {
 // settingsUpdate is the PUT body. All fields are optional; an omitted field is
 // left untouched. Secret values are write-only: a non-empty value sets the
 // secret, an empty string clears it, and the response never echoes them.
+//
+// Agent changes are persisted to config.yaml but, like the ASR backend, only take
+// effect on a daemon RESTART (the runner is resolved once at startup) - nothing
+// under Agent is live. The response body is the fresh GET view.
 type settingsUpdate struct {
 	CORSOrigins *[]string         `json:"cors_origins"`
 	Secrets     map[string]string `json:"secrets"`
+	Agent       *agentUpdate      `json:"agent"`
+}
+
+// agentUpdate carries the optional agent-config mutations. Scalar fields are
+// pointers (nil = leave unchanged); the model maps replace the corresponding config
+// map wholesale when present (a nil map = leave unchanged). config.Validate rejects
+// a bad backend, a sub-1 timeout, or a non-agent-stage model key.
+type agentUpdate struct {
+	Backend        *string           `json:"backend"`
+	Concurrency    *int              `json:"concurrency"`
+	TimeoutMinutes *int              `json:"timeout_minutes"`
+	Claude         map[string]string `json:"claude_models"`
+	OpenAI         map[string]string `json:"openai_models"`
+}
+
+// applyAgentUpdate overlays u onto cfg in place.
+func applyAgentUpdate(cfg *config.AgentConfig, u *agentUpdate) {
+	if u.Backend != nil {
+		cfg.Backend = *u.Backend
+	}
+	if u.Concurrency != nil {
+		cfg.Concurrency = *u.Concurrency
+	}
+	if u.TimeoutMinutes != nil {
+		cfg.TimeoutMinutes = *u.TimeoutMinutes
+	}
+	if u.Claude != nil {
+		cfg.Claude = u.Claude
+	}
+	if u.OpenAI != nil {
+		cfg.OpenAI = u.OpenAI
+	}
 }
 
 func (a *API) handlePutSettings(w http.ResponseWriter, r *http.Request) {
@@ -203,14 +267,21 @@ func (a *API) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Apply cors_origins (validated) and persist config.
-	if req.CORSOrigins != nil {
+	// Apply config-backed fields (cors_origins + agent) onto one copy, validate the
+	// whole thing, then persist. Agent maps replace wholesale when present; a nil map
+	// in the update leaves the existing map untouched.
+	if req.CORSOrigins != nil || req.Agent != nil {
 		next := a.snapshot()
-		origins := *req.CORSOrigins
-		if origins == nil {
-			origins = []string{}
+		if req.CORSOrigins != nil {
+			origins := *req.CORSOrigins
+			if origins == nil {
+				origins = []string{}
+			}
+			next.CORSOrigins = origins
 		}
-		next.CORSOrigins = origins
+		if req.Agent != nil {
+			applyAgentUpdate(&next.Agent, req.Agent)
+		}
 		if err := next.Validate(); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return

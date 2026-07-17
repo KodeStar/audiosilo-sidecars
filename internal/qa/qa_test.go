@@ -527,7 +527,7 @@ func TestClean(t *testing.T) {
 	}
 }
 
-// --- pyRepr (matches Python repr() so the golden test can compare snippets) ---
+// --- PyRepr (matches Python repr() so the golden test can compare snippets) ---
 
 func TestPyRepr(t *testing.T) {
 	cases := []struct{ in, want string }{
@@ -540,8 +540,8 @@ func TestPyRepr(t *testing.T) {
 		{`back\slash`, `'back\\slash'`},
 	}
 	for _, c := range cases {
-		if got := pyRepr(c.in); got != c.want {
-			t.Errorf("pyRepr(%q) = %s, want %s", c.in, got, c.want)
+		if got := PyRepr(c.in); got != c.want {
+			t.Errorf("PyRepr(%q) = %s, want %s", c.in, got, c.want)
 		}
 	}
 }

@@ -127,6 +127,12 @@ func contiguous(chs []Chapter) bool {
 	return true
 }
 
+// Contiguous reports whether chs number a gapless run starting at 0 or 1 (the
+// historical validation), exported so the markers_normalizing agent stage can
+// validate an agent-produced manifest against the same rule inspect used. It
+// delegates to the unexported contiguous so there is a single implementation.
+func Contiguous(chs []Chapter) bool { return contiguous(chs) }
+
 // WriteManifest writes m to workDir/manifest.json atomically (temp + rename).
 func WriteManifest(workDir string, m Manifest) error {
 	out, err := json.MarshalIndent(m, "", "  ")

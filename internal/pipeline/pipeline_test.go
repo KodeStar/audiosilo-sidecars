@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/asr"
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
 	"github.com/kodestar/audiosilo-sidecars/internal/events"
@@ -146,7 +147,14 @@ func TestPipelineInspectSplitToDone(t *testing.T) {
 	hub := events.NewHub(1024)
 
 	fake := newFakeBackend()
-	exe := NewExecutor(Config{DB: db, FFmpeg: ffmpeg, FFprobe: ffprobe, DataDir: dir, ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond)})
+	// A full fake agent drives the M5 agent stages (spelling_research onward) so the book
+	// runs the whole pipeline to done; the mechanical stages before it stay real.
+	fakeAgent := newFakeRunner()
+	fakeAgent.act = fullFakeAct(t, fullFakeOpts{title: "Fixture Book"})
+	cfg := fullFakeConfig(dir, fakeAgent)
+	cfg.DB, cfg.FFmpeg, cfg.FFprobe, cfg.ASR = db, ffmpeg, ffprobe, fakeASR(fake)
+	cfg.Fallback = scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond)
+	exe := NewExecutor(cfg)
 	sched := scheduler.New(db, hub, exe, 2, workRoot)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -271,11 +279,13 @@ func genM4BWithTitles(t *testing.T, ffmpeg, dir string, titles []string) string 
 	return out
 }
 
-// TestPipelineParksUnnormalizableMarkers is the item-1 guard: a book whose markers
+// TestPipelineParksUnnormalizableMarkers is the routing guard: a book whose markers
 // are not a clean contiguous run (a gap), AND a markerless file (zero usable
-// markers), both route to markers_normalizing and park needs_attention with the
-// clear M5-deferral message - rather than the stub advancing them into a
-// manifest-less split that fails misleadingly.
+// markers), both route to markers_normalizing - rather than the stub advancing them
+// into a manifest-less split that fails misleadingly. With no agent backend available,
+// the stage parks needs_attention with AgentUnavailableMsg (an actionable,
+// Retry-able precondition); the marker-mapping itself is exercised by the agent-stage
+// tests with a fake runner.
 func TestPipelineParksUnnormalizableMarkers(t *testing.T) {
 	ffmpeg, err := exec.LookPath("ffmpeg")
 	if err != nil {
@@ -313,6 +323,11 @@ func TestPipelineParksUnnormalizableMarkers(t *testing.T) {
 			t.Cleanup(func() { _ = db.Close() })
 			hub := events.NewHub(1024)
 			exe := NewExecutor(Config{DB: db, FFmpeg: ffmpeg, FFprobe: ffprobe, DataDir: dir, ASR: fakeASR(newFakeBackend()), Fallback: scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond)})
+			// This machine may have a real claude CLI; force the agent unavailable so the
+			// stage parks deterministically on the routing, not on a live agent run.
+			exe.redetectAgent = func(context.Context) (agent.Runner, agent.Availability) {
+				return nil, agent.Availability{Detail: "no agent CLI found"}
+			}
 			sched := scheduler.New(db, hub, exe, 2, workRoot)
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan struct{})
@@ -338,8 +353,8 @@ func TestPipelineParksUnnormalizableMarkers(t *testing.T) {
 			if final.State != string(state.MarkersNormalizing) {
 				t.Errorf("parked at state %q, want markers_normalizing", final.State)
 			}
-			if final.Error != MarkersNormalizingMsg {
-				t.Errorf("park reason = %q, want %q", final.Error, MarkersNormalizingMsg)
+			if final.Error != AgentUnavailableMsg {
+				t.Errorf("park reason = %q, want %q", final.Error, AgentUnavailableMsg)
 			}
 		})
 	}
@@ -361,6 +376,27 @@ func writeManifest(t *testing.T, workDir string, n int) {
 
 // seedFLACs writes placeholder chapter FLACs so the asr stage's existence check
 // passes (the fake backend does not read them).
+// TestSplitRejectsNonContiguousManifest is the item-5 regression: the split stage
+// fails loudly on a non-contiguous manifest rather than cutting FLACs at credit/sample
+// boundaries (the last-line guard restored after inspect began writing draft manifests
+// for non-contiguous markers). ffmpeg is a dummy non-empty path so the contiguity
+// check is reached but never executed.
+func TestSplitRejectsNonContiguousManifest(t *testing.T) {
+	work := t.TempDir()
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: 6, ChapterCount: 3, Chapters: markerChapters(1, 2, 4)})
+	exe := NewExecutor(Config{FFmpeg: "/usr/bin/true", DataDir: t.TempDir(), Fallback: scheduler.NewStubExecutor(0, 0)})
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Splitting, nil)
+	if err == nil {
+		t.Fatal("split accepted a non-contiguous manifest, want a loud error")
+	}
+	if !strings.Contains(err.Error(), "not contiguous") {
+		t.Errorf("error = %v, want it to mention non-contiguity", err)
+	}
+	if scheduler.SentinelExists(work, string(state.Splitting)) {
+		t.Error("split wrote a sentinel despite the contiguity error")
+	}
+}
+
 func seedFLACs(t *testing.T, workDir string, n int) {
 	t.Helper()
 	dir := filepath.Join(workDir, audio.ChaptersDir)
@@ -554,7 +590,7 @@ func TestSanitizeStageDerivesLayers(t *testing.T) {
 	}
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: ASRSetup{}, Fallback: scheduler.NewStubExecutor(0, 0)})
 	book := store.Book{ID: 1, WorkDir: work}
-	for pass := 0; pass < 2; pass++ { // idempotent: run twice
+	for pass := range 2 { // idempotent: run twice
 		if _, err := exe.Execute(context.Background(), book, state.Sanitizing, nil); err != nil {
 			t.Fatalf("sanitize pass %d: %v", pass, err)
 		}
@@ -634,9 +670,15 @@ func TestPipelineCancelMidASRResumes(t *testing.T) {
 		t.Errorf("blocked chapter 1 was finalized %d times, want 0", blocking.count(1))
 	}
 
-	// Second run: a fresh, unblocked backend resumes the book to done.
+	// Second run: a fresh, unblocked backend resumes the book to done. The full fake
+	// agent drives the M5 agent stages so the resumed book reaches done.
 	resume := newFakeBackend()
-	exe2 := NewExecutor(Config{DB: db, FFmpeg: ffmpeg, FFprobe: ffprobe, DataDir: dir, ASR: fakeASR(resume), Fallback: scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond)})
+	fakeAgent := newFakeRunner()
+	fakeAgent.act = fullFakeAct(t, fullFakeOpts{title: "Fixture"})
+	cfg2 := fullFakeConfig(dir, fakeAgent)
+	cfg2.DB, cfg2.FFmpeg, cfg2.FFprobe, cfg2.ASR = db, ffmpeg, ffprobe, fakeASR(resume)
+	cfg2.Fallback = scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond)
+	exe2 := NewExecutor(cfg2)
 	sched2 := scheduler.New(db, hub, exe2, 2, workRoot)
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	done2 := make(chan struct{})
@@ -1041,20 +1083,5 @@ func TestQASweepMissingManifestErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "inspect") {
 		t.Errorf("error = %q, want it to name the inspect stage", err)
-	}
-}
-
-// TestQAAdjudicatingParks asserts the qa_adjudicating stage parks needs_attention
-// with exactly QAAdjudicatingMsg - a dirty book must wait for the M5 adjudicator, not
-// silently advance carrying suspect narration into the fact pass.
-func TestQAAdjudicatingParks(t *testing.T) {
-	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: ASRSetup{}, Fallback: scheduler.NewStubExecutor(0, 0)})
-	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: t.TempDir()}, state.QAAdjudicating, nil)
-	var pe *scheduler.ParkError
-	if !errors.As(err, &pe) {
-		t.Fatalf("qa_adjudicating error = %v, want a ParkError", err)
-	}
-	if pe.Reason != QAAdjudicatingMsg {
-		t.Errorf("park reason = %q, want %q", pe.Reason, QAAdjudicatingMsg)
 	}
 }

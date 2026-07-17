@@ -93,11 +93,11 @@ export function hiddenBooks(books: ScannedBook[]): ScannedBook[] {
 }
 
 // POS_SENTINEL sorts an empty/unparseable position last. It matches the Go
-// parseSeriesPos sentinel (1e18) exactly so the two implementations are
+// scheduler.ParseSeriesPos sentinel (1e18) exactly so the two implementations are
 // behaviorally identical, not merely both "sort last".
 export const POS_SENTINEL = 1e18;
 
-// parsePos is an exact behavioral mirror of the server's parseSeriesPos
+// parsePos is an exact behavioral mirror of the server's scheduler.ParseSeriesPos
 // (internal/scheduler/scheduler.go): it takes the leading run of digit/dot
 // characters and parses that as a single float, so "1-3.5" -> 1 (stops at '-')
 // and "2.5" -> 2.5, while anything the Go strconv.ParseFloat would reject -

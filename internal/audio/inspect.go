@@ -84,11 +84,11 @@ func audioFilesIn(dir string) ([]string, error) {
 	return files, nil
 }
 
-// Inspect probes a book's source audio, writes probe.json + (when a chapter list
-// can be built) manifest.json into workDir, and reports whether the chapter
-// markers are contiguous. A non-contiguous marker set writes no manifest and
-// returns markersContiguous=false, deferring to the M5 markers_normalizing stage.
-// A multi-file book is always contiguous (chapters are synthesized 1..N).
+// Inspect probes a book's source audio, writes probe.json + a manifest.json into
+// workDir, and reports whether the chapter markers are contiguous. A non-contiguous
+// marker set still writes manifest.json - as a DRAFT the M5 markers_normalizing stage
+// corrects - but returns markersContiguous=false so the state machine routes there
+// first. A multi-file book is always contiguous (chapters are synthesized 1..N).
 func Inspect(ctx context.Context, sourcePath, workDir, ffprobePath string) (Manifest, bool, error) {
 	if err := os.MkdirAll(workDir, 0o750); err != nil {
 		return Manifest{}, false, err
@@ -132,10 +132,11 @@ func inspectMarkers(ctx context.Context, bookFile, workDir, ffprobePath string) 
 	}
 	sort.SliceStable(chapters, func(i, j int) bool { return chapters[i].Start < chapters[j].Start })
 
-	if !contiguous(chapters) {
-		// Logical markers need manual/agent mapping; do not guess a manifest.
-		return Manifest{}, false, nil
-	}
+	// Always write the manifest, even for a non-contiguous marker set: it is the DRAFT
+	// the markers_normalizing agent stage reads and corrects (renumber/exclude/retitle).
+	// contiguous() is still the routing decision - when it is false the state machine
+	// sends the book to markers_normalizing before split, which never runs on a draft.
+	contig := contiguous(chapters)
 	m := Manifest{
 		Source:       bookFile,
 		Title:        meta.Format.Tags["title"],
@@ -147,7 +148,7 @@ func inspectMarkers(ctx context.Context, bookFile, workDir, ffprobePath string) 
 	if err := WriteManifest(workDir, m); err != nil {
 		return Manifest{}, false, err
 	}
-	return m, true, nil
+	return m, contig, nil
 }
 
 // inspectFiles builds a synthesized-chapter manifest for a multi-file book: one

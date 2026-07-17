@@ -300,6 +300,13 @@ func TestPurgeScratchEndpoint(t *testing.T) {
 	if err := env.db.UpdateScratchBytes(context.Background(), bookID, 4096); err != nil {
 		t.Fatal(err)
 	}
+	// Account an agent stage-run cost so the list's total_cost_usd rollup is non-zero.
+	if _, err := env.db.StartStageRun(context.Background(), bookID, "fact_pass", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.db.AddOpenStageRunUsage(context.Background(), bookID, "fact_pass", "opus", 100, 40, 0.0123); err != nil {
+		t.Fatal(err)
+	}
 	{
 		r := env.do(t, http.MethodGet, "/api/v1/books", token, "")
 		var lr listBooksResponse
@@ -307,6 +314,9 @@ func TestPurgeScratchEndpoint(t *testing.T) {
 		r.Body.Close()
 		if len(lr.Books) != 1 || lr.Books[0].ScratchBytes != 4096 {
 			t.Fatalf("list scratch_bytes = %+v, want the column value 4096 (no walk)", lr.Books)
+		}
+		if c := lr.Books[0].TotalCostUSD; c < 0.0122 || c > 0.0124 {
+			t.Fatalf("list total_cost_usd = %v, want ~0.0123", c)
 		}
 	}
 

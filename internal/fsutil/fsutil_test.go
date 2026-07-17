@@ -65,6 +65,54 @@ func TestWriteFileAtomicOverwrites(t *testing.T) {
 	}
 }
 
+func TestCopyFile(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.txt")
+	if err := os.WriteFile(src, []byte("payload\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "out", "nested", "dst.txt")
+	if err := CopyFile(src, dst, 0o444); err != nil {
+		t.Fatalf("CopyFile: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(got) != "payload\n" {
+		t.Errorf("content = %q, want %q", got, "payload\n")
+	}
+	if runtime.GOOS != "windows" {
+		info, _ := os.Stat(dst)
+		if perm := info.Mode().Perm(); perm != 0o444 {
+			t.Errorf("perm = %o, want 444", perm)
+		}
+	}
+	if err := CopyFile(filepath.Join(dir, "missing"), dst, 0o644); err == nil {
+		t.Error("CopyFile(missing src) = nil, want error")
+	}
+}
+
+func TestWithin(t *testing.T) {
+	root := filepath.Join(string(filepath.Separator), "a", "b")
+	cases := []struct {
+		root, path string
+		want       bool
+	}{
+		{root, root, true},                                                 // root itself is contained
+		{root, filepath.Join(root, "c"), true},                             // direct child
+		{root, filepath.Join(root, "c", "d"), true},                        // nested descendant
+		{root, filepath.Join(string(filepath.Separator), "a"), false},      // parent escapes
+		{root, filepath.Join(string(filepath.Separator), "a", "x"), false}, // sibling escapes
+		{root, filepath.Join(root, "..", "x"), false},                      // traversal escapes
+	}
+	for _, tc := range cases {
+		if got := Within(tc.root, tc.path); got != tc.want {
+			t.Errorf("Within(%q, %q) = %v, want %v", tc.root, tc.path, got, tc.want)
+		}
+	}
+}
+
 func TestIsFile(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "f")

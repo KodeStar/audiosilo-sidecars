@@ -1,5 +1,6 @@
 import type {
   BookCandidate,
+  BookDetail,
   ChangePasswordBody,
   CreateBooksResponse,
   CreateScanResponse,
@@ -179,6 +180,13 @@ export class ApiClient {
 
   listBooks(): Promise<ListBooksResponse> {
     return this.request<ListBooksResponse>('/api/v1/books');
+  }
+
+  // getBook fetches one book's detail view, including its per-stage run ledger
+  // (model/token/cost). The list endpoint omits stage_runs, so the Running tab
+  // fetches this lazily when a row is expanded.
+  getBook(id: number): Promise<BookDetail> {
+    return this.request<BookDetail>(`/api/v1/books/${id}`);
   }
 
   pauseBook(id: number): Promise<void> {

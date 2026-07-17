@@ -61,7 +61,7 @@ func renderMarkdown(r *Report) string {
 	} else {
 		for _, run := range r.RepeatedRuns {
 			add(fmt.Sprintf("- ch%03d %s: %dx at %.1f min: %s",
-				run.Chapter, kindLabel(run.Kind), run.Length, run.StartSec/60, pyRepr(run.Snippet)))
+				run.Chapter, kindLabel(run.Kind), run.Length, run.StartSec/60, PyRepr(run.Snippet)))
 		}
 	}
 	add("")
@@ -91,7 +91,7 @@ func renderMarkdown(r *Report) string {
 				span = fmt.Sprintf("%.0f-%.0fs", *h.FirstSec, *h.LastSec)
 			}
 			add(fmt.Sprintf("- ch%03d: x%3d at %5.1f%% of chapter (%s): %s",
-				h.Chapter, h.Count, h.Pos, span, pyRepr(truncateRunes(h.Phrase, snippetLen))))
+				h.Chapter, h.Count, h.Pos, span, PyRepr(TruncateRunes(h.Phrase, snippetLen))))
 		}
 	}
 	add("")
@@ -102,7 +102,7 @@ func renderMarkdown(r *Report) string {
 	} else {
 		for _, h := range r.WithinSegment {
 			add(fmt.Sprintf("- ch%03d: 6gram x%d at %.0f%% pos: %s",
-				h.Chapter, h.Count, h.Pos, pyRepr(h.Phrase)))
+				h.Chapter, h.Count, h.Pos, PyRepr(h.Phrase)))
 		}
 	}
 	add("")
@@ -121,7 +121,7 @@ func renderMarkdown(r *Report) string {
 				where = fmt.Sprintf("%.0fs (%.0f%%)", *f.AtSec, f.Pos)
 			}
 			add(fmt.Sprintf("- ch%03d [%-8s] x%3d %-15s at %14s: %s",
-				f.Chapter, f.Source, f.Count, tag, where, pyRepr(truncateRunes(f.Phrase, multiPhrase))))
+				f.Chapter, f.Source, f.Count, tag, where, PyRepr(TruncateRunes(f.Phrase, multiPhrase))))
 		}
 	}
 	add("")
@@ -132,7 +132,7 @@ func renderMarkdown(r *Report) string {
 	} else {
 		for _, h := range r.TailRate {
 			add(fmt.Sprintf("- ch%03d: %6.1f w/s (%d words in %ss): %s",
-				h.Chapter, h.WPS, tailWords, trimFloat(h.Span), pyRepr(h.Tail)))
+				h.Chapter, h.WPS, tailWords, trimFloat(h.Span), PyRepr(h.Tail)))
 		}
 	}
 
@@ -176,13 +176,13 @@ func trimFloat(v float64) string {
 	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
-// pyRepr renders s the way Python's repr() of a str does, so the repeated-run
+// PyRepr renders s the way Python's repr() of a str does, so the repeated-run
 // snippet line matches qa_sweep.py exactly (a later golden test compares it against a
 // historical qa_report.md). Python prefers single quotes, switches to double quotes
 // only when the string contains a single quote and no double quote, escapes the
 // active quote plus the standard C escapes, renders control characters as \xXX, and
 // leaves printable (including non-ASCII) characters as-is.
-func pyRepr(s string) string {
+func PyRepr(s string) string {
 	quote := byte('\'')
 	if strings.ContainsRune(s, '\'') && !strings.ContainsRune(s, '"') {
 		quote = '"'

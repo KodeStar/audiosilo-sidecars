@@ -34,6 +34,16 @@ export interface AsrInfo {
   detail: string;
 }
 
+// Resolved agent-runner capability (mirrors the Go /system `agent` block): which
+// backend (claude/codex/"") will run the agent stages and whether it is usable.
+// version/detail are omitempty on the wire, so optional here.
+export interface AgentInfo {
+  backend: string;
+  available: boolean;
+  version?: string;
+  detail?: string;
+}
+
 export interface SystemInfo {
   version: string;
   data_dir: string;
@@ -41,6 +51,7 @@ export interface SystemInfo {
   tabs: SystemTab[];
   tools: ToolsInfo;
   asr: AsrInfo;
+  agent: AgentInfo;
   // Daemon-total on-disk scratch (sum of every book's work dir), the disk gauge.
   scratch_bytes: number;
 }
@@ -56,9 +67,15 @@ export interface AsrConfig {
   backend: string;
 }
 
+// AgentConfig mirrors the Go settings `agent` view: the backend selector, the
+// scheduler concurrency and per-invocation timeout, and the per-stage model maps
+// (agent-stage name -> model; an absent/empty entry means the backend default).
 export interface AgentConfig {
   backend: string;
   concurrency: number;
+  timeout_minutes: number;
+  claude_models: Record<string, string>;
+  openai_models: Record<string, string>;
 }
 
 export interface Settings {
@@ -69,11 +86,24 @@ export interface Settings {
   agent: AgentConfig;
 }
 
+// AgentUpdate is the optional agent envelope of PUT /settings. Scalar fields are
+// left untouched when omitted; the model maps replace the corresponding config map
+// wholesale when present (so an omitted stage = the backend default). Agent changes
+// are persisted but only take effect on a daemon RESTART.
+export interface AgentUpdate {
+  backend?: string;
+  concurrency?: number;
+  timeout_minutes?: number;
+  claude_models?: Record<string, string>;
+  openai_models?: Record<string, string>;
+}
+
 // Keys understood by PUT /settings. A non-empty secret string sets it, an empty
 // string clears it, an omitted key is left untouched.
 export interface SettingsUpdate {
   cors_origins?: string[];
   secrets?: Partial<Record<keyof SecretsPresence, string>>;
+  agent?: AgentUpdate;
 }
 
 export interface ChangePasswordBody {
@@ -267,8 +297,36 @@ export interface BookView {
   // Current on-disk size of the book's work dir in bytes (chapters + durables);
   // 0 when not yet created or already purged.
   scratch_bytes: number;
+  // Summed agent spend across the book's stage runs in USD (0 for a book that has
+  // run only mechanical/ASR stages or none yet, or when the backend reports no cost).
+  // Present on both the list and detail views.
+  total_cost_usd: number;
   created_at: string;
   updated_at: string;
+}
+
+// StageRun is one execution (or attempt) of a stage for a book, from the book
+// detail ledger. Model/InputTokens/OutputTokens/CostUSD (M5) capture agent spend;
+// mechanical/ASR stages leave them zero. cost_usd is 0 when the backend reports no
+// USD cost (codex). ok is null while running, true on success, false on failure.
+export interface StageRun {
+  id: number;
+  book_id: number;
+  stage: string;
+  attempt: number;
+  started_at: string;
+  finished_at: string;
+  ok: boolean | null;
+  metrics?: unknown;
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+}
+
+// BookDetail is GET /books/{id}: a BookView plus the per-execution stage-run ledger.
+export interface BookDetail extends BookView {
+  stage_runs: StageRun[];
 }
 
 export interface BookCreateResult {

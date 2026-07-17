@@ -34,6 +34,7 @@ function system(scratchBytes: number): SystemInfo {
       version: 'Python 3.12',
       detail: '',
     },
+    agent: { backend: 'claude', available: true, version: '1.0.0' },
     scratch_bytes: scratchBytes,
   };
 }

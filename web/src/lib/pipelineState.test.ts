@@ -18,6 +18,8 @@ describe('stateLabel', () => {
   it('uses friendly labels and title-cases unknowns', () => {
     expect(stateLabel('qa_sweep')).toBe('QA sweep');
     expect(stateLabel('asr')).toBe('Transcribing');
+    expect(stateLabel('fact_pass')).toBe('Fact pass');
+    expect(stateLabel('qa_adjudicating')).toBe('QA adjudicating');
     expect(stateLabel('some_new_stage')).toBe('Some New Stage');
   });
 });

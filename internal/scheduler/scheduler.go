@@ -376,6 +376,17 @@ func (s *Scheduler) runStage(ctx context.Context, b store.Book) {
 		}
 		return
 	}
+	// A stage that returns success MUST have written its sentinel (the content-truth
+	// marker crash-resume relies on) as its final durable action. If it did not,
+	// advancing would spin silently forever: the next reconcile finds the sentinel
+	// missing, rewinds to re-run the stage, and the stage again "succeeds" with no
+	// sentinel. Turn that stage-implementation bug into a loud, terminal failure.
+	if !SentinelExists(b.WorkDir, stageName) {
+		serr := fmt.Errorf("stage %q returned success without writing its sentinel - bug in the stage implementation", stageName)
+		_ = s.db.FinishStageRun(ctx, runID, false, metricsErr(serr))
+		s.setStatus(b.ID, state.StatusFailed, serr.Error())
+		return
+	}
 	if ferr := s.db.FinishStageRun(ctx, runID, true, result.Metrics); ferr != nil {
 		return
 	}
@@ -515,16 +526,17 @@ func lockHolders(books []store.Book) map[int64]bool {
 
 // seriesLess orders two books of the same series by numeric position, then id.
 func seriesLess(a, b store.Book) bool {
-	pa, pb := parseSeriesPos(a.SeriesPos), parseSeriesPos(b.SeriesPos)
+	pa, pb := ParseSeriesPos(a.SeriesPos), ParseSeriesPos(b.SeriesPos)
 	if pa != pb {
 		return pa < pb
 	}
 	return a.ID < b.ID
 }
 
-// parseSeriesPos extracts the leading number of a position string ("1", "2.5",
-// "1-3.5" -> 1). Unparseable positions sort last (+Inf).
-func parseSeriesPos(pos string) float64 {
+// ParseSeriesPos extracts the leading number of a position string ("1", "2.5",
+// "1-3.5" -> 1). Unparseable positions sort last (+Inf). Exported so the pipeline's
+// series-carryover discovery shares one parse of a series position.
+func ParseSeriesPos(pos string) float64 {
 	pos = strings.TrimSpace(pos)
 	if pos == "" {
 		return 1e18

@@ -98,7 +98,7 @@ func repeatedRuns(docs []chapterDoc) []RepeatedRun {
 				Kind:     kind,
 				Length:   runLen,
 				StartSec: startT,
-				Snippet:  truncateRunes(segs[runStart].Text, snippetLen),
+				Snippet:  TruncateRunes(segs[runStart].Text, snippetLen),
 			})
 		}
 		for i, seg := range segs {
@@ -177,7 +177,7 @@ func crossSegmentLoops(docs []chapterDoc) []CrossSegmentHit {
 		if len(toks) < crossMinTokens {
 			continue
 		}
-		gram, count := topGram(toks)
+		gram, count := TopGram(toks)
 		if count < crossThreshold {
 			continue
 		}
@@ -227,7 +227,7 @@ func withinSegmentLoops(docs []chapterDoc) []WithinSegmentHit {
 			if len(toks) < withinMinTokens {
 				continue
 			}
-			gram, count := topGram(toks)
+			gram, count := TopGram(toks)
 			if count < withinThreshold {
 				continue
 			}
@@ -287,6 +287,11 @@ func multiLoops(docs []chapterDoc, workDir string) []MultiLoopFinding {
 // multi-loop scan, preferring transcripts-repaired/chNNN.txt when it exists
 // (multi_loop_scan.py reads the repaired layer in preference to the raw text,
 // because a repair can uncover a second loop the first was masking).
+//
+// It deliberately does NOT use transcript.ChapterTextPath: its fallback is the
+// chapter's already-loaded in-memory doc text (d.fulltext, labelled "raw"), not a
+// transcripts-text/ read, so the "prefer repaired" preference is the only shared part
+// and the semantics diverge on the fallback branch.
 func multiText(d chapterDoc, workDir string) (text, src string) {
 	repaired := filepath.Join(workDir, transcript.RepairedDir, transcript.TextName(d.number))
 	if raw, err := os.ReadFile(repaired); err == nil { //nolint:gosec // path derives from the book's own work dir
@@ -302,7 +307,7 @@ func multiText(d chapterDoc, workDir string) (text, src string) {
 // then `pos = at/dur*100 if at else -1` - a segment starting at exactly 0 is FALSY in
 // Python, so it yields pos -1 and a "?" location, not a real 0% position.
 func locateMulti(d chapterDoc, normSegs []string, phrase string, count int, src string) MultiLoopFinding {
-	needle := truncateRunes(phrase, 24)
+	needle := TruncateRunes(phrase, 24)
 	var at float64
 	located := false
 	for i, ns := range normSegs {
@@ -367,7 +372,7 @@ func tailRateOutliers(docs []chapterDoc) []TailRateHit {
 				Chapter: d.number,
 				WPS:     round1(wps),
 				Span:    round2(span),
-				Tail:    truncateRunes(strings.Join(words, " "), tailTextLen),
+				Tail:    TruncateRunes(strings.Join(words, " "), tailTextLen),
 			})
 		}
 	}
@@ -415,10 +420,10 @@ func normalizeASCII(s string) string {
 	return strings.Join(strings.Fields(b.String()), " ")
 }
 
-// topGram returns the most common 6-gram in toks and its count, breaking ties by
+// TopGram returns the most common 6-gram in toks and its count, breaking ties by
 // first appearance (Python Counter.most_common(1) over an insertion-ordered
 // Counter). Returns (nil, 0) when there are fewer than 6 tokens.
-func topGram(toks []string) ([]string, int) {
+func TopGram(toks []string) ([]string, int) {
 	counts, order, keys := gramCounts(toks)
 	best := -1
 	var bestGram []string
@@ -511,9 +516,9 @@ func wordSetKey(g []string) string {
 	return strings.Join(keys, "\x00")
 }
 
-// truncateRunes returns the first n runes of s (Python's s[:n] over a str, which is
+// TruncateRunes returns the first n runes of s (Python's s[:n] over a str, which is
 // rune-indexed), or s when it is already short enough.
-func truncateRunes(s string, n int) string {
+func TruncateRunes(s string, n int) string {
 	r := []rune(s)
 	if len(r) <= n {
 		return s

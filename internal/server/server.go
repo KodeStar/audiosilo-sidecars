@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/api"
 	"github.com/kodestar/audiosilo-sidecars/internal/asr"
 	"github.com/kodestar/audiosilo-sidecars/internal/auth"
@@ -142,6 +143,25 @@ func Run(ctx context.Context, opts Options) error {
 	fmt.Fprintf(opts.Out, "[info] asr backend: %s (available=%v device=%s)%s\n",
 		asrCap.Backend, asrCap.Available, asrCap.Device, asrDetailSuffix(asrCap))
 
+	// Resolve the agent runner once at startup (auto/claude/codex). Detect is cheap
+	// (resolve the binary + a fast --version). agent.Select returns a loud error only
+	// for a misconfiguration a person must fix - an unknown backend name, or an
+	// explicitly-configured backend/path that does not resolve - so it is fatal (auto
+	// mode never errors: it just reports unavailable). An unavailable runner is
+	// surfaced on /system and parks a book's agent stages with an actionable message
+	// while the rest of the daemon works; a stage re-detects on Retry after an install.
+	agentSelect := agent.SelectConfig{
+		Backend:    cfg.Agent.Backend,
+		ClaudePath: cfg.Agent.ClaudePath,
+		CodexPath:  cfg.Agent.CodexPath,
+	}
+	agentRunner, agentAvail, err := agent.Select(ctx, agentSelect, sec)
+	if err != nil {
+		return fmt.Errorf("select agent backend: %w", err)
+	}
+	fmt.Fprintf(opts.Out, "[info] agent backend: %s (available=%v)%s\n",
+		agentDisplay(agentAvail.Backend), agentAvail.Available, agentDetailSuffix(agentAvail))
+
 	// Pipeline wiring: the metadata client, the async scan manager (using the
 	// resolved ffprobe), and the three-lane scheduler over the composite executor
 	// (real inspect/split/asr/sanitize from internal/pipeline, stubs beyond). The
@@ -184,8 +204,14 @@ func Run(ctx context.Context, opts Options) error {
 			DataDir:        opts.DataDir,
 			Log:            toolLog,
 		},
-		Log:      toolLog,
-		Fallback: scheduler.NewStubExecutor(0, 0),
+		Agent:        agentRunner,
+		AgentAvail:   agentAvail,
+		AgentSelect:  agentSelect,
+		AgentModels:  pipeline.AgentModels{Claude: cfg.Agent.Claude, OpenAI: cfg.Agent.OpenAI},
+		AgentTimeout: time.Duration(cfg.Agent.TimeoutMinutes) * time.Minute,
+		Secrets:      sec,
+		Log:          toolLog,
+		Fallback:     scheduler.NewStubExecutor(0, 0),
 	})
 	sched := scheduler.New(db, hub, exec, cfg.Agent.Concurrency, workRoot)
 	schedCtx, cancelSched := context.WithCancel(ctx)
@@ -234,6 +260,18 @@ func Run(ctx context.Context, opts Options) error {
 				Version:   cap.Version,
 				Detail:    cap.Detail,
 			}, ff, fp
+		},
+		// AgentStatus reports the executor's CURRENT agent-runner availability (which a
+		// stage may have re-detected after a retry), so /system reflects an install
+		// without a daemon restart.
+		AgentStatus: func() api.AgentInfo {
+			av := exec.AgentStatus()
+			return api.AgentInfo{
+				Backend:   av.Backend,
+				Available: av.Available,
+				Version:   av.Version,
+				Detail:    av.Detail,
+			}
 		},
 	}).Handler()
 
@@ -387,6 +425,24 @@ func asrDetailSuffix(cap asr.Capability) string {
 		return ""
 	}
 	return " - " + cap.Detail
+}
+
+// agentDisplay renders the resolved agent backend for the startup log, marking an
+// absent backend clearly rather than printing an empty string.
+func agentDisplay(backend string) string {
+	if backend == "" {
+		return "(none)"
+	}
+	return backend
+}
+
+// agentDetailSuffix appends the agent unavailability reason to the startup log line
+// when the runner is not ready, so the operator sees why immediately.
+func agentDetailSuffix(av agent.Availability) string {
+	if av.Available || av.Detail == "" {
+		return ""
+	}
+	return " - " + av.Detail
 }
 
 // toolDisplay renders a resolved tool path for the startup log, marking an

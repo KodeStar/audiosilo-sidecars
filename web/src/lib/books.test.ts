@@ -20,6 +20,7 @@ function bk(partial: Partial<BookView>): BookView {
     status: partial.status ?? '',
     progress: partial.progress ?? [],
     scratch_bytes: partial.scratch_bytes ?? 0,
+    total_cost_usd: partial.total_cost_usd ?? 0,
     created_at: partial.created_at ?? '2026-01-01T00:00:00Z',
     updated_at: partial.updated_at ?? '2026-01-01T00:00:00Z',
     ...partial,

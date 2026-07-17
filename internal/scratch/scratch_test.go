@@ -66,9 +66,13 @@ func TestConfinedAllowedAndDenied(t *testing.T) {
 func TestPurgeRemovesChaptersKeepsDurables(t *testing.T) {
 	root := t.TempDir()
 	work := filepath.Join(root, "book-1")
-	// chapters/ is reclaimable; probe.json/manifest.json/transcripts are durable.
+	// chapters/, _runs/, clips/, retranscribe/ are reclaimable; probe.json/
+	// manifest.json/transcripts/facts are durable.
 	writeFile(t, filepath.Join(work, audio.ChaptersDir, "ch001.flac"), 1024)
 	writeFile(t, filepath.Join(work, audio.ChaptersDir, "ch002.flac"), 1024)
+	writeFile(t, filepath.Join(work, "_runs", "fact_pass-a01", "out", "x.md"), 300)
+	writeFile(t, filepath.Join(work, "clips", "t002.flac"), 400)
+	writeFile(t, filepath.Join(work, "retranscribe", "ch002.json"), 500)
 	writeFile(t, filepath.Join(work, audio.ProbeName), 50)
 	writeFile(t, filepath.Join(work, audio.ManifestName), 80)
 	writeFile(t, filepath.Join(work, "transcripts-raw", "ch001.json"), 200)
@@ -76,8 +80,10 @@ func TestPurgeRemovesChaptersKeepsDurables(t *testing.T) {
 	if err := Purge(root, work); err != nil {
 		t.Fatalf("Purge: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(work, audio.ChaptersDir)); !os.IsNotExist(err) {
-		t.Error("Purge did not remove chapters/")
+	for _, gone := range []string{audio.ChaptersDir, "_runs", "clips", "retranscribe"} {
+		if _, err := os.Stat(filepath.Join(work, gone)); !os.IsNotExist(err) {
+			t.Errorf("Purge did not remove reclaimable %s/", gone)
+		}
 	}
 	for _, keep := range []string{audio.ProbeName, audio.ManifestName, "transcripts-raw/ch001.json"} {
 		if _, err := os.Stat(filepath.Join(work, keep)); err != nil {

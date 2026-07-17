@@ -4,19 +4,28 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 )
 
 // StageRun is one execution (or attempt) of a stage for a book. Ok is a nullable
 // tri-state: nil = still running, false = failed/interrupted, true = completed.
+//
+// Model/InputTokens/OutputTokens/CostUSD (M5) capture agent spend: an agent stage
+// accumulates them per invocation via AddOpenStageRunUsage. Mechanical/ASR stages
+// leave them zero. CostUSD is 0 when the backend does not report a USD cost (codex).
 type StageRun struct {
-	ID         int64           `json:"id"`
-	BookID     int64           `json:"book_id"`
-	Stage      string          `json:"stage"`
-	Attempt    int             `json:"attempt"`
-	StartedAt  string          `json:"started_at"`
-	FinishedAt string          `json:"finished_at"` // "" while running
-	Ok         *bool           `json:"ok"`
-	Metrics    json.RawMessage `json:"metrics"`
+	ID           int64           `json:"id"`
+	BookID       int64           `json:"book_id"`
+	Stage        string          `json:"stage"`
+	Attempt      int             `json:"attempt"`
+	StartedAt    string          `json:"started_at"`
+	FinishedAt   string          `json:"finished_at"` // "" while running
+	Ok           *bool           `json:"ok"`
+	Metrics      json.RawMessage `json:"metrics"`
+	Model        string          `json:"model"`
+	InputTokens  int64           `json:"input_tokens"`
+	OutputTokens int64           `json:"output_tokens"`
+	CostUSD      float64         `json:"cost_usd"`
 }
 
 // StartStageRun opens a new run for (book, stage) with finished_at NULL and
@@ -52,6 +61,73 @@ func boolToInt(b bool) int {
 	return 0
 }
 
+// AddOpenStageRunUsage accumulates one agent invocation's token/cost usage onto the
+// single OPEN run (finished_at IS NULL) for (book, stage). Token counts and cost add
+// (a stage may invoke the agent several times - retries, per-chunk fact passes); the
+// model column takes the LAST NON-EMPTY model. A failed/rate-limited invocation reports
+// a zero Usage with Model="" (the backend never ran to report one), so overwriting the
+// model unconditionally would erase the real model already recorded - the CASE keeps
+// the prior value when the incoming model is empty. It must be called BEFORE the run is
+// finished, so callers accumulate usage after each invocation and crash-preserve the
+// spend. No open run for (book, stage) is a programming error (usage was reported
+// outside a started run) and returns a descriptive error naming the book and stage.
+func (db *DB) AddOpenStageRunUsage(ctx context.Context, bookID int64, stage, model string, in, out int64, cost float64) error {
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE stage_runs
+		 SET input_tokens = input_tokens + ?,
+		     output_tokens = output_tokens + ?,
+		     cost_usd = cost_usd + ?,
+		     model = CASE WHEN ? <> '' THEN ? ELSE model END
+		 WHERE book_id=? AND stage=? AND finished_at IS NULL`,
+		in, out, cost, model, model, bookID, stage)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("AddOpenStageRunUsage: no open stage_run for book %d stage %q", bookID, stage)
+	}
+	return nil
+}
+
+// StageRunTotals returns the summed agent cost_usd per book across all stage runs,
+// bucketed by book id, in ONE grouped query so the book-list endpoint attaches per-book
+// totals without an N+1. Books with no runs (or only zero-cost mechanical/ASR runs) are
+// absent from the map (callers read a missing key as 0).
+func (db *DB) StageRunTotals(ctx context.Context) (map[int64]float64, error) {
+	rows, err := db.sql.QueryContext(ctx,
+		`SELECT book_id, COALESCE(SUM(cost_usd), 0) FROM stage_runs GROUP BY book_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[int64]float64{}
+	for rows.Next() {
+		var bookID int64
+		var total float64
+		if err := rows.Scan(&bookID, &total); err != nil {
+			return nil, err
+		}
+		out[bookID] = total
+	}
+	return out, rows.Err()
+}
+
+// SumStageRunCost returns the summed agent cost_usd across one book's stage runs - the
+// single-book form of StageRunTotals for the book-detail/create paths.
+func (db *DB) SumStageRunCost(ctx context.Context, bookID int64) (float64, error) {
+	var total float64
+	err := db.sql.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(cost_usd), 0) FROM stage_runs WHERE book_id=?`, bookID).Scan(&total)
+	if err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
 // CountStageRuns returns how many runs of stage exist for a book (all attempts),
 // used to compute the next attempt number and the fix-loop count.
 func (db *DB) CountStageRuns(ctx context.Context, bookID int64, stage string) (int, error) {
@@ -69,7 +145,8 @@ func (db *DB) CountStageSuccesses(ctx context.Context, bookID int64, stage strin
 	return n, err
 }
 
-const runCols = `id, book_id, stage, attempt, started_at, finished_at, ok, metrics`
+const runCols = `id, book_id, stage, attempt, started_at, finished_at, ok, metrics, ` +
+	`model, input_tokens, output_tokens, cost_usd`
 
 func scanRun(sc interface{ Scan(...any) error }) (StageRun, error) {
 	var r StageRun
@@ -77,7 +154,7 @@ func scanRun(sc interface{ Scan(...any) error }) (StageRun, error) {
 	var ok sql.NullInt64
 	var metrics string
 	if err := sc.Scan(&r.ID, &r.BookID, &r.Stage, &r.Attempt, &r.StartedAt,
-		&finished, &ok, &metrics); err != nil {
+		&finished, &ok, &metrics, &r.Model, &r.InputTokens, &r.OutputTokens, &r.CostUSD); err != nil {
 		return StageRun{}, err
 	}
 	if finished.Valid {
