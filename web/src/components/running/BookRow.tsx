@@ -18,6 +18,9 @@ interface BookRowProps {
   // A monotonically-updated clock (ms) from the panel's single interval, used to
   // compute elapsed time without a per-row timer.
   now: number;
+  // Opaque counter bumped on each durable book-scoped SSE frame; retriggers the log
+  // refetch effect below.
+  eventCount: number;
   onAction: (id: number, action: BookAction) => void;
   // Lazily fetches the book's detail (with its stage-run cost ledger) when the row
   // is expanded. Kept as a prop so the row stays decoupled from ApiClient.
@@ -62,6 +65,7 @@ export const BookRow = memo(function BookRow({
   book,
   busy,
   now,
+  eventCount,
   onAction,
   getDetail,
   getEvents,
@@ -99,9 +103,11 @@ export const BookRow = memo(function BookRow({
     }
   }, [getEvents, book.id]);
 
-  // Refresh the live log when opened, and on each book.state / stage.progress SSE
-  // patch for this book while open (book.state and progressKey change on those),
-  // throttled to at most one refetch per LOG_REFETCH_THROTTLE_MS.
+  // Refresh the live log when opened, and while open on any change that may have added
+  // a log line, throttled to at most one refetch per LOG_REFETCH_THROTTLE_MS. eventCount
+  // covers every durable book-scoped SSE frame (the main trigger, incl. long agent
+  // stages that emit only stage.note); book.state/book.status/progressKey cover
+  // load()-driven full reloads (which do not go through the SSE counter).
   const progressKey = book.progress.map((p) => `${p.stage}:${p.done}/${p.total}`).join(',');
   useEffect(() => {
     if (!expanded) return;
@@ -112,7 +118,7 @@ export const BookRow = memo(function BookRow({
     }
     const timer = setTimeout(() => void refetchLog(), LOG_REFETCH_THROTTLE_MS - since);
     return () => clearTimeout(timer);
-  }, [expanded, book.state, book.status, progressKey, refetchLog]);
+  }, [expanded, book.state, book.status, progressKey, eventCount, refetchLog]);
 
   return (
     <div

@@ -61,6 +61,42 @@ export function applyStageProgress(books: BookView[], ev: StageProgressEvent): B
   return changed ? next : books;
 }
 
+// bumpBookEventCount folds a durable book-scoped SSE frame into a per-book counter,
+// returning a new record (so a memoized BookRow re-renders on the changed count
+// prop). The criterion: it counts the PublishBook frames that append a line to the
+// book's durable log - book.state, stage.progress, stage.note, and contrib.update -
+// so BookRow's throttled log refetch retriggers on any of them. This matters because
+// a long agent stage emits no stage.progress ticks (only stage.note heartbeats) and a
+// contrib.update advancing a done book's status changes no book field the row already
+// holds; without this the open log would not refresh until the stage completed or the
+// row was collapsed/expanded. The counter's value is opaque - only its change matters.
+// Bulk/ephemeral frames (eta.update, queue.stats) are NOT counted: they write no
+// per-book log line, and eta.update would retrigger every row each dispatch pass. Pure
+// + tested.
+export function bumpBookEventCount(
+  counts: Record<number, number>,
+  bookId: number,
+): Record<number, number> {
+  return { ...counts, [bookId]: (counts[bookId] ?? 0) + 1 };
+}
+
+// pruneBookEventCounts drops counter keys for books no longer in the given live-id
+// set (books removed by a reload), returning the same reference when nothing changes
+// so a functional setState is a no-op. Pure.
+export function pruneBookEventCounts(
+  counts: Record<number, number>,
+  liveIds: Iterable<number>,
+): Record<number, number> {
+  const live = liveIds instanceof Set ? liveIds : new Set(liveIds);
+  const keys = Object.keys(counts);
+  if (keys.every((k) => live.has(Number(k)))) return counts;
+  const next: Record<number, number> = {};
+  for (const k of keys) {
+    if (live.has(Number(k))) next[Number(k)] = counts[Number(k)];
+  }
+  return next;
+}
+
 // isDone reports whether a book has reached the terminal state.
 export function isDone(book: BookView): boolean {
   return book.state === 'done';

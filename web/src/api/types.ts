@@ -495,6 +495,16 @@ export interface StageProgressEvent {
   total: number;
 }
 
+// StageNoteEvent is the durable `stage.note` SSE frame: a human-readable liveness
+// line (agent heartbeats, stage work-set descriptors) appended to the book's log.
+// The line arrives via the REST log fetch; the frame only signals a refetch (see
+// bumpBookEventCount in @/lib/books).
+export interface StageNoteEvent {
+  book_id: number;
+  stage: string;
+  msg: string;
+}
+
 export interface QueueStatsEvent {
   asr_active: number;
   agent_active: number;

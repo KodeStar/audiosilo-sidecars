@@ -3,12 +3,20 @@ import { useEffect, useRef, useState } from 'react';
 export type EventStreamStatus = 'connecting' | 'open' | 'closed';
 
 // The named SSE events the daemon publishes for the pipeline (besides the
-// ephemeral heartbeat). See internal/scheduler's publish sites.
+// ephemeral heartbeat). See internal/scheduler's publish sites
+// (scheduler.go: book.state / stage.progress / stage.note; eta.update from the
+// dispatch pass; queue.stats; contrib.update from the contributing stage/poller).
+// stage.note is a durable liveness line (agent heartbeats + stage work-set
+// descriptors) - a long agent stage emits no stage.progress ticks, so the open
+// log panel relies on stage.note to refresh while a subprocess is running.
 export type PipelineEventType =
-  'book.state' | 'stage.progress' | 'queue.stats' | 'eta.update' | 'contrib.update';
-const PIPELINE_EVENTS: PipelineEventType[] = [
+  'book.state' | 'stage.progress' | 'stage.note' | 'queue.stats' | 'eta.update' | 'contrib.update';
+// Exported so a drift-guard test can assert every published event type is
+// registered (an unregistered type is silently discarded by the browser).
+export const PIPELINE_EVENTS: PipelineEventType[] = [
   'book.state',
   'stage.progress',
+  'stage.note',
   'queue.stats',
   'eta.update',
   'contrib.update',

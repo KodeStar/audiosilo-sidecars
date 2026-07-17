@@ -5,8 +5,10 @@ import {
   applyEtaUpdate,
   applyStageProgress,
   availableActions,
+  bumpBookEventCount,
   formatBytes,
   isDone,
+  pruneBookEventCounts,
   sortBooks,
 } from './books';
 
@@ -133,6 +135,43 @@ describe('applyStageProgress', () => {
   it('ignores events for unknown books', () => {
     const books = [bk({ id: 1 })];
     expect(applyStageProgress(books, { book_id: 2, stage: 'asr', done: 1, total: 2 })).toBe(books);
+  });
+});
+
+describe('bumpBookEventCount', () => {
+  it('starts a book at 1 and increments on each frame', () => {
+    let counts: Record<number, number> = {};
+    counts = bumpBookEventCount(counts, 7);
+    expect(counts[7]).toBe(1);
+    counts = bumpBookEventCount(counts, 7);
+    expect(counts[7]).toBe(2);
+  });
+
+  it('tracks books independently and returns a new record each time', () => {
+    const a: Record<number, number> = {};
+    const b = bumpBookEventCount(a, 1);
+    const c = bumpBookEventCount(b, 2);
+    expect(b).not.toBe(a); // new reference so a memoized row re-renders
+    expect(a).toEqual({}); // original untouched
+    expect(c).toEqual({ 1: 1, 2: 1 });
+  });
+});
+
+describe('pruneBookEventCounts', () => {
+  it('drops counter keys not in the live-id set', () => {
+    const counts = { 1: 3, 2: 1, 3: 5 };
+    expect(pruneBookEventCounts(counts, [1, 3])).toEqual({ 1: 3, 3: 5 });
+  });
+
+  it('returns the same reference when nothing needs dropping', () => {
+    const counts = { 1: 3, 2: 1 };
+    expect(pruneBookEventCounts(counts, [1, 2, 4])).toBe(counts);
+    expect(pruneBookEventCounts({}, [1])).toEqual({});
+  });
+
+  it('accepts a Set of live ids', () => {
+    const counts = { 1: 3, 2: 1 };
+    expect(pruneBookEventCounts(counts, new Set([2]))).toEqual({ 2: 1 });
   });
 });
 

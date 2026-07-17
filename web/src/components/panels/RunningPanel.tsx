@@ -4,16 +4,20 @@ import { ApiError } from '@/lib/apiClient';
 import type {
   BookStateEvent,
   BookView,
+  ContributionUpdateEvent,
   EtaUpdateEvent,
   QueueStatsEvent,
+  StageNoteEvent,
   StageProgressEvent,
 } from '@/api/types';
 import {
   applyBookState,
   applyEtaUpdate,
   applyStageProgress,
+  bumpBookEventCount,
   formatBytes,
   isDone,
+  pruneBookEventCounts,
   sortBooks,
   type BookAction,
 } from '@/lib/books';
@@ -44,6 +48,9 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
   const [coreBook, setCoreBook] = useState<BookView | null>(null);
   // A single shared clock driving every row's elapsed display (no per-row timer).
   const [now, setNow] = useState(() => Date.now());
+  // Per-book counter of durable book-scoped SSE frames, giving BookRow a changing
+  // prop that retriggers its throttled log refetch. See bumpBookEventCount.
+  const [bookEventCounts, setBookEventCounts] = useState<Record<number, number>>({});
 
   // Reload the books AND the daemon-total scratch gauge together. Fetching the
   // gauge here (not just on mount) keeps it fresh after an action - notably a
@@ -53,6 +60,10 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
     try {
       const { books: list } = await client.listBooks();
       setBooks(sortBooks(list));
+      // Drop counters for books the reload no longer holds (functional setState so a
+      // concurrent bump is not clobbered).
+      const liveIds = new Set(list.map((b) => b.id));
+      setBookEventCounts((prev) => pruneBookEventCounts(prev, liveIds));
       setLoadError(null);
     } catch (err) {
       setLoadError(err instanceof ApiError ? err.message : 'Could not load the pipeline.');
@@ -76,15 +87,25 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
   }, []);
 
   // Live-update from the SSE hub. book.state/stage.progress patch existing rows;
-  // queue.stats feeds the header strip. A book newly created elsewhere is picked
-  // up on the next full load (e.g. after switching back to this tab).
+  // queue.stats feeds the header strip. Every durable book-scoped frame also bumps
+  // the book's event counter so an open log panel refetches (eta.update/queue.stats
+  // do not - they write no per-book log line). A book newly created elsewhere is
+  // picked up on the next full load (e.g. after switching back to this tab).
   const onEvent = useCallback((type: PipelineEventType, data: unknown) => {
     if (type === 'book.state') {
       const ev = data as BookStateEvent;
       setBooks((prev) => (prev ? sortBooks(applyBookState(prev, ev)) : prev));
+      setBookEventCounts((prev) => bumpBookEventCount(prev, ev.book_id));
     } else if (type === 'stage.progress') {
       const ev = data as StageProgressEvent;
       setBooks((prev) => (prev ? applyStageProgress(prev, ev) : prev));
+      setBookEventCounts((prev) => bumpBookEventCount(prev, ev.book_id));
+    } else if (type === 'stage.note') {
+      const ev = data as StageNoteEvent;
+      setBookEventCounts((prev) => bumpBookEventCount(prev, ev.book_id));
+    } else if (type === 'contrib.update') {
+      const ev = data as ContributionUpdateEvent;
+      setBookEventCounts((prev) => bumpBookEventCount(prev, ev.book_id));
     } else if (type === 'queue.stats') {
       setStats(data as QueueStatsEvent);
     } else if (type === 'eta.update') {
@@ -216,6 +237,9 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
               // 30s tick does not break their memo (notably done rows, which render
               // no elapsed).
               now={!isDone(b) && b.started_at ? now : 0}
+              // Changes on each durable book-scoped SSE frame, triggering the open
+              // log panel's throttled refetch.
+              eventCount={bookEventCounts[b.id] ?? 0}
               onAction={handleAction}
               getDetail={getDetail}
               getEvents={getEvents}
