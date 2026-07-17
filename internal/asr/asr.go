@@ -90,6 +90,11 @@ type Job struct {
 	Chapter       int
 	InitialPrompt string
 	Language      string
+	// NoContext disables context-conditioning across decode windows (the prior
+	// window's text is not fed as context for the next). It is used by the
+	// repair-path re-transcription so a deterministic Whisper repetition collapse
+	// does not replay identically on every retry; first-pass ASR leaves it false.
+	NoContext bool
 }
 
 // Backend is one ASR implementation. Detect is cheap and side-effect-free (probe

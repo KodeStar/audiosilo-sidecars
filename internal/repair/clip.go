@@ -3,6 +3,7 @@ package repair
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,14 @@ import (
 // repeat any 6-gram more than once. A clip that loops has re-degenerated and is never
 // adopted blind.
 const clipHealthMax6gram = 1
+
+// knownFailedTolSec is how close (seconds) an effective clip window start must be to a
+// prior CLIP-REDEGENERATED verdict's recorded clip_start to count as "the same window
+// that already failed" - so a re-queued identical tail_clip is skipped rather than
+// re-cut and re-transcribed (which would re-degenerate identically). Both values are
+// pyRound'd to 1 decimal, so 1s comfortably absorbs rounding without merging distinct
+// windows.
+const knownFailedTolSec = 1.0
 
 // ClipCutter cuts [startSec, startSec+durSec] of the source FLAC into dstFlac. It is
 // injected so internal/repair depends on neither ffmpeg-for-cutting nor a hard exec;
@@ -39,6 +48,18 @@ type ClipSpliceRequest struct {
 	ChapterEnd float64               // the chapter's duration (manifest chend)
 	Cut        ClipCutter            // audio cutter (FFmpegClipCutter in production)
 	Transcribe TranscribeClip        // prompt-free clip transcription
+	// StartOverrideSec is an OPTIONAL agent-supplied window start (seconds from chapter
+	// start). When > 0 it replaces the transcript-derived ClipWindow start, so the agent
+	// can relocate a window whose derived cut kept re-degenerating; 0 derives as usual
+	// (the historical-port geometry stays byte-identical). The loop is still LOCATED on
+	// the transcript for the rotation-adjudication unit regardless.
+	StartOverrideSec float64
+	// DecodeTag identifies the decode parameters this attempt uses (the pipeline passes a
+	// package const, e.g. "nocontext-v1"). It is recorded on any CLIP-REDEGENERATED verdict
+	// this attempt writes, and the known-failed skip fires only when a recorded verdict's
+	// tag EQUALS this one - so a legacy verdict written with different (context-conditioned)
+	// decode params never blocks a chapter's one fresh attempt under the new params.
+	DecodeTag string
 }
 
 // ClipResult reports what ClipAndSplice did for one chapter.
@@ -48,12 +69,17 @@ type ClipResult struct {
 	Verdict     Verdict // the adjudication verdict (empty when no run was located)
 	Spliced     bool    // transcripts-repaired/chNNN.txt was written
 	ClipHealthy bool    // the fresh clip passed the max-6-gram-x1 health check
-	InClip      int
-	Unit        string
-	Period      int
-	ClipStart   float64 // rounded clip start (the splice cut point)
-	WordsBefore int
-	WordsAfter  int
+	// SkippedKnownFailed is set when the effective window matched a prior
+	// CLIP-REDEGENERATED verdict for this chapter, so no cut/transcribe was attempted
+	// (Verdict is CLIP-REDEGENERATED, Spliced false). It is distinct from a fresh
+	// re-degeneration - no ASR ran - so the stage counts it separately (free retry).
+	SkippedKnownFailed bool
+	InClip             int
+	Unit               string
+	Period             int
+	ClipStart          float64 // rounded clip start (the splice cut point)
+	WordsBefore        int
+	WordsAfter         int
 }
 
 // ClipAndSplice runs the full mechanical tail repair for one chapter: locate the tail
@@ -78,9 +104,29 @@ func ClipAndSplice(ctx context.Context, req ClipSpliceRequest) (ClipResult, erro
 	}
 	res.Located = true
 
+	// Window start: the transcript-derived snap by default, or the agent's override when
+	// supplied. The override relocates a window the derived cut kept re-degenerating; the
+	// end geometry (+2s pad) and everything downstream are unchanged, so the derived path
+	// stays byte-identical.
 	snapped := ClipWindow(req.Transcript, run)
+	if req.StartOverrideSec > 0 {
+		snapped = req.StartOverrideSec
+	}
 	clipStart := pyRound(snapped, 1)
 	res.ClipStart = clipStart
+
+	// Known-failed skip: if this exact window already re-degenerated in a prior round
+	// UNDER THE SAME DECODE PARAMS (a CLIP-REDEGENERATED verdict at the same clip_start
+	// whose recorded decode_tag matches this attempt's), cutting and re-transcribing the
+	// identical audio with the identical params would just re-degenerate again - often 20+
+	// minutes of wasted ASR. Skip it; the caller counts it separately. A legacy verdict
+	// written under different params (empty/differing tag) never matches, so the chapter
+	// still gets exactly one fresh attempt under the new params.
+	if knownFailedWindow(req.WorkDir, req.Chapter, clipStart, req.DecodeTag) {
+		res.SkippedKnownFailed = true
+		res.Verdict = VerdictClipRedegenerated
+		return res, nil
+	}
 
 	// Cut the window: [snapped, chend - snapped + 2] (tail_clip_check.py adds 2s of
 	// tail so the real ending is fully captured). Resumable: a present clip is reused.
@@ -88,7 +134,12 @@ func ClipAndSplice(ctx context.Context, req ClipSpliceRequest) (ClipResult, erro
 	if err := os.MkdirAll(clipsDir, 0o750); err != nil {
 		return res, err
 	}
-	clipFlac := filepath.Join(clipsDir, fmt.Sprintf("t%03d.flac", req.Chapter))
+	// The clip filename is keyed on the chapter AND the effective (pyRound'd) window start,
+	// so a same-window resume reuses the file but a RELOCATED window (StartOverrideSec) forces
+	// a fresh cut instead of reusing the prior window's audio spliced at the new boundary. The
+	// transcription output name follows automatically (asr.RawOutputName derives from the clip
+	// stem). A stale old-window clip lingers in clips/ until the scratch purge - acceptable.
+	clipFlac := filepath.Join(clipsDir, fmt.Sprintf("t%03d-%.1f.flac", req.Chapter, clipStart))
 	if !fsutil.IsFile(clipFlac) {
 		srcFlac := filepath.Join(req.WorkDir, audio.ChaptersDir, audio.ChapterFileName(req.Chapter))
 		dur := req.ChapterEnd - snapped + 2
@@ -120,7 +171,7 @@ func ClipAndSplice(ctx context.Context, req ClipSpliceRequest) (ClipResult, erro
 	// clip is forced to CLIP-REDEGENERATED regardless of the rotation match.
 	if adj.Verdict == VerdictClipRedegenerated || !res.ClipHealthy {
 		res.Verdict = VerdictClipRedegenerated
-		if err := MergeTailVerdict(req.WorkDir, tailVerdict(run, adj, clipStart, req.ChapterEnd, res.Verdict)); err != nil {
+		if err := MergeTailVerdict(req.WorkDir, tailVerdict(run, adj, clipStart, req.ChapterEnd, res.Verdict, req.DecodeTag)); err != nil {
 			return res, err
 		}
 		return res, nil
@@ -136,15 +187,17 @@ func ClipAndSplice(ctx context.Context, req ClipSpliceRequest) (ClipResult, erro
 	if err := AppendRepairLog(req.WorkDir, line); err != nil {
 		return res, err
 	}
-	if err := MergeTailVerdict(req.WorkDir, tailVerdict(run, adj, clipStart, req.ChapterEnd, adj.Verdict)); err != nil {
+	if err := MergeTailVerdict(req.WorkDir, tailVerdict(run, adj, clipStart, req.ChapterEnd, adj.Verdict, req.DecodeTag)); err != nil {
 		return res, err
 	}
 	res.Spliced = true
 	return res, nil
 }
 
-// tailVerdict assembles the persisted verdict record for a chapter.
-func tailVerdict(run TailRun, adj Adjudication, clipStart, chapterEnd float64, verdict Verdict) TailVerdict {
+// tailVerdict assembles the persisted verdict record for a chapter. decodeTag records the
+// decode params this attempt ran under, so a later known-failed skip only fires when the
+// params match (see knownFailedWindow).
+func tailVerdict(run TailRun, adj Adjudication, clipStart, chapterEnd float64, verdict Verdict, decodeTag string) TailVerdict {
 	return TailVerdict{
 		Chapter:    run.Chapter,
 		Count:      run.Count,
@@ -157,6 +210,7 @@ func tailVerdict(run TailRun, adj Adjudication, clipStart, chapterEnd float64, v
 		Period:     adj.Period,
 		InClip:     adj.InClip,
 		Verdict:    verdict,
+		DecodeTag:  decodeTag,
 	}
 }
 
@@ -167,6 +221,24 @@ func ClipHealthy(clipText string) bool {
 	toks := strings.Fields(normTail(clipText))
 	_, count := qa.TopGram(toks)
 	return count <= clipHealthMax6gram
+}
+
+// knownFailedWindow reports whether chapter's tail_verdicts.json already carries a
+// CLIP-REDEGENERATED verdict whose recorded clip_start is within knownFailedTolSec of
+// clipStart AND whose recorded decode_tag EQUALS decodeTag - i.e. this exact window was
+// already cut, re-transcribed, and re-degenerated in a prior round UNDER THE SAME DECODE
+// PARAMS, so re-attempting it is pointless. A legacy verdict written under different params
+// (empty/differing tag) does not match, so the chapter still gets one fresh attempt under
+// the new params (whose new verdict then re-arms this skip). An unreadable/absent ledger is
+// "not known-failed" (proceed), so the first attempt at any window is never skipped.
+func knownFailedWindow(workDir string, chapter int, clipStart float64, decodeTag string) bool {
+	byCh, err := TailVerdictsByChapter(workDir)
+	if err != nil {
+		return false
+	}
+	v, ok := byCh[chapter]
+	return ok && v.Verdict == VerdictClipRedegenerated && v.DecodeTag == decodeTag &&
+		math.Abs(v.ClipStart-clipStart) <= knownFailedTolSec
 }
 
 // FFmpegClipCutter returns a ClipCutter that cuts the window to a mono/16 kHz FLAC.

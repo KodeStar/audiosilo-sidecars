@@ -195,7 +195,19 @@ internal/
             adjudicate FABRICATED/BENIGN/CLIP-REDEGENERATED, splice into
             transcripts-repaired/ + repairs.log/tail_verdicts.json) and AdoptFresh
             (never-blindly-adopt full-chapter plausibility). No agent; injected a
-            ClipCutter (ffmpeg) + a Transcribe func so it stays unit-testable.
+            ClipCutter (ffmpeg) + a Transcribe func so it stays unit-testable. The
+            re-transcription (full-chapter AND clip) runs NoContext (asr.Job.NoContext)
+            so a context-conditioned repetition collapse cannot replay identically.
+            ClipSpliceRequest.StartOverrideSec accepts an agent-supplied window start
+            (0 = derive as before, byte-identical); the cut clip file is keyed on
+            chapter+effective window start (t%03d-<start>.flac), so a relocated window
+            forces a fresh cut instead of reusing the prior window's audio. A window whose
+            clip_start already carries a CLIP-REDEGENERATED verdict (within ~1s) UNDER THE
+            SAME decode params is SKIPPED without cutting/re-transcribing
+            (SkippedKnownFailed), so a re-queued identical tail_clip is free instead of
+            minutes of ASR - the verdict records a DecodeTag, so a legacy verdict written
+            under different (context-conditioned) params never blocks the chapter's one
+            fresh NoContext attempt.
   pipeline/ composite scheduler.Executor: routes inspecting -> audio.Inspect,
             splitting -> audio.Split, asr -> the per-chapter internal/asr loop
             (resumable: skip complete raws, delete+retry malformed, freeze each raw
@@ -220,7 +232,33 @@ internal/
             deliberately RE-DERIVES all chapters every run (cheap, idempotent, raw is the
             source of truth) rather than tracking per-chapter freshness. Missing tools or
             an unavailable agent backend PARK a book needs_attention (a human-fixable
-            precondition Retry re-admits) instead of hard-failing.
+            precondition Retry re-admits) instead of hard-failing. The qa_adjudicating ->
+            retranscribing -> qa_sweep loop has three convergence guards beyond the
+            3-round cap: (1) a FIXED-POINT park - qaAdjudicate fingerprints (sha256, in
+            qa_round_fingerprint) the qa_report.json PLUS tail_verdicts.json it
+            adjudicated (the report alone is not enough: detectors read the raw layer a
+            splice never touches, so a successful splice can leave the report
+            bit-identical while the verdict ledger moved - real progress, not a fixed
+            point); if the next round's report+ledger state is bit-identical AND a plan
+            exists, the repairs moved nothing, so it
+            parks ParkQANoConverge naming the stuck chapters. The fingerprint is DELETED on
+            ANY qa_adjudicating park (both the fixed-point park and the 3-round-cap park) and
+            whenever the round count is 0 (a stale-leftover guard: a fingerprint is only ever
+            written at the end of a successful round, so done==0 with one present means a
+            Retry/purge-rewind/crash left it - drop it), so a Retry always gets exactly ONE
+            fresh agent round before re-parking (keyed on fingerprint+plan, not the round
+            count, so a Retry-reset CountStageSuccesses cannot dodge it); (2) a WIDENED
+            tail-residual auto-accept - tailOnlyChapters now also accepts a repaired chapter
+            whose cross-segment / non-mid multi-loop hits are themselves tail residuals
+            covered by the recorded splice (the WHOLE located span starts within
+            [clip_start - 15s, end], or position >= 95% when the hit has no usable time); (3)
+            plan clip_start_sec (per tail_clip entry) feeds the repair known-failed skip
+            above. wph outliers, within-segment hits, non-end-fade runs, MID-CHAPTER
+            multi-loops, and spans that straddle mid-chapter into the tail still always
+            disqualify a chapter from tail-only. The repair re-transcription is decode-tagged
+            (retranscribe/decode_params marker): a stale pre-NoContext fresh raw is discarded
+            so the chapter is re-transcribed under the current params rather than reused, and
+            a free known-failed skip is excluded from the stage's rate sample.
   contrib/  M7: everything GitHub-facing for contribution. TokenSource (secrets
             GitHubPAT first, else `gh auth token` - the token NEVER enters argv/logs/
             errors, leak-canary tested), a stdlib REST client (issues/gists/fork/

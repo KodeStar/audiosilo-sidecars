@@ -31,7 +31,8 @@ import (
 // model or the network.
 type fakeBackend struct {
 	mu            sync.Mutex
-	transcribed   map[int]int // chapter -> transcribe count
+	transcribed   map[int]int  // chapter -> transcribe count
+	noContext     map[int]bool // chapter -> whether the last Job for it set NoContext
 	before        func(chapter int)
 	block         chan struct{} // when non-nil, Transcribe waits on it (or ctx)
 	transcribeErr error         // when non-nil, Transcribe returns it (a real failure)
@@ -42,7 +43,9 @@ type fakeBackend struct {
 	emptyMode string
 }
 
-func newFakeBackend() *fakeBackend { return &fakeBackend{transcribed: map[int]int{}} }
+func newFakeBackend() *fakeBackend {
+	return &fakeBackend{transcribed: map[int]int{}, noContext: map[int]bool{}}
+}
 
 func (f *fakeBackend) ID() string { return "fake" }
 
@@ -68,6 +71,7 @@ func (f *fakeBackend) Transcribe(ctx context.Context, job asr.Job) error {
 	}
 	f.mu.Lock()
 	f.transcribed[job.Chapter]++
+	f.noContext[job.Chapter] = job.NoContext
 	attempt := f.transcribed[job.Chapter] // 1-based attempt count for this chapter
 	mode := f.emptyMode
 	f.mu.Unlock()
@@ -92,6 +96,14 @@ func (f *fakeBackend) count(chapter int) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.transcribed[chapter]
+}
+
+// sawNoContext reports whether the last Transcribe Job for a chapter had NoContext
+// set - the repair paths must, so a repetition collapse is not retried identically.
+func (f *fakeBackend) sawNoContext(chapter int) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.noContext[chapter]
 }
 
 // fakeASR builds an ASRSetup around a fake backend (available).

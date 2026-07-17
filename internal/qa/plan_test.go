@@ -108,6 +108,37 @@ func TestPlanValidate_InvalidAction(t *testing.T) {
 	}
 }
 
+// TestPlanValidate_ClipStartSecValid: a positive clip_start_sec on a tail_clip entry
+// (chapter 5) is accepted, and a zero/omitted value on any action stays valid.
+func TestPlanValidate_ClipStartSecValid(t *testing.T) {
+	p := fullPlan()
+	p.Entries[1].ClipStartSec = 1180.5 // chapter 5 is the tail_clip entry
+	if err := p.Validate(baseReport()); err != nil {
+		t.Fatalf("expected valid clip_start_sec on a tail_clip entry, got %v", err)
+	}
+}
+
+// TestPlanValidate_ClipStartSecNegative: a negative clip_start_sec is rejected.
+func TestPlanValidate_ClipStartSecNegative(t *testing.T) {
+	p := fullPlan()
+	p.Entries[1].ClipStartSec = -3
+	err := p.Validate(baseReport())
+	if err == nil || !strings.Contains(err.Error(), "negative clip_start_sec") {
+		t.Fatalf("expected negative-clip_start_sec error, got %v", err)
+	}
+}
+
+// TestPlanValidate_ClipStartSecOnNonTailClip: clip_start_sec set on a non-tail_clip
+// entry (chapter 2 is retranscribe) is rejected - only a tail_clip window is relocatable.
+func TestPlanValidate_ClipStartSecOnNonTailClip(t *testing.T) {
+	p := fullPlan()
+	p.Entries[0].ClipStartSec = 100 // chapter 2 is the retranscribe entry
+	err := p.Validate(baseReport())
+	if err == nil || !strings.Contains(err.Error(), "clip_start_sec on a") {
+		t.Fatalf("expected clip_start_sec-on-non-tail_clip error, got %v", err)
+	}
+}
+
 func TestPlanValidate_NilReport(t *testing.T) {
 	if err := fullPlan().Validate(nil); err == nil {
 		t.Fatal("expected error for nil report")

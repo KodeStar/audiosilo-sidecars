@@ -35,4 +35,11 @@ describe('parkHint', () => {
     expect(parkHint('')).toBeNull();
     expect(parkHint('bogus_code')).toBeNull();
   });
+
+  it('qa_no_converge hint states no fixed round count (it can park after 1 round now)', () => {
+    const hint = parkHint('qa_no_converge');
+    expect(hint).toBeTruthy();
+    expect(hint).not.toMatch(/3 rounds/);
+    expect(hint).toMatch(/progress/i);
+  });
 });

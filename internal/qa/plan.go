@@ -32,6 +32,13 @@ type PlanEntry struct {
 	Chapter int        `json:"chapter"`
 	Action  PlanAction `json:"action"`
 	Reason  string     `json:"reason"`
+	// ClipStartSec is an OPTIONAL agent-supplied tail-clip window start (seconds from
+	// chapter start) for a "tail_clip" entry. When set (> 0) the repair stage cuts the
+	// window from this point instead of deriving it from the transcript - the agent uses
+	// it to relocate a window whose prior derived cut re-degenerated (CLIP-REDEGENERATED),
+	// so a re-queued tail_clip does not replay the identical failed window. 0 (the default,
+	// omitted) means "derive as usual". Only a tail_clip entry may carry it (Validate).
+	ClipStartSec float64 `json:"clip_start_sec,omitempty"`
 }
 
 // Plan is the qa_adjudicating agent's output: one entry per actionable finding plus
@@ -41,16 +48,24 @@ type Plan struct {
 	Notes   string      `json:"notes,omitempty"`
 }
 
+// NonAcceptEntries returns the entries that ask for actual repair work (Action !=
+// "accept": the retranscribe/tail_clip dispositions). It is nil when every entry is an
+// accept (or the plan is empty), which callers read as "no work queued".
+func (p *Plan) NonAcceptEntries() []PlanEntry {
+	var out []PlanEntry
+	for _, e := range p.Entries {
+		if e.Action != ActionAccept {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // RetranscribeNeeded reports whether any entry asks for work beyond acceptance - the
 // signal the pipeline maps onto StageResult.RetranscribeNeeded (qa_adjudicating ->
 // retranscribing when true, else -> spelling_research).
 func (p *Plan) RetranscribeNeeded() bool {
-	for _, e := range p.Entries {
-		if e.Action != ActionAccept {
-			return true
-		}
-	}
-	return false
+	return len(p.NonAcceptEntries()) > 0
 }
 
 // LoadReport reads qa_report.json from workDir (the qa_adjudicating stage's
@@ -114,6 +129,12 @@ func (p *Plan) Validate(rep *Report) error {
 		}
 		if strings.TrimSpace(e.Reason) == "" {
 			return fmt.Errorf("qa plan: chapter %d has an empty reason", e.Chapter)
+		}
+		if e.ClipStartSec < 0 {
+			return fmt.Errorf("qa plan: chapter %d has a negative clip_start_sec %.1f", e.Chapter, e.ClipStartSec)
+		}
+		if e.ClipStartSec != 0 && e.Action != ActionTailClip {
+			return fmt.Errorf("qa plan: chapter %d sets clip_start_sec on a %q entry (only tail_clip may)", e.Chapter, e.Action)
 		}
 		if !allowed[e.Chapter] {
 			return fmt.Errorf("qa plan: chapter %d has an entry but the QA sweep flagged nothing for it", e.Chapter)

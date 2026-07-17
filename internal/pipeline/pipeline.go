@@ -823,6 +823,18 @@ func rawIsEmpty(path string) (bool, error) {
 	return len(tr.Segments) == 0, nil
 }
 
+// hexSHA256 returns the hex-encoded sha256 over the concatenation of parts (one digest
+// over all of them, in order). A nil part contributes nothing, so a missing optional
+// input hashes as empty. It is the shared fingerprint primitive for manifestFingerprint
+// and qaRoundFingerprint.
+func hexSHA256(parts ...[]byte) string {
+	h := sha256.New()
+	for _, p := range parts {
+		h.Write(p)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // manifestFingerprint returns the hex sha256 of the book's manifest.json bytes. The
 // manifest is written canonically by audio.WriteManifest, so the digest is stable
 // across reads and changes exactly when the inspected source/chapter layout changes.
@@ -831,8 +843,7 @@ func manifestFingerprint(workDir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:]), nil
+	return hexSHA256(raw), nil
 }
 
 // writeASRProvenance records the backend/model/language (plus fingerprint + empty

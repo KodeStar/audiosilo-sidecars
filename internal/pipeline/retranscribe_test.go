@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -115,6 +116,11 @@ func TestRetranscribeAdoptsPlausibleFresh(t *testing.T) {
 	if fake.count(2) != 1 {
 		t.Errorf("chapter 2 transcribed %d times, want 1", fake.count(2))
 	}
+	// The repair re-transcription must disable context-conditioning so a deterministic
+	// repetition collapse does not replay identically on the retry.
+	if !fake.sawNoContext(2) {
+		t.Error("retranscribeChapter did not set NoContext on the re-transcription Job")
+	}
 }
 
 // TestRetranscribeKeepsCollapsedFresh: when the fresh run collapses (implausible for the
@@ -176,6 +182,118 @@ func TestRetranscribeTailClipSplices(t *testing.T) {
 	}
 	if !strings.Contains(string(logRaw), "ch002") {
 		t.Errorf("repairs.log has no ch002 entry:\n%s", logRaw)
+	}
+	// The clip re-transcription must disable context-conditioning - the tail loop being
+	// cut is a context-conditioned collapse, so a context-on retry would just replay it.
+	if !fake.sawNoContext(2) {
+		t.Error("tailClipChapter did not set NoContext on the clip re-transcription Job")
+	}
+}
+
+// seedFreshRaw writes a structurally-complete fresh raw into a retranscribe/ dir, as if a
+// prior run had produced it (used to exercise the decode-params marker's stale-raw purge).
+func seedFreshRaw(t *testing.T, dir string, chapter int) {
+	t.Helper()
+	raw := fmt.Sprintf(`{"text":" fake chapter %d","language":"en","segments":[{"id":0,"start":0,"end":1,"text":" fake chapter %d","words":[{"word":" fake","start":0,"end":0.5,"probability":0.9}]}]}`, chapter, chapter)
+	if err := os.WriteFile(filepath.Join(dir, transcript.RawName(chapter)), []byte(raw+"\n"), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+}
+
+// TestRetranscribeDecodeParamsMarker is the item-3 regression: a structurally-complete
+// fresh raw left by a PRE-NoContext run must be discarded (so the chapter is re-transcribed
+// under the new NoContext params) when the retranscribe/ decode-params marker is absent or
+// records different params, while a raw whose marker matches the current tag is reused (the
+// intended cheap resume).
+func TestRetranscribeDecodeParamsMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		marker    string // "" = no marker file at all
+		wantCalls int
+	}{
+		{"missing marker re-transcribes", "", 1},
+		{"mismatched marker re-transcribes", "old-params", 1},
+		{"matching marker reuses", retranscribeDecodeTag, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			work := t.TempDir()
+			writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: 1, ChapterCount: 1, Chapters: []audio.Chapter{{Chapter: 2, Start: 0, End: 1, Duration: 1}}})
+			seedNormalized(t, work, oneWordTranscript(2))
+			seedFLACs(t, work, 2)
+			seedPlan(t, work, qa.PlanEntry{Chapter: 2, Action: qa.ActionRetranscribe, Reason: "collapse"})
+			// Pre-seed a complete fresh raw (as if an earlier run produced it) + optional marker.
+			freshDir := filepath.Join(work, repair.RetranscribeDir)
+			if err := os.MkdirAll(freshDir, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			seedFreshRaw(t, freshDir, 2)
+			if tc.marker != "" {
+				if err := os.WriteFile(filepath.Join(freshDir, "decode_params"), []byte(tc.marker+"\n"), 0o644); err != nil { //nolint:gosec // test artifact
+					t.Fatal(err)
+				}
+			}
+
+			fake := newFakeBackend()
+			exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+			if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{}); err != nil {
+				t.Fatalf("retranscribing: %v", err)
+			}
+			if fake.count(2) != tc.wantCalls {
+				t.Errorf("chapter 2 transcribed %d times, want %d", fake.count(2), tc.wantCalls)
+			}
+			// After the stage the marker always records the current tag.
+			got, err := os.ReadFile(filepath.Join(freshDir, "decode_params"))
+			if err != nil || strings.TrimSpace(string(got)) != retranscribeDecodeTag {
+				t.Errorf("decode-params marker = %q (%v), want %q", got, err, retranscribeDecodeTag)
+			}
+		})
+	}
+}
+
+// TestRetranscribeTailClipKnownFailedSkipped is the item-2/C regression: a tail_clip
+// entry whose effective window already carries a CLIP-REDEGENERATED verdict is skipped -
+// no re-cut, no re-ASR - and counted under clips_skipped_known_failed (distinct from a
+// fresh re-degeneration). The agent re-queues the same window via clip_start_sec.
+func TestRetranscribeTailClipKnownFailedSkipped(t *testing.T) {
+	work := t.TempDir()
+	loop, dur := tailLoopTranscript(2)
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: dur, ChapterCount: 1, Chapters: []audio.Chapter{{Chapter: 2, Start: 0, End: dur, Duration: dur}}})
+	seedNormalized(t, work, loop)
+	seedFLACs(t, work, 2)
+	// A prior round already cut this window and it re-degenerated UNDER THE CURRENT decode
+	// params (verdict only, no splice; the tag matches what the stage passes today).
+	const window = 10.0
+	if err := repair.MergeTailVerdict(work, repair.TailVerdict{Chapter: 2, ClipStart: window, Verdict: repair.VerdictClipRedegenerated, DecodeTag: retranscribeDecodeTag}); err != nil {
+		t.Fatal(err)
+	}
+	// The agent re-queues the SAME window via clip_start_sec.
+	seedPlan(t, work, qa.PlanEntry{Chapter: 2, Action: qa.ActionTailClip, Reason: "tail loop", ClipStartSec: window})
+
+	fake := newFakeBackend()
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	cutCalls := 0
+	exe.clipCutter = func(_ context.Context, _, dstFlac string, _, _ float64) error {
+		cutCalls++
+		return os.WriteFile(dstFlac, []byte("clip"), 0o644) //nolint:gosec // test artifact
+	}
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{})
+	if err != nil {
+		t.Fatalf("retranscribing: %v", err)
+	}
+	assertRetranscribeMetrics(t, res.Metrics, map[string]int{"clips_skipped_known_failed": 1, "clips_spliced": 0, "clips_redegenerated": 0})
+	if fake.count(2) != 0 {
+		t.Errorf("a known-failed window re-transcribed chapter 2 %d times, want 0", fake.count(2))
+	}
+	if cutCalls != 0 {
+		t.Errorf("a known-failed window was cut %d times, want 0", cutCalls)
+	}
+	if _, err := os.Stat(filepath.Join(work, transcript.RepairedDir, transcript.TextName(2))); !os.IsNotExist(err) {
+		t.Errorf("known-failed skip must not write a repaired file, stat err = %v", err)
+	}
+	// Item-6: a free known-failed skip did no productive ASR, so it must record no rate
+	// sample (a skip-only run's units net to zero).
+	if res.RateSample != nil {
+		t.Errorf("known-failed skip recorded a rate sample %+v, want none", res.RateSample)
 	}
 }
 

@@ -48,6 +48,15 @@ web access.
   collapse, mid-chapter loop that ate a large span).
 - `tail_clip` - the corruption is confined to a tail loop; the repair stage cuts
   the affected window, retranscribes just that clip prompt-free, and splices it.
+  You MAY add an optional `"clip_start_sec"` (seconds from the chapter start) to a
+  tail_clip entry to tell the repair stage where the trailing garbage really begins.
+  Only supply it when re-queuing a tail_clip whose prior verdict in
+  `tail_verdicts.json` is `CLIP-REDEGENERATED`: the repair stage already tried the
+  window it derived on its own and it re-degenerated, so re-cutting the SAME window
+  will fail identically and is skipped as known-failed. Read the transcript, find
+  where the real narration ends and the loop starts, and give that timestamp so the
+  stage cuts a DIFFERENT (usually narrower) window. Omit it otherwise (the stage
+  derives the window itself).
 - `accept` - the flag is a false positive or a genuinely harmless end-fade echo;
   give the argued reason.
 {{if .AutoAccepted}}
@@ -68,6 +77,7 @@ disposition ONLY the other flagged chapters.
   "entries": [
     { "chapter": 12, "action": "retranscribe", "reason": "argued reason in your own words" },
     { "chapter": 5, "action": "tail_clip", "reason": "..." },
+    { "chapter": 16, "action": "tail_clip", "reason": "prior clip re-degenerated; the loop starts later", "clip_start_sec": 1180.0 },
     { "chapter": 3, "action": "accept", "reason": "..." }
   ],
   "notes": "any cross-chapter observations, or empty"

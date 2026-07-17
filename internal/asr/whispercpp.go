@@ -208,6 +208,12 @@ func (w *whisperCpp) Transcribe(ctx context.Context, job Job) error {
 	if strings.TrimSpace(job.InitialPrompt) != "" {
 		args = append(args, "--prompt", job.InitialPrompt)
 	}
+	if job.NoContext {
+		// -nc/--no-context: do not use past transcription as the decoder's initial
+		// prompt across windows. The repair path sets this so a deterministic
+		// repetition collapse cannot replay identically on the retry.
+		args = append(args, "--no-context")
+	}
 	if out, err := runTool(ctx, 2*time.Hour, cli, args...); err != nil {
 		return fmt.Errorf("whisper-cli chapter %d: %w: %s", job.Chapter, err, out)
 	}

@@ -120,6 +120,12 @@ type TailVerdict struct {
 	Period     int     `json:"period"`
 	InClip     int     `json:"in_clip"`
 	Verdict    Verdict `json:"verdict"`
+	// DecodeTag records the decode parameters the re-transcription attempt ran under (the
+	// pipeline's retranscribeDecodeTag, e.g. "nocontext-v1"). The known-failed skip only
+	// fires when a re-queued window's tag matches, so a legacy verdict written under
+	// different (context-conditioned) params never blocks a fresh attempt. Empty on legacy
+	// verdicts and omitted from JSON when unset.
+	DecodeTag string `json:"decode_tag,omitempty"`
 }
 
 // LoadTailVerdicts reads workDir/tail_verdicts.json, returning an empty slice when the
@@ -137,6 +143,23 @@ func LoadTailVerdicts(workDir string) ([]TailVerdict, error) {
 		return nil, fmt.Errorf("parse %s: %w", TailVerdictsName, err)
 	}
 	return out, nil
+}
+
+// TailVerdictsByChapter loads the verdict ledger and indexes it by chapter. Because
+// MergeTailVerdict upserts one entry per chapter (a re-entry round replaces a chapter's
+// prior verdict), each chapter has at most one verdict, so callers can look a chapter up
+// directly instead of hand-rolling a linear scan. An absent ledger yields an empty map
+// (a first round).
+func TailVerdictsByChapter(workDir string) (map[int]TailVerdict, error) {
+	verdicts, err := LoadTailVerdicts(workDir)
+	if err != nil {
+		return nil, err
+	}
+	byCh := make(map[int]TailVerdict, len(verdicts))
+	for _, v := range verdicts {
+		byCh[v.Chapter] = v
+	}
+	return byCh, nil
 }
 
 // MergeTailVerdict upserts v into workDir/tail_verdicts.json by chapter (a re-entry

@@ -425,6 +425,369 @@ func TestQAAdjudicateAutoAcceptsRepairedTails(t *testing.T) {
 	}
 }
 
+// f64ptr returns a pointer to v, for the optional *float64 report fields.
+func f64ptr(v float64) *float64 { return &v }
+
+// newTailClipAdjudicateFixture seeds a work dir whose QA report flags a single tail_rate
+// chapter (5) alongside a 6-chapter manifest, and builds an executor whose fake agent
+// always dispositions chapter 5 as one tail_clip. It is the shared setup for the two
+// fixed-point tests, which diverge only in what they do between adjudication rounds.
+func newTailClipAdjudicateFixture(t *testing.T) (work string, exe *Executor, fake *fakeRunner, book store.Book) {
+	t.Helper()
+	work = t.TempDir()
+	rep := &qa.Report{Chapters: 6, TailRate: []qa.TailRateHit{{Chapter: 5, WPS: 9, Tail: "loop"}}}
+	if err := qa.WriteReport(work, rep); err != nil {
+		t.Fatal(err)
+	}
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: 30, ChapterCount: 6, Chapters: markerChapters(1, 2, 3, 4, 5, 6)})
+	fake = newFakeRunner()
+	fake.act = func(f *fakeRunner, req agent.Request, attempt int) (agent.Result, error) {
+		writeOut(t, req, qa.PlanFile, qa.Plan{Entries: []qa.PlanEntry{{Chapter: 5, Action: qa.ActionTailClip, Reason: "tail loop"}}})
+		return agent.Result{}, nil
+	}
+	exe = NewExecutor(withAgentConfig(t.TempDir(), fake))
+	book = store.Book{ID: 1, Title: "Book", WorkDir: work}
+	return work, exe, fake, book
+}
+
+// TestQAAdjudicateFixedPointParks is the item-3 regression: once a round adjudicates a
+// report and the next sweep is bit-identical with an unchanged verdict ledger (the
+// repairs moved nothing), the stage parks WITHOUT another agent round, deletes the
+// fingerprint, and a user Retry gets exactly one fresh round before the fixed point
+// re-parks (never the 3-round burn). The fixture's agent dispositions chapter 5 as a
+// tail_clip, but nothing here rewrites qa_report.json or tail_verdicts.json (the latter
+// never exists), so the next round's fingerprint inputs are identical.
+func TestQAAdjudicateFixedPointParks(t *testing.T) {
+	work, exe, fake, book := newTailClipAdjudicateFixture(t)
+	stage := string(state.QAAdjudicating)
+	fpPath := filepath.Join(work, "qa_round_fingerprint")
+
+	// Round 1: no prior fingerprint -> the agent runs; a plan + fingerprint are written.
+	if _, err := exe.Execute(context.Background(), book, state.QAAdjudicating, scheduler.StageReport{}); err != nil {
+		t.Fatalf("round 1: %v", err)
+	}
+	if n := fake.count(stage); n != 1 {
+		t.Fatalf("round 1 agent calls = %d, want 1", n)
+	}
+	if _, err := os.Stat(fpPath); err != nil {
+		t.Fatalf("fingerprint not written after round 1: %v", err)
+	}
+
+	// Round 2: report unchanged and a plan exists -> fixed point: park, no agent, and the
+	// fingerprint is deleted.
+	_, err := exe.Execute(context.Background(), book, state.QAAdjudicating, scheduler.StageReport{})
+	var pe *scheduler.ParkError
+	if !errors.As(err, &pe) {
+		t.Fatalf("round 2 error = %v, want a ParkError (fixed point)", err)
+	}
+	if pe.Code != state.ParkQANoConverge {
+		t.Errorf("park code = %q, want %q", pe.Code, state.ParkQANoConverge)
+	}
+	if !strings.Contains(pe.Reason, "fixed point") || !strings.Contains(pe.Reason, "5") {
+		t.Errorf("park reason = %q, want a fixed-point message naming chapter 5", pe.Reason)
+	}
+	if n := fake.count(stage); n != 1 {
+		t.Errorf("round 2 agent calls = %d, want still 1 (no agent on a fixed point)", n)
+	}
+	if _, serr := os.Stat(fpPath); !os.IsNotExist(serr) {
+		t.Errorf("fingerprint must be deleted on a fixed-point park, stat err = %v", serr)
+	}
+
+	// A user Retry: the deleted fingerprint means exactly ONE fresh agent round runs.
+	if _, err := exe.Execute(context.Background(), book, state.QAAdjudicating, scheduler.StageReport{}); err != nil {
+		t.Fatalf("retry round: %v", err)
+	}
+	if n := fake.count(stage); n != 2 {
+		t.Errorf("retry agent calls = %d, want 2 (one fresh round after Retry)", n)
+	}
+	// The very next round re-parks (fixed point again) without a third agent call.
+	_, err = exe.Execute(context.Background(), book, state.QAAdjudicating, scheduler.StageReport{})
+	if !errors.As(err, &pe) {
+		t.Fatalf("post-retry error = %v, want a ParkError (fixed point re-parks)", err)
+	}
+	if n := fake.count(stage); n != 2 {
+		t.Errorf("post-retry agent calls = %d, want still 2 (re-park without agent)", n)
+	}
+}
+
+// TestQAAdjudicateSpliceProgressNotFixedPoint is the false-park regression on the
+// fingerprint design: the tail_rate/cross_segment detectors read the raw
+// transcripts-json layer (golden contract), which a SPLICE does not touch - so a round
+// whose tail_clips all succeeded leaves qa_report.json bit-identical while
+// tail_verdicts.json gained the splice's verdict (real progress). Because the
+// fingerprint covers report+verdicts, the next round must run normally (auto-accept /
+// agent), NOT park as a fixed point.
+func TestQAAdjudicateSpliceProgressNotFixedPoint(t *testing.T) {
+	work, exe, fake, book := newTailClipAdjudicateFixture(t)
+
+	// Round 1: agent queues a tail_clip; the fingerprint records report + empty ledger.
+	if _, err := exe.Execute(context.Background(), book, state.QAAdjudicating, scheduler.StageReport{}); err != nil {
+		t.Fatalf("round 1: %v", err)
+	}
+
+	// Between rounds: the retranscribing stage SUCCESSFULLY splices chapter 5 - the
+	// repaired file appears and tail_verdicts.json gains a BENIGN entry, but the re-sweep
+	// report (reading the untouched transcripts-json layer) is bit-identical.
+	if err := transcript.WriteText(filepath.Join(work, transcript.RepairedDir), 5, "the real ending"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repair.MergeTailVerdict(work, repair.TailVerdict{Chapter: 5, ClipStart: 20, Verdict: repair.VerdictBenign}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Round 2: NOT a fixed point (the ledger moved). The round runs normally - here the
+	// repaired chapter auto-accepts (tail-only + splice evidence), no agent, no park.
+	res, err := exe.Execute(context.Background(), book, state.QAAdjudicating, scheduler.StageReport{})
+	if err != nil {
+		t.Fatalf("round 2 must not park as a fixed point after a successful splice: %v", err)
+	}
+	if res.RetranscribeNeeded {
+		t.Error("round 2 RetranscribeNeeded = true, want false (the repaired chapter auto-accepts)")
+	}
+	if n := fake.count(string(state.QAAdjudicating)); n != 1 {
+		t.Errorf("round 2 agent calls = %d, want still 1 (auto-accept, no agent)", n)
+	}
+	plan, err := qa.LoadPlan(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Entries) != 1 || plan.Entries[0].Chapter != 5 || plan.Entries[0].Action != qa.ActionAccept {
+		t.Errorf("round 2 plan = %+v, want a single auto-accept for chapter 5", plan.Entries)
+	}
+}
+
+// dbBackedQAExecutor opens a real store, creates a book at work dir `work`, and returns a
+// db-backed executor with the fake agent - the setup the fingerprint-lifecycle tests need
+// so CountStageSuccesses is live (withAgentConfig alone leaves e.db nil).
+func dbBackedQAExecutor(t *testing.T, work string, fake *fakeRunner) (*store.DB, *Executor, store.Book) {
+	t.Helper()
+	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "sidecars.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	book, err := db.CreateBook(context.Background(), store.NewBook{SourcePath: filepath.Join(t.TempDir(), "b.m4b"), WorkDir: work, Title: "Book"})
+	if err != nil {
+		t.Fatalf("create book: %v", err)
+	}
+	cfg := withAgentConfig(t.TempDir(), fake)
+	cfg.DB = db
+	return db, NewExecutor(cfg), book
+}
+
+// TestQAAdjudicateRoundCapClearsFingerprint is the item-4(a) regression: the 3-round cap
+// park deletes qa_round_fingerprint too, so a user Retry after a round-cap park (like after
+// a fixed-point park) gets a clean slate rather than immediately re-parking on a stale
+// fixed-point signal.
+func TestQAAdjudicateRoundCapClearsFingerprint(t *testing.T) {
+	work := t.TempDir()
+	seedQAReport(t, work, []int{2})
+	fake := newFakeRunner() // never invoked - the round cap parks before any agent round
+	db, exe, book := dbBackedQAExecutor(t, work, fake)
+	// 3 completed rounds -> the round cap fires.
+	for i := 0; i < 3; i++ {
+		runID, err := db.StartStageRun(context.Background(), book.ID, string(state.QAAdjudicating), i+1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.FinishStageRun(context.Background(), runID, true, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fpPath := filepath.Join(work, "qa_round_fingerprint")
+	if err := os.WriteFile(fpPath, []byte("stale\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := exe.Execute(context.Background(), book, state.QAAdjudicating, scheduler.StageReport{})
+	var pe *scheduler.ParkError
+	if !errors.As(err, &pe) || pe.Code != state.ParkQANoConverge {
+		t.Fatalf("error = %v, want a ParkQANoConverge park (round cap)", err)
+	}
+	if strings.Contains(pe.Reason, "fixed point") {
+		t.Errorf("round-cap park reason = %q, want the 3-round message not the fixed-point one", pe.Reason)
+	}
+	if _, serr := os.Stat(fpPath); !os.IsNotExist(serr) {
+		t.Errorf("round-cap park must delete the fingerprint, stat err = %v", serr)
+	}
+	if n := fake.count(string(state.QAAdjudicating)); n != 0 {
+		t.Errorf("agent called %d times on a round-cap park, want 0", n)
+	}
+}
+
+// TestQAAdjudicateStaleFingerprintRunsAgent is the item-5 regression: when the round budget
+// is reset (CountStageSuccesses == 0) but a MATCHING fingerprint + plan are still on disk
+// (stale leftovers a Retry/purge-rewind/crash left behind), the stale-fingerprint guard
+// drops them so the round runs a fresh agent pass instead of falsely parking as a fixed
+// point - the documented contract that a reset round budget always gets one fresh round.
+func TestQAAdjudicateStaleFingerprintRunsAgent(t *testing.T) {
+	work := t.TempDir()
+	seedQAReport(t, work, []int{2})
+	fake := newFakeRunner()
+	fake.act = func(f *fakeRunner, req agent.Request, attempt int) (agent.Result, error) {
+		writeOut(t, req, qa.PlanFile, qa.Plan{Entries: []qa.PlanEntry{{Chapter: 2, Action: qa.ActionAccept, Reason: "harmless echo"}}})
+		return agent.Result{}, nil
+	}
+	db, exe, book := dbBackedQAExecutor(t, work, fake)
+	// Open the stage run (agent usage target) but record NO successes -> done == 0.
+	if _, err := db.StartStageRun(context.Background(), book.ID, string(state.QAAdjudicating), 1); err != nil {
+		t.Fatal(err)
+	}
+	// Seed a plan + a MATCHING fingerprint: without the stale guard this reads as a fixed
+	// point (fingerprint == current report+ledger state AND a plan exists).
+	if err := qa.WritePlan(work, &qa.Plan{Entries: []qa.PlanEntry{{Chapter: 2, Action: qa.ActionTailClip, Reason: "tail loop"}}}); err != nil {
+		t.Fatal(err)
+	}
+	fp, err := qaRoundFingerprint(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeQAFingerprint(work, fp); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := exe.Execute(context.Background(), book, state.QAAdjudicating, scheduler.StageReport{}); err != nil {
+		t.Fatalf("done==0 with a stale fingerprint must run the agent, not park: %v", err)
+	}
+	if n := fake.count(string(state.QAAdjudicating)); n != 1 {
+		t.Errorf("agent called %d times, want 1 (a reset round budget gets one fresh round)", n)
+	}
+}
+
+// TestTailOnlyChaptersTailResiduals drives the widened tail-residual classification
+// (item-1) over incident-shaped fixtures: a cross-segment / non-mid multi-loop finding
+// whose time or position sits in the chapter's spliced tail zone no longer disqualifies
+// the chapter, while a mid-chapter finding, a wph outlier, a within-segment hit, a
+// straddling span (starts mid-chapter, ends in the tail), or a finding with no covering
+// splice still does. It reads the report + a verdict map only.
+func TestTailOnlyChaptersTailResiduals(t *testing.T) {
+	verdicts := map[int]repair.TailVerdict{
+		2:  {ClipStart: 425.7},
+		8:  {ClipStart: 826.1},
+		10: {ClipStart: 977.8},
+		11: {ClipStart: 500.0},
+		12: {ClipStart: 300.0},
+		13: {ClipStart: 400.0},
+		20: {ClipStart: 100.0},
+		21: {ClipStart: 100.0},
+		30: {ClipStart: 826.1},
+	}
+	rep := &qa.Report{
+		Chapters: 30,
+		// Every listed chapter is flagged via a tail_rate hit (so it is required).
+		TailRate: []qa.TailRateHit{
+			{Chapter: 2}, {Chapter: 8}, {Chapter: 10}, {Chapter: 11}, {Chapter: 12},
+			{Chapter: 13}, {Chapter: 20}, {Chapter: 21}, {Chapter: 25}, {Chapter: 30},
+		},
+		CrossSegment: []qa.CrossSegmentHit{
+			// ch2: located span starts inside the tail (430 >= 425.7-15) -> covered.
+			{Chapter: 2, Count: 6, FirstSec: f64ptr(430), LastSec: f64ptr(450), Pos: 99},
+			// ch8: the real incident case - span 814-845s, clip_start 826.1: FirstSec
+			// 814 >= 811.1 -> covered (the whole span begins in the tail zone).
+			{Chapter: 8, Count: 6, FirstSec: f64ptr(814), LastSec: f64ptr(845), Pos: 98},
+			// ch11: a genuine mid-chapter cross hit (starts 100s, clip_start 500) -> NOT covered.
+			{Chapter: 11, Count: 6, FirstSec: f64ptr(100), LastSec: f64ptr(120), Pos: 20},
+			// ch12: no usable time, position in the tail (>= 95) -> covered.
+			{Chapter: 12, Count: 6, Pos: 97},
+			// ch13: no usable time, "-1.0% (?)" not-located -> NOT covered.
+			{Chapter: 13, Count: 6, Pos: -1},
+			// ch30: a STRADDLING span - starts mid-chapter (790s) but ends in the tail
+			// (845s) past clip_start 826.1. Testing FirstSec (790 < 811.1) -> NOT covered,
+			// so a hit that ate real narration before the loop is not auto-accepted.
+			{Chapter: 30, Count: 6, FirstSec: f64ptr(790), LastSec: f64ptr(845), Pos: 96},
+		},
+		MultiLoop: []qa.MultiLoopFinding{
+			// ch10: a non-mid multi-loop located in the tail -> covered.
+			{Chapter: 10, Count: 6, AtSec: f64ptr(985), Pos: 96, MidChapter: false},
+			// ch20: a MID-CHAPTER multi-loop -> always disqualifies.
+			{Chapter: 20, Count: 6, AtSec: f64ptr(200), Pos: 40, MidChapter: true},
+		},
+		WithinSegment: []qa.WithinSegmentHit{
+			// ch21: a within-segment loop always disqualifies (even in the tail).
+			{Chapter: 21, Count: 8, Pos: 99},
+		},
+		WPHOutliers: []qa.WPHOutlier{
+			{Chapter: 25, WPH: 9000, Z: 4}, // ch25: wph outlier always disqualifies.
+		},
+		RetranscribeQueue: []int{25},
+	}
+	got := tailOnlyChapters(rep, verdicts)
+	wantTailOnly := map[int]bool{2: true, 8: true, 10: true, 12: true}
+	notTailOnly := []int{11, 13, 20, 21, 25, 30}
+	for ch := range wantTailOnly {
+		if !got[ch] {
+			t.Errorf("chapter %d should be tail-only (a covered tail residual)", ch)
+		}
+	}
+	for _, ch := range notTailOnly {
+		if got[ch] {
+			t.Errorf("chapter %d should NOT be tail-only", ch)
+		}
+	}
+}
+
+// TestAutoAcceptRepairedTailsIncident reproduces the production report shape: 8 chapters
+// with a successful splice and only tail-zone residual findings auto-accept, while two
+// CLIP-REDEGENERATED chapters (verdict only, no repaired file) and a wph-outlier +
+// mid-chapter chapter do not.
+func TestAutoAcceptRepairedTailsIncident(t *testing.T) {
+	work := t.TempDir()
+	spliced := map[int]float64{2: 425.7, 8: 826.1, 10: 977.8, 14: 1217.7, 15: 937.8, 21: 1746.4, 22: 1086.3, 24: 1263.7}
+	redegen := []int{5, 16} // CLIP-REDEGENERATED: verdict only, no repaired file
+	var tailFlagged []qa.TailRateHit
+	var crossHits []qa.CrossSegmentHit
+	for ch, cs := range spliced {
+		tailFlagged = append(tailFlagged, qa.TailRateHit{Chapter: ch})
+		// A cross-segment residual sitting in the tail (last segment past clip_start).
+		crossHits = append(crossHits, qa.CrossSegmentHit{Chapter: ch, Count: 6, FirstSec: f64ptr(cs - 5), LastSec: f64ptr(cs + 10), Pos: 98})
+		// Durable evidence of a completed splice: repaired file + a verdict entry.
+		if err := transcript.WriteText(filepath.Join(work, transcript.RepairedDir), ch, "the real ending"); err != nil {
+			t.Fatal(err)
+		}
+		if err := repair.MergeTailVerdict(work, repair.TailVerdict{Chapter: ch, ClipStart: cs, Verdict: repair.VerdictBenign}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, ch := range redegen {
+		tailFlagged = append(tailFlagged, qa.TailRateHit{Chapter: ch})
+		// A CLIP-REDEGENERATED verdict (no repaired file) - has a clip_start, but not "done".
+		if err := repair.MergeTailVerdict(work, repair.TailVerdict{Chapter: ch, ClipStart: 500, Verdict: repair.VerdictClipRedegenerated}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// ch25: a wph outlier + a mid-chapter run - never tail-only, never repaired.
+	rep := &qa.Report{
+		Chapters:          30,
+		TailRate:          tailFlagged,
+		CrossSegment:      crossHits,
+		WPHOutliers:       []qa.WPHOutlier{{Chapter: 25, WPH: 9000, Z: 4}},
+		RepeatedRuns:      []qa.RepeatedRun{{Chapter: 25, Kind: qa.KindMidChapter, Length: 5}},
+		RetranscribeQueue: []int{25},
+	}
+
+	entries := (&Executor{}).autoAcceptRepairedTails(rep, work)
+	got := map[int]bool{}
+	for _, en := range entries {
+		if en.Action != qa.ActionAccept {
+			t.Errorf("chapter %d auto-entry action = %q, want accept", en.Chapter, en.Action)
+		}
+		got[en.Chapter] = true
+	}
+	for ch := range spliced {
+		if !got[ch] {
+			t.Errorf("chapter %d (spliced, tail-residual only) should auto-accept", ch)
+		}
+	}
+	for _, ch := range append(redegen, 25) {
+		if got[ch] {
+			t.Errorf("chapter %d should NOT auto-accept", ch)
+		}
+	}
+	if len(entries) != len(spliced) {
+		t.Errorf("auto-accepted %d chapters, want %d", len(entries), len(spliced))
+	}
+}
+
 func TestQAAdjudicateRecordsUsage(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(context.Background(), filepath.Join(dir, "sidecars.db"))

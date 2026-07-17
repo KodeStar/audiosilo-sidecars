@@ -10,7 +10,7 @@ const PARK_HINTS: Record<string, string> = {
   markers_not_confident:
     "Chapter markers could not be normalized confidently. Check the audio's chapters, then Retry.",
   qa_no_converge:
-    'Transcript QA did not converge after 3 rounds. Inspect qa_report.md in the work dir.',
+    'Transcript QA repairs stopped making progress. Inspect qa_report.md in the work dir; Retry grants one fresh adjudication round.',
   spelling_gate_failure:
     'A spelling correction failed its safety gates. Inspect corrections.json, then Retry.',
   media_tools_unavailable: 'ffmpeg/ffprobe are missing. Fix tool paths (Settings), then Retry.',

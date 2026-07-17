@@ -154,6 +154,172 @@ func TestClipAndSplice_NotLocatedNoOp(t *testing.T) {
 	}
 }
 
+// recordingCut wraps fakeCut, capturing the window start it is called with (and the
+// number of cuts) so a test can assert the effective window ClipAndSplice used.
+type recordingCut struct {
+	starts []float64
+}
+
+func (rc *recordingCut) cut(ctx context.Context, src, dst string, startSec, durSec float64) error {
+	rc.starts = append(rc.starts, startSec)
+	return fakeCut(ctx, src, dst, startSec, durSec)
+}
+
+// TestClipAndSplice_StartOverrideHonored: a StartOverrideSec replaces the transcript-
+// derived window start - the cut is taken from the override, and res.ClipStart reflects
+// it (rounded) - while the splice/adjudication machinery still runs.
+func TestClipAndSplice_StartOverrideHonored(t *testing.T) {
+	dir := t.TempDir()
+	rc := &recordingCut{}
+	const override = 150.0
+	req := ClipSpliceRequest{
+		WorkDir:          dir,
+		Chapter:          4,
+		Transcript:       locatedTranscript(),
+		ChapterEnd:       200.0,
+		Cut:              rc.cut,
+		Transcribe:       fakeTranscribe("he walked to the door and left the room quietly"),
+		StartOverrideSec: override,
+	}
+	res, err := ClipAndSplice(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ClipAndSplice: %v", err)
+	}
+	if len(rc.starts) != 1 || rc.starts[0] != override {
+		t.Fatalf("cut window starts = %v, want a single cut at %.1f (the override)", rc.starts, override)
+	}
+	if res.ClipStart != override {
+		t.Errorf("res.ClipStart = %.1f, want %.1f (the override)", res.ClipStart, override)
+	}
+	if !res.Spliced {
+		t.Error("expected the fabricated fresh clip to still splice under an override")
+	}
+}
+
+// recordingTranscribe counts how many times it is invoked (0 proves the known-failed
+// skip cut no audio and ran no ASR).
+type recordingTranscribe struct {
+	calls int
+}
+
+func (rt *recordingTranscribe) fn(_ context.Context, _ string) ([]byte, error) {
+	rt.calls++
+	return rawOpenAI("he walked to the door and left the room quietly"), nil
+}
+
+// TestClipAndSplice_KnownFailedWindowSkipped is the item-2 regression: when the effective
+// window matches a prior CLIP-REDEGENERATED verdict for the chapter AND the decode tags
+// match, ClipAndSplice skips the cut+transcribe entirely (no ASR, ~minutes saved) and
+// returns SkippedKnownFailed.
+func TestClipAndSplice_KnownFailedWindowSkipped(t *testing.T) {
+	dir := t.TempDir()
+	const override = 150.0
+	const tag = "nocontext-v1"
+	// Seed the prior round's verdict: this exact window already re-degenerated UNDER THE
+	// SAME decode params (tag).
+	if err := MergeTailVerdict(dir, TailVerdict{Chapter: 4, ClipStart: override, Verdict: VerdictClipRedegenerated, DecodeTag: tag}); err != nil {
+		t.Fatal(err)
+	}
+	rc := &recordingCut{}
+	rt := &recordingTranscribe{}
+	res, err := ClipAndSplice(context.Background(), ClipSpliceRequest{
+		WorkDir:          dir,
+		Chapter:          4,
+		Transcript:       locatedTranscript(),
+		ChapterEnd:       200.0,
+		Cut:              rc.cut,
+		Transcribe:       rt.fn,
+		StartOverrideSec: override,
+		DecodeTag:        tag,
+	})
+	if err != nil {
+		t.Fatalf("ClipAndSplice: %v", err)
+	}
+	if !res.SkippedKnownFailed {
+		t.Error("expected SkippedKnownFailed=true for a known-failed window")
+	}
+	if res.Spliced {
+		t.Error("expected no splice on a known-failed skip")
+	}
+	if res.Verdict != VerdictClipRedegenerated {
+		t.Errorf("verdict = %s, want CLIP-REDEGENERATED", res.Verdict)
+	}
+	if rt.calls != 0 {
+		t.Errorf("Transcribe called %d times, want 0 (known-failed skip must not re-transcribe)", rt.calls)
+	}
+	if len(rc.starts) != 0 {
+		t.Errorf("Cut called %d times, want 0 (known-failed skip must not re-cut)", len(rc.starts))
+	}
+}
+
+// TestClipAndSplice_LegacyVerdictNotSkipped is the item-2 legacy-tag regression: a
+// CLIP-REDEGENERATED verdict written BEFORE decode tags existed (empty DecodeTag) was
+// produced under context-conditioned decoding, so it must NOT block a fresh NoContext
+// attempt (a differing tag never matches) - the chapter gets exactly one re-transcription
+// under the new params, whose new verdict then re-arms the skip.
+func TestClipAndSplice_LegacyVerdictNotSkipped(t *testing.T) {
+	dir := t.TempDir()
+	const override = 150.0
+	// A legacy verdict at the SAME window but with an empty (pre-tag) DecodeTag.
+	if err := MergeTailVerdict(dir, TailVerdict{Chapter: 4, ClipStart: override, Verdict: VerdictClipRedegenerated}); err != nil {
+		t.Fatal(err)
+	}
+	rc := &recordingCut{}
+	rt := &recordingTranscribe{}
+	res, err := ClipAndSplice(context.Background(), ClipSpliceRequest{
+		WorkDir:          dir,
+		Chapter:          4,
+		Transcript:       locatedTranscript(),
+		ChapterEnd:       200.0,
+		Cut:              rc.cut,
+		Transcribe:       rt.fn,
+		StartOverrideSec: override,
+		DecodeTag:        "nocontext-v1", // differs from the legacy verdict's empty tag
+	})
+	if err != nil {
+		t.Fatalf("ClipAndSplice: %v", err)
+	}
+	if res.SkippedKnownFailed {
+		t.Error("a legacy (empty-tag) verdict must NOT skip a fresh NoContext attempt")
+	}
+	if rt.calls != 1 {
+		t.Errorf("Transcribe called %d times, want 1 (one fresh attempt under the new params)", rt.calls)
+	}
+	if len(rc.starts) != 1 {
+		t.Errorf("Cut called %d times, want 1 (the window is re-cut for the fresh attempt)", len(rc.starts))
+	}
+}
+
+// TestClipAndSplice_NearButDistinctWindowNotSkipped: a prior CLIP-REDEGENERATED verdict
+// more than the tolerance away from the effective window does NOT trigger the skip - a
+// genuinely relocated (agent-supplied) window is re-attempted.
+func TestClipAndSplice_NearButDistinctWindowNotSkipped(t *testing.T) {
+	dir := t.TempDir()
+	// Prior failure at 150.0; the agent relocates to 165.0 (> 1s away) -> not skipped.
+	if err := MergeTailVerdict(dir, TailVerdict{Chapter: 4, ClipStart: 150.0, Verdict: VerdictClipRedegenerated}); err != nil {
+		t.Fatal(err)
+	}
+	rt := &recordingTranscribe{}
+	res, err := ClipAndSplice(context.Background(), ClipSpliceRequest{
+		WorkDir:          dir,
+		Chapter:          4,
+		Transcript:       locatedTranscript(),
+		ChapterEnd:       200.0,
+		Cut:              fakeCut,
+		Transcribe:       rt.fn,
+		StartOverrideSec: 165.0,
+	})
+	if err != nil {
+		t.Fatalf("ClipAndSplice: %v", err)
+	}
+	if res.SkippedKnownFailed {
+		t.Error("a distinct relocated window must not be skipped as known-failed")
+	}
+	if rt.calls != 1 {
+		t.Errorf("Transcribe called %d times, want 1 (the relocated window is re-attempted)", rt.calls)
+	}
+}
+
 // --- AppendRepairLog / MergeTailVerdict -------------------------------------
 
 func TestAppendRepairLog_HeaderThenAppend(t *testing.T) {

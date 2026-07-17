@@ -681,6 +681,141 @@ func TestSelect(t *testing.T) {
 	}
 }
 
+// recordingWhisperCLI writes a fake whisper-cli that records every argv token (one
+// per line) into argsFile and still emits a valid -ojf raw JSON at the -of prefix,
+// so a test can assert which flags Transcribe passed.
+func recordingWhisperCLI(t *testing.T, argsFile string) string {
+	t.Helper()
+	dir := t.TempDir()
+	return writeScript(t, filepath.Join(dir, "whisper-cli"), fmt.Sprintf(`#!/bin/sh
+for a in "$@"; do printf '%%s\n' "$a" >> %q; done
+OF=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -of) OF="$2"; shift 2;;
+    -m|-f|-l|--prompt) shift 2;;
+    -oj|-ojf|--no-context) shift;;
+    *) shift;;
+  esac
+done
+printf '{"result":{"language":"en"},"transcription":[{"offsets":{"from":0,"to":1000},"text":" fake","tokens":[{"text":" fake","offsets":{"from":0,"to":500},"p":0.9}]}]}\n' > "$OF.json"
+`, argsFile))
+}
+
+// TestWhisperCppNoContextArg: the whisper-cpp backend appends --no-context exactly
+// when Job.NoContext is set (the repair path), and omits it otherwise (first-pass
+// ASR) - so a deterministic repetition collapse can be retried with context
+// disabled instead of replaying identically. Transcribe itself has no platform
+// guard, so this runs on any unix.
+func TestWhisperCppNoContextArg(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fake is unix-only")
+	}
+	for _, tc := range []struct {
+		name      string
+		noContext bool
+		want      bool
+	}{
+		{"first-pass omits it", false, false},
+		{"repair path sets it", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			argsFile := filepath.Join(t.TempDir(), "args")
+			cli := recordingWhisperCLI(t, argsFile)
+			dataDir := t.TempDir()
+			b := newWhisperCpp(SelectConfig{WhisperCLIPath: cli, DataDir: dataDir, Log: discardLogger()})
+			seedWhisperModel(t, b, dataDir)
+
+			audio := filepath.Join(dataDir, "ch002.flac")
+			if err := os.WriteFile(audio, []byte("flac"), 0o644); err != nil { //nolint:gosec // test artifact
+				t.Fatal(err)
+			}
+			job := Job{Audio: audio, OutDir: filepath.Join(dataDir, "raw"), Chapter: 2, Language: "en", NoContext: tc.noContext}
+			if err := b.Transcribe(context.Background(), job); err != nil {
+				t.Fatalf("Transcribe: %v", err)
+			}
+			gotArgs, err := os.ReadFile(argsFile)
+			if err != nil {
+				t.Fatalf("read recorded args: %v", err)
+			}
+			has := hasLine(string(gotArgs), "--no-context")
+			if has != tc.want {
+				t.Errorf("--no-context present = %v, want %v (args: %q)", has, tc.want, gotArgs)
+			}
+		})
+	}
+}
+
+// TestMLXNoContextArg: the mlx-whisper backend appends
+// `--condition-on-previous-text False` exactly when Job.NoContext is set. Transcribe
+// runs the venv's python directly (no platform guard), so a fake python planted at
+// the venv path exercises the arg construction on any unix.
+func TestMLXNoContextArg(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fake is unix-only")
+	}
+	for _, tc := range []struct {
+		name      string
+		noContext bool
+		want      bool
+	}{
+		{"first-pass omits it", false, false},
+		{"repair path sets it", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			b := newMLXWhisper(SelectConfig{DataDir: dataDir, Log: discardLogger()})
+			argsFile := filepath.Join(dataDir, "args")
+			// A fake venv python that records argv and emits an mlx-format raw JSON at
+			// --output-dir; --condition-on-previous-text takes a value, so `shift 2`.
+			writeScript(t, b.venvBin(dataDir, "python"), fmt.Sprintf(`#!/bin/sh
+for a in "$@"; do printf '%%s\n' "$a" >> %q; done
+shift 2  # -m mlx_whisper.cli
+OUTDIR=""; AUDIO=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output-dir) OUTDIR="$2"; shift 2;;
+    --model|--language|--output-format|--word-timestamps|--verbose|--initial-prompt|--condition-on-previous-text) shift 2;;
+    -*) shift;;
+    *) AUDIO="$1"; shift;;
+  esac
+done
+STEM=$(basename "$AUDIO"); STEM=${STEM%%.*}
+mkdir -p "$OUTDIR"
+printf '{"text":" fake","language":"en","segments":[]}\n' > "$OUTDIR/$STEM.json"
+`, argsFile))
+
+			audio := filepath.Join(dataDir, "ch002.flac")
+			if err := os.WriteFile(audio, []byte("flac"), 0o644); err != nil { //nolint:gosec // test artifact
+				t.Fatal(err)
+			}
+			job := Job{Audio: audio, OutDir: filepath.Join(dataDir, "raw"), Chapter: 2, Language: "en", NoContext: tc.noContext}
+			if err := b.Transcribe(context.Background(), job); err != nil {
+				t.Fatalf("Transcribe: %v", err)
+			}
+			gotArgs, err := os.ReadFile(argsFile)
+			if err != nil {
+				t.Fatalf("read recorded args: %v", err)
+			}
+			has := hasLine(string(gotArgs), "--condition-on-previous-text")
+			if has != tc.want {
+				t.Errorf("--condition-on-previous-text present = %v, want %v (args: %q)", has, tc.want, gotArgs)
+			}
+		})
+	}
+}
+
+// hasLine reports whether want appears as a whole line in the newline-separated argv
+// dump the fake CLIs record.
+func hasLine(dump, want string) bool {
+	for _, line := range strings.Split(dump, "\n") {
+		if line == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestRawOutputName(t *testing.T) {
 	cases := []struct {
 		audioPath string

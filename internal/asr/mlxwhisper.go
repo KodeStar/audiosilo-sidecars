@@ -205,6 +205,12 @@ func (m *mlxWhisper) Transcribe(ctx context.Context, job Job) error {
 	if strings.TrimSpace(job.InitialPrompt) != "" {
 		args = append(args, "--initial-prompt", job.InitialPrompt)
 	}
+	if job.NoContext {
+		// --condition-on-previous-text False: do not feed the prior window's text as
+		// context for the next window. The repair path sets this so a deterministic
+		// repetition collapse cannot replay identically on the retry.
+		args = append(args, "--condition-on-previous-text", "False")
+	}
 	if out, err := runTool(ctx, 2*time.Hour, python, args...); err != nil {
 		return fmt.Errorf("mlx_whisper chapter %d: %w: %s", job.Chapter, err, out)
 	}
