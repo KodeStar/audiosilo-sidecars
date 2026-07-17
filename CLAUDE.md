@@ -702,6 +702,36 @@ Milestones from the workspace plan; each is shippable.
   buildx build --check` (a full GPU build + live NVIDIA transcription is manual -
   needs NVIDIA hardware, matching the whisper-binaries CUDA leg).
 
+- **Post-M8 UX + observability round (done):** first-real-use feedback after the
+  v0.1.0 release.
+  - **Library tab**: a candidate **search** box (case-insensitive AND-token match
+    over title/authors/series/narrators/asin/isbn) and **series-order sort**
+    (grouped by series name, then parsed series position, then title/path) as the
+    default candidate order (`web/src/lib/candidates.ts` `searchCandidates`/
+    `sortBySeries`, `scanStore` `search`).
+  - **Faster large-SMB scans**: audiosilo-meta `pkg/scan` was parallelized (bounded
+    concurrent directory walk instead of a serial ReadDir chain) and gained an
+    `OnWalk` callback; the require is bumped to consume it and the Library
+    "Scanning folders..." line now streams live "N folders, M books found" during
+    the walk (`internal/metaops` `walk_dirs`/`walk_groups` on `ScanProgress`,
+    `web/src/lib/scanStatus.ts`).
+  - **Running tab**: a book **duration** chip (total audio length from inspect,
+    persisted as `books.duration_sec`, migration 0007, via a `SetBookDuration`
+    gauge that does not bump `updated_at`) and a **bucketed order** - active/running
+    book(s) on top (furthest-along the mainline first), then the queue FIFO, then
+    paused/needs_attention/failed, then done (`web/src/lib/books.ts` `sortBooks`).
+  - **Pipeline observability**: the stage reporter is now
+    `scheduler.StageReport{Progress, Note}`; `Note` publishes a durable `stage.note`
+    event. A **heartbeat** (`agent.Request.Heartbeat`, ticked from inside
+    `runCLI`'s select loop) emits "<stage>: still running (Nm elapsed)" every 60s
+    ONLY while the agent subprocess is genuinely alive (a real liveness signal,
+    silent during rate-limit backoff), and stages emit a **work-set descriptor on
+    entry** (e.g. "re-transcribing 2 chapters: 2, 3"). The per-book **log** is now
+    fully reachable: `store.ListEvents` gained a `beforeID` keyset cursor,
+    `GET /books/{id}/events?before_id=` pages, and the Running details render a
+    scrollable log with a **Download log** button (`web/src/lib/bookLog.ts`
+    `fetchAllEvents`/`logToText`).
+
 Still **not built**: signed installers / a friendlier packaged client (a possible
 follow-up per the meta EXTRACTION roadmap); a separately-deployable UI-only image
 (scoped out of M8, deferred). The contributing stage submits sidecars but never
