@@ -155,13 +155,16 @@ func TestClipAndSplice_NotLocatedNoOp(t *testing.T) {
 }
 
 // recordingCut wraps fakeCut, capturing the window start it is called with (and the
-// number of cuts) so a test can assert the effective window ClipAndSplice used.
+// destination clip path) so a test can assert the effective window ClipAndSplice used
+// and the filename it wrote.
 type recordingCut struct {
 	starts []float64
+	dsts   []string
 }
 
 func (rc *recordingCut) cut(ctx context.Context, src, dst string, startSec, durSec float64) error {
 	rc.starts = append(rc.starts, startSec)
+	rc.dsts = append(rc.dsts, dst)
 	return fakeCut(ctx, src, dst, startSec, durSec)
 }
 
@@ -193,6 +196,41 @@ func TestClipAndSplice_StartOverrideHonored(t *testing.T) {
 	}
 	if !res.Spliced {
 		t.Error("expected the fabricated fresh clip to still splice under an override")
+	}
+}
+
+// TestClipAndSplice_ClipFilenameStemIsDotFree guards the round-trip between the clip
+// audio filename and the raw-output name the ASR backends derive from its stem: the
+// backends split the extension in a way that treats a '.' in the stem as an extra
+// suffix (mlx wrote t005-660.json for a t005-660.0.flac input), so a decimal window
+// start in the name breaks the read-back. The name must carry exactly one '.', the
+// extension - even for a fractional window start.
+func TestClipAndSplice_ClipFilenameStemIsDotFree(t *testing.T) {
+	dir := t.TempDir()
+	rc := &recordingCut{}
+	// A window start with a fractional part (0.1s resolution) is exactly the case that
+	// produced a dotted filename before the deciseconds encoding.
+	req := ClipSpliceRequest{
+		WorkDir:          dir,
+		Chapter:          5,
+		Transcript:       locatedTranscript(),
+		ChapterEnd:       200.0,
+		Cut:              rc.cut,
+		Transcribe:       fakeTranscribe("he walked to the door and left the room quietly"),
+		StartOverrideSec: 150.5,
+	}
+	if _, err := ClipAndSplice(context.Background(), req); err != nil {
+		t.Fatalf("ClipAndSplice: %v", err)
+	}
+	if len(rc.dsts) != 1 {
+		t.Fatalf("expected one cut, got %d", len(rc.dsts))
+	}
+	base := filepath.Base(rc.dsts[0])
+	if n := strings.Count(base, "."); n != 1 {
+		t.Errorf("clip filename %q has %d dots, want exactly 1 (the extension) - a dotted stem breaks the ASR raw-output round-trip", base, n)
+	}
+	if !strings.HasSuffix(base, ".flac") {
+		t.Errorf("clip filename %q is not a .flac", base)
 	}
 }
 

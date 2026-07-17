@@ -134,12 +134,17 @@ func ClipAndSplice(ctx context.Context, req ClipSpliceRequest) (ClipResult, erro
 	if err := os.MkdirAll(clipsDir, 0o750); err != nil {
 		return res, err
 	}
-	// The clip filename is keyed on the chapter AND the effective (pyRound'd) window start,
-	// so a same-window resume reuses the file but a RELOCATED window (StartOverrideSec) forces
-	// a fresh cut instead of reusing the prior window's audio spliced at the new boundary. The
-	// transcription output name follows automatically (asr.RawOutputName derives from the clip
-	// stem). A stale old-window clip lingers in clips/ until the scratch purge - acceptable.
-	clipFlac := filepath.Join(clipsDir, fmt.Sprintf("t%03d-%.1f.flac", req.Chapter, clipStart))
+	// The clip filename is keyed on the chapter AND the effective window start, so a
+	// same-window resume reuses the file but a RELOCATED window (StartOverrideSec) forces
+	// a fresh cut instead of reusing the prior window's audio spliced at the new boundary.
+	// The start is encoded as an INTEGER number of deciseconds (clipStart is already
+	// pyRound'd to 0.1s, so this is exact and collision-free) - the stem must stay
+	// dot-free because the ASR backends derive the raw-output name from the input stem
+	// (asr.RawOutputName), and a '.' in the name makes their splitext-style naming
+	// disagree with outputStem (mlx wrote t005-660.json for a t005-660.0.flac input),
+	// breaking the read-back. A stale old-window clip lingers in clips/ until the scratch
+	// purge - acceptable.
+	clipFlac := filepath.Join(clipsDir, fmt.Sprintf("t%03d-%d.flac", req.Chapter, int(math.Round(clipStart*10))))
 	if !fsutil.IsFile(clipFlac) {
 		srcFlac := filepath.Join(req.WorkDir, audio.ChaptersDir, audio.ChapterFileName(req.Chapter))
 		dur := req.ChapterEnd - snapped + 2
