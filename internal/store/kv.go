@@ -63,23 +63,38 @@ type LoggedEvent struct {
 }
 
 // ListEvents returns up to limit most-recent events, optionally filtered to a
-// book (bookID > 0). Newest first. Scaffolding for the M6 per-book log view (the
-// SSE hub is the live feed; this reads the durable backlog).
-func (db *DB) ListEvents(ctx context.Context, bookID int64, limit int) ([]LoggedEvent, error) {
+// book (bookID > 0). Newest first. A beforeID > 0 is a keyset cursor: only events
+// with a smaller (older) id are returned, so a caller pages back through the whole
+// history by passing the oldest id seen so far (beforeID == 0 is the newest page).
+// The per-book log view uses this to fetch/download the full backlog; the SSE hub
+// is the live feed.
+func (db *DB) ListEvents(ctx context.Context, bookID int64, beforeID int64, limit int) ([]LoggedEvent, error) {
 	if limit <= 0 {
 		limit = 200
 	}
+	// Full static queries per filter combination (no string building) so the SQL is
+	// obviously constant; bookID/beforeID/limit ride as bound parameters.
 	var (
 		rows *sql.Rows
 		err  error
 	)
-	if bookID > 0 {
+	switch {
+	case bookID > 0 && beforeID > 0:
+		rows, err = db.sql.QueryContext(ctx,
+			`SELECT id, hub_id, ts, type, book_id, payload FROM events WHERE book_id=? AND id<? ORDER BY id DESC LIMIT ?`,
+			bookID, beforeID, limit)
+	case bookID > 0:
 		rows, err = db.sql.QueryContext(ctx,
 			`SELECT id, hub_id, ts, type, book_id, payload FROM events WHERE book_id=? ORDER BY id DESC LIMIT ?`,
 			bookID, limit)
-	} else {
+	case beforeID > 0:
 		rows, err = db.sql.QueryContext(ctx,
-			`SELECT id, hub_id, ts, type, book_id, payload FROM events ORDER BY id DESC LIMIT ?`, limit)
+			`SELECT id, hub_id, ts, type, book_id, payload FROM events WHERE id<? ORDER BY id DESC LIMIT ?`,
+			beforeID, limit)
+	default:
+		rows, err = db.sql.QueryContext(ctx,
+			`SELECT id, hub_id, ts, type, book_id, payload FROM events ORDER BY id DESC LIMIT ?`,
+			limit)
 	}
 	if err != nil {
 		return nil, err

@@ -205,6 +205,24 @@ func TestBookEventsAllowedAndDenied(t *testing.T) {
 	if len(deflt.Events) != 3 {
 		t.Errorf("bad-limit events len = %d, want 3 (default window)", len(deflt.Events))
 	}
+
+	// before_id cursor: only events older than the newest id are returned.
+	newestID := got.Events[0].ID
+	resp = env.do(t, http.MethodGet, "/api/v1/books/"+i64(id)+"/events?before_id="+i64(newestID), token, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("before_id status = %d, want 200", resp.StatusCode)
+	}
+	var older bookEventsResponse
+	_ = json.NewDecoder(resp.Body).Decode(&older)
+	resp.Body.Close()
+	if len(older.Events) != 2 {
+		t.Fatalf("before_id events len = %d, want 2 (older than newest)", len(older.Events))
+	}
+	for _, e := range older.Events {
+		if e.ID >= newestID {
+			t.Errorf("before_id returned id %d >= cursor %d", e.ID, newestID)
+		}
+	}
 }
 
 func TestBookEventsUnknownBook404(t *testing.T) {

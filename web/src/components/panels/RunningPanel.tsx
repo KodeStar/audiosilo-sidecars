@@ -104,7 +104,7 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
 
   // Stable callback for a row to lazily fetch its event log when expanded.
   const getEvents = useCallback(
-    (id: number, limit?: number) => client.getBookEvents(id, limit),
+    (id: number, limit?: number, beforeId?: number) => client.getBookEvents(id, limit, beforeId),
     [client],
   );
 

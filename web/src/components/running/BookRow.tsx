@@ -1,8 +1,9 @@
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import type { BookDetail, BookEventsResponse, BookView, LoggedEvent } from '@/api/types';
 import { availableActions, formatBytes, isDone, type BookAction } from '@/lib/books';
-import { formatLogEvent, formatLogTime } from '@/lib/bookLog';
+import { fetchAllEvents, formatLogEvent, formatLogTime, logToText } from '@/lib/bookLog';
 import { formatCost } from '@/lib/cost';
+import { triggerBlobDownload } from '@/lib/download';
 import { formatDuration, formatEta } from '@/lib/duration';
 import { parkHint } from '@/lib/parkReasons';
 import { normalizeLane, stateChipClass, stateLabel, statusBadge } from '@/lib/pipelineState';
@@ -22,8 +23,9 @@ interface BookRowProps {
   // is expanded. Kept as a prop so the row stays decoupled from ApiClient.
   getDetail: (id: number) => Promise<BookDetail>;
   // Lazily fetches the book's durable event log (newest first) for the details
-  // expansion. Kept as a prop for the same decoupling.
-  getEvents: (id: number, limit?: number) => Promise<BookEventsResponse>;
+  // expansion. Kept as a prop for the same decoupling. beforeId pages back through
+  // the history (the Download-log control walks the whole backlog).
+  getEvents: (id: number, limit?: number, beforeId?: number) => Promise<BookEventsResponse>;
   // Opens the core (add-work) proposal modal for a book parked core_needed. The
   // panel owns the modal; the row only surfaces the affordance.
   onCompleteCoreProposal: (book: BookView) => void;
@@ -226,7 +228,7 @@ export const BookRow = memo(function BookRow({
             <p className="text-xs text-pink-500">Could not load stage details.</p>
           )}
           {detailState === 'idle' && detail && <StageCostList runs={detail.stage_runs} />}
-          <BookLog events={logEvents} />
+          <BookLog events={logEvents} bookId={book.id} title={book.title} getEvents={getEvents} />
         </div>
       )}
     </div>
@@ -256,17 +258,58 @@ function StageTimeline({ state, status, lane }: { state: string; status: string;
   );
 }
 
-// BookLog renders the per-book event log (newest first) as a compact list.
-function BookLog({ events }: { events: LoggedEvent[] | null }) {
+// BookLog renders the per-book event log (newest first) in a bounded, scrollable
+// panel, with a Download control that pages back through the WHOLE history (the live
+// list only holds the newest window) and saves it as a chronological .txt.
+function BookLog({
+  events,
+  bookId,
+  title,
+  getEvents,
+}: {
+  events: LoggedEvent[] | null;
+  bookId: number;
+  title: string;
+  getEvents: (id: number, limit?: number, beforeId?: number) => Promise<BookEventsResponse>;
+}) {
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState(false);
+
+  const download = useCallback(async () => {
+    setDownloading(true);
+    setDownloadError(false);
+    try {
+      const all = await fetchAllEvents(getEvents, bookId);
+      const header = `Log for: ${title}\n\n`;
+      const blob = new Blob([header + logToText(all)], { type: 'text/plain;charset=utf-8' });
+      triggerBlobDownload(blob, `audiosilo-${bookId}-log.txt`);
+    } catch {
+      setDownloadError(true);
+    } finally {
+      setDownloading(false);
+    }
+  }, [getEvents, bookId, title]);
+
   return (
     <div className="flex flex-col gap-1">
-      <div className="text-[11px] font-semibold uppercase tracking-wide text-dim">Log</div>
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-[11px] font-semibold uppercase tracking-wide text-dim">Log</div>
+        <button
+          type="button"
+          disabled={downloading}
+          onClick={() => void download()}
+          className="rounded-md border border-edge px-2 py-0.5 text-[11px] font-medium text-body transition-colors hover:border-pink-600 hover:text-hi disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {downloading ? 'Preparing...' : 'Download log'}
+        </button>
+      </div>
+      {downloadError && <p className="text-xs text-pink-500">Could not download the full log.</p>}
       {events === null ? (
         <p className="text-xs text-dim">Loading log...</p>
       ) : events.length === 0 ? (
         <p className="text-xs text-dim">No log entries yet.</p>
       ) : (
-        <ul className="flex flex-col gap-0.5 text-xs">
+        <ul className="flex max-h-64 flex-col gap-0.5 overflow-y-auto text-xs">
           {events.map((e) => (
             <li key={e.id} className="flex items-baseline gap-2">
               <span className="shrink-0 font-mono text-[10px] text-dim">{formatLogTime(e.ts)}</span>

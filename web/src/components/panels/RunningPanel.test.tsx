@@ -241,6 +241,6 @@ describe('RunningPanel live log', () => {
 
     expect(await screen.findByText('asr 3/84')).toBeInTheDocument();
     expect(screen.getByText('state -> asr')).toBeInTheDocument();
-    await waitFor(() => expect(getBookEvents).toHaveBeenCalledWith(1, 50));
+    await waitFor(() => expect(getBookEvents).toHaveBeenCalledWith(1, 50, undefined));
   });
 });

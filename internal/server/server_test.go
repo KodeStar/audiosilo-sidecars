@@ -132,7 +132,7 @@ func TestEventPersisterDropsOnOverflowAndDrains(t *testing.T) {
 	p.start()
 	p.Close()
 
-	evs, err := db.ListEvents(context.Background(), 0, 10)
+	evs, err := db.ListEvents(context.Background(), 0, 0, 10)
 	if err != nil {
 		t.Fatalf("ListEvents: %v", err)
 	}

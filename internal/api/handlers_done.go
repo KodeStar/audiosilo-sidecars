@@ -60,7 +60,10 @@ type bookEventsResponse struct {
 // handleBookEvents returns the book's durable event backlog (newest first) from the
 // store. The live feed is the SSE hub; this reads the persisted log so a reloaded
 // Done/Running detail view can show history. limit defaults to 100 and clamps to
-// 1..500; a non-numeric limit falls back to the default.
+// 1..500; a non-numeric limit falls back to the default. An optional before_id is a
+// keyset cursor (only events older than it): the client pages back through the whole
+// history by passing the oldest id seen so far, so the log view can show/download the
+// entire backlog rather than just the newest page.
 func (a *API) handleBookEvents(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseID(w, r)
 	if !ok {
@@ -88,7 +91,16 @@ func (a *API) handleBookEvents(w http.ResponseWriter, r *http.Request) {
 		limit = eventsMaxLimit
 	}
 
-	rows, err := a.store.ListEvents(ctx, id, limit)
+	// before_id is an optional keyset cursor; an absent/invalid/non-positive value
+	// means "newest page" (0).
+	beforeID := int64(0)
+	if raw := r.URL.Query().Get("before_id"); raw != "" {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+			beforeID = n
+		}
+	}
+
+	rows, err := a.store.ListEvents(ctx, id, beforeID, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not read events")
 		return

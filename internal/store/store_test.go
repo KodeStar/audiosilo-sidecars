@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -453,11 +454,11 @@ func TestEventsLogAndPrune(t *testing.T) {
 	if err := db.InsertEvent(ctx, now.Add(-40*24*time.Hour), 7, "queue.stats", 0, nil); err != nil {
 		t.Fatal(err)
 	}
-	evs, _ := db.ListEvents(ctx, 0, 10)
+	evs, _ := db.ListEvents(ctx, 0, 0, 10)
 	if len(evs) != 2 {
 		t.Fatalf("ListEvents all = %d", len(evs))
 	}
-	byBook, _ := db.ListEvents(ctx, 7, 10)
+	byBook, _ := db.ListEvents(ctx, 7, 0, 10)
 	if len(byBook) != 1 || byBook[0].BookID == nil || *byBook[0].BookID != 7 {
 		t.Fatalf("ListEvents by book = %+v", byBook)
 	}
@@ -472,9 +473,67 @@ func TestEventsLogAndPrune(t *testing.T) {
 	if removed != 1 {
 		t.Fatalf("PruneEvents removed = %d, want 1", removed)
 	}
-	evs, _ = db.ListEvents(ctx, 0, 10)
+	evs, _ = db.ListEvents(ctx, 0, 0, 10)
 	if len(evs) != 1 {
 		t.Fatalf("after prune = %d", len(evs))
+	}
+}
+
+// TestListEventsBeforeCursor exercises the keyset (before_id) pagination: paging
+// with the oldest id seen so far walks the whole per-book history in order.
+func TestListEventsBeforeCursor(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	// 5 events for book 3, ascending ids (insertion order).
+	for i := 0; i < 5; i++ {
+		if err := db.InsertEvent(ctx, now, uint64(i+1), "stage.progress", 3, json.RawMessage(`{"n":`+strconv.Itoa(i)+`}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A second book's events must never leak into a book-scoped page.
+	if err := db.InsertEvent(ctx, now, 99, "book.state", 4, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Newest page (beforeID 0), 2 per page: the two highest ids, descending.
+	page1, err := db.ListEvents(ctx, 3, 0, 2)
+	if err != nil {
+		t.Fatalf("page1: %v", err)
+	}
+	if len(page1) != 2 || page1[0].ID <= page1[1].ID {
+		t.Fatalf("page1 = %+v, want 2 rows newest-first", page1)
+	}
+
+	// Older page: everything with id < the oldest id on page1.
+	cursor := page1[1].ID
+	page2, err := db.ListEvents(ctx, 3, cursor, 2)
+	if err != nil {
+		t.Fatalf("page2: %v", err)
+	}
+	if len(page2) != 2 {
+		t.Fatalf("page2 len = %d, want 2", len(page2))
+	}
+	for _, e := range page2 {
+		if e.ID >= cursor {
+			t.Fatalf("page2 id %d >= cursor %d (not older)", e.ID, cursor)
+		}
+		if e.BookID == nil || *e.BookID != 3 {
+			t.Fatalf("page2 leaked a non-book-3 row: %+v", e)
+		}
+	}
+
+	// Last page: one row remains, then the cursor exhausts.
+	cursor = page2[1].ID
+	page3, err := db.ListEvents(ctx, 3, cursor, 2)
+	if err != nil {
+		t.Fatalf("page3: %v", err)
+	}
+	if len(page3) != 1 {
+		t.Fatalf("page3 len = %d, want 1 (5 total events)", len(page3))
+	}
+	if next, _ := db.ListEvents(ctx, 3, page3[0].ID, 2); len(next) != 0 {
+		t.Fatalf("beyond-last page = %d, want 0", len(next))
 	}
 }
 

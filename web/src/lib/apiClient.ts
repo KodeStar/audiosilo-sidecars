@@ -224,10 +224,17 @@ export class ApiClient {
   }
 
   // getBookEvents fetches the book's durable event-log rows (newest first). limit
-  // clamps daemon-side to 1..500 (default 100 when omitted).
-  getBookEvents(id: number, limit?: number): Promise<BookEventsResponse> {
-    const query = limit === undefined ? '' : `?limit=${limit}`;
-    return this.request<BookEventsResponse>(`/api/v1/books/${id}/events${query}`);
+  // clamps daemon-side to 1..500 (default 100 when omitted). beforeId is a keyset
+  // cursor: only events older than it are returned, so the log view pages back
+  // through the whole history to show/download the full backlog.
+  getBookEvents(id: number, limit?: number, beforeId?: number): Promise<BookEventsResponse> {
+    const params = new URLSearchParams();
+    if (limit !== undefined) params.set('limit', String(limit));
+    if (beforeId !== undefined) params.set('before_id', String(beforeId));
+    const query = params.toString();
+    return this.request<BookEventsResponse>(
+      `/api/v1/books/${id}/events${query ? `?${query}` : ''}`,
+    );
   }
 
   // --- M7: contribution ---
