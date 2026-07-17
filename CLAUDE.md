@@ -736,5 +736,7 @@ Still **not built**: signed installers / a friendlier packaged client (a possibl
 follow-up per the meta EXTRACTION roadmap); a separately-deployable UI-only image
 (scoped out of M8, deferred). The contributing stage submits sidecars but never
 retracts them - cancelling a core_pending book leaves its already-opened add-work
-issue for a maintainer to close. All four tabs report `ready` on `/system`. Keep
-this file honest as milestones land.
+issue for a maintainer to close. **Ebook input** (accept an EPUB and skip the
+audio / ASR / QA / spelling stages, reusing the fact_pass -> synthesis -> audit
+back half) is designed but unbuilt - see [EBOOK-INPUT.md](EBOOK-INPUT.md). All
+four tabs report `ready` on `/system`. Keep this file honest as milestones land.
