@@ -33,7 +33,7 @@ type pipelineEnv struct {
 	cfg config.Config
 }
 
-func newPipelineEnv(t *testing.T, libraryRoots []string) *pipelineEnv {
+func newPipelineEnv(t *testing.T, libraryRoots []string, opts ...func(*Deps)) *pipelineEnv {
 	t.Helper()
 	db, err := store.Open(context.Background(), ":memory:")
 	if err != nil {
@@ -51,12 +51,12 @@ func newPipelineEnv(t *testing.T, libraryRoots []string) *pipelineEnv {
 	cfg.Metadata.BaseURL = "" // disabled: coverage is 'unavailable' in tests
 
 	hub := events.NewHub(64)
-	sched := scheduler.New(db, hub, scheduler.NewStubExecutor(0, 0), 2, t.TempDir())
+	sched := scheduler.New(db, hub, scheduler.NewStubExecutor(0, 0), 2, t.TempDir(), false)
 	meta := metaops.NewClient(cfg.Metadata.BaseURL)
 	scans := metaops.NewScanManager(context.Background(), meta, "", storeOverrides(db))
 
 	env := &testEnv{password: pw}
-	env.api = New(Deps{
+	deps := Deps{
 		Auth:      mgr,
 		Limiter:   auth.NewRateLimiter(100, 100),
 		Secrets:   secrets.NewMemStore(),
@@ -78,7 +78,28 @@ func newPipelineEnv(t *testing.T, libraryRoots []string) *pipelineEnv {
 			}
 			return raw, err
 		},
-	})
+		// The two pipeline loaders mirror server.go; the Contrib service is wired per
+		// test via opts (it needs a fake-GitHub base URL).
+		CoreProposalLoader: func(workDir string) (json.RawMessage, error) {
+			raw, err := pipeline.CoreProposalJSON(workDir)
+			if errors.Is(err, pipeline.ErrNoCoreProposal) {
+				return nil, ErrNoCoreProposal
+			}
+			return raw, err
+		},
+		ExportArchive: func(b store.Book) ([]byte, string, error) {
+			slug := pipeline.ExportSlug(b)
+			data, err := pipeline.ExportArchive(b.WorkDir, slug)
+			if errors.Is(err, pipeline.ErrNoSidecars) {
+				return nil, "", ErrNoSidecars
+			}
+			return data, slug + "-sidecars.zip", err
+		},
+	}
+	for _, opt := range opts {
+		opt(&deps)
+	}
+	env.api = New(deps)
 	env.srv = httptest.NewServer(env.api.Handler())
 	t.Cleanup(env.srv.Close)
 	return &pipelineEnv{testEnv: env, db: db, cfg: cfg}
@@ -147,6 +168,34 @@ func TestScanUnknownJob(t *testing.T) {
 		t.Errorf("unknown scan = %d, want 404", resp.StatusCode)
 	}
 	resp.Body.Close()
+}
+
+// TestCreateBooksPersistsNarrators asserts the POST /books candidate's narrators are
+// stored via NewBook (they ride to the contributing stage's core proposal).
+func TestCreateBooksPersistsNarrators(t *testing.T) {
+	env := newPipelineEnv(t, nil)
+	token := env.login(t)
+
+	body := `{"candidates":[{"source_path":"/b/narr","title":"Narrated",` +
+		`"authors":["Auth One"],"narrators":["Nora Narrator","Sam Speaker"]}]}`
+	resp := env.do(t, http.MethodPost, "/api/v1/books", token, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("create = %d, want 200", resp.StatusCode)
+	}
+	var cr createBooksResponse
+	_ = json.NewDecoder(resp.Body).Decode(&cr)
+	resp.Body.Close()
+	if len(cr.Results) != 1 || cr.Results[0].Book == nil {
+		t.Fatalf("results = %+v", cr.Results)
+	}
+
+	got, err := env.db.GetBook(context.Background(), cr.Results[0].Book.ID)
+	if err != nil {
+		t.Fatalf("GetBook: %v", err)
+	}
+	if len(got.Narrators) != 2 || got.Narrators[0] != "Nora Narrator" || got.Narrators[1] != "Sam Speaker" {
+		t.Errorf("persisted narrators = %+v, want [Nora Narrator, Sam Speaker]", got.Narrators)
+	}
 }
 
 func TestBooksCreateListDedupAndDetail(t *testing.T) {

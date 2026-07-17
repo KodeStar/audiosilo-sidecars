@@ -59,7 +59,7 @@ func (h *harness) addBook(t *testing.T, db *store.DB, slug, series, pos string) 
 func runUntil(t *testing.T, db *store.DB, hub *events.Hub, exec Executor, agentCap int,
 	pred func([]store.Book) bool, timeout time.Duration) []store.Book {
 	t.Helper()
-	sched := New(db, hub, exec, agentCap, "")
+	sched := New(db, hub, exec, agentCap, "", false)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { _ = sched.Start(ctx); close(done) }()
@@ -141,7 +141,7 @@ func TestCrashResumeNoDuplicateStages(t *testing.T) {
 	// First run: cancel mid-flight (once at least one book has made progress but
 	// not everything is done).
 	exec := NewStubExecutor(4*time.Millisecond, 10*time.Millisecond)
-	sched := New(db, h.hub, exec, 2, h.workRoot)
+	sched := New(db, h.hub, exec, 2, h.workRoot, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { _ = sched.Start(ctx); close(done) }()
@@ -201,7 +201,7 @@ func TestPauseResume(t *testing.T) {
 	b := h.addBook(t, db, "paused-book", "", "")
 
 	// Pause before the scheduler starts: it must not progress.
-	if err := New(db, h.hub, NewStubExecutor(0, 0), 2, h.workRoot).Pause(context.Background(), b.ID); err != nil {
+	if err := New(db, h.hub, NewStubExecutor(0, 0), 2, h.workRoot, false).Pause(context.Background(), b.ID); err != nil {
 		t.Fatalf("pause: %v", err)
 	}
 	exec := NewStubExecutor(2*time.Millisecond, 5*time.Millisecond)
@@ -215,7 +215,7 @@ func TestPauseResume(t *testing.T) {
 	}
 
 	// Resume: it now runs to done.
-	sched := New(db, h.hub, exec, 2, h.workRoot)
+	sched := New(db, h.hub, exec, 2, h.workRoot, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = sched.Start(ctx) }()

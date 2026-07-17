@@ -391,6 +391,83 @@ func TestSettingsAgentPUTRejectsInvalid(t *testing.T) {
 	}
 }
 
+// TestSettingsContributionGET asserts the GET view carries the contribution config
+// with its defaults.
+func TestSettingsContributionGET(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.login(t)
+
+	resp := env.do(t, http.MethodGet, "/api/v1/settings", token, "")
+	var view settingsResponse
+	if err := json.Unmarshal([]byte(readAll(t, resp)), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if view.Contribution.Mode != config.DefaultContributionMode ||
+		view.Contribution.Repo != config.DefaultContributionRepo ||
+		!view.Contribution.AutoPurge ||
+		view.Contribution.PollMinutes != config.DefaultContributionPollMinutes {
+		t.Errorf("contribution view = %+v", view.Contribution)
+	}
+}
+
+// TestSettingsContributionPUT updates the contribution config and asserts it
+// validates, persists through Save, and reads back on GET (auto_purge false included).
+func TestSettingsContributionPUT(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.login(t)
+
+	body := `{"contribution":{"mode":"pr","repo":"acme/meta","auto_purge":false,"poll_minutes":20}}`
+	resp := env.do(t, http.MethodPut, "/api/v1/settings", token, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("put contribution = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	if env.saved == nil {
+		t.Fatal("config not persisted")
+	}
+	if env.saved.Contribution.Mode != "pr" || env.saved.Contribution.Repo != "acme/meta" ||
+		env.saved.Contribution.AutoPurge || env.saved.Contribution.PollMinutes != 20 {
+		t.Errorf("saved contribution = %+v", env.saved.Contribution)
+	}
+
+	resp = env.do(t, http.MethodGet, "/api/v1/settings", token, "")
+	var view settingsResponse
+	if err := json.Unmarshal([]byte(readAll(t, resp)), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if view.Contribution.Mode != "pr" || view.Contribution.AutoPurge {
+		t.Errorf("GET after PUT = %+v", view.Contribution)
+	}
+}
+
+// TestSettingsContributionPUTRejectsInvalid asserts a bad mode and a malformed repo
+// are both rejected 400 and do not persist.
+func TestSettingsContributionPUTRejectsInvalid(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.login(t)
+
+	resp := env.do(t, http.MethodPut, "/api/v1/settings", token, `{"contribution":{"mode":"email"}}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("bad mode = %d, want 400", resp.StatusCode)
+	}
+	if body := readAll(t, resp); !strings.Contains(body, "contribution.mode") {
+		t.Errorf("400 body missing validation message: %s", body)
+	}
+
+	resp = env.do(t, http.MethodPut, "/api/v1/settings", token, `{"contribution":{"repo":"noslash"}}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("bad repo = %d, want 400", resp.StatusCode)
+	}
+	if body := readAll(t, resp); !strings.Contains(body, "contribution.repo") {
+		t.Errorf("400 body missing validation message: %s", body)
+	}
+
+	if env.saved != nil {
+		t.Errorf("invalid contribution PUT persisted config: %+v", env.saved)
+	}
+}
+
 func TestSettingsCORSValidationAndPersist(t *testing.T) {
 	env := newTestEnv(t)
 	token := env.login(t)

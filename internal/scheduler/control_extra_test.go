@@ -89,7 +89,7 @@ func TestPauseAfterSentinelBeforeAdvanceStaysPaused(t *testing.T) {
 			})
 		}
 	}}
-	sched := New(db, h.hub, exec, 1, h.workRoot)
+	sched := New(db, h.hub, exec, 1, h.workRoot, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
@@ -128,7 +128,7 @@ func TestBookStateEventCarriesError(t *testing.T) {
 	h := newHarness(t)
 	db := h.openDB(t)
 	b := h.addBook(t, db, "errbook", "", "")
-	sched := New(db, h.hub, NewStubExecutor(0, 0), 2, h.workRoot)
+	sched := New(db, h.hub, NewStubExecutor(0, 0), 2, h.workRoot, false)
 
 	_, sub := h.hub.Subscribe(0)
 	defer sub.Close()
@@ -280,7 +280,7 @@ func TestDeleteRemovesWorkDirWithinRoot(t *testing.T) {
 	h := newHarness(t)
 	db := h.openDB(t)
 	ctx := context.Background()
-	sched := New(db, h.hub, NewStubExecutor(0, 0), 2, h.workRoot)
+	sched := New(db, h.hub, NewStubExecutor(0, 0), 2, h.workRoot, false)
 
 	// A book whose work dir is under the work root: delete removes it.
 	b := h.addBook(t, db, "delme", "", "")
@@ -331,7 +331,7 @@ func TestParkCodePersistsAndClears(t *testing.T) {
 	_, sub := h.hub.Subscribe(0)
 	defer sub.Close()
 
-	sched := New(db, h.hub, parkCodeExecutor{code: state.ParkAgentUnavailable}, 1, h.workRoot)
+	sched := New(db, h.hub, parkCodeExecutor{code: state.ParkAgentUnavailable}, 1, h.workRoot, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { _ = sched.Start(ctx); close(done) }()

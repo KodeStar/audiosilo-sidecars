@@ -97,6 +97,7 @@ type bookCandidate struct {
 	SourcePath string            `json:"source_path"`
 	Title      string            `json:"title"`
 	Authors    []string          `json:"authors"`
+	Narrators  []string          `json:"narrators,omitempty"`
 	Series     string            `json:"series"`
 	SeriesPos  string            `json:"series_pos"`
 	ASIN       string            `json:"asin"`
@@ -160,6 +161,7 @@ func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
 			WorkDir:         store.DeriveWorkDir(a.workRoot(), sp, c.Title),
 			Title:           strings.TrimSpace(c.Title),
 			Authors:         c.Authors,
+			Narrators:       c.Narrators,
 			Series:          strings.TrimSpace(c.Series),
 			SeriesPos:       strings.TrimSpace(c.SeriesPos),
 			ASIN:            strings.TrimSpace(c.ASIN),
@@ -177,7 +179,7 @@ func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
 			res.Error = "could not create book"
 		default:
 			res.Created = true
-			v := a.bookToView(ctx, b)
+			v := a.bookToView(ctx, b, nil) // a freshly created book has no contribution rows yet
 			res.Book = &v
 			created++
 		}
@@ -233,24 +235,38 @@ type bookView struct {
 	// book that has run only mechanical/ASR stages or none yet), attached on both the
 	// list and detail views so the Running/Done UI can show a per-book cost.
 	TotalCostUSD float64 `json:"total_cost_usd"`
-	CreatedAt    string  `json:"created_at"`
-	UpdatedAt    string  `json:"updated_at"`
+	// Contribution is the book's aggregate contribution chip (status + best link),
+	// folded from its contribution rows (store.ContributionSummary). Omitted when the
+	// book has no contribution rows yet (the UI then shows the legacy "Local only").
+	Contribution *contributionSummaryView `json:"contribution,omitempty"`
+	CreatedAt    string                   `json:"created_at"`
+	UpdatedAt    string                   `json:"updated_at"`
 }
 
-// bookDetail adds the per-execution stage-run ledger.
+// contributionSummaryView is the aggregate contribution chip on a bookView.
+type contributionSummaryView struct {
+	Status string `json:"status"`
+	URL    string `json:"url,omitempty"`
+}
+
+// bookDetail adds the per-execution stage-run ledger and the full contribution rows.
 type bookDetail struct {
 	bookView
-	StageRuns []store.StageRun `json:"stage_runs"`
+	StageRuns     []store.StageRun      `json:"stage_runs"`
+	Contributions []contributionRowView `json:"contributions"`
 }
 
 // bookToView builds the detail view for one book, fetching its progress, summed
-// agent cost, earliest stage-run start, and the scheduler's latest ETA. The list
-// endpoint uses buildBookView with pre-fetched values to avoid an N+1.
-func (a *API) bookToView(ctx context.Context, b store.Book) bookView {
+// agent cost, earliest stage-run start, and the scheduler's latest ETA. The
+// contribution rows are passed in (fetched once by the caller) so a caller that
+// already has them - e.g. handleGetBook, which also renders the full rows - does not
+// re-query; pass nil when the book has no rows (a freshly created book). The list
+// endpoint uses buildBookView directly with pre-fetched values to avoid an N+1.
+func (a *API) bookToView(ctx context.Context, b store.Book, contribRows []store.Contribution) bookView {
 	progress, _ := a.store.ListProgress(ctx, b.ID)
 	totalCost, _ := a.store.SumStageRunCost(ctx, b.ID)
 	startedAt, _, _ := a.store.FirstStageRunStart(ctx, b.ID)
-	return buildBookView(b, progress, totalCost, startedAt, a.bookETA(b.ID))
+	return buildBookView(b, progress, totalCost, startedAt, a.bookETA(b.ID), contribRows)
 }
 
 // bookETA reads a book's latest ETA from the scheduler (never computed here). It
@@ -281,7 +297,7 @@ func (a *API) bookETASnapshot() map[int64]int64 {
 // summed agent cost, earliest stage-run start, and ETA seconds, normalizing the
 // always-present JSON fields. scratch_bytes is served from the persisted column
 // (written by the split stage / PurgeScratch), so no read walks the work dir.
-func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64, startedAt string, etaSeconds int64) bookView {
+func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64, startedAt string, etaSeconds int64, contribRows []store.Contribution) bookView {
 	authors := b.Authors
 	if authors == nil {
 		authors = []string{}
@@ -293,6 +309,10 @@ func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64
 	if progress == nil {
 		progress = []store.Progress{}
 	}
+	var contribution *contributionSummaryView
+	if status, url := store.ContributionSummary(contribRows); status != "" {
+		contribution = &contributionSummaryView{Status: status, URL: url}
+	}
 	return bookView{
 		ID: b.ID, SourcePath: b.SourcePath, Title: b.Title, Authors: authors,
 		Series: b.Series, SeriesPos: b.SeriesPos, ASIN: b.ASIN, ISBN: b.ISBN,
@@ -301,7 +321,8 @@ func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64
 		Status: b.Status, Error: b.Error, ParkCode: b.ParkCode, Coverage: b.Coverage,
 		ETASeconds: etaSeconds, StartedAt: startedAt,
 		Progress: progress, ScratchBytes: b.ScratchBytes, TotalCostUSD: totalCostUSD,
-		CreatedAt: b.CreatedAt, UpdatedAt: b.UpdatedAt,
+		Contribution: contribution,
+		CreatedAt:    b.CreatedAt, UpdatedAt: b.UpdatedAt,
 	}
 }
 
@@ -334,31 +355,29 @@ func (a *API) handleListBooks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not list stage-run starts")
 		return
 	}
+	// One grouped contribution query for the whole list (no N+1) -> aggregate chip.
+	contribByBook, err := a.store.ContributionsByBook(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not list contributions")
+		return
+	}
 	// One ETA snapshot for the whole list (a single scheduler lock, not one per book).
 	etaByBook := a.bookETASnapshot()
 	views := make([]bookView, 0, len(books))
 	for _, b := range books {
 		views = append(views, buildBookView(b, progressByBook[b.ID], costByBook[b.ID],
-			startsByBook[b.ID], etaByBook[b.ID]))
+			startsByBook[b.ID], etaByBook[b.ID], contribByBook[b.ID]))
 	}
 	writeJSON(w, http.StatusOK, listBooksResponse{Books: views})
 }
 
 func (a *API) handleGetBook(w http.ResponseWriter, r *http.Request) {
-	id, ok := parseID(w, r)
+	b, ok := a.lookupBook(w, r)
 	if !ok {
 		return
 	}
 	ctx := r.Context()
-	b, err := a.store.GetBook(ctx, id)
-	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "book not found")
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not read book")
-		return
-	}
+	id := b.ID
 	runs, err := a.store.ListStageRuns(ctx, id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not read stage runs")
@@ -367,7 +386,20 @@ func (a *API) handleGetBook(w http.ResponseWriter, r *http.Request) {
 	if runs == nil {
 		runs = []store.StageRun{}
 	}
-	writeJSON(w, http.StatusOK, bookDetail{bookView: a.bookToView(ctx, b), StageRuns: runs})
+	contribRows, err := a.store.ListContributionsByBook(ctx, id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not read contributions")
+		return
+	}
+	contribViews := make([]contributionRowView, 0, len(contribRows))
+	for _, c := range contribRows {
+		contribViews = append(contribViews, toContributionRowView(c))
+	}
+	writeJSON(w, http.StatusOK, bookDetail{
+		bookView:      a.bookToView(ctx, b, contribRows),
+		StageRuns:     runs,
+		Contributions: contribViews,
+	})
 }
 
 // bookAction adapts a scheduler control method to a handler, mapping its errors

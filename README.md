@@ -10,10 +10,14 @@ agent fact/synthesis/audit pass -> validated sidecars) behind a small Go daemon
 with an embedded web UI. Bring your own Claude or ChatGPT backend (subscription
 or API key).
 
-> Status: **early development.** Milestone M0 is in place - the daemon skeleton
-> (auth, secrets, live event stream) and the web UI shell. The extraction
-> pipeline itself is being built out across later milestones and does not run
-> yet. See [CLAUDE.md](CLAUDE.md) for the roadmap.
+> Status: **feature-complete, pre-release.** The full pipeline runs end to end -
+> folder scan with coverage checks, chapter split, local ASR (mlx-whisper or
+> whisper.cpp, auto-downloaded), transcript QA, the agent fact/synthesis/audit
+> stages, validation, and contribution back to meta.audiosilo.app (prefilled
+> intake issues by default, direct fork+PR, or keep-local export), with live
+> boards, ETAs, and per-stage cost tracking in the web UI. Remaining before a
+> first release: packaging (installers + Docker images). See
+> [CLAUDE.md](CLAUDE.md) for the roadmap.
 
 This is the seventh repository in the AudioSilo workspace. Code is licensed
 **AGPL-3.0** (see [LICENSE](LICENSE)); the sidecars it produces are CC BY-SA 3.0,

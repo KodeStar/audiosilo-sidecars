@@ -5,6 +5,7 @@ import type { AgentInfo, AsrInfo, SecretsPresence, Settings, ToolsInfo } from '@
 import { ChangePasswordForm } from './settings/ChangePasswordForm';
 import { SecretRow } from './settings/SecretRow';
 import { AgentSettingsForm } from './settings/AgentSettingsForm';
+import { ContributionSettingsForm } from './settings/ContributionSettingsForm';
 
 interface SettingsPanelProps {
   client: ApiClient;
@@ -142,6 +143,11 @@ export function SettingsPanel({ client }: SettingsPanelProps) {
       <Card>
         <SectionTitle>Agent configuration</SectionTitle>
         <AgentSettingsForm client={client} initial={settings.agent} info={agentInfo} />
+      </Card>
+
+      <Card>
+        <SectionTitle>Contribution</SectionTitle>
+        <ContributionSettingsForm client={client} initial={settings.contribution} />
       </Card>
     </div>
   );

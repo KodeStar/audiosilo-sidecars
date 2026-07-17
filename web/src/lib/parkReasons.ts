@@ -19,6 +19,10 @@ const PARK_HINTS: Record<string, string> = {
     'The audio changed on disk since transcription. Retry re-runs from the new manifest.',
   fix_loop_exhausted:
     'The audit -> fix loop hit its cap. Review audit.json in the work dir, then Retry.',
+  contrib_unavailable: 'Add a GitHub PAT in Settings or run gh auth login, then Retry.',
+  core_needed: "This book's work is not on AudioSilo Meta yet - complete the work proposal.",
+  core_pending:
+    'Work proposal submitted - waiting for the metadata PR to merge; resumes automatically.',
 };
 
 // parkHint returns the actionable hint for a park code, or null for an unknown

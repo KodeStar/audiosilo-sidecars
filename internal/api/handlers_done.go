@@ -15,17 +15,8 @@ import (
 // SidecarLoader so the api never imports pipeline); this handler is transport-only:
 // it resolves the book, calls the loader, and maps ErrNoSidecars to 404.
 func (a *API) handleBookSidecars(w http.ResponseWriter, r *http.Request) {
-	id, ok := parseID(w, r)
+	b, ok := a.lookupBook(w, r)
 	if !ok {
-		return
-	}
-	b, err := a.store.GetBook(r.Context(), id)
-	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "book not found")
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not read book")
 		return
 	}
 	if a.sidecarLoader == nil {

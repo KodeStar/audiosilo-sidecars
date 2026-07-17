@@ -71,7 +71,7 @@ describe('DonePanel', () => {
         ],
       }),
     });
-    render(<DonePanel client={client} />);
+    render(<DonePanel client={client} apiBase="" token="" />);
 
     expect(await screen.findByText('Done One')).toBeInTheDocument();
     expect(screen.queryByText('Still Running')).not.toBeInTheDocument();
@@ -81,7 +81,7 @@ describe('DonePanel', () => {
     const client = makeClient({
       listBooks: vi.fn().mockResolvedValue({ books: [book({ state: 'asr' })] }),
     });
-    render(<DonePanel client={client} />);
+    render(<DonePanel client={client} apiBase="" token="" />);
 
     expect(await screen.findByText(/No finished books yet/i)).toBeInTheDocument();
   });
@@ -110,7 +110,7 @@ describe('DonePanel', () => {
         }),
       ),
     });
-    render(<DonePanel client={client} />);
+    render(<DonePanel client={client} apiBase="" token="" />);
 
     const detailsBtn = await screen.findByRole('button', { name: 'Details' });
     await userEvent.click(detailsBtn);
@@ -126,7 +126,7 @@ describe('DonePanel', () => {
     const client = makeClient({
       listBooks: vi.fn().mockResolvedValue({ books: [book({ id: 3 })] }),
     });
-    render(<DonePanel client={client} />);
+    render(<DonePanel client={client} apiBase="" token="" />);
 
     const previewBtn = await screen.findByRole('button', { name: 'Preview' });
     await userEvent.click(previewBtn);
@@ -151,7 +151,7 @@ describe('DonePanel', () => {
       listBooks: vi.fn().mockResolvedValue({ books: [book({ id: 4 })] }),
       getBookSidecars: vi.fn().mockRejectedValue(new ApiError(404, 'not found')),
     });
-    render(<DonePanel client={client} />);
+    render(<DonePanel client={client} apiBase="" token="" />);
 
     await userEvent.click(await screen.findByRole('button', { name: 'Preview' }));
     expect(await screen.findByText(/No sidecars produced/i)).toBeInTheDocument();
@@ -166,7 +166,7 @@ describe('DonePanel', () => {
       deleteBook,
     });
     vi.spyOn(window, 'confirm').mockReturnValue(true);
-    render(<DonePanel client={client} />);
+    render(<DonePanel client={client} apiBase="" token="" />);
 
     await userEvent.click(await screen.findByRole('button', { name: 'Free disk' }));
     await waitFor(() => expect(purgeScratch).toHaveBeenCalledWith(9));
@@ -182,7 +182,7 @@ describe('DonePanel', () => {
       deleteBook,
     });
     vi.spyOn(window, 'confirm').mockReturnValue(false);
-    render(<DonePanel client={client} />);
+    render(<DonePanel client={client} apiBase="" token="" />);
 
     await userEvent.click(await screen.findByRole('button', { name: 'Delete' }));
     expect(deleteBook).not.toHaveBeenCalled();

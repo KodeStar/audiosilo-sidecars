@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { filterDoneBooks, runDurationSeconds, stageRunRows } from './doneBoard';
-import type { BookView, StageRun } from '@/api/types';
+import {
+  contributionChip,
+  contributionRowLines,
+  filterDoneBooks,
+  runDurationSeconds,
+  stageRunRows,
+} from './doneBoard';
+import type { BookView, ContributionRow, StageRun } from '@/api/types';
 
 function book(partial: Partial<BookView>): BookView {
   return {
@@ -133,5 +139,104 @@ describe('stageRunRows', () => {
     ]);
     expect(rows[0]).toMatchObject({ failed: true, running: false });
     expect(rows[1]).toMatchObject({ failed: false, running: true, elapsed: '-' });
+  });
+});
+
+describe('contributionChip', () => {
+  it('maps each aggregate status to its label, link, and tint', () => {
+    expect(contributionChip({ status: 'submitted', url: 'https://x/i/1' })).toEqual({
+      label: 'Issue open',
+      url: 'https://x/i/1',
+      attention: false,
+    });
+    expect(contributionChip({ status: 'pr_open', url: 'https://x/p/2' })).toEqual({
+      label: 'PR open',
+      url: 'https://x/p/2',
+      attention: false,
+    });
+    expect(contributionChip({ status: 'merged', url: 'https://x/p/2' })).toEqual({
+      label: 'Merged',
+      url: 'https://x/p/2',
+      attention: false,
+    });
+    expect(contributionChip({ status: 'closed', url: 'https://x/i/1' })).toEqual({
+      label: 'Closed',
+      url: 'https://x/i/1',
+      attention: true,
+    });
+    expect(contributionChip({ status: 'local', url: '' })).toEqual({
+      label: 'Local only',
+      url: null,
+      attention: false,
+    });
+  });
+
+  it('renders an absent summary and an unknown status as the legacy Local only chip', () => {
+    expect(contributionChip(undefined)).toEqual({
+      label: 'Local only',
+      url: null,
+      attention: false,
+    });
+    expect(contributionChip({ status: 'weird', url: 'https://x' })).toEqual({
+      label: 'Local only',
+      url: null,
+      attention: false,
+    });
+  });
+
+  it('drops a link when the summary carries no url', () => {
+    expect(contributionChip({ status: 'submitted', url: '' }).url).toBeNull();
+  });
+});
+
+function crow(partial: Partial<ContributionRow>): ContributionRow {
+  return {
+    kind: 'characters',
+    mode: 'issue',
+    repo: 'KodeStar/audiosilo-meta',
+    number: 0,
+    url: '',
+    pr_number: 0,
+    pr_url: '',
+    status: 'submitted',
+    note: '',
+    created_at: '',
+    updated_at: '',
+    ...partial,
+  };
+}
+
+describe('contributionRowLines', () => {
+  it('returns [] for absent rows', () => {
+    expect(contributionRowLines(undefined)).toEqual([]);
+  });
+
+  it('labels each row with its kind + number, status word, and best link', () => {
+    const lines = contributionRowLines([
+      crow({ kind: 'characters', number: 123, url: 'https://x/i/123', status: 'submitted' }),
+      crow({ kind: 'recaps', number: 124, url: '', pr_url: 'https://x/p/9', status: 'pr_open' }),
+      crow({ kind: 'core', number: 0, status: 'merged', note: 'work merged' }),
+    ]);
+    expect(lines[0]).toEqual({
+      key: 'characters',
+      label: 'characters #123',
+      statusLabel: 'issue open',
+      url: 'https://x/i/123',
+      note: '',
+    });
+    // Falls back to pr_url when the row has no direct url.
+    expect(lines[1]).toMatchObject({
+      label: 'recaps #124',
+      url: 'https://x/p/9',
+      statusLabel: 'PR open',
+    });
+    // No number -> no "#"; no link -> null; note carried.
+    expect(lines[2]).toEqual({
+      key: 'core',
+      label: 'core',
+      statusLabel: 'merged',
+      url: null,
+      note: 'work merged',
+    });
   });
 });

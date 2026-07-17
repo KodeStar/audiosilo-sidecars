@@ -67,6 +67,9 @@ export function toCandidate(book: ScannedBook): BookCandidate {
     coverage: book.coverage,
     sources: book.sources,
   };
+  // Carry narrators through so a later core (add-work) proposal can prefill them
+  // (metaissue requires >= 1 narrator). Omit an empty list to keep the payload tidy.
+  if (book.narrators && book.narrators.length > 0) candidate.narrators = book.narrators;
   const c = book.coverage;
   if (c && c.known && c.work_id) candidate.work_id = c.work_id;
   return candidate;

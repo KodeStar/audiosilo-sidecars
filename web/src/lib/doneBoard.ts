@@ -4,7 +4,7 @@
 // lib/duration formatDuration; a null (uncomputable) span renders "-" at the call
 // site below.
 
-import type { BookView, StageRun } from '@/api/types';
+import type { BookView, ContributionRow, ContributionSummary, StageRun } from '@/api/types';
 import { compareByTimestampDesc } from '@/lib/books';
 import { formatDuration } from '@/lib/duration';
 import { stateLabel } from '@/lib/pipelineState';
@@ -63,6 +63,75 @@ export function stageRunRows(runs: StageRun[]): StageRunRow[] {
       elapsed: dur === null ? '-' : formatDuration(dur),
       failed: r.ok === false,
       running: r.ok === null,
+    };
+  });
+}
+
+// ContributionChip is the display model for the Done board's contribution chip:
+// the label, an optional link, and whether it needs an attention (warn) tint.
+export interface ContributionChip {
+  label: string;
+  url: string | null;
+  attention: boolean;
+}
+
+// contributionChip maps a book's aggregate contribution summary to its chip. An
+// absent summary (a book with no contribution rows) and any unrecognized status
+// both read as the legacy "Local only" chip with no link. Only a `closed` status
+// carries the attention tint (a contribution that will not land without help).
+export function contributionChip(summary: ContributionSummary | undefined): ContributionChip {
+  const url = summary?.url ? summary.url : null;
+  switch (summary?.status) {
+    case 'submitted':
+      return { label: 'Issue open', url, attention: false };
+    case 'pr_open':
+      return { label: 'PR open', url, attention: false };
+    case 'merged':
+      return { label: 'Merged', url, attention: false };
+    case 'closed':
+      return { label: 'Closed', url, attention: true };
+    case 'local':
+      return { label: 'Local only', url, attention: false };
+    default:
+      // Absent summary or an unknown status: the legacy local-only presentation.
+      return { label: 'Local only', url: null, attention: false };
+  }
+}
+
+// A short human label for one contribution status, used on the per-kind detail rows.
+const STATUS_LABEL: Record<string, string> = {
+  submitted: 'issue open',
+  pr_open: 'PR open',
+  merged: 'merged',
+  closed: 'closed',
+  local: 'local',
+  already_covered: 'already covered',
+};
+
+// ContributionRowLine is the display model for one per-kind contribution row in the
+// expanded Done details: a label like "characters #123", the best link, a status
+// word, and any caveat note.
+export interface ContributionRowLine {
+  key: string;
+  label: string;
+  statusLabel: string;
+  url: string | null;
+  note: string;
+}
+
+// contributionRowLines maps the per-kind rows (from the book detail) to display
+// lines. The link prefers the row's own url, falling back to the intake PR url when
+// only that is known (issue mode before the bot PR opens has just the issue url).
+export function contributionRowLines(rows: ContributionRow[] | undefined): ContributionRowLine[] {
+  if (!rows) return [];
+  return rows.map((r) => {
+    const number = r.number > 0 ? ` #${r.number}` : '';
+    return {
+      key: r.kind,
+      label: `${r.kind}${number}`,
+      statusLabel: STATUS_LABEL[r.status] ?? r.status,
+      url: r.url ? r.url : r.pr_url ? r.pr_url : null,
+      note: r.note,
     };
   });
 }

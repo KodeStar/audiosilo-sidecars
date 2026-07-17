@@ -12,6 +12,7 @@ import {
   type AgentStageKey,
 } from '@/lib/agentSettings';
 import { stateLabel } from '@/lib/pipelineState';
+import { Field } from '@/components/ui/Field';
 
 interface AgentSettingsFormProps {
   client: ApiClient;
@@ -222,24 +223,5 @@ function ModelCell({
       onChange={(e) => onChange(stage, col, e.target.value)}
       className="w-full min-w-[8rem] rounded-md border border-edge bg-raised px-2 py-1.5 text-body placeholder:text-dim"
     />
-  );
-}
-
-function Field({
-  label,
-  htmlFor,
-  children,
-}: {
-  label: string;
-  htmlFor: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex flex-col gap-1.5">
-      <label htmlFor={htmlFor} className="text-sm font-medium text-hi">
-        {label}
-      </label>
-      {children}
-    </div>
   );
 }

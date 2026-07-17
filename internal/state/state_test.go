@@ -286,3 +286,29 @@ func TestCanStartGuards(t *testing.T) {
 		}
 	}
 }
+
+// TestIsParkedWith checks the shared park-code predicate: it matches only when the
+// status is needs_attention AND the code is among the wanted set.
+func TestIsParkedWith(t *testing.T) {
+	na := string(StatusNeedsAttention)
+	cases := []struct {
+		name   string
+		status string
+		code   string
+		want   []ParkCode
+		expect bool
+	}{
+		{"match single", na, string(ParkCoreNeeded), []ParkCode{ParkCoreNeeded}, true},
+		{"match one of many", na, string(ParkCorePending), []ParkCode{ParkCoreNeeded, ParkCorePending}, true},
+		{"code not wanted", na, string(ParkContribUnavailable), []ParkCode{ParkCoreNeeded}, false},
+		{"wrong status", string(StatusNone), string(ParkCoreNeeded), []ParkCode{ParkCoreNeeded}, false},
+		{"failed status", string(StatusFailed), string(ParkCoreNeeded), []ParkCode{ParkCoreNeeded}, false},
+		{"empty code parked", na, "", []ParkCode{ParkCoreNeeded}, false},
+		{"no wanted codes", na, string(ParkCoreNeeded), nil, false},
+	}
+	for _, c := range cases {
+		if got := IsParkedWith(c.status, c.code, c.want...); got != c.expect {
+			t.Errorf("%s: IsParkedWith(%q,%q,%v) = %v, want %v", c.name, c.status, c.code, c.want, got, c.expect)
+		}
+	}
+}

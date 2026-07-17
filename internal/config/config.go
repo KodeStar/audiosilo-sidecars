@@ -50,6 +50,27 @@ const (
 // queries. Overridable (env / config) so tests can point at a local httptest.
 const DefaultMetadataBaseURL = "https://meta.audiosilo.app"
 
+// Contribution mode selector values: how the contributing stage publishes a book's
+// sidecars. issue opens prefilled intake issues (the meta repo's bot composes the
+// PR); pr forks + opens a direct PR; local exports to <data>/export with no network.
+const (
+	ContributionModeIssue = "issue"
+	ContributionModePR    = "pr"
+	ContributionModeLocal = "local"
+)
+
+// Contribution section defaults.
+const (
+	DefaultContributionMode        = ContributionModeIssue
+	DefaultContributionRepo        = "KodeStar/audiosilo-meta"
+	DefaultContributionAutoPurge   = true
+	DefaultContributionPollMinutes = 10
+	// DefaultContributionAPIBaseURL is the GitHub REST API root the contributing
+	// stage and intake poller talk to. Overridable (config/env) for tests (point at
+	// an httptest fake) and GitHub Enterprise (a self-hosted API host).
+	DefaultContributionAPIBaseURL = "https://api.github.com"
+)
+
 // DefaultAutoDownload is the tools.auto_download default: when a tool is not found
 // locally (explicit path -> next to the binary -> $PATH), fetch a static build
 // into <data>/tools rather than failing (HTTPS from pinned hosts, self-checked by
@@ -109,6 +130,25 @@ type AgentConfig struct {
 	OpenAI         map[string]string `yaml:"openai"`          // agent-stage name -> model (empty = codex default)
 }
 
+// ContributionConfig controls the contributing stage + the intake poller (M7). Mode
+// selects how a book's sidecars are published; Repo is the upstream meta repository
+// (owner/name); AutoPurge reclaims a book's scratch once it reaches done; PollMinutes
+// is the interval at which open contributions are polled for their intake-PR status.
+//
+// Changing any contribution field takes effect only on a daemon RESTART (the stage
+// and poller are wired once at startup, like asr.backend and agent.*), unlike
+// cors_origins which the API re-reads live per request.
+type ContributionConfig struct {
+	Mode        string `yaml:"mode"`         // "issue" | "pr" | "local"
+	Repo        string `yaml:"repo"`         // upstream meta repo, owner/name
+	AutoPurge   bool   `yaml:"auto_purge"`   // purge scratch when a book reaches done
+	PollMinutes int    `yaml:"poll_minutes"` // open-contribution poll interval (>= 1)
+	// APIBaseURL is the GitHub REST API root (absolute http(s) URL). Empty defaults
+	// to https://api.github.com. Overridable for tests (an httptest fake) and GitHub
+	// Enterprise (a self-hosted API host).
+	APIBaseURL string `yaml:"api_base_url"`
+}
+
 // MetadataConfig points the coverage/lookup client at the community metadata API.
 type MetadataConfig struct {
 	// BaseURL is the metadata API root. Must be an absolute http(s) URL. Empty
@@ -161,6 +201,8 @@ type Config struct {
 	// is live in M1).
 	ASR   ASRConfig   `yaml:"asr"`
 	Agent AgentConfig `yaml:"agent"`
+	// Contribution configures the contributing stage + intake poller (M7).
+	Contribution ContributionConfig `yaml:"contribution"`
 }
 
 // Default returns a Config with secure defaults.
@@ -177,6 +219,13 @@ func Default() Config {
 			TimeoutMinutes: DefaultTimeoutMinutes,
 			Claude:         defaultClaudeModels(),
 			OpenAI:         map[string]string{},
+		},
+		Contribution: ContributionConfig{
+			Mode:        DefaultContributionMode,
+			Repo:        DefaultContributionRepo,
+			AutoPurge:   DefaultContributionAutoPurge,
+			PollMinutes: DefaultContributionPollMinutes,
+			APIBaseURL:  DefaultContributionAPIBaseURL,
 		},
 	}
 }
@@ -234,6 +283,21 @@ func Load(dataDir string) (Config, error) {
 	}
 	if cfg.LibraryRoots == nil {
 		cfg.LibraryRoots = []string{}
+	}
+	// Normalize contribution defaults so a config predating M7 (no contribution
+	// section) or with an empty mode/repo/interval resolves to working values. AutoPurge
+	// is a bool with no empty sentinel, so an explicit false is honored as-is.
+	if strings.TrimSpace(cfg.Contribution.Mode) == "" {
+		cfg.Contribution.Mode = DefaultContributionMode
+	}
+	if strings.TrimSpace(cfg.Contribution.Repo) == "" {
+		cfg.Contribution.Repo = DefaultContributionRepo
+	}
+	if cfg.Contribution.PollMinutes == 0 {
+		cfg.Contribution.PollMinutes = DefaultContributionPollMinutes
+	}
+	if strings.TrimSpace(cfg.Contribution.APIBaseURL) == "" {
+		cfg.Contribution.APIBaseURL = DefaultContributionAPIBaseURL
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -296,6 +360,25 @@ func applyEnv(cfg *Config) {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
 			cfg.Agent.TimeoutMinutes = n
 		}
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_MODE"); ok {
+		cfg.Contribution.Mode = strings.TrimSpace(v)
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_REPO"); ok {
+		cfg.Contribution.Repo = strings.TrimSpace(v)
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_AUTO_PURGE"); ok {
+		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			cfg.Contribution.AutoPurge = b
+		}
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_POLL_MINUTES"); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			cfg.Contribution.PollMinutes = n
+		}
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_API_BASE_URL"); ok {
+		cfg.Contribution.APIBaseURL = strings.TrimSpace(v)
 	}
 }
 
@@ -360,6 +443,35 @@ func (c Config) Validate() error {
 	default:
 		return fmt.Errorf("asr.backend %q must be one of %q, %q, or %q",
 			c.ASR.Backend, ASRBackendAuto, ASRBackendMLXWhisper, ASRBackendWhisperCpp)
+	}
+	switch c.Contribution.Mode {
+	case ContributionModeIssue, ContributionModePR, ContributionModeLocal:
+	default:
+		return fmt.Errorf("contribution.mode %q must be %q, %q, or %q",
+			c.Contribution.Mode, ContributionModeIssue, ContributionModePR, ContributionModeLocal)
+	}
+	if err := validateRepo(c.Contribution.Repo); err != nil {
+		return err
+	}
+	if c.Contribution.PollMinutes < 1 {
+		return fmt.Errorf("contribution.poll_minutes must be >= 1, got %d", c.Contribution.PollMinutes)
+	}
+	if u, err := url.Parse(c.Contribution.APIBaseURL); err != nil ||
+		(u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("contribution.api_base_url %q must be an absolute http(s) URL", c.Contribution.APIBaseURL)
+	}
+	return nil
+}
+
+// validateRepo enforces the GitHub owner/name shape: exactly one slash, both parts
+// non-empty, and no whitespace anywhere (it is interpolated into REST paths).
+func validateRepo(repo string) error {
+	if strings.ContainsAny(repo, " \t\r\n") {
+		return fmt.Errorf("contribution.repo %q must not contain whitespace", repo)
+	}
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return fmt.Errorf("contribution.repo %q must be owner/name", repo)
 	}
 	return nil
 }

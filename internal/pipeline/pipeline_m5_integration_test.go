@@ -146,7 +146,7 @@ func TestPipelineFullMachineToDone(t *testing.T) {
 	cfg.DB, cfg.FFmpeg, cfg.FFprobe, cfg.ASR = db, ffmpeg, ffprobe, fakeASR(backend)
 	cfg.Fallback = scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond)
 	exe := NewExecutor(cfg)
-	sched := scheduler.New(db, hub, exe, 2, workRoot)
+	sched := scheduler.New(db, hub, exe, 2, workRoot, false)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

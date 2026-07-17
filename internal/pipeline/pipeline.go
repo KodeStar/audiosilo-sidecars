@@ -1,7 +1,7 @@
 // Package pipeline wires the real stage executors into the scheduler. It provides a
 // composite scheduler.Executor that routes each pipeline stage to its implementation.
-// As of M5 EVERY pipeline stage is real; only contributing (M7) still falls through to
-// the stub fallback. The mechanical stages are inspecting -> internal/audio.Inspect,
+// As of M7 EVERY pipeline stage is real (contributing publishes the sidecars to
+// KodeStar/audiosilo-meta). The mechanical stages are inspecting -> internal/audio.Inspect,
 // splitting -> internal/audio.Split, asr -> the per-chapter internal/asr loop,
 // sanitizing -> internal/transcript normalization, qa_sweep -> the internal/qa
 // degeneration sweep, retranscribing -> internal/repair (tail-clip + adoption),
@@ -107,6 +107,19 @@ type Config struct {
 	AgentModels  AgentModels
 	AgentTimeout time.Duration
 	Secrets      secrets.Store
+
+	// Contribution (M7) drives the contributing stage. Meta resolves a book's work
+	// slug and reads sidecar coverage (nil = metadata disabled); TokenSource resolves a
+	// GitHub credential for issue/pr modes (nil = no credential); ContribMode is
+	// issue|pr|local; ContribRepo is the upstream owner/name; ContribBaseURL overrides
+	// the GitHub REST base for tests (empty = api.github.com); ExportRoot is where local
+	// mode writes the repo-layout export.
+	Meta           MetaCoverage
+	TokenSource    TokenResolver
+	ContribMode    string
+	ContribRepo    string
+	ContribBaseURL string
+	ExportRoot     string
 }
 
 // Executor is the composite stage executor. ffmpeg/ffprobe are the resolved tool
@@ -141,6 +154,14 @@ type Executor struct {
 	secrets      secrets.Store
 	log          *slog.Logger
 	fallback     scheduler.Executor
+
+	// Contribution-stage deps (M7); see Config.
+	meta           MetaCoverage
+	tokenSource    TokenResolver
+	contribMode    string
+	contribRepo    string
+	contribBaseURL string
+	exportRoot     string
 
 	// redetectASR re-selects an ASR backend when the frozen one is unavailable. It is
 	// a field so a test can inject a scripted result; NewExecutor sets it to
@@ -185,6 +206,13 @@ func NewExecutor(cfg Config) *Executor {
 		secrets:      cfg.Secrets,
 		log:          log,
 		fallback:     cfg.Fallback,
+
+		meta:           cfg.Meta,
+		tokenSource:    cfg.TokenSource,
+		contribMode:    cfg.ContribMode,
+		contribRepo:    cfg.ContribRepo,
+		contribBaseURL: cfg.ContribBaseURL,
+		exportRoot:     cfg.ExportRoot,
 	}
 	e.redetectASR = e.defaultRedetectASR
 	e.redetectAgent = e.defaultRedetectAgent
@@ -269,8 +297,9 @@ func (e *Executor) ensureTools() (ffmpeg, ffprobe string) {
 	return e.ffmpeg, e.ffprobe
 }
 
-// Execute routes a stage to its implementation. As of M5 every pipeline stage is
-// handled here; only contributing (M7) falls through to the stub fallback.
+// Execute routes a stage to its implementation. As of M7 every pipeline stage is
+// handled here (contributing landed in M7); the fallback runs only an unrecognized
+// state, which the state machine never produces.
 func (e *Executor) Execute(ctx context.Context, book store.Book, stage state.State, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
 	switch stage {
 	case state.Inspecting:
@@ -303,6 +332,8 @@ func (e *Executor) Execute(ctx context.Context, book store.Book, stage state.Sta
 		return e.audit(ctx, book, report)
 	case state.Fixing:
 		return e.fixSidecars(ctx, book, report)
+	case state.Contributing:
+		return e.contribute(ctx, book, report)
 	default:
 		return e.fallback.Execute(ctx, book, stage, report)
 	}

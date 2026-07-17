@@ -297,7 +297,7 @@ func TestRetranscribeLoopsBackToQASweep(t *testing.T) {
 	cfg.DB, cfg.ASR = db, fakeASR(fake)
 	cfg.Fallback = scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond)
 	exe := NewExecutor(cfg)
-	sched := scheduler.New(db, hub, exe, 2, workRoot)
+	sched := scheduler.New(db, hub, exe, 2, workRoot, false)
 
 	book, err := db.CreateBook(context.Background(), store.NewBook{SourcePath: filepath.Join(dir, "b.m4b"), WorkDir: work, Title: "Book"})
 	if err != nil {

@@ -90,7 +90,7 @@ function renderPanel(active: string, ctx: PanelContext) {
     case 'running':
       return <RunningPanel client={ctx.client} apiBase={ctx.apiBase} token={ctx.token} />;
     case 'done':
-      return <DonePanel client={ctx.client} />;
+      return <DonePanel client={ctx.client} apiBase={ctx.apiBase} token={ctx.token} />;
     case 'settings':
       return <SettingsPanel client={ctx.client} />;
     default:

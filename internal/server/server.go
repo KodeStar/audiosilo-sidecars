@@ -22,6 +22,7 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/asr"
 	"github.com/kodestar/audiosilo-sidecars/internal/auth"
 	"github.com/kodestar/audiosilo-sidecars/internal/config"
+	"github.com/kodestar/audiosilo-sidecars/internal/contrib"
 	"github.com/kodestar/audiosilo-sidecars/internal/events"
 	"github.com/kodestar/audiosilo-sidecars/internal/metaops"
 	"github.com/kodestar/audiosilo-sidecars/internal/pipeline"
@@ -184,6 +185,10 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	scanMgr := metaops.NewScanManager(ctx, metaClient, tools.FFprobe, overrideSrc)
 	workRoot := filepath.Join(opts.DataDir, "work")
+	// One GitHub token source shared by the contributing stage (executor) and the
+	// core-submit/poller service - both resolve the same PAT-then-`gh auth token`
+	// credential, so there is no reason to build two.
+	tokenSource := contrib.NewTokenSource(sec)
 	exec := pipeline.NewExecutor(pipeline.Config{
 		DB:      db,
 		FFmpeg:  tools.FFmpeg,
@@ -213,8 +218,19 @@ func Run(ctx context.Context, opts Options) error {
 		Secrets:      sec,
 		Log:          toolLog,
 		Fallback:     scheduler.NewStubExecutor(0, 0),
+		// Contribution (M7): the contributing stage resolves the work slug against the
+		// metadata client, resolves a GitHub credential (PAT in secrets, else `gh auth
+		// token`), and publishes per the configured mode. ContribBaseURL is the GitHub
+		// REST base (config.contribution.api_base_url, default api.github.com; overridable
+		// for tests and GitHub Enterprise); ExportRoot receives local-mode exports.
+		Meta:           metaClient,
+		TokenSource:    tokenSource,
+		ContribMode:    cfg.Contribution.Mode,
+		ContribRepo:    cfg.Contribution.Repo,
+		ContribBaseURL: cfg.Contribution.APIBaseURL,
+		ExportRoot:     filepath.Join(opts.DataDir, "export"),
 	})
-	sched := scheduler.New(db, hub, exec, cfg.Agent.Concurrency, workRoot)
+	sched := scheduler.New(db, hub, exec, cfg.Agent.Concurrency, workRoot, cfg.Contribution.AutoPurge)
 	schedCtx, cancelSched := context.WithCancel(ctx)
 	defer cancelSched()
 	schedDone := make(chan struct{})
@@ -223,6 +239,39 @@ func Run(ctx context.Context, opts Options) error {
 		if err := sched.Start(schedCtx); err != nil {
 			fmt.Fprintf(opts.Out, "[error] scheduler stopped: %v\n", err)
 		}
+	}()
+
+	// Contribution service (M7): the core add-work submit endpoint and the intake
+	// poller share it. It reaches the scheduler (re-admit) and the event hub (SSE)
+	// through injected function seams so contrib imports neither. VerifyWork maps the
+	// metadata client's errors to contrib's local sentinels (a disabled service accepts
+	// the slug shape alone). The poller runs under schedCtx so it stops with the
+	// scheduler; it works tokenless (public reads).
+	contribSvc := contrib.NewService(contrib.ServiceDeps{
+		DB:      db,
+		Repo:    cfg.Contribution.Repo,
+		BaseURL: cfg.Contribution.APIBaseURL, // GitHub REST base (default api.github.com)
+		Tokens:  tokenSource,
+		Publish: func(u contrib.ContribUpdate) { _ = hub.PublishBook("contrib.update", u.BookID, u) },
+		Readmit: sched.Retry,
+		VerifyWork: func(ctx context.Context, workID string) error {
+			_, err := metaClient.CoverageForWork(ctx, workID)
+			switch {
+			case err == nil, errors.Is(err, metaops.ErrDisabled):
+				return nil
+			case errors.Is(err, metaops.ErrWorkNotFound):
+				return contrib.ErrWorkNotFound
+			default:
+				return err
+			}
+		},
+		CorePendingMsg: pipeline.CorePendingMsg,
+		Log:            toolLog,
+	})
+	pollerDone := make(chan struct{})
+	go func() {
+		defer close(pollerDone)
+		contribSvc.RunPoller(schedCtx, time.Duration(cfg.Contribution.PollMinutes)*time.Minute)
 	}()
 
 	apiHandler := api.New(api.Deps{
@@ -285,6 +334,25 @@ func Run(ctx context.Context, opts Options) error {
 			}
 			return raw, err
 		},
+		// Contribution (M7): the core-submit/set-work service plus the two pipeline
+		// loaders (core-proposal prefill + sidecars-zip export), each translating the
+		// pipeline's no-data sentinel into the api's so the handlers map them to 404.
+		Contrib: contribSvc,
+		CoreProposalLoader: func(workDir string) (json.RawMessage, error) {
+			raw, err := pipeline.CoreProposalJSON(workDir)
+			if errors.Is(err, pipeline.ErrNoCoreProposal) {
+				return nil, api.ErrNoCoreProposal
+			}
+			return raw, err
+		},
+		ExportArchive: func(b store.Book) ([]byte, string, error) {
+			slug := pipeline.ExportSlug(b)
+			data, err := pipeline.ExportArchive(b.WorkDir, slug)
+			if errors.Is(err, pipeline.ErrNoSidecars) {
+				return nil, "", api.ErrNoSidecars
+			}
+			return data, slug + "-sidecars.zip", err
+		},
 	}).Handler()
 
 	root := http.NewServeMux()
@@ -322,6 +390,7 @@ func Run(ctx context.Context, opts Options) error {
 	// sched.Start returns only after ctx is cancelled AND wg.Wait completes.
 	cancelSched()
 	<-schedDone
+	<-pollerDone
 	// Drain and stop the durable event persister (its queue may hold late events).
 	persister.Close()
 	return runErr

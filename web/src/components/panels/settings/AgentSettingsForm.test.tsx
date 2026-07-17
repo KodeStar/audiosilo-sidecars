@@ -23,6 +23,12 @@ function settingsWith(agent: AgentConfig): Settings {
     secrets: { anthropic_api_key: false, openai_api_key: false, github_pat: false },
     asr: { backend: '' },
     agent,
+    contribution: {
+      mode: 'issue',
+      repo: 'KodeStar/audiosilo-meta',
+      auto_purge: true,
+      poll_minutes: 10,
+    },
   };
 }
 

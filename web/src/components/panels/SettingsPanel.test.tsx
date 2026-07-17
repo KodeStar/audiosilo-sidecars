@@ -10,6 +10,12 @@ const settings: Settings = {
   secrets: { anthropic_api_key: false, openai_api_key: false, github_pat: false },
   asr: { backend: '' },
   agent: { backend: '', concurrency: 2, timeout_minutes: 60, claude_models: {}, openai_models: {} },
+  contribution: {
+    mode: 'issue',
+    repo: 'KodeStar/audiosilo-meta',
+    auto_purge: true,
+    poll_minutes: 10,
+  },
 };
 
 const defaultAgent: AgentInfo = { backend: 'claude', available: true, version: '1.0.0' };

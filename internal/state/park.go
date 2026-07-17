@@ -1,5 +1,7 @@
 package state
 
+import "slices"
+
 // ParkCode is a machine-readable reason a book was parked needs_attention,
 // carried beside the free-text error message so a client can render a per-class
 // affordance hint (retry now, install a tool, delete and re-enqueue, ...). Empty
@@ -24,4 +26,28 @@ const (
 	ParkASRUnavailable           ParkCode = "asr_unavailable"
 	ParkManifestChanged          ParkCode = "manifest_changed"
 	ParkFixLoopExhausted         ParkCode = "fix_loop_exhausted"
+
+	// ParkContribUnavailable: the contributing stage runs in issue/pr mode but no
+	// GitHub credential is available (no PAT in secrets, no `gh auth token`). The user
+	// adds a PAT in Settings or runs `gh auth login`, then Retry.
+	ParkContribUnavailable ParkCode = "contrib_unavailable"
+	// ParkCoreNeeded: the book's work does not exist upstream, so an add-work (core)
+	// proposal awaits completion/confirmation in the UI before the sidecars can attach.
+	ParkCoreNeeded ParkCode = "core_needed"
+	// ParkCorePending: a core proposal has been submitted; the book waits for the intake
+	// PR to merge, after which the poller resolves the real work slug and re-admits it.
+	ParkCorePending ParkCode = "core_pending"
 )
+
+// IsParkedWith reports whether a book carrying the given status/park code is parked
+// (needs_attention) with a park code among want. It centralizes the
+// "status == needs_attention && park code in {...}" test the api's park-gated handlers
+// and contrib's re-admit path both need, keeping them tied to the park-code invariant:
+// park_code is non-empty iff status is needs_attention (store-enforced), so a match on
+// want implies the needs_attention status this guard also checks.
+func IsParkedWith(status, code string, want ...ParkCode) bool {
+	if status != string(StatusNeedsAttention) {
+		return false
+	}
+	return slices.Contains(want, ParkCode(code))
+}

@@ -79,7 +79,7 @@ func newMetaEnv(t *testing.T, libraryRoots []string, metaURL string) *pipelineEn
 	cfg.Metadata.BaseURL = metaURL
 
 	hub := events.NewHub(64)
-	sched := scheduler.New(db, hub, scheduler.NewStubExecutor(0, 0), 2, t.TempDir())
+	sched := scheduler.New(db, hub, scheduler.NewStubExecutor(0, 0), 2, t.TempDir(), false)
 	meta := metaops.NewClient(metaURL)
 	scans := metaops.NewScanManager(context.Background(), meta, "", storeOverrides(db))
 

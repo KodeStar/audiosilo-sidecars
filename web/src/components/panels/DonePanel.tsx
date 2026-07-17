@@ -3,18 +3,27 @@ import type { ApiClient } from '@/lib/apiClient';
 import { ApiError } from '@/lib/apiClient';
 import type { BookView } from '@/api/types';
 import { filterDoneBooks } from '@/lib/doneBoard';
+import { useThrottledCallback } from '@/lib/throttleTrailing';
+import { useEventStream, type PipelineEventType } from '@/lib/useEventStream';
 import { DoneRow } from '../done/DoneRow';
 
 interface DonePanelProps {
   client: ApiClient;
+  apiBase: string;
+  token: string;
 }
 
-// DonePanel lists finished books (state === 'done'), newest first. It does NOT
-// subscribe to the SSE hub: the Done set changes rarely and only grows, so a full
-// reload on mount and after each action is enough. A book that finishes while this
-// tab is open is therefore missed until the tab is remounted (switch away and back)
-// - an acceptable trade for the simplicity of a stateless list.
-export function DonePanel({ client }: DonePanelProps) {
+// Coalesce a burst of contrib.update frames (a book contributes several dimensions
+// at once) into one refetch.
+const REFETCH_THROTTLE_MS = 1500;
+
+// DonePanel lists finished books (state === 'done'), newest first. It reloads on
+// mount, after each row action, and - via the SSE hub - on every contrib.update
+// frame (throttled) so the contribution chips stay live while the tab is open. A
+// book that newly *finishes* while the tab is open is still only picked up on a
+// remount (its state transition is a book.state frame the Running tab owns); the
+// contrib.update subscription keeps the already-listed done books' chips current.
+export function DonePanel({ client, apiBase, token }: DonePanelProps) {
   const [books, setBooks] = useState<BookView[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
@@ -34,8 +43,24 @@ export function DonePanel({ client }: DonePanelProps) {
     void load();
   }, [load]);
 
+  // Throttle the contrib.update-driven refetch: at most one reload per window.
+  const scheduleRefetch = useThrottledCallback(
+    useCallback(() => void load(), [load]),
+    REFETCH_THROTTLE_MS,
+  );
+
+  const onEvent = useCallback(
+    (type: PipelineEventType) => {
+      if (type === 'contrib.update') scheduleRefetch();
+    },
+    [scheduleRefetch],
+  );
+
+  useEventStream(apiBase, token, { onEvent });
+
   const getDetail = useCallback((id: number) => client.getBook(id), [client]);
   const getSidecars = useCallback((id: number) => client.getBookSidecars(id), [client]);
+  const getExport = useCallback((id: number) => client.exportSidecars(id), [client]);
 
   // runAction is the shared confirm -> busy -> clear-error -> call -> reload ->
   // catch -> finally lifecycle every row action follows. The caller supplies the
@@ -118,6 +143,7 @@ export function DonePanel({ client }: DonePanelProps) {
               onDelete={handleDelete}
               getDetail={getDetail}
               getSidecars={getSidecars}
+              getExport={getExport}
             />
           ))}
         </div>

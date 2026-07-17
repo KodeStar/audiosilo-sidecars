@@ -86,6 +86,10 @@ func withSidecarAgent(dataDir string, fake *fakeRunner) Config {
 		cfg.AgentModels.Claude[s] = "opus"
 	}
 	cfg.Fallback = scheduler.NewStubExecutor(0, 0)
+	// The contributing stage is real (M7); run it in LOCAL mode so a full-pipeline
+	// integration test reaches done without a GitHub credential or upstream match.
+	cfg.ContribMode = contribModeLocal
+	cfg.ExportRoot = filepath.Join(dataDir, "export")
 	return cfg
 }
 
@@ -528,7 +532,7 @@ func startSidecarBook(t *testing.T, fake *fakeRunner) (store.Book, *store.DB, fu
 	cfg := withSidecarAgent(dir, fake)
 	cfg.DB = db
 	exe := NewExecutor(cfg)
-	sched := scheduler.New(db, hub, exe, 2, workRoot)
+	sched := scheduler.New(db, hub, exe, 2, workRoot, false)
 
 	book, err := db.CreateBook(context.Background(), store.NewBook{
 		SourcePath: filepath.Join(dir, "b.m4b"), WorkDir: work, Title: "Book",

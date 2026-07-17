@@ -14,6 +14,9 @@ describe('parkHint', () => {
       'asr_unavailable',
       'manifest_changed',
       'fix_loop_exhausted',
+      'contrib_unavailable',
+      'core_needed',
+      'core_pending',
     ];
     for (const code of codes) {
       const hint = parkHint(code);

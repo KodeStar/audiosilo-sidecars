@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"sort"
 	"strings"
@@ -49,6 +50,11 @@ type Scheduler struct {
 	hub      *events.Hub
 	exec     Executor
 	agentCap int
+	// autoPurge reclaims a book's scratch automatically when it reaches done (and
+	// startup-GCs already-done books' scratch on reconcile). Set at construction from
+	// config.Contribution.AutoPurge (a New parameter, so it can never be silently
+	// left disabled).
+	autoPurge bool
 	// workRoot is the daemon's work directory root (<data>/work). Delete removes a
 	// book's scratch dir only when it lives inside this root - a guard so a
 	// doctored WorkDir can never make delete rm an arbitrary path. Empty disables
@@ -97,21 +103,24 @@ type inflightBook struct {
 
 // New constructs a scheduler. agentCap < 1 is clamped to 1. workRoot is the
 // daemon's <data>/work directory (Delete's on-disk cleanup is confined to it);
-// pass "" to disable that cleanup.
-func New(db *store.DB, hub *events.Hub, exec Executor, agentCap int, workRoot string) *Scheduler {
+// pass "" to disable that cleanup. autoPurge enables automatic scratch reclamation
+// (on a book reaching done, and startup-GC of already-done books) - a construction
+// parameter so the feature can never be silently left off.
+func New(db *store.DB, hub *events.Hub, exec Executor, agentCap int, workRoot string, autoPurge bool) *Scheduler {
 	if agentCap < 1 {
 		agentCap = 1
 	}
 	return &Scheduler{
-		db:       db,
-		hub:      hub,
-		exec:     exec,
-		agentCap: agentCap,
-		workRoot: workRoot,
-		wake:     make(chan struct{}, 1),
-		inflight: map[int64]*inflightBook{},
-		rates:    map[string]float64{},
-		bookETA:  map[int64]int64{},
+		db:        db,
+		hub:       hub,
+		exec:      exec,
+		agentCap:  agentCap,
+		autoPurge: autoPurge,
+		workRoot:  workRoot,
+		wake:      make(chan struct{}, 1),
+		inflight:  map[int64]*inflightBook{},
+		rates:     map[string]float64{},
+		bookETA:   map[int64]int64{},
 	}
 }
 
@@ -195,7 +204,51 @@ func (s *Scheduler) Reconcile(ctx context.Context) error {
 			return err
 		}
 	}
+	if s.autoPurge {
+		// Run the startup GC OFF the dispatch-gating path: purging a large done backlog
+		// serially inside Reconcile would stall the first dispatch pass. Track it on the
+		// WaitGroup so Stop drains it, and let it observe ctx cancellation.
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.startupGC(ctx, books)
+		}()
+	}
 	return nil
+}
+
+// startupGC reclaims the scratch of every already-done book that still accounts
+// scratch on disk (a daemon that crashed before auto-purge ran, or was upgraded into
+// auto-purge). It runs in a background goroutine started from Reconcile (off the
+// dispatch-gating path) and only touches TERMINAL books, which no worker ever runs, so
+// it needs no reservation; it observes ctx cancellation between books. Per-book
+// failures are logged and skipped; one summary line reports the count reclaimed.
+func (s *Scheduler) startupGC(ctx context.Context, books []store.Book) {
+	purged := 0
+	for _, b := range books {
+		if ctx.Err() != nil {
+			return
+		}
+		if !state.IsTerminal(state.State(b.State)) || b.ScratchBytes <= 0 {
+			continue
+		}
+		// Reserve the book for the reclaim (mirroring PurgeScratch): a terminal book is
+		// never dispatched, but a concurrent PurgeScratch/Delete could still touch it, so
+		// hold the slot to serialize with them and skip a book already reserved/busy.
+		if !s.reserve(b.ID) {
+			continue
+		}
+		err := s.purgeScratchInner(ctx, b)
+		s.unreserve(b.ID)
+		if err != nil {
+			slog.Warn("startup GC: purge failed", "book_id", b.ID, "err", err)
+			continue
+		}
+		purged++
+	}
+	if purged > 0 {
+		slog.Info("startup GC: reclaimed scratch for done books", "count", purged)
+	}
 }
 
 // reconcileBook rewinds one active book to the earliest completed stage whose
@@ -502,6 +555,29 @@ func (s *Scheduler) advance(ctx context.Context, b store.Book, stage state.State
 		return
 	}
 	s.publishState(b.ID, string(next), "", "", "")
+
+	// Auto-purge: a book that just reached done no longer needs its scratch. The worker
+	// already holds this book's in-flight slot, so reclaim WITHOUT reserving (that would
+	// see itself busy). A failure is logged, never fails the stage.
+	if next == state.Done && s.autoPurge {
+		s.autoPurgeDone(ctx, b.ID)
+	}
+}
+
+// autoPurgeDone reclaims a just-completed book's scratch. It re-reads the book (its
+// state is now done, so the shared purge helper skips the reconcile) and calls the
+// no-reserve purge body. A failure is logged, never propagated.
+func (s *Scheduler) autoPurgeDone(ctx context.Context, id int64) {
+	b, err := s.db.GetBook(ctx, id)
+	if err != nil {
+		return
+	}
+	if !purgeAllowed(b) {
+		return
+	}
+	if err := s.purgeScratchInner(ctx, b); err != nil {
+		slog.Warn("auto-purge after done failed", "book_id", id, "err", err)
+	}
 }
 
 // advanceWaypoints promotes queued/ready books (no lane, no executor) to their

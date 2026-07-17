@@ -178,6 +178,17 @@ func (s *Scheduler) PurgeScratch(ctx context.Context, id int64) error {
 	}
 	defer s.unreserve(id)
 
+	return s.purgeScratchInner(ctx, b)
+}
+
+// purgeScratchInner is the reclaim body shared by the manual PurgeScratch (which
+// reserves the id first) and the auto-purge/startup-GC callers (which already hold, or
+// do not need, the slot - so it must NOT reserve, or an in-flight worker calling it
+// would deadlock/see itself busy). It reclaims the split scratch, invalidates the
+// affected stage sentinels, re-accounts scratch_bytes, and reconciles a non-terminal
+// book so a later Retry re-runs the invalidated stage. b must carry the book's CURRENT
+// state (its terminal check gates the reconcile).
+func (s *Scheduler) purgeScratchInner(ctx context.Context, b store.Book) error {
 	if err := scratch.Purge(s.workRoot, b.WorkDir); err != nil {
 		return err
 	}
@@ -190,22 +201,25 @@ func (s *Scheduler) PurgeScratch(ctx context.Context, id int64) error {
 	// Re-account what remains (the durables) in one walk so scratch_bytes reflects
 	// the reclaim without a read-side walk. If the walk itself fails, the pre-purge
 	// value is now definitely wrong (we just deleted the chapters), so record 0
-	// rather than leave a stale over-count.
+	// rather than leave a stale over-count. The gauge write uses a non-cancellable
+	// context: the files are already deleted, so a shutdown-timed auto-purge/startup-GC
+	// must not skip the accounting and leave scratch_bytes overstating disk that is gone.
+	acctCtx := context.WithoutCancel(ctx)
 	if n, derr := scratch.DirSize(b.WorkDir); derr == nil {
-		_ = s.db.UpdateScratchBytes(ctx, id, n)
+		_ = s.db.UpdateScratchBytes(acctCtx, b.ID, n)
 	} else {
 		slog.Warn("purge: re-accounting the work dir failed; recording 0 scratch",
-			"book_id", id, "work_dir", b.WorkDir, "err", derr)
-		_ = s.db.UpdateScratchBytes(ctx, id, 0)
+			"book_id", b.ID, "work_dir", b.WorkDir, "err", derr)
+		_ = s.db.UpdateScratchBytes(acctCtx, b.ID, 0)
 	}
 	// Reconcile the purged book WITHOUT waiting for a restart: dropping the split
 	// sentinel above only re-runs the book if it is still AT splitting. A book past
 	// splitting (e.g. failed at asr) would otherwise retry into an empty chapters/
 	// and fail. reconcileBook rewinds it to the earliest completed stage whose
 	// sentinel we just invalidated, so a following Retry re-splits. Terminal (done)
-	// books are left untouched. It runs while the id is still reserved.
+	// books are left untouched.
 	if !state.IsTerminal(state.State(b.State)) {
-		succeeded, serr := s.db.SucceededStages(ctx, id)
+		succeeded, serr := s.db.SucceededStages(ctx, b.ID)
 		if serr != nil {
 			return serr
 		}

@@ -5,6 +5,7 @@
 // immediate feedback; a rejected save still surfaces the server's 400 message.
 
 import type { AgentConfig, AgentUpdate } from '@/api/types';
+import { parseIntOrNaN } from '@/lib/formNumbers';
 
 // The agent-lane stage names, in pipeline order. Mirrors the Go config's
 // defaultClaudeModels keys / state.IsAgent set - a model-map key outside this set
@@ -88,14 +89,6 @@ export function validateAgentForm(form: AgentFormState): string | null {
     return 'Timeout must be a whole number of at least 1 minute.';
   }
   return null;
-}
-
-// parseIntOrNaN parses a base-10 integer, returning NaN for blank/non-numeric
-// input (so validation rejects it) rather than parseInt's lenient prefix parse.
-function parseIntOrNaN(raw: string): number {
-  const s = raw.trim();
-  if (s === '' || !/^-?\d+$/.test(s)) return NaN;
-  return Number(s);
 }
 
 // The three selectable backends for the card's dropdown, label included.

@@ -78,12 +78,34 @@ export interface AgentConfig {
   openai_models: Record<string, string>;
 }
 
+// ContributionConfig mirrors the Go settings `contribution` view (M7): how the
+// contributing stage publishes a book's sidecars and how the intake poller runs.
+// mode is issue | pr | local; repo is owner/name; auto_purge reclaims scratch when
+// a book reaches done; poll_minutes is the open-contribution poll interval.
+export interface ContributionConfig {
+  mode: string;
+  repo: string;
+  auto_purge: boolean;
+  poll_minutes: number;
+}
+
 export interface Settings {
   listen: string;
   cors_origins: string[];
   secrets: SecretsPresence;
   asr: AsrConfig;
   agent: AgentConfig;
+  contribution: ContributionConfig;
+}
+
+// ContributionUpdate is the optional contribution envelope of PUT /settings. Each
+// field is left untouched when omitted. Like the agent section, changes are
+// persisted but only take effect on a daemon RESTART.
+export interface ContributionUpdate {
+  mode?: string;
+  repo?: string;
+  auto_purge?: boolean;
+  poll_minutes?: number;
 }
 
 // AgentUpdate is the optional agent envelope of PUT /settings. Scalar fields are
@@ -104,6 +126,7 @@ export interface SettingsUpdate {
   cors_origins?: string[];
   secrets?: Partial<Record<keyof SecretsPresence, string>>;
   agent?: AgentUpdate;
+  contribution?: ContributionUpdate;
 }
 
 export interface ChangePasswordBody {
@@ -254,6 +277,9 @@ export interface BookCandidate {
   source_path: string;
   title: string;
   authors: string[];
+  // Narrator credits from the scan, carried through so a later core proposal can
+  // prefill them (metaissue requires >= 1 narrator). Omitted when the scan found none.
+  narrators?: string[];
   series: string;
   series_pos: string;
   asin: string;
@@ -275,6 +301,46 @@ export interface BookProgress {
   total: number;
 }
 
+// The three sidecar dimensions a book can contribute. core is the metadata work
+// proposal (add-work), needed when the book's work does not yet exist upstream.
+export type ContributionKind = 'characters' | 'recaps' | 'core';
+
+// How a single contribution was published (the config mode at submit time).
+export type ContributionMode = 'issue' | 'pr' | 'local';
+
+// A single contribution's lifecycle status. submitted/pr_open are open; merged/
+// closed/local/already_covered are terminal. The aggregate summary on BookView
+// collapses the per-kind rows to one of submitted | pr_open | merged | closed |
+// local (see the daemon's aggregate helper).
+export type ContributionStatus =
+  'submitted' | 'pr_open' | 'merged' | 'closed' | 'local' | 'already_covered';
+
+// ContributionSummary is the aggregate chip shown on a done book (BookView). It is
+// ABSENT when the book has no contribution rows (a legacy/local book), which the UI
+// renders as the "Local only" chip. url is the best link (issue or PR), '' when none.
+export interface ContributionSummary {
+  status: string;
+  url: string;
+}
+
+// ContributionRow is one per-kind contribution record from the book detail view.
+// number is the issue number (issue mode) or PR number (pr mode); pr_number/pr_url
+// point at the intake bot's PR once it opens (issue mode). note carries any caveat
+// (e.g. "labels missing - a maintainer must apply data:characters").
+export interface ContributionRow {
+  kind: ContributionKind;
+  mode: ContributionMode;
+  repo: string;
+  number: number;
+  url: string;
+  pr_number: number;
+  pr_url: string;
+  status: string;
+  note: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface BookView {
   id: number;
   source_path: string;
@@ -284,6 +350,9 @@ export interface BookView {
   series_pos?: string;
   asin?: string;
   isbn?: string;
+  // The matched meta work slug, once resolved (manual match at enqueue, an
+  // asin/isbn/search match, or a core proposal that merged). Empty/absent until then.
+  work_id?: string;
   state: string;
   // lane is the served lane the current state runs in ('asr' | 'agent' |
   // 'mechanical' | '' for a waypoint). The daemon computes it (state.LaneOf), so
@@ -311,6 +380,9 @@ export interface BookView {
   // run only mechanical/ASR stages or none yet, or when the backend reports no cost).
   // Present on both the list and detail views.
   total_cost_usd: number;
+  // Aggregate contribution chip (M7): the one status shown on the Done board.
+  // ABSENT when the book has no contribution rows - the UI shows "Local only".
+  contribution?: ContributionSummary;
   created_at: string;
   updated_at: string;
 }
@@ -334,9 +406,50 @@ export interface StageRun {
   cost_usd: number;
 }
 
-// BookDetail is GET /books/{id}: a BookView plus the per-execution stage-run ledger.
+// BookDetail is GET /books/{id}: a BookView plus the per-execution stage-run ledger
+// and the per-kind contribution rows (M7; absent/empty until the book contributes).
 export interface BookDetail extends BookView {
   stage_runs: StageRun[];
+  contributions?: ContributionRow[];
+}
+
+// --- M7: core work proposal (add-work) ---
+
+// A region-scoped Audible ASIN pair carried on a core proposal.
+export interface RegionAsin {
+  region: string;
+  asin: string;
+}
+
+// CoreProposal is the add-work metadata proposal for a book whose work does not yet
+// exist on AudioSilo Meta. It mirrors the Go contrib.CoreProposal / the GET and POST
+// bodies of the contribute-core endpoints. The daemon requires title, >= 1 author,
+// language, >= 1 narrator, and non-empty sources (see validateCoreForm, which mirrors
+// it for immediate feedback). abridged is '' (unknown) | 'Unabridged' | 'Abridged'.
+export interface CoreProposal {
+  title: string;
+  subtitle: string;
+  authors: string[];
+  language: string;
+  first_published: string;
+  series_name: string;
+  series_position: string;
+  print_isbns: string[];
+  narrators: string[];
+  abridged: '' | 'Unabridged' | 'Abridged';
+  runtime_min: number;
+  release_date: string;
+  publisher: string;
+  asins: RegionAsin[];
+  audiobook_isbns: string[];
+  cover_url: string;
+  sources: string;
+}
+
+// SetBookWorkBody is the POST /books/{id}/work body: attach an existing meta work
+// slug to a book (the "the work already exists" escape hatch).
+export interface SetBookWorkBody {
+  work_id: string;
 }
 
 export interface BookCreateResult {
@@ -389,6 +502,16 @@ export interface QueueStatsEvent {
 export interface EtaUpdateEvent {
   queue_seconds: number | null;
   books: { book_id: number; eta_seconds: number }[];
+}
+
+// ContributionUpdateEvent is the `contrib.update` SSE frame (M7): published by the
+// contributing stage after a submission and by the intake poller on every status
+// change. The Done tab refetches on it so the contribution chip stays live.
+export interface ContributionUpdateEvent {
+  book_id: number;
+  kind: string;
+  status: string;
+  url: string;
 }
 
 // --- Done tab: sidecar preview (GET /books/{id}/sidecars) ---

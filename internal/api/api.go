@@ -14,6 +14,7 @@ import (
 
 	"github.com/kodestar/audiosilo-sidecars/internal/auth"
 	"github.com/kodestar/audiosilo-sidecars/internal/config"
+	"github.com/kodestar/audiosilo-sidecars/internal/contrib"
 	"github.com/kodestar/audiosilo-sidecars/internal/events"
 	"github.com/kodestar/audiosilo-sidecars/internal/metaops"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
@@ -67,6 +68,18 @@ type Deps struct {
 	// in internal/pipeline and is injected here so the api never imports pipeline
 	// (dependency direction). nil -> the /sidecars endpoint 503s.
 	SidecarLoader func(workDir string) (json.RawMessage, error)
+	// Contrib is the M7 contribution service (core add-work submit + manual set-work).
+	// The API is transport-only over it: it calls Contrib and maps typed errors to
+	// status codes. nil disables the contribute/core + work endpoints (503).
+	Contrib *contrib.Service
+	// CoreProposalLoader returns a book's prefilled contrib/core_proposal.json bytes,
+	// or ErrNoCoreProposal when absent (mapped to 404). Injected from pipeline (api
+	// must not import it); nil -> the contrib/core GET 503s.
+	CoreProposalLoader func(workDir string) (json.RawMessage, error)
+	// ExportArchive builds a book's sidecars zip plus its download filename, returning
+	// ErrNoSidecars when the book has no sidecars (mapped to 404). Injected from
+	// pipeline; nil -> the export endpoint 503s.
+	ExportArchive func(b store.Book) (data []byte, filename string, err error)
 }
 
 // ASRInfo is the resolved ASR backend capability shown on /system.
@@ -107,15 +120,25 @@ type API struct {
 	agentStatus   func() AgentInfo
 	sidecarLoader func(workDir string) (json.RawMessage, error)
 
+	contrib            *contrib.Service
+	coreProposalLoader func(workDir string) (json.RawMessage, error)
+	exportArchive      func(b store.Book) ([]byte, string, error)
+
 	mu   sync.Mutex // guards cfg
 	cfg  config.Config
 	save func(config.Config) error
 }
 
 // ErrNoSidecars signals that a book's work dir holds no sidecar files yet, so the
-// /sidecars endpoint answers 404. The pipeline loader returns its own sentinel; the
-// server-side adapter translates it to this one so the api never imports pipeline.
+// /sidecars (and /export) endpoints answer 404. The pipeline loader returns its own
+// sentinel; the server-side adapter translates it to this one so the api never
+// imports pipeline.
 var ErrNoSidecars = errors.New("no sidecars")
+
+// ErrNoCoreProposal signals that a book's work dir holds no prefilled core proposal,
+// so the contrib/core GET answers 404. The pipeline loader returns its own sentinel;
+// the server-side adapter translates it to this one.
+var ErrNoCoreProposal = errors.New("no core proposal")
 
 // New constructs an API from its dependencies.
 func New(d Deps) *API {
@@ -140,8 +163,13 @@ func New(d Deps) *API {
 		liveStatus:    d.LiveStatus,
 		agentStatus:   d.AgentStatus,
 		sidecarLoader: d.SidecarLoader,
-		cfg:           d.Config,
-		save:          save,
+
+		contrib:            d.Contrib,
+		coreProposalLoader: d.CoreProposalLoader,
+		exportArchive:      d.ExportArchive,
+
+		cfg:  d.Config,
+		save: save,
 	}
 	// The override-upsert workflow lives in metaops (transport-only handler over
 	// it). It needs the store + scan manager; requirePipeline gates the handler
@@ -197,6 +225,10 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/books/{id}", a.requireAuth(a.requirePipeline(a.handleGetBook)))
 	mux.HandleFunc("GET /api/v1/books/{id}/sidecars", a.requireAuth(a.requirePipeline(a.handleBookSidecars)))
 	mux.HandleFunc("GET /api/v1/books/{id}/events", a.requireAuth(a.requirePipeline(a.handleBookEvents)))
+	mux.HandleFunc("GET /api/v1/books/{id}/contrib/core", a.requireAuth(a.requirePipeline(a.handleGetCoreProposal)))
+	mux.HandleFunc("POST /api/v1/books/{id}/contribute/core", a.requireAuth(a.requirePipeline(a.handleContributeCore)))
+	mux.HandleFunc("POST /api/v1/books/{id}/work", a.requireAuth(a.requirePipeline(a.handleSetWork)))
+	mux.HandleFunc("GET /api/v1/books/{id}/export", a.requireAuth(a.requirePipeline(a.handleBookExport)))
 	mux.HandleFunc("POST /api/v1/books/{id}/pause", a.requireAuth(a.requirePipeline(a.bookAction((*scheduler.Scheduler).Pause))))
 	mux.HandleFunc("POST /api/v1/books/{id}/resume", a.requireAuth(a.requirePipeline(a.bookAction((*scheduler.Scheduler).Resume))))
 	mux.HandleFunc("POST /api/v1/books/{id}/retry", a.requireAuth(a.requirePipeline(a.bookAction((*scheduler.Scheduler).Retry))))

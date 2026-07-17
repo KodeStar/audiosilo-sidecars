@@ -24,6 +24,9 @@ interface BookRowProps {
   // Lazily fetches the book's durable event log (newest first) for the details
   // expansion. Kept as a prop for the same decoupling.
   getEvents: (id: number, limit?: number) => Promise<BookEventsResponse>;
+  // Opens the core (add-work) proposal modal for a book parked core_needed. The
+  // panel owns the modal; the row only surfaces the affordance.
+  onCompleteCoreProposal: (book: BookView) => void;
 }
 
 const ACTION_LABEL: Record<BookAction, string> = {
@@ -60,6 +63,7 @@ export const BookRow = memo(function BookRow({
   onAction,
   getDetail,
   getEvents,
+  onCompleteCoreProposal,
 }: BookRowProps) {
   const done = isDone(book);
   // A book only actively advertises live readouts (a ticking elapsed clock and an
@@ -169,6 +173,15 @@ export const BookRow = memo(function BookRow({
             <p className="mt-1 text-xs text-pink-500">{book.error}</p>
           )}
           {hint && <p className="mt-1 text-xs text-dim">{hint}</p>}
+          {book.park_code === 'core_needed' && (
+            <button
+              type="button"
+              onClick={() => onCompleteCoreProposal(book)}
+              className="mt-1.5 w-max rounded-md border border-pink-600/50 px-3 py-1 text-xs font-medium text-pink-400 transition-colors hover:border-pink-600 hover:text-hi"
+            >
+              Complete work proposal
+            </button>
+          )}
         </div>
 
         <div className="flex shrink-0 flex-wrap gap-2">

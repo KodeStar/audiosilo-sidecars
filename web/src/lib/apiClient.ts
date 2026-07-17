@@ -3,6 +3,8 @@ import type {
   BookDetail,
   BookEventsResponse,
   ChangePasswordBody,
+  ContributionRow,
+  CoreProposal,
   CreateBooksResponse,
   CreateScanResponse,
   ListBooksResponse,
@@ -17,6 +19,7 @@ import type {
   SidecarsView,
   SystemInfo,
 } from '@/api/types';
+import { parseContentDispositionFilename } from '@/lib/download';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -55,9 +58,22 @@ export class ApiClient {
     this.onAuthError = opts.onAuthError;
   }
 
-  private async request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
-    const { method = 'GET', body, auth = true } = opts;
-    const headers: Record<string, string> = {};
+  // authedFetch is the shared request core: it attaches the bearer token (on authed
+  // calls), fires onAuthError on a 401, and throws ApiError on any non-2xx. The two
+  // public shapes build on it - request() adds JSON body encoding + parsing,
+  // exportSidecars reads the raw Blob. Keeping the 401/error handling in one place
+  // means both paths get identical dead-token semantics.
+  private async authedFetch(
+    path: string,
+    init: {
+      method?: string;
+      headers?: Record<string, string>;
+      body?: string;
+      auth?: boolean;
+    } = {},
+  ): Promise<Response> {
+    const { method = 'GET', body, auth = true } = init;
+    const headers: Record<string, string> = { ...init.headers };
 
     if (auth) {
       const token = this.getToken();
@@ -66,16 +82,10 @@ export class ApiClient {
       }
     }
 
-    let payload: string | undefined;
-    if (body !== undefined) {
-      headers['Content-Type'] = 'application/json';
-      payload = JSON.stringify(body);
-    }
-
     const res = await fetch(`${this.baseUrl}${path}`, {
       method,
       headers,
-      body: payload,
+      body,
     });
 
     if (res.status === 401 && auth) {
@@ -86,6 +96,21 @@ export class ApiClient {
     if (!res.ok) {
       throw new ApiError(res.status, await extractError(res));
     }
+
+    return res;
+  }
+
+  private async request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
+    const { method = 'GET', body, auth = true } = opts;
+    const headers: Record<string, string> = {};
+
+    let payload: string | undefined;
+    if (body !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      payload = JSON.stringify(body);
+    }
+
+    const res = await this.authedFetch(path, { method, headers, body: payload, auth });
 
     if (res.status === 204) {
       return undefined as T;
@@ -203,6 +228,49 @@ export class ApiClient {
   getBookEvents(id: number, limit?: number): Promise<BookEventsResponse> {
     const query = limit === undefined ? '' : `?limit=${limit}`;
     return this.request<BookEventsResponse>(`/api/v1/books/${id}/events${query}`);
+  }
+
+  // --- M7: contribution ---
+
+  // getCoreProposal fetches the prefill for a book's core (add-work) proposal, as
+  // written by the contributing stage when it parked the book core_needed. 404 when
+  // the daemon has not written one - the caller starts from an empty form.
+  getCoreProposal(id: number): Promise<CoreProposal> {
+    return this.request<CoreProposal>(`/api/v1/books/${id}/contrib/core`);
+  }
+
+  // submitCoreProposal posts the completed add-work proposal. On success the book
+  // flips from core_needed to core_pending (the poller resolves the real slug once
+  // the metadata PR merges). 400 names the missing field; 409 = wrong park state.
+  submitCoreProposal(id: number, proposal: CoreProposal): Promise<ContributionRow> {
+    return this.request<ContributionRow>(`/api/v1/books/${id}/contribute/core`, {
+      method: 'POST',
+      body: proposal,
+    });
+  }
+
+  // setBookWork attaches an existing meta work slug to a book (the "the work
+  // already exists" escape hatch), re-admitting a book parked core_needed/pending.
+  // 400 on a bad/unknown slug.
+  setBookWork(id: number, workId: string): Promise<BookDetail> {
+    return this.request<BookDetail>(`/api/v1/books/${id}/work`, {
+      method: 'POST',
+      body: { work_id: workId },
+    });
+  }
+
+  // exportSidecars fetches the book's sidecars as a zip (repo layout) with an authed
+  // request - request() parses JSON, so this reads the raw Blob and the download
+  // filename from Content-Disposition itself. 404 (ApiError) when the book has no
+  // sidecars; the caller disables the Download control on it.
+  async exportSidecars(id: number): Promise<{ blob: Blob; filename: string }> {
+    const res = await this.authedFetch(`/api/v1/books/${id}/export`);
+    const blob = await res.blob();
+    const filename = parseContentDispositionFilename(
+      res.headers.get('Content-Disposition'),
+      `book-${id}-sidecars.zip`,
+    );
+    return { blob, filename };
   }
 
   pauseBook(id: number): Promise<void> {

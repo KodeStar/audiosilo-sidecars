@@ -107,7 +107,11 @@ internal/
             LIVE: backend (""|claude|codex), concurrency, claude_path/codex_path,
             timeout_minutes, and the per-stage claude/openai model maps (keys are agent
             stage names). Validate rejects an unknown backend, an unknown model-map key,
-            or timeout_minutes < 1; Default() seeds the claude map.
+            or timeout_minutes < 1; Default() seeds the claude map. M7 added
+            contribution.{mode [issue|pr|local], repo, auto_purge, poll_minutes,
+            api_base_url} (restart-to-apply; api_base_url exists for tests/GHE;
+            Validate rejects an unknown mode, a non-owner/name repo, poll_minutes < 1,
+            a non-http(s) api_base_url).
   toolfetch/ fetches the three external artifact families, all gated by
             tools.auto_download and confined to <data>/tools: ffmpeg/ffprobe static
             builds (explicit path -> next to the binary -> $PATH -> HTTPS download,
@@ -146,7 +150,9 @@ internal/
             transcript_is_complete) + writers (transcripts-json/ normalized,
             transcripts-text/ concatenated text). NEVER writes transcripts-raw/.
   scratch/  per-book DirSize gauge + Purge (removes chapters/, keeps durables),
-            confined to the work root. Manual purge only in M2; auto-purge is M7.
+            confined to the work root. Reclaimed manually (purge-scratch), by M7's
+            auto-purge when a book reaches done (contribution.auto_purge, default on),
+            and by the startup GC (async, reservation-guarded, done books only).
             A purge also invalidates the split sentinel (scheduler.purgeInvalidatedStages)
             so a later retry re-splits rather than skipping into an empty chapters/.
   qa/       M4: the mechanical transcript-QA degeneration sweep, a faithful Go port
@@ -201,7 +207,11 @@ internal/
             + validated outputs via the shared runAgent driver, usage recorded onto the
             open stage_run after every invocation), while retranscribing/correcting/
             validating are MECHANICAL (ASR+repair / spelling engine / canonicalize+ngram).
-            Only contributing remains a stub (M7). The load-bearing invariants live in
+            M7 made contributing real (contrib_stage.go: slug reconcile -> skip-if-
+            covered -> submit per contribution.mode, resume-idempotent via the
+            contributions rows; export.go composes the download zip + core-proposal
+            JSON injected into api) - EVERY stage is now real. The load-bearing
+            invariants live in
             the staging (synthesizing/auditing dirs hold NO transcripts, fact_pass chunk
             dirs hold no chapter beyond the chunk's end, spelling reference_files are
             restricted to the daemon-staged carryover). Constructed in server.go with the
@@ -211,6 +221,27 @@ internal/
             source of truth) rather than tracking per-chapter freshness. Missing tools or
             an unavailable agent backend PARK a book needs_attention (a human-fixable
             precondition Retry re-admits) instead of hard-failing.
+  contrib/  M7: everything GitHub-facing for contribution. TokenSource (secrets
+            GitHubPAT first, else `gh auth token` - the token NEVER enters argv/logs/
+            errors, leak-canary tested), a stdlib REST client (issues/gists/fork/
+            contents/refs/pulls; injectable base URL; typed RateLimitError; APIError
+            carries status + trimmed body only), composers that render the meta repo's
+            issue-form markdown VERBATIM to metaissue's parser contract (headings +
+            ticked checkbox items pinned from the form YAML; env-gated round-trip test
+            AUDIOSILO_META_DIR runs the real `go run ./cmd/metaissue` -> verdict ok;
+            >60000-byte bodies fall back to a secret gist link, which metaissue's
+            attachment allowlist accepts), CoreProposal (+Validate: title/authors/
+            language/narrators/sources required; an ASIN without a region is rejected,
+            never silently dropped), Service (SubmitCore: per-book mutex, reuses an
+            already-recorded core issue, persists the row BEFORE the park flip;
+            SetWork validates the slug upstream), and the poller (jittered
+            poll_minutes tick; issue rows advance submitted -> pr_open [FindIntakePR
+            on branch intake/issue-<n>] -> merged/closed; a merged core PR's files
+            name data/works/<shard>/<slug>/work.json -> SetBookWorkID [regardless of
+            park state] -> Readmit [only when parked core_pending]; targeted
+            ListBooksWithUnresolvedMergedCore query, no full scans; tokenless reads
+            work). Imports neither scheduler nor api - reaches them via injected
+            Readmit/Publish seams.
   auth/     single admin password (argon2id, generated + printed once on first run),
             opaque SHA-256-hashed session tokens, a per-IP login rate limiter; the
             Store interface is storage-agnostic (MemStore for tests; the SQLite
@@ -225,14 +256,23 @@ internal/
             per-stage cost rides on the book view. M6's 0005 added books.{chapters,
             park_code}; the park_code invariant (non-empty iff status is
             needs_attention) is enforced INSIDE SetBookState/SetBookStatus, not by
-            caller discipline. Plain tested CRUD; AuthStore adapts it to auth.Store.
+            caller discipline. M7's 0006 added the contributions table (one row per
+            (book_id, kind characters|recaps|core); UNIQUE index makes
+            UpsertContribution the crash-resume idempotency guard; status submitted|
+            pr_open|merged|closed|local|already_covered) + books.narrators (JSON
+            array like authors, feeds the core add-work proposal);
+            ContributionSummary folds rows into the one aggregate chip status.
+            Plain tested CRUD; AuthStore adapts it to auth.Store.
             Holds the SCHEDULING truth.
   state/    per-book pipeline state machine: table-driven states/lanes/transitions,
             CanStart/NextState guards, the audit fix-loop cap. Pure, no I/O. M6 added
-            ParkCode (the 10 typed park reasons), MainlineNext (the optimistic mainline
+            ParkCode (typed park reasons - M7 added contrib_unavailable, core_needed,
+            core_pending, so 13 now), MainlineNext (the optimistic mainline
             successor the ETA engine walks - the table's Next ordering is load-bearing:
-            conditional/loop target first, mainline continuation LAST), and
-            ParseSeriesPos (moved here from scheduler so eta/scheduler share one parser).
+            conditional/loop target first, mainline continuation LAST),
+            ParseSeriesPos (moved here from scheduler so eta/scheduler share one
+            parser), and IsParkedWith (the one status+park-code predicate api/contrib
+            share instead of hand-rolling it).
   eta/      the PURE ETA engine (no I/O, no clock): per-stage unit kinds
             (chapter/chunk/book) + seed rates from the historical extraction metrics,
             EWMA Observe (alpha 0.3), book ETA = rate x remaining units over the
@@ -253,7 +293,13 @@ internal/
             query/sim) and publishes deduped eta.update SSE (queue_seconds is null when
             idle); ETASnapshot/ETASeconds feed the books API. Progress reporting is
             display-only and resume-aware (a resumable stage's FIRST report is the
-            already-complete baseline; skipped units never tick).
+            already-complete baseline; skipped units never tick). M7: auto-purge -
+            a book advancing to done reclaims its scratch in-line (the worker still
+            holds the inflight slot; accounting runs under context.WithoutCancel so
+            a shutdown-timed purge can't leave a stale gauge) and an async,
+            WaitGroup-tracked startup GC purges done-with-scratch books after
+            Reconcile (per-book reservation so a concurrent Delete sees busy); both
+            gated by the autoPurge constructor param (from contribution.auto_purge).
   metaops/  meta.audiosilo.app client (coverage/lookup, capped 1h TTL caches,
             graceful degrade) + async folder-scan job manager over audiosilo-meta
             pkg/scan + the library_roots PathAllowed check. Coverage resolves
@@ -283,6 +329,13 @@ internal/
             loader func - api never imports pipeline; 404 via ErrNoSidecars when no
             sidecar files exist) and GET /books/{id}/events (per-book durable log,
             limit clamped 1..500); bookView carries eta_seconds/started_at/park_code.
+            M7 added GET /books/{id}/contrib/core (the prefilled proposal, 404
+            absent), POST /books/{id}/contribute/core (409 unless parked core_needed,
+            400 on Validate, 502 on rate limit), POST /books/{id}/work (manual slug
+            set + readmit), GET /books/{id}/export (zip via injected
+            pipeline.ExportArchive), bookView.contribution (aggregate chip) +
+            bookDetail.contributions (rows), and the contrib.update SSE event; all
+            new endpoints have allowed + denied auth tests.
   web/      go:embed of the SPA (build-tag selected) + SPA-fallback static serving
   server/   http.Server wiring, graceful shutdown, the startup banner
 web/          the SPA: Vite + React 19 + TS + Tailwind v4 (npm, Node 24); dist/ is embedded
@@ -290,7 +343,11 @@ web/          the SPA: Vite + React 19 + TS + Tailwind v4 (npm, Node 24); dist/ 
               pipelineState, recentRoots, useEventStream, scanStore; M6 added timeline,
               duration, bookLog, parkReasons, doneBoard, time, useLazyDetail, and
               expressive.ts - VENDORED from audiosilo-meta site/src/lib/expressive.ts
-              with its tests, keep it tracking upstream); src/components/
+              with its tests, keep it tracking upstream; M7 added coreProposal,
+              contributionSettings, formNumbers, throttleTrailing, download);
+              src/components/ui/ holds the shared Modal + Field primitives
+              (extracted in M7 - new modals/forms use them, don't re-inline the
+              chrome); src/components/
               {library,running,done}/ are the Library/Running/Done tab views; components
               stay thin over src/lib. The timeline's stage graph is a hand-mirror of the
               Go state table - a drift-guard test pins its stage set to the label maps. The Library tab's scan + selection state lives in
@@ -565,13 +622,53 @@ Milestones from the workspace plan; each is shippable.
   timeline/ETA/elapsed/log, agent-unavailable park with the typed hint, kill -9
   resume without re-transcribing, done-book cost table/preview/purge through the real
   API, SSE `eta.update` frames, idle null queue ETA).
-- **M7-M8 (planned):** contribution (intake issue / PR / keep-local, M7 - includes
-  resolving the workSlug placeholder to the real meta work slug), auto-purge /
-  startup-GC of scratch (M7), and packaging (GoReleaser + Docker matrix, M8). See the
-  plan for the full table.
+- **M7 (done):** **contribution**. The `contributing` stage is real: it reconciles
+  the sidecars' workSlug placeholder to the real meta work slug (books.work_id ->
+  asin/isbn lookup; NEVER a fuzzy auto-adopt - wrong-work attachment is a spoiler
+  hazard), rewrites the files' `work` field + appends the
+  {type:"community",ref:"audiosilo-sidecars"} provenance source + re-canonicalizes
+  in place, skips upstream-covered dimensions (already_covered rows), then submits
+  per contribution.mode: **issue** (default - prefilled add-characters/add-recaps
+  intake issues rendered to metaissue's exact form-markdown contract, secret-gist
+  fallback for >60k bodies, label verification with a maintainer-hint note when
+  GitHub drops labels for non-collaborators), **pr** (fork + branch
+  sidecars/<slug>-<id> + contents at data/works/<shard>/<slug>/ + one PR;
+  crash-resume reuses an existing branch/PR/file-sha instead of 422ing), or
+  **local** (export to <data>/export in repo layout + the Done tab's zip
+  download). Every submit is resume-idempotent via the contributions rows.
+  **Needs-core flow**: a work missing upstream parks core_needed with a prefilled
+  contrib/core_proposal.json (narrators/authors/title from the scan, language from
+  asr.json, runtime from manifest.json - omit-never-guess); the Running tab's
+  modal completes it -> POST contribute/core opens the add-work issue (per-book
+  mutex + row-reuse make it double-submit-proof) -> core_pending -> the poller
+  reads the merged intake PR's files for the REAL slug (deterministic, no
+  lookup-guessing), persists it, and re-admits; a lagging metaserve artifact
+  cannot oscillate the book (a merged core row makes the stage trust the recorded
+  slug on a 404). **Live status**: the poller advances rows submitted -> pr_open
+  (intake/issue-<n>) -> merged/closed and publishes contrib.update; the Done
+  tab's chip is live (Issue open/PR open/Merged/Closed/Local only + per-kind
+  links; pre-M7 done books show the legacy Local-only chip). Auto-purge on
+  reaching done + async reservation-guarded startup GC close the scratch loop.
+  GitHub credentials: secrets GitHubPAT else `gh auth token`, never argv/logs.
+  Companion meta-repo change (PR #43, merged): intake.yml runs on `labeled`
+  (outcome labels excluded) so a maintainer applying the routing label admits a
+  label-dropped API issue. Note: scratch_bytes measures the whole work dir, so a
+  purged done book keeps its durable footprint (sidecars/manifest/asr.json) and
+  the startup GC re-runs its idempotent purge each boot - harmless. Gate
+  verified: full Go + web gates green after /simplify (16 applied) and
+  /code-review high (9 verified bugs + 5 cleanups applied, incl. submitPR
+  crash-resume idempotency, SubmitCore double-submit safety, the core_pending
+  oscillation guard), plus a live smoke against a scripted local fake GitHub
+  (contribution.api_base_url) + live meta reads: 17/17 assertions - both intake
+  issues with exact form bodies, poller submitted -> pr_open -> merged with SSE
+  frames, crash-resume posting no duplicate issues, the full needs-core round
+  trip (park -> modal -> add-work issue -> merged-PR slug resolve -> readmit ->
+  done), local export + zip download, 401s on unauthed endpoints, auto-purge +
+  startup GC, and a headless-Chrome drive of chips/preview/modal/settings.
+- **M8 (planned):** packaging (GoReleaser + Docker matrix). See the plan for the
+  full table.
 
-Still **not built**: the `contributing` stage (M7) - the only pipeline stage still a
-stub, so a `ready` book advances straight to `done` without opening an intake issue/PR
-yet (the Done tab shows a "Local only" contribution chip until then). Auto-purge/
-startup-GC of scratch is M7 (manual purge only). All four tabs now report `ready` on
-`/system`. Keep this file honest as milestones land.
+Still **not built**: M8 packaging. The contributing stage submits sidecars but never
+retracts them - cancelling a core_pending book leaves its already-opened add-work
+issue for a maintainer to close. All four tabs report `ready` on `/system`. Keep
+this file honest as milestones land.

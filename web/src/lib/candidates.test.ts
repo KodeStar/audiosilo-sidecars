@@ -119,6 +119,20 @@ describe('toCandidate', () => {
     );
     expect('work_id' in unknown).toBe(false);
   });
+
+  it('carries narrators through when the scan found them, else omits the key', () => {
+    const withNarrators = toCandidate(
+      book({ path: '/n', narrators: ['Nora Narrator', 'Sam Speaker'] }),
+    );
+    expect(withNarrators.narrators).toEqual(['Nora Narrator', 'Sam Speaker']);
+
+    // No narrators -> the key is omitted (kept tidy, like an empty work_id).
+    const none = toCandidate(book({ path: '/nn' }));
+    expect('narrators' in none).toBe(false);
+
+    const empty = toCandidate(book({ path: '/ne', narrators: [] }));
+    expect('narrators' in empty).toBe(false);
+  });
 });
 
 describe('filterCandidates', () => {

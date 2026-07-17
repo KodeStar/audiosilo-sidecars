@@ -204,6 +204,127 @@ func TestAgentEnvOverrides(t *testing.T) {
 	}
 }
 
+func TestContributionDefaults(t *testing.T) {
+	cfg := Default()
+	if cfg.Contribution.Mode != DefaultContributionMode {
+		t.Errorf("mode = %q, want %q", cfg.Contribution.Mode, DefaultContributionMode)
+	}
+	if cfg.Contribution.Repo != DefaultContributionRepo {
+		t.Errorf("repo = %q, want %q", cfg.Contribution.Repo, DefaultContributionRepo)
+	}
+	if !cfg.Contribution.AutoPurge {
+		t.Error("auto_purge should default to true")
+	}
+	if cfg.Contribution.PollMinutes != DefaultContributionPollMinutes {
+		t.Errorf("poll_minutes = %d, want %d", cfg.Contribution.PollMinutes, DefaultContributionPollMinutes)
+	}
+	if cfg.Contribution.APIBaseURL != DefaultContributionAPIBaseURL {
+		t.Errorf("api_base_url = %q, want %q", cfg.Contribution.APIBaseURL, DefaultContributionAPIBaseURL)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Default() contribution invalid: %v", err)
+	}
+}
+
+func TestContributionValidation(t *testing.T) {
+	bad := map[string]func(*Config){
+		"bad mode":         func(c *Config) { c.Contribution.Mode = "email" },
+		"repo no slash":    func(c *Config) { c.Contribution.Repo = "audiosilo-meta" },
+		"repo empty owner": func(c *Config) { c.Contribution.Repo = "/audiosilo-meta" },
+		"repo empty name":  func(c *Config) { c.Contribution.Repo = "KodeStar/" },
+		"repo two slashes": func(c *Config) { c.Contribution.Repo = "a/b/c" },
+		"repo whitespace":  func(c *Config) { c.Contribution.Repo = "Kode Star/meta" },
+		"poll zero":        func(c *Config) { c.Contribution.PollMinutes = 0 },
+		"poll negative":    func(c *Config) { c.Contribution.PollMinutes = -3 },
+		"api base not url": func(c *Config) { c.Contribution.APIBaseURL = "not-a-url" },
+		"api base ftp":     func(c *Config) { c.Contribution.APIBaseURL = "ftp://api.example" },
+		"api base no host": func(c *Config) { c.Contribution.APIBaseURL = "https://" },
+	}
+	for name, mutate := range bad {
+		t.Run(name, func(t *testing.T) {
+			cfg := Default()
+			mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Errorf("Validate() = nil, want error for %s", name)
+			}
+		})
+	}
+	// Valid non-default: pr mode, a custom owner/name repo, poll interval 1, an
+	// enterprise-style api base URL.
+	good := Default()
+	good.Contribution.Mode = ContributionModePR
+	good.Contribution.Repo = "acme/meta"
+	good.Contribution.PollMinutes = 1
+	good.Contribution.APIBaseURL = "https://github.acme.com/api/v3"
+	if err := good.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil for valid contribution", err)
+	}
+}
+
+func TestContributionEnvOverridesAndRoundTrip(t *testing.T) {
+	// Round-trip through Save/Load, including an explicit auto_purge=false.
+	dir := t.TempDir()
+	in := Default()
+	in.Contribution.Mode = ContributionModePR
+	in.Contribution.Repo = "acme/meta"
+	in.Contribution.AutoPurge = false
+	in.Contribution.PollMinutes = 30
+	in.Contribution.APIBaseURL = "https://github.acme.com/api/v3"
+	if err := Save(dir, in); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	out, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if out.Contribution.Mode != ContributionModePR || out.Contribution.Repo != "acme/meta" ||
+		out.Contribution.AutoPurge || out.Contribution.PollMinutes != 30 ||
+		out.Contribution.APIBaseURL != "https://github.acme.com/api/v3" {
+		t.Errorf("round-trip = %+v", out.Contribution)
+	}
+
+	// Env overrides take precedence, including auto_purge=false and a new interval.
+	envDir := t.TempDir()
+	t.Setenv("AUDIOSILO_SIDECARS_CONTRIBUTION_MODE", "local")
+	t.Setenv("AUDIOSILO_SIDECARS_CONTRIBUTION_REPO", "org/repo")
+	t.Setenv("AUDIOSILO_SIDECARS_CONTRIBUTION_AUTO_PURGE", "false")
+	t.Setenv("AUDIOSILO_SIDECARS_CONTRIBUTION_POLL_MINUTES", "25")
+	t.Setenv("AUDIOSILO_SIDECARS_CONTRIBUTION_API_BASE_URL", "http://127.0.0.1:9999")
+	cfg, err := Load(envDir)
+	if err != nil {
+		t.Fatalf("Load env: %v", err)
+	}
+	if cfg.Contribution.Mode != "local" || cfg.Contribution.Repo != "org/repo" ||
+		cfg.Contribution.AutoPurge || cfg.Contribution.PollMinutes != 25 ||
+		cfg.Contribution.APIBaseURL != "http://127.0.0.1:9999" {
+		t.Errorf("env overrides = %+v", cfg.Contribution)
+	}
+}
+
+func TestContributionNormalizesEmpty(t *testing.T) {
+	// A config file with an empty contribution mode/repo and a zero interval normalizes
+	// to defaults on Load (a section predating M7 has none of these keys at all).
+	dir := t.TempDir()
+	in := Default()
+	in.Contribution.Mode = ""
+	in.Contribution.Repo = ""
+	in.Contribution.PollMinutes = 0
+	in.Contribution.APIBaseURL = ""
+	if err := Save(dir, in); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Contribution.Mode != DefaultContributionMode ||
+		cfg.Contribution.Repo != DefaultContributionRepo ||
+		cfg.Contribution.PollMinutes != DefaultContributionPollMinutes ||
+		cfg.Contribution.APIBaseURL != DefaultContributionAPIBaseURL {
+		t.Errorf("normalization = %+v", cfg.Contribution)
+	}
+}
+
 func TestValidateAcceptsGoodOrigins(t *testing.T) {
 	cfg := Default()
 	cfg.CORSOrigins = []string{"http://localhost:5173", "https://ui.example.com"}

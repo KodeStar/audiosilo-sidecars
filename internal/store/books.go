@@ -84,11 +84,14 @@ var ErrDuplicate = errors.New("duplicate source_path")
 // decoded from their JSON columns. State/Status are opaque strings here (the
 // store never interprets them); internal/state owns their meaning.
 type Book struct {
-	ID              int64
-	SourcePath      string
-	WorkDir         string
-	Title           string
-	Authors         []string
+	ID         int64
+	SourcePath string
+	WorkDir    string
+	Title      string
+	Authors    []string
+	// Narrators holds the scan's narrator credits (JSON-array column, like Authors);
+	// used by the contributing stage to compose a core add-work proposal.
+	Narrators       []string
 	Series          string
 	SeriesPos       string
 	ASIN            string
@@ -119,10 +122,12 @@ type Book struct {
 // NewBook is the input to CreateBook: the identity/metadata fields a caller
 // supplies. State defaults to "queued".
 type NewBook struct {
-	SourcePath      string
-	WorkDir         string
-	Title           string
-	Authors         []string
+	SourcePath string
+	WorkDir    string
+	Title      string
+	Authors    []string
+	// Narrators holds the scan's narrator credits (JSON-array column, like Authors).
+	Narrators       []string
 	Series          string
 	SeriesPos       string
 	ASIN            string
@@ -156,22 +161,34 @@ func marshalJSON(v any) (string, error) {
 	return string(b), nil
 }
 
+// marshalJSONDefault marshals v to a JSON string, substituting fallback when v
+// marshals empty (a nil slice/map), so a JSON-array/object column stores "[]"/"{}"
+// rather than "". Shared by CreateBook's authors/narrators/identity_sources encoding.
+func marshalJSONDefault(v any, fallback string) (string, error) {
+	s, err := marshalJSON(v)
+	if err != nil {
+		return "", err
+	}
+	if s == "" {
+		return fallback, nil
+	}
+	return s, nil
+}
+
 // CreateBook inserts a queued book. It returns ErrDuplicate if source_path is
 // already tracked, so the API can report a per-item conflict.
 func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
-	authors, err := marshalJSON(nb.Authors)
+	authors, err := marshalJSONDefault(nb.Authors, "[]")
 	if err != nil {
 		return Book{}, err
 	}
-	if authors == "" {
-		authors = "[]"
-	}
-	idsrc, err := marshalJSON(nb.IdentitySources)
+	narrators, err := marshalJSONDefault(nb.Narrators, "[]")
 	if err != nil {
 		return Book{}, err
 	}
-	if idsrc == "" {
-		idsrc = "{}"
+	idsrc, err := marshalJSONDefault(nb.IdentitySources, "{}")
+	if err != nil {
+		return Book{}, err
 	}
 	st := nb.State
 	if st == "" {
@@ -180,10 +197,10 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 	now := timestamp(nowFn())
 	res, err := db.sql.ExecContext(ctx,
 		`INSERT INTO books
-		 (source_path, work_dir, title, authors, series, series_pos, asin, isbn,
+		 (source_path, work_dir, title, authors, narrators, series, series_pos, asin, isbn,
 		  identity_sources, work_id, state, status, error, coverage, created_at, updated_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,'','',?,?,?)`,
-		nb.SourcePath, nb.WorkDir, nb.Title, authors, nb.Series, nb.SeriesPos,
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'','',?,?,?)`,
+		nb.SourcePath, nb.WorkDir, nb.Title, authors, narrators, nb.Series, nb.SeriesPos,
 		nb.ASIN, nb.ISBN, idsrc, nb.WorkID, st, string(nb.Coverage), now, now)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -203,6 +220,7 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 		WorkDir:         nb.WorkDir,
 		Title:           nb.Title,
 		Authors:         nb.Authors,
+		Narrators:       nb.Narrators,
 		Series:          nb.Series,
 		SeriesPos:       nb.SeriesPos,
 		ASIN:            nb.ASIN,
@@ -216,14 +234,14 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 	}, nil
 }
 
-const bookCols = `id, source_path, work_dir, title, authors, series, series_pos,
+const bookCols = `id, source_path, work_dir, title, authors, narrators, series, series_pos,
 	asin, isbn, identity_sources, work_id, state, status, error, coverage, scratch_bytes,
 	chapters, park_code, created_at, updated_at`
 
 func scanBook(sc interface{ Scan(...any) error }) (Book, error) {
 	var b Book
-	var authors, idsrc, coverage string
-	if err := sc.Scan(&b.ID, &b.SourcePath, &b.WorkDir, &b.Title, &authors,
+	var authors, narrators, idsrc, coverage string
+	if err := sc.Scan(&b.ID, &b.SourcePath, &b.WorkDir, &b.Title, &authors, &narrators,
 		&b.Series, &b.SeriesPos, &b.ASIN, &b.ISBN, &idsrc, &b.WorkID, &b.State, &b.Status,
 		&b.Error, &coverage, &b.ScratchBytes, &b.Chapters, &b.ParkCode,
 		&b.CreatedAt, &b.UpdatedAt); err != nil {
@@ -232,6 +250,11 @@ func scanBook(sc interface{ Scan(...any) error }) (Book, error) {
 	if authors != "" {
 		if err := json.Unmarshal([]byte(authors), &b.Authors); err != nil {
 			return Book{}, fmt.Errorf("decode authors: %w", err)
+		}
+	}
+	if narrators != "" {
+		if err := json.Unmarshal([]byte(narrators), &b.Narrators); err != nil {
+			return Book{}, fmt.Errorf("decode narrators: %w", err)
 		}
 	}
 	if idsrc != "" {

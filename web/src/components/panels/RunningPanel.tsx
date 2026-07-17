@@ -20,6 +20,7 @@ import {
 import { formatEta } from '@/lib/duration';
 import { useEventStream, type PipelineEventType } from '@/lib/useEventStream';
 import { BookRow } from '../running/BookRow';
+import { CoreProposalModal } from '../running/CoreProposalModal';
 
 // The elapsed clock is coarse (rows show whole minutes/seconds), so a 30s tick is
 // plenty and keeps the panel cheap.
@@ -39,6 +40,8 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
   const [scratchBytes, setScratchBytes] = useState<number | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  // The book whose core (add-work) proposal modal is open, or null when closed.
+  const [coreBook, setCoreBook] = useState<BookView | null>(null);
   // A single shared clock driving every row's elapsed display (no per-row timer).
   const [now, setNow] = useState(() => Date.now());
 
@@ -104,6 +107,9 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
     (id: number, limit?: number) => client.getBookEvents(id, limit),
     [client],
   );
+
+  // Stable across renders so the memoized BookRow only re-renders on its own props.
+  const handleCompleteCoreProposal = useCallback((book: BookView) => setCoreBook(book), []);
 
   // Stable across renders (deps: client, load) so the memoized BookRow only
   // re-renders when its own props change, not on every parent render.
@@ -213,9 +219,22 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
               onAction={handleAction}
               getDetail={getDetail}
               getEvents={getEvents}
+              onCompleteCoreProposal={handleCompleteCoreProposal}
             />
           ))}
         </div>
+      )}
+
+      {coreBook && (
+        <CoreProposalModal
+          book={coreBook}
+          client={client}
+          onClose={() => setCoreBook(null)}
+          onDone={() => {
+            setCoreBook(null);
+            void load();
+          }}
+        />
       )}
     </div>
   );

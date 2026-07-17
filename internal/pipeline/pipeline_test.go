@@ -155,7 +155,7 @@ func TestPipelineInspectSplitToDone(t *testing.T) {
 	cfg.DB, cfg.FFmpeg, cfg.FFprobe, cfg.ASR = db, ffmpeg, ffprobe, fakeASR(fake)
 	cfg.Fallback = scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond)
 	exe := NewExecutor(cfg)
-	sched := scheduler.New(db, hub, exe, 2, workRoot)
+	sched := scheduler.New(db, hub, exe, 2, workRoot, false)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -328,7 +328,7 @@ func TestPipelineParksUnnormalizableMarkers(t *testing.T) {
 			exe.redetectAgent = func(context.Context) (agent.Runner, agent.Availability) {
 				return nil, agent.Availability{Detail: "no agent CLI found"}
 			}
-			sched := scheduler.New(db, hub, exe, 2, workRoot)
+			sched := scheduler.New(db, hub, exe, 2, workRoot, false)
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan struct{})
 			go func() { defer close(done); _ = sched.Start(ctx) }()
@@ -672,7 +672,7 @@ func TestPipelineCancelMidASRResumes(t *testing.T) {
 		}
 	}
 	exe1 := NewExecutor(Config{DB: db, FFmpeg: ffmpeg, FFprobe: ffprobe, DataDir: dir, ASR: fakeASR(blocking), Fallback: scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond)})
-	sched1 := scheduler.New(db, hub, exe1, 2, workRoot)
+	sched1 := scheduler.New(db, hub, exe1, 2, workRoot, false)
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	done1 := make(chan struct{})
 	go func() { defer close(done1); _ = sched1.Start(ctx1) }()
@@ -706,7 +706,7 @@ func TestPipelineCancelMidASRResumes(t *testing.T) {
 	cfg2.DB, cfg2.FFmpeg, cfg2.FFprobe, cfg2.ASR = db, ffmpeg, ffprobe, fakeASR(resume)
 	cfg2.Fallback = scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond)
 	exe2 := NewExecutor(cfg2)
-	sched2 := scheduler.New(db, hub, exe2, 2, workRoot)
+	sched2 := scheduler.New(db, hub, exe2, 2, workRoot, false)
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	done2 := make(chan struct{})
 	go func() { defer close(done2); _ = sched2.Start(ctx2) }()

@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
@@ -141,5 +142,10 @@ func fullFakeConfig(dataDir string, fake *fakeRunner) Config {
 		Agent:      fake,
 		AgentAvail: agent.Availability{Backend: agent.IDClaude, Available: true, Version: "fake"},
 		Fallback:   scheduler.NewStubExecutor(0, 0),
+		// The contributing stage is real (M7). A full-pipeline-to-done test has no
+		// upstream work match or GitHub credential, so run it in LOCAL mode: it exports
+		// the sidecars under a placeholder slug and advances to done, no network.
+		ContribMode: contribModeLocal,
+		ExportRoot:  filepath.Join(dataDir, "export"),
 	}
 }

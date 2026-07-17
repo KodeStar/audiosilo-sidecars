@@ -20,7 +20,7 @@ func TestRecordRate(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	defer db.Close()
-	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, "")
+	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, "", false)
 	ctx := context.Background()
 
 	// A sample of 10 chapters in 100s -> observed 10 s/chapter, blended with the asr
@@ -71,7 +71,7 @@ func TestPublishETAsAndDedup(t *testing.T) {
 	}
 	defer db.Close()
 	hub := events.NewHub(64)
-	s := New(db, hub, NewStubExecutor(0, 0), 2, "")
+	s := New(db, hub, NewStubExecutor(0, 0), 2, "", false)
 	s.ctx = context.Background()
 
 	b, err := db.CreateBook(context.Background(), store.NewBook{
@@ -125,7 +125,7 @@ func TestETASecondsNoETAForParked(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	defer db.Close()
-	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, "")
+	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, "", false)
 	s.ctx = context.Background()
 
 	ctx := context.Background()
@@ -157,7 +157,7 @@ func TestPublishETAsIdleEmptySnapshot(t *testing.T) {
 	}
 	defer db.Close()
 	hub := events.NewHub(64)
-	s := New(db, hub, NewStubExecutor(0, 0), 2, "")
+	s := New(db, hub, NewStubExecutor(0, 0), 2, "", false)
 	s.ctx = context.Background()
 	ctx := context.Background()
 
@@ -216,7 +216,7 @@ func TestETASnapshot(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	defer db.Close()
-	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, "")
+	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, "", false)
 	s.ctx = context.Background()
 	ctx := context.Background()
 

@@ -161,12 +161,20 @@ type agentView struct {
 	OpenAIModels   map[string]string `json:"openai_models"`
 }
 
+type contributionView struct {
+	Mode        string `json:"mode"`
+	Repo        string `json:"repo"`
+	AutoPurge   bool   `json:"auto_purge"`
+	PollMinutes int    `json:"poll_minutes"`
+}
+
 type settingsResponse struct {
-	Listen      string          `json:"listen"`
-	CORSOrigins []string        `json:"cors_origins"`
-	Secrets     map[string]bool `json:"secrets"`
-	ASR         asrView         `json:"asr"`
-	Agent       agentView       `json:"agent"`
+	Listen       string           `json:"listen"`
+	CORSOrigins  []string         `json:"cors_origins"`
+	Secrets      map[string]bool  `json:"secrets"`
+	ASR          asrView          `json:"asr"`
+	Agent        agentView        `json:"agent"`
+	Contribution contributionView `json:"contribution"`
 }
 
 // settingsView composes the read model. Secrets are presence booleans ONLY - the
@@ -197,6 +205,12 @@ func (a *API) settingsView() (settingsResponse, error) {
 			ClaudeModels:   copyStringMap(cfg.Agent.Claude),
 			OpenAIModels:   copyStringMap(cfg.Agent.OpenAI),
 		},
+		Contribution: contributionView{
+			Mode:        cfg.Contribution.Mode,
+			Repo:        cfg.Contribution.Repo,
+			AutoPurge:   cfg.Contribution.AutoPurge,
+			PollMinutes: cfg.Contribution.PollMinutes,
+		},
 	}, nil
 }
 
@@ -225,9 +239,10 @@ func (a *API) handleGetSettings(w http.ResponseWriter, _ *http.Request) {
 // effect on a daemon RESTART (the runner is resolved once at startup) - nothing
 // under Agent is live. The response body is the fresh GET view.
 type settingsUpdate struct {
-	CORSOrigins *[]string         `json:"cors_origins"`
-	Secrets     map[string]string `json:"secrets"`
-	Agent       *agentUpdate      `json:"agent"`
+	CORSOrigins  *[]string           `json:"cors_origins"`
+	Secrets      map[string]string   `json:"secrets"`
+	Agent        *agentUpdate        `json:"agent"`
+	Contribution *contributionUpdate `json:"contribution"`
 }
 
 // agentUpdate carries the optional agent-config mutations. Scalar fields are
@@ -240,6 +255,33 @@ type agentUpdate struct {
 	TimeoutMinutes *int              `json:"timeout_minutes"`
 	Claude         map[string]string `json:"claude_models"`
 	OpenAI         map[string]string `json:"openai_models"`
+}
+
+// contributionUpdate carries the optional contribution-config mutations. Each field
+// is a pointer (nil = leave unchanged). config.Validate rejects a bad mode, a
+// malformed repo, or a sub-1 poll interval. Like the agent config, changes persist to
+// config.yaml but take effect only on a daemon RESTART.
+type contributionUpdate struct {
+	Mode        *string `json:"mode"`
+	Repo        *string `json:"repo"`
+	AutoPurge   *bool   `json:"auto_purge"`
+	PollMinutes *int    `json:"poll_minutes"`
+}
+
+// applyContributionUpdate overlays u onto cfg in place.
+func applyContributionUpdate(cfg *config.ContributionConfig, u *contributionUpdate) {
+	if u.Mode != nil {
+		cfg.Mode = *u.Mode
+	}
+	if u.Repo != nil {
+		cfg.Repo = *u.Repo
+	}
+	if u.AutoPurge != nil {
+		cfg.AutoPurge = *u.AutoPurge
+	}
+	if u.PollMinutes != nil {
+		cfg.PollMinutes = *u.PollMinutes
+	}
 }
 
 // applyAgentUpdate overlays u onto cfg in place.
@@ -270,7 +312,7 @@ func (a *API) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 	// Apply config-backed fields (cors_origins + agent) onto one copy, validate the
 	// whole thing, then persist. Agent maps replace wholesale when present; a nil map
 	// in the update leaves the existing map untouched.
-	if req.CORSOrigins != nil || req.Agent != nil {
+	if req.CORSOrigins != nil || req.Agent != nil || req.Contribution != nil {
 		next := a.snapshot()
 		if req.CORSOrigins != nil {
 			origins := *req.CORSOrigins
@@ -281,6 +323,9 @@ func (a *API) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.Agent != nil {
 			applyAgentUpdate(&next.Agent, req.Agent)
+		}
+		if req.Contribution != nil {
+			applyContributionUpdate(&next.Contribution, req.Contribution)
 		}
 		if err := next.Validate(); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())

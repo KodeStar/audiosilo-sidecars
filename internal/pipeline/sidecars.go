@@ -276,11 +276,15 @@ func cell(s string) string {
 	return strings.ReplaceAll(s, "|", `\|`)
 }
 
-// workSlug is the sidecars' work slug: the book's matched work id when known
-// (already a slug), else a kebab-case slug of the title. validating tolerates a
-// placeholder slug; the contribution stage (M7) reconciles it against the real work.
+// workSlug is the single sidecars work-slug derivation shared by synthesis, the
+// contributing stage, and the local export (ExportSlug forwards to it): the book's
+// matched work id when it is a valid meta slug, else a kebab-case slug of the title,
+// else "book". Applying model.ValidSlug to the stored WorkID means an INVALID id falls
+// back to the title (the tightened, correct semantics) rather than shipping a
+// non-slug work. validating tolerates a placeholder slug; the contribution stage (M7)
+// reconciles it against the real work.
 func workSlug(book store.Book) string {
-	if s := strings.TrimSpace(book.WorkID); s != "" {
+	if s := strings.TrimSpace(book.WorkID); model.ValidSlug(s) {
 		return s
 	}
 	if s := slugify(book.Title); s != "" {

@@ -57,7 +57,7 @@ func TestPipelineSpellingToSynthesisFlow(t *testing.T) {
 		Fallback:   scheduler.NewStubExecutor(time.Millisecond, 2*time.Millisecond),
 	}
 	exe := NewExecutor(cfg)
-	sched := scheduler.New(db, hub, exe, 2, workRoot)
+	sched := scheduler.New(db, hub, exe, 2, workRoot, false)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

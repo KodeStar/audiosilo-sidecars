@@ -29,7 +29,7 @@ func seedChapters(t *testing.T, workDir string) string {
 func TestPurgeScratchAllowedStates(t *testing.T) {
 	h := newHarness(t)
 	db := h.openDB(t)
-	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, h.workRoot)
+	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, h.workRoot, false)
 	ctx := context.Background()
 
 	// A done book: purge removes chapters/ and re-accounts scratch_bytes to what
@@ -74,7 +74,7 @@ func TestPurgeScratchAllowedStates(t *testing.T) {
 func TestPurgeScratchRefusesRunning(t *testing.T) {
 	h := newHarness(t)
 	db := h.openDB(t)
-	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, h.workRoot)
+	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, h.workRoot, false)
 	ctx := context.Background()
 
 	// A running book (status none, non-terminal) must not be purgeable.
@@ -102,7 +102,7 @@ func TestPurgeScratchRefusesRunning(t *testing.T) {
 func TestPurgeReservationBusy(t *testing.T) {
 	h := newHarness(t)
 	db := h.openDB(t)
-	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, h.workRoot)
+	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, h.workRoot, false)
 	ctx := context.Background()
 
 	p := h.addBook(t, db, "reserved", "", "")
@@ -165,7 +165,7 @@ func TestReservationBlocksDispatchUntilReleased(t *testing.T) {
 	}
 
 	exec := &signalExecutor{signalStage: state.Splitting, started: make(chan struct{})}
-	s := New(db, h.hub, exec, 2, h.workRoot)
+	s := New(db, h.hub, exec, 2, h.workRoot, false)
 
 	// Reserve BEFORE the loop runs (mirrors PurgeScratch holding the slot), so the
 	// first dispatch pass cannot start the book even once we resume it.
@@ -254,7 +254,7 @@ func TestPurgeInvalidatesSplitSentinel(t *testing.T) {
 	}
 
 	exec := &splitReExecExecutor{stub: NewStubExecutor(time.Millisecond, 2*time.Millisecond)}
-	s := New(db, h.hub, exec, 2, h.workRoot)
+	s := New(db, h.hub, exec, 2, h.workRoot, false)
 
 	// Purge drops chapters/ AND the split sentinel.
 	if err := s.PurgeScratch(ctx, b.ID); err != nil {
@@ -313,7 +313,7 @@ func recordSuccess(t *testing.T, db *store.DB, bookID int64, stage state.State) 
 func TestPurgeThenRetryReSplitsWithoutRestart(t *testing.T) {
 	h := newHarness(t)
 	db := h.openDB(t)
-	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, h.workRoot)
+	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, h.workRoot, false)
 	ctx := context.Background()
 	b := h.addBook(t, db, "failed-at-asr", "", "")
 
@@ -363,7 +363,7 @@ func TestPurgeThenRetryReSplitsWithoutRestart(t *testing.T) {
 
 	// Drive to completion to prove no restart is needed: Retry -> Start re-splits.
 	exec := &splitReExecExecutor{stub: NewStubExecutor(time.Millisecond, 2*time.Millisecond)}
-	rs := New(db, h.hub, exec, 2, h.workRoot)
+	rs := New(db, h.hub, exec, 2, h.workRoot, false)
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() { _ = rs.Start(runCtx); close(done) }()
@@ -393,7 +393,7 @@ func TestPurgeThenRetryReSplitsWithoutRestart(t *testing.T) {
 func TestPurgeDoneBookNotReconciled(t *testing.T) {
 	h := newHarness(t)
 	db := h.openDB(t)
-	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, h.workRoot)
+	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, h.workRoot, false)
 	ctx := context.Background()
 	b := h.addBook(t, db, "done-book", "", "")
 
