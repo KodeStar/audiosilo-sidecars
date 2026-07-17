@@ -10,6 +10,7 @@ import {
   toCandidate,
 } from '@/lib/candidates';
 import { scanStore, useScanStore } from '@/lib/scanStore';
+import { runningScanDetail } from '@/lib/scanStatus';
 import { addRecentRoot, loadRecentRoots } from '@/lib/recentRoots';
 import { CandidateRow } from '../library/CandidateRow';
 import { MatchModal } from '../library/MatchModal';
@@ -361,23 +362,7 @@ function ScanProgressLine({ job }: { job: ScanJob }) {
   }
 
   if (job.status === 'running') {
-    const p = job.progress;
-    let detail: string;
-    if (p.phase === 'coverage') {
-      detail =
-        p.coverage_total > 0
-          ? `Checking coverage ${p.coverage_done}/${p.coverage_total}`
-          : 'Checking coverage';
-    } else {
-      const folders =
-        p.groups_total > 0
-          ? `Scanning folders ${p.groups_done}/${p.groups_total}`
-          : 'Scanning folders';
-      const found =
-        p.books_found > 0 ? ` - ${p.books_found} book${p.books_found === 1 ? '' : 's'} found` : '';
-      detail = folders + found;
-    }
-    return <p className="text-sm text-dim">{detail}...</p>;
+    return <p className="text-sm text-dim">{runningScanDetail(job.progress)}...</p>;
   }
 
   const count = job.books.length;

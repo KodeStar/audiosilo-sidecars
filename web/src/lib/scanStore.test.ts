@@ -35,6 +35,8 @@ function job(partial: Partial<ScanJob>): ScanJob {
     status: partial.status ?? 'running',
     progress: partial.progress ?? {
       phase: 'scanning',
+      walk_dirs: 0,
+      walk_groups: 0,
       groups_done: 0,
       groups_total: 0,
       books_found: 0,

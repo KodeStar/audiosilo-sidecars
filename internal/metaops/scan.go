@@ -91,12 +91,17 @@ type ScannedBook struct {
 // coverage_done/coverage_total; books_found grows as books stream in. The phase
 // is display-only - the counters are the authoritative story.
 type ScanProgress struct {
-	Phase         string `json:"phase"` // "scanning" | "coverage" | "done"
-	GroupsDone    int    `json:"groups_done"`
-	GroupsTotal   int    `json:"groups_total"`
-	BooksFound    int    `json:"books_found"`
-	CoverageDone  int    `json:"coverage_done"`
-	CoverageTotal int    `json:"coverage_total"`
+	Phase string `json:"phase"` // "scanning" | "coverage" | "done"
+	// WalkDirs/WalkGroups report directory-walk progress WHILE the tree is being
+	// enumerated (before groups_total is known); the UI shows them during the
+	// scanning phase until groups_total > 0.
+	WalkDirs      int `json:"walk_dirs"`
+	WalkGroups    int `json:"walk_groups"`
+	GroupsDone    int `json:"groups_done"`
+	GroupsTotal   int `json:"groups_total"`
+	BooksFound    int `json:"books_found"`
+	CoverageDone  int `json:"coverage_done"`
+	CoverageTotal int `json:"coverage_total"`
 }
 
 // ScanJob is an async folder-scan job snapshot (safe to serialize). Books is the
@@ -170,6 +175,8 @@ type scanJob struct {
 	startedAt time.Time
 	phase     string
 
+	walkDirs    int
+	walkGroups  int
 	groupsDone  int
 	groupsTotal int
 
@@ -354,6 +361,13 @@ func (m *ScanManager) run(id, path string) {
 
 	res, stats, err := m.scan(path, metascan.Options{
 		FFprobePath: m.ffprobePath,
+		OnWalk: func(dirsScanned, groupsFound int) {
+			m.mu.Lock()
+			if job, ok := m.jobs[id]; ok {
+				job.walkDirs, job.walkGroups = dirsScanned, groupsFound
+			}
+			m.mu.Unlock()
+		},
 		OnProgress: func(done, total int) {
 			m.mu.Lock()
 			if job, ok := m.jobs[id]; ok {
@@ -538,6 +552,8 @@ func (m *ScanManager) progressLocked(job *scanJob) ScanProgress {
 	}
 	return ScanProgress{
 		Phase:         job.phase,
+		WalkDirs:      job.walkDirs,
+		WalkGroups:    job.walkGroups,
 		GroupsDone:    job.groupsDone,
 		GroupsTotal:   job.groupsTotal,
 		BooksFound:    len(job.books),

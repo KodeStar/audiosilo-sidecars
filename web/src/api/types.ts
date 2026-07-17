@@ -145,6 +145,10 @@ export type MatchedBy = 'asin' | 'isbn' | 'search' | 'manual';
 
 export interface ScanProgress {
   phase: string; // "scanning" | "coverage" | "done"
+  // Directory-walk progress, reported while the tree is enumerated (before
+  // groups_total is known). Shown during the scanning phase until groups_total > 0.
+  walk_dirs: number;
+  walk_groups: number;
   groups_done: number;
   groups_total: number;
   books_found: number;

@@ -90,6 +90,10 @@ func TestScanManagerFindsBooksWithDisabledCoverage(t *testing.T) {
 // without a real filesystem walk.
 func fakeScan(books []metascan.Book, stats metascan.Stats) scanFunc {
 	return func(root string, opts metascan.Options) (*metascan.Result, metascan.Stats, error) {
+		if opts.OnWalk != nil {
+			// The walk phase reports dirs/groups BEFORE OnProgress/OnBook fire.
+			opts.OnWalk(len(books)*2, len(books))
+		}
 		if opts.OnProgress != nil {
 			opts.OnProgress(0, len(books))
 		}
@@ -141,6 +145,49 @@ func TestScanManagerStreamsAndResolvesCoverage(t *testing.T) {
 	}
 	if u := byPath["/lib/unknown"]; u.Coverage.Known {
 		t.Fatalf("unknown book should not be known: %+v", u.Coverage)
+	}
+}
+
+// TestScanManagerReportsWalkProgress proves the OnWalk callback updates the job's
+// walk counters and they surface on the progress snapshot WHILE the scan is still
+// running (before groups_total is known). The scan func blocks after reporting the
+// walk so the assertion observes the running snapshot deterministically.
+func TestScanManagerReportsWalkProgress(t *testing.T) {
+	walked := make(chan struct{})
+	proceed := make(chan struct{})
+	m := NewScanManager(context.Background(), NewClient(""), "", nil)
+	m.scan = func(root string, opts metascan.Options) (*metascan.Result, metascan.Stats, error) {
+		if opts.OnWalk != nil {
+			opts.OnWalk(7, 3)
+		}
+		close(walked)
+		<-proceed
+		return &metascan.Result{Root: root}, metascan.Stats{}, nil
+	}
+
+	id, err := m.Start(t.TempDir())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	<-walked
+
+	job, ok := m.Get(id)
+	if !ok {
+		t.Fatal("job vanished")
+	}
+	if job.Status != ScanRunning {
+		t.Fatalf("status = %q, want running", job.Status)
+	}
+	if job.Progress.WalkDirs != 7 || job.Progress.WalkGroups != 3 {
+		t.Fatalf("walk counters = %+v, want dirs=7 groups=3", job.Progress)
+	}
+	if job.Progress.GroupsTotal != 0 {
+		t.Fatalf("groups_total = %d, want 0 (walk not yet done)", job.Progress.GroupsTotal)
+	}
+
+	close(proceed)
+	if done := waitDone(t, m, id); done.Status != ScanDone {
+		t.Fatalf("final status = %q (%q)", done.Status, done.Error)
 	}
 }
 
