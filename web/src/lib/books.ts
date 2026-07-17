@@ -3,6 +3,7 @@
 // unit-tested; the panel holds the list in state and applies these on each event.
 
 import type { BookStateEvent, BookView, EtaUpdateEvent, StageProgressEvent } from '@/api/types';
+import { MAINLINE, OFF_MAINLINE_AFTER } from '@/lib/timeline';
 
 // applyBookState patches the matching book's state + lane + status + error +
 // park_code. An event for a book not in the list is ignored (a newly created
@@ -135,14 +136,63 @@ export function compareByTimestampDesc(aTs: string, bTs: string, aId: number, bI
   return bId - aId;
 }
 
-// sortBooks orders the list newest-created first, keeping done books last so the
-// active work stays at the top of the Running tab.
+// bucketRank groups a book for the Running list's top-to-bottom order (lower sorts
+// higher): the active/current book(s) first, then the ready queue, then paused,
+// parked (needs_attention), failed, and done last. isDone is checked first so a
+// finished book (status '', empty lane) never falls into the queued bucket.
+function bucketRank(book: BookView): number {
+  if (isDone(book)) return 5;
+  switch (book.status) {
+    case 'paused':
+      return 2;
+    case 'needs_attention':
+      return 3;
+    case 'failed':
+      return 4;
+    default:
+      // status === '' : on a worker now (non-empty lane) = active, else queued/ready.
+      return book.lane ? 0 : 1;
+  }
+}
+
+// mainlineIndex maps a book's pipeline state to its position along the optimistic
+// MAINLINE (higher = further along), so the active bucket can put the
+// furthest-along ("current") book at the very top. An off-mainline state
+// (markers_normalizing, qa_adjudicating, retranscribing, fixing) resolves to the
+// mainline stage it forks from; an unknown state sorts as not-started (-1). Reuses
+// the timeline module's stage tables (the hand-mirror of the Go state table) so
+// there is a single ordered stage list.
+function mainlineIndex(state: string): number {
+  const i = MAINLINE.indexOf(state);
+  if (i >= 0) return i;
+  const anchor = OFF_MAINLINE_AFTER[state];
+  return anchor ? MAINLINE.indexOf(anchor) : -1;
+}
+
+// sortBooks orders the Running list so the active/current book is on top, then the
+// queue (FIFO: the next-to-run right under it), then paused, parked, and failed
+// books, with done books last. Within the active bucket the furthest-along book
+// sorts first (tie-broken by newest start, then id); the other non-queue buckets
+// keep a stable newest-change-first order. Total and deterministic.
 export function sortBooks(books: BookView[]): BookView[] {
   return [...books].sort((a, b) => {
-    const ad = isDone(a) ? 1 : 0;
-    const bd = isDone(b) ? 1 : 0;
-    if (ad !== bd) return ad - bd;
-    // Newest first within each group.
-    return compareByTimestampDesc(a.created_at, b.created_at, a.id, b.id);
+    const ra = bucketRank(a);
+    const rb = bucketRank(b);
+    if (ra !== rb) return ra - rb;
+    if (ra === 0) {
+      // Active: furthest along the pipeline first, then newest start, then id.
+      const ia = mainlineIndex(a.state);
+      const ib = mainlineIndex(b.state);
+      if (ia !== ib) return ib - ia;
+      return compareByTimestampDesc(a.started_at ?? '', b.started_at ?? '', a.id, b.id);
+    }
+    if (ra === 1) {
+      // Queued: FIFO - oldest created first, so the next-to-run sits at the top of
+      // the group right under the active book. Ascending id is the stable tiebreak.
+      if (a.created_at !== b.created_at) return a.created_at < b.created_at ? -1 : 1;
+      return a.id - b.id;
+    }
+    // Paused / parked / failed / done: newest real change first, id as the tiebreak.
+    return compareByTimestampDesc(a.updated_at, b.updated_at, a.id, b.id);
   });
 }

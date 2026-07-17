@@ -652,6 +652,26 @@ func TestChaptersAndParkCodeColumns(t *testing.T) {
 		t.Errorf("SetBookChapters(missing) = %v, want ErrNotFound", err)
 	}
 
+	// SetBookDuration records the seconds and, like SetBookChapters, does NOT bump
+	// updated_at (a pure gauge). A fresh book reads 0.
+	if got.DurationSec != 0 {
+		t.Errorf("new book duration_sec = %v, want 0", got.DurationSec)
+	}
+	beforeDur, _ := db.GetBook(ctx, b.ID)
+	if err := db.SetBookDuration(ctx, b.ID, 3661.5); err != nil {
+		t.Fatalf("SetBookDuration: %v", err)
+	}
+	got, _ = db.GetBook(ctx, b.ID)
+	if got.DurationSec != 3661.5 {
+		t.Errorf("duration_sec = %v, want 3661.5", got.DurationSec)
+	}
+	if got.UpdatedAt != beforeDur.UpdatedAt {
+		t.Errorf("SetBookDuration bumped updated_at (%q -> %q); it must not", beforeDur.UpdatedAt, got.UpdatedAt)
+	}
+	if err := db.SetBookDuration(ctx, 9999, 1); !errors.Is(err, ErrNotFound) {
+		t.Errorf("SetBookDuration(missing) = %v, want ErrNotFound", err)
+	}
+
 	// park_code is set on a needs_attention write and cleared when status clears.
 	if err := db.SetBookStatus(ctx, b.ID, "needs_attention", "agent down", "agent_unavailable"); err != nil {
 		t.Fatal(err)

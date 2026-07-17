@@ -158,6 +158,11 @@ export const BookRow = memo(function BookRow({
                 ETA {formatEta(book.eta_seconds)}
               </span>
             )}
+            {(book.duration_sec ?? 0) > 0 && (
+              <span className="text-[11px] text-dim" title="Total audio length">
+                {formatDuration(book.duration_sec ?? 0)} length
+              </span>
+            )}
             {book.scratch_bytes > 0 && (
               <span className="text-[11px] text-dim" title="Scratch on disk (chapters + durables)">
                 {formatBytes(book.scratch_bytes)} on disk

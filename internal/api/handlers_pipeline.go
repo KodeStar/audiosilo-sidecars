@@ -231,6 +231,9 @@ type bookView struct {
 	// durables), so the UI can show disk usage and offer a purge. 0 when the work
 	// dir does not exist yet (or was purged).
 	ScratchBytes int64 `json:"scratch_bytes"`
+	// DurationSec is the book's total audio duration in seconds, written after
+	// inspect (0 before inspect / for a pre-migration book - the UI hides the chip).
+	DurationSec float64 `json:"duration_sec,omitempty"`
 	// TotalCostUSD is the summed agent spend across the book's stage runs (0 for a
 	// book that has run only mechanical/ASR stages or none yet), attached on both the
 	// list and detail views so the Running/Done UI can show a per-book cost.
@@ -320,9 +323,9 @@ func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64
 		State: b.State, Lane: string(state.LaneOf(state.State(b.State))),
 		Status: b.Status, Error: b.Error, ParkCode: b.ParkCode, Coverage: b.Coverage,
 		ETASeconds: etaSeconds, StartedAt: startedAt,
-		Progress: progress, ScratchBytes: b.ScratchBytes, TotalCostUSD: totalCostUSD,
-		Contribution: contribution,
-		CreatedAt:    b.CreatedAt, UpdatedAt: b.UpdatedAt,
+		Progress: progress, ScratchBytes: b.ScratchBytes, DurationSec: b.DurationSec,
+		TotalCostUSD: totalCostUSD, Contribution: contribution,
+		CreatedAt: b.CreatedAt, UpdatedAt: b.UpdatedAt,
 	}
 }
 

@@ -386,6 +386,7 @@ func (e *Executor) inspect(ctx context.Context, book store.Book) (scheduler.Stag
 	// db in tests, or a lost row); a failure never fails the stage.
 	if e.db != nil {
 		_ = e.db.SetBookChapters(context.WithoutCancel(ctx), book.ID, manifest.ChapterCount)
+		_ = e.db.SetBookDuration(context.WithoutCancel(ctx), book.ID, manifest.Duration)
 	}
 	result := scheduler.StageResult{
 		MarkersContiguous: contiguous,

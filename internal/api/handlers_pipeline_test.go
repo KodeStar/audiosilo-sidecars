@@ -499,10 +499,10 @@ func TestBookViewETAParkStartedFields(t *testing.T) {
 	resp.Body.Close()
 	id := cr.Results[0].Book.ID
 
-	// A freshly created book: no stage run, no park, no ETA snapshot -> all three
-	// fields omitted (omitempty).
+	// A freshly created book: no stage run, no park, no ETA snapshot, no duration ->
+	// all four fields omitted (omitempty).
 	fresh := readAll(t, env.do(t, http.MethodGet, "/api/v1/books/"+strconv.FormatInt(id, 10), token, ""))
-	for _, key := range []string{`"started_at"`, `"park_code"`, `"eta_seconds"`} {
+	for _, key := range []string{`"started_at"`, `"park_code"`, `"eta_seconds"`, `"duration_sec"`} {
 		if strings.Contains(fresh, key) {
 			t.Errorf("fresh book JSON unexpectedly contains %s: %s", key, fresh)
 		}
@@ -510,6 +510,10 @@ func TestBookViewETAParkStartedFields(t *testing.T) {
 
 	// Give it a stage-run start and a typed park; both now surface on the detail view.
 	if _, err := env.db.StartStageRun(ctx, id, "inspecting", 1); err != nil {
+		t.Fatal(err)
+	}
+	// A recorded inspect duration surfaces on the book view (the Running list's length).
+	if err := env.db.SetBookDuration(ctx, id, 3600); err != nil {
 		t.Fatal(err)
 	}
 	if err := env.db.SetBookStatus(ctx, id, "needs_attention", "agent down", "agent_unavailable"); err != nil {
@@ -521,6 +525,9 @@ func TestBookViewETAParkStartedFields(t *testing.T) {
 	}
 	if !strings.Contains(detailBody, `"park_code":"agent_unavailable"`) {
 		t.Errorf("detail JSON missing park_code: %s", detailBody)
+	}
+	if !strings.Contains(detailBody, `"duration_sec":3600`) {
+		t.Errorf("detail JSON missing duration_sec: %s", detailBody)
 	}
 	// eta_seconds stays omitted: the (unstarted) scheduler published no snapshot.
 	if strings.Contains(detailBody, `"eta_seconds"`) {

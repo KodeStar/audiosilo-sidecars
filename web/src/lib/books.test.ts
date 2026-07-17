@@ -194,11 +194,49 @@ describe('formatBytes', () => {
 });
 
 describe('sortBooks', () => {
-  it('keeps done books last and newest active first', () => {
-    const a = bk({ id: 1, state: 'asr', created_at: '2026-01-01T00:00:00Z' });
-    const b = bk({ id: 2, state: 'asr', created_at: '2026-01-02T00:00:00Z' });
-    const d = bk({ id: 3, state: 'done', created_at: '2026-01-03T00:00:00Z' });
-    const out = sortBooks([a, d, b]);
-    expect(out.map((x) => x.id)).toEqual([2, 1, 3]);
+  it('orders active-on-top, queued FIFO, then paused/parked/failed, done last', () => {
+    // Active bucket: status '' with a non-empty lane (on a worker now). Furthest
+    // along the mainline sorts first.
+    const activeEarly = bk({ id: 1, state: 'asr', lane: 'asr', status: '' });
+    const activeLate = bk({ id: 2, state: 'auditing', lane: 'agent', status: '' });
+    // Queued bucket: status '' with an empty lane. FIFO by created_at (oldest first
+    // = the next to run, right under the active book).
+    const queuedOld = bk({ id: 3, state: 'queued', created_at: '2026-01-01T00:00:00Z' });
+    const queuedNew = bk({ id: 4, state: 'queued', created_at: '2026-01-02T00:00:00Z' });
+    const paused = bk({ id: 5, state: 'asr', status: 'paused' });
+    const parked = bk({ id: 6, state: 'auditing', status: 'needs_attention' });
+    const failed = bk({ id: 7, state: 'asr', status: 'failed' });
+    const done = bk({ id: 8, state: 'done' });
+
+    const out = sortBooks([
+      done,
+      failed,
+      parked,
+      paused,
+      queuedNew,
+      queuedOld,
+      activeEarly,
+      activeLate,
+    ]);
+    expect(out.map((x) => x.id)).toEqual([2, 1, 3, 4, 5, 6, 7, 8]);
+  });
+
+  it('orders the active bucket furthest-along first, then newest start', () => {
+    const a = bk({
+      id: 1,
+      state: 'asr',
+      lane: 'asr',
+      status: '',
+      started_at: '2026-01-01T00:00:00Z',
+    });
+    const b = bk({
+      id: 2,
+      state: 'asr',
+      lane: 'asr',
+      status: '',
+      started_at: '2026-01-02T00:00:00Z',
+    });
+    // Same stage -> the newer start sorts first.
+    expect(sortBooks([a, b]).map((x) => x.id)).toEqual([2, 1]);
   });
 });

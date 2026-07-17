@@ -376,6 +376,9 @@ export interface BookView {
   // Current on-disk size of the book's work dir in bytes (chapters + durables);
   // 0 when not yet created or already purged.
   scratch_bytes: number;
+  // Total audio duration in seconds, written after inspect. Absent (or 0) before
+  // inspect / for a pre-migration book - the Running list hides the length chip.
+  duration_sec?: number;
   // Summed agent spend across the book's stage runs in USD (0 for a book that has
   // run only mechanical/ASR stages or none yet, or when the backend reports no cost).
   // Present on both the list and detail views.

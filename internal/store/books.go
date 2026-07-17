@@ -112,6 +112,10 @@ type Book struct {
 	// inspect succeeds (0 = not yet known). The ETA engine reads it as the per-book
 	// chapter total for the per-chapter stages.
 	Chapters int
+	// DurationSec is the book's total audio duration in seconds, written by the
+	// pipeline right after inspect succeeds (0 = not yet known / pre-inspect). It
+	// rides on the book view so the Running list can show each book's length.
+	DurationSec float64
 	// ParkCode is the typed park reason (empty = none): set when status becomes
 	// needs_attention, cleared whenever status clears. It rides beside Error.
 	ParkCode  string
@@ -236,14 +240,14 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 
 const bookCols = `id, source_path, work_dir, title, authors, narrators, series, series_pos,
 	asin, isbn, identity_sources, work_id, state, status, error, coverage, scratch_bytes,
-	chapters, park_code, created_at, updated_at`
+	chapters, duration_sec, park_code, created_at, updated_at`
 
 func scanBook(sc interface{ Scan(...any) error }) (Book, error) {
 	var b Book
 	var authors, narrators, idsrc, coverage string
 	if err := sc.Scan(&b.ID, &b.SourcePath, &b.WorkDir, &b.Title, &authors, &narrators,
 		&b.Series, &b.SeriesPos, &b.ASIN, &b.ISBN, &idsrc, &b.WorkID, &b.State, &b.Status,
-		&b.Error, &coverage, &b.ScratchBytes, &b.Chapters, &b.ParkCode,
+		&b.Error, &coverage, &b.ScratchBytes, &b.Chapters, &b.DurationSec, &b.ParkCode,
 		&b.CreatedAt, &b.UpdatedAt); err != nil {
 		return Book{}, err
 	}
@@ -317,6 +321,18 @@ func (db *DB) SetBookState(ctx context.Context, id int64, state, status, errMsg,
 func (db *DB) SetBookChapters(ctx context.Context, id int64, chapters int) error {
 	res, err := db.sql.ExecContext(ctx,
 		`UPDATE books SET chapters=? WHERE id=?`, chapters, id)
+	return checkAffected(res, err)
+}
+
+// SetBookDuration records a book's total audio duration in seconds (written by the
+// pipeline once inspect succeeds), which the Running list shows as the book's
+// length. Like SetBookChapters it is a pure gauge write and deliberately does NOT
+// bump updated_at: the duration is bookkeeping derived from the source, not a
+// change to the book's pipeline position, and a spurious updated_at bump would
+// reorder the Running list.
+func (db *DB) SetBookDuration(ctx context.Context, id int64, sec float64) error {
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE books SET duration_sec=? WHERE id=?`, sec, id)
 	return checkAffected(res, err)
 }
 
