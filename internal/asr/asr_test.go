@@ -680,3 +680,20 @@ func TestSelect(t *testing.T) {
 		}
 	}
 }
+
+func TestRawOutputName(t *testing.T) {
+	cases := []struct {
+		audioPath string
+		want      string
+	}{
+		{"ch002.flac", "ch002.json"},
+		{"t002.flac", "t002.json"},
+		{filepath.Join("work", "chapters", "ch010.flac"), "ch010.json"},
+		{"a.b.flac", "a.b.json"},
+	}
+	for _, c := range cases {
+		if got := RawOutputName(c.audioPath); got != c.want {
+			t.Errorf("RawOutputName(%q) = %q, want %q", c.audioPath, got, c.want)
+		}
+	}
+}

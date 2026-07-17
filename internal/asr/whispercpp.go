@@ -193,9 +193,10 @@ func (w *whisperCpp) Transcribe(ctx context.Context, job Job) error {
 	if err := os.MkdirAll(job.OutDir, 0o750); err != nil {
 		return err
 	}
-	// -of sets the output prefix; whisper-cli appends .json. The stem matches the
-	// input FLAC stem so the raw file lines up with the chapter (chNNN.json).
-	outPrefix := filepath.Join(job.OutDir, strings.TrimSuffix(filepath.Base(job.Audio), filepath.Ext(job.Audio)))
+	// -of sets the output prefix; whisper-cli appends .json. outputStem is the one
+	// authority for the input-stem naming (RawOutputName reads the same file back),
+	// so the raw lines up with the input FLAC.
+	outPrefix := filepath.Join(job.OutDir, outputStem(job.Audio))
 	args := []string{
 		"-m", model,
 		"-f", job.Audio,

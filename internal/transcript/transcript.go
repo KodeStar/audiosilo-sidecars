@@ -129,6 +129,8 @@ func ChapterTextPath(workDir string, chapter int) (string, bool) {
 
 // RawName is the raw-output filename a backend writes for a chapter (a backend's
 // own output naming derives from the input FLAC stem, which is this same stem).
+// It is the chapter-layer specialization, valid only for chNNN stems; backend
+// output for an arbitrary audio file is named by asr.RawOutputName.
 func RawName(chapter int) string { return name(chapter) + ".json" }
 
 // ParseChapter extracts the chapter number from a "chNNN.<ext>" filename, or

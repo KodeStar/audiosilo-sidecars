@@ -18,7 +18,6 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
-	"github.com/kodestar/audiosilo-sidecars/internal/transcript"
 )
 
 // genNonContiguousM4B builds a tiny 3-chapter .m4b whose chapter markers number 1, 2, 4
@@ -94,7 +93,11 @@ func (b *loopBackend) Transcribe(ctx context.Context, job asr.Job) error {
 	} else {
 		raw = fmt.Sprintf(`{"text":" fake chapter %d","language":"en","segments":[{"id":0,"start":0,"end":1,"text":" fake chapter %d","avg_logprob":NaN,"words":[{"word":" fake","start":0,"end":0.5,"probability":0.9}]}]}`, job.Chapter, job.Chapter)
 	}
-	return os.WriteFile(filepath.Join(job.OutDir, transcript.RawName(job.Chapter)), []byte(raw+"\n"), 0o644) //nolint:gosec // test artifact
+	// Both real backends name the raw <audio-stem>.json - hand-mirrored here (not via
+	// asr.RawOutputName) so a wrapper or helper that drifts from the tools' naming fails
+	// this test.
+	stem := strings.TrimSuffix(filepath.Base(job.Audio), filepath.Ext(job.Audio))
+	return os.WriteFile(filepath.Join(job.OutDir, stem+".json"), []byte(raw+"\n"), 0o644) //nolint:gosec // test artifact
 }
 
 func (b *loopBackend) count(chapter int) int {

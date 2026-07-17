@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/toolfetch"
 )
@@ -186,6 +187,20 @@ func normalizeBackend(b string) string {
 // toolsDir is the shared <data>/tools directory a backend caches its venv/model
 // under, derived from the daemon data dir.
 func toolsDir(dataDir string) string { return filepath.Join(dataDir, "tools") }
+
+// outputStem is the raw-output basename (no extension) a backend writes for an
+// input audio file: the input's own stem (mlx_whisper --output-dir and whisper-cli
+// -of both name from the input stem). It is the single authority for that naming.
+func outputStem(audioPath string) string {
+	return strings.TrimSuffix(filepath.Base(audioPath), filepath.Ext(audioPath))
+}
+
+// RawOutputName is the raw JSON filename a backend writes for an input audio
+// file: <audio-stem>.json in Job.OutDir (mlx_whisper --output-dir and
+// whisper-cli -of both name from the input stem). Callers reading the raw
+// after Transcribe must derive the name from the audio path via this helper,
+// never assume a chNNN stem - the tail-clip repair transcribes t%03d.flac.
+func RawOutputName(audioPath string) string { return outputStem(audioPath) + ".json" }
 
 // orDiscard returns log, or a discard logger when log is nil, so a directly
 // constructed backend (and Select) never nil-panics on a log call.

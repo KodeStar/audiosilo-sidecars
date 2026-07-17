@@ -177,9 +177,9 @@ func (m *mlxWhisper) writeVersionMarker(dataDir string) error {
 // Transcribe runs one chapter FLAC through mlx-whisper via the venv's python
 // binary (`python -m mlx_whisper.cli ...`, not the console script - see the type
 // doc), writing raw JSON (with word timestamps) into job.OutDir as
-// <flac-stem>.json. The initial prompt is passed only when non-empty (verified
-// spellings), matching audio_extract.py - a seeded guess makes a wrong spelling
-// recur.
+// <flac-stem>.json (the name RawOutputName reconstructs). The initial prompt is
+// passed only when non-empty (verified spellings), matching audio_extract.py - a
+// seeded guess makes a wrong spelling recur.
 func (m *mlxWhisper) Transcribe(ctx context.Context, job Job) error {
 	python := m.venvBin(m.dataDir, "python")
 	if !fsutil.IsFile(python) {

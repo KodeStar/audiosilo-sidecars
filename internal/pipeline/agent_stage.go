@@ -960,12 +960,13 @@ func (e *Executor) tailClipChapter(ctx context.Context, setup ASRSetup, cut repa
 	transcribe := func(ctx context.Context, clipPath string) ([]byte, error) {
 		outDir := filepath.Join(book.WorkDir, repair.ClipsDir)
 		// Prompt-free clip transcription (contract: a seeded prompt makes the model echo
-		// it over sparse audio). The backend names the raw from the chapter number.
+		// it over sparse audio). The backend names the raw from the audio stem (see
+		// asr.RawOutputName), so the read derives from clipPath (t%03d.flac), not chNNN.
 		job := asr.Job{Audio: clipPath, OutDir: outDir, Chapter: chapter, Language: setup.Language}
 		if terr := setup.Backend.Transcribe(ctx, job); terr != nil {
 			return nil, terr
 		}
-		return os.ReadFile(filepath.Join(outDir, transcript.RawName(chapter))) //nolint:gosec // path derives from the book's work dir
+		return os.ReadFile(filepath.Join(outDir, asr.RawOutputName(clipPath))) //nolint:gosec // path derives from the book's work dir
 	}
 	res, err := repair.ClipAndSplice(ctx, repair.ClipSpliceRequest{
 		WorkDir:    book.WorkDir,
