@@ -9,6 +9,15 @@
 # without Node.
 set -euo pipefail
 
+# --sync-only: build the SPA and sync it into internal/web/dist, but skip the
+# trailing `go build`. The release workflow uses this because GoReleaser then
+# cross-compiles every target itself (a local single-target build would be
+# thrown away); local dev omits the flag to also get a runnable bin/.
+SYNC_ONLY=0
+if [ "${1:-}" = "--sync-only" ]; then
+  SYNC_ONLY=1
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
@@ -27,6 +36,11 @@ echo ">> syncing web/dist -> $EMBED_DIR ..."
 rm -rf "$EMBED_DIR"
 mkdir -p "$EMBED_DIR"
 cp -R web/dist/. "$EMBED_DIR"/
+
+if [ "$SYNC_ONLY" -eq 1 ]; then
+  echo ">> --sync-only: skipping bin build (internal/web/dist is ready to embed)."
+  exit 0
+fi
 
 echo ">> building bin/audiosilo-sidecars (-tags embedui) ..."
 mkdir -p bin

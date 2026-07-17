@@ -1,0 +1,54 @@
+# Native binary release (GoReleaser). On each v* tag this builds self-contained,
+# cross-platform binaries of the audiosilo-sidecars daemon + embedded web UI, then
+# uploads archives + checksums to a DRAFT GitHub Release for review before
+# publishing. The daemon is CGO-free (modernc SQLite), so every target
+# cross-compiles from this one Linux runner.
+#
+# The real web UI is embedded via -tags=embedui, which reads internal/web/dist. That
+# directory is gitignored and populated by scripts/build-web.sh, so we build the SPA
+# BEFORE GoReleaser runs (a goreleaser `before` hook is deliberately NOT used).
+#
+# External tools (ffmpeg/ffprobe, whisper.cpp, ASR models) are NOT bundled - they
+# are found locally or auto-downloaded at runtime. This is independent of the Docker
+# image pipeline; both can run on the same tag.
+name: release (native binaries)
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the GitHub Release + upload assets
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # GoReleaser needs full history + tags
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # Build the SPA and sync it into internal/web/dist so -tags=embedui finds it.
+      # --sync-only skips the script's local `go build` (GoReleaser cross-compiles
+      # every target next, so a single-target build here would be thrown away).
+      - name: Build web UI for embedding
+        run: scripts/build-web.sh --sync-only
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,80 @@
+# GoReleaser config for the audiosilo-sidecars native distribution.
+#
+# Produces self-contained, cross-platform binaries on each `v*` tag (see
+# .github/workflows/release.yml) so contributors can download one file and run the
+# daemon + embedded web UI. The daemon is CGO-free (modernc SQLite), so all targets
+# cross-compile from a single Linux runner with no C toolchain.
+#
+# The real web UI is embedded via `-tags=embedui`, which embeds internal/web/dist.
+# That directory is gitignored and populated by scripts/build-web.sh, so the release
+# workflow runs that script (npm build + sync) BEFORE GoReleaser - do not add a
+# `before` hook here. Because both web/dist and internal/web/dist are gitignored,
+# populating them does not dirty the tree, so GoReleaser's clean-tree check stays
+# happy (no --skip-validate needed).
+#
+# whisper.cpp binaries, ffmpeg/ffprobe and the ASR models are NOT bundled - they are
+# found locally or auto-downloaded at runtime into <data>/tools. This keeps the
+# download small; see the release footer for the GPU/advanced Docker path.
+#
+# The Docker image keeps its own pipeline (Dockerfile + image workflow); this is
+# purely the native-binary path. Validate locally with:
+#   goreleaser check
+#   scripts/build-web.sh   # populate internal/web/dist for -tags=embedui
+#   goreleaser build --snapshot --clean --single-target
+version: 2
+
+project_name: audiosilo-sidecars
+
+builds:
+  - id: audiosilo-sidecars
+    main: ./cmd/audiosilo-sidecars
+    binary: audiosilo-sidecars
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+      - -tags=embedui
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+
+archives:
+  - id: native
+    ids: [audiosilo-sidecars]
+    name_template: "audiosilo-sidecars_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    # Windows users expect a .zip; everyone else a .tar.gz.
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+      - LICENSE*
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  github:
+    owner: KodeStar
+    name: audiosilo-sidecars
+  draft: true # let a human review the release notes/artifacts before publishing
+  footer: |
+    ---
+    These native builds embed the web UI. External tools are NOT bundled -
+    ffmpeg/ffprobe, the whisper.cpp CLI and the ASR models are found locally
+    (PATH or next to the binary) or auto-downloaded on first use into
+    `<data>/tools`. For advanced / GPU-accelerated setups prefer Docker:
+    `ghcr.io/kodestar/audiosilo-sidecars` (plus the `-cuda` variant for NVIDIA GPUs).

@@ -358,9 +358,14 @@ web/          the SPA: Vite + React 19 + TS + Tailwind v4 (npm, Node 24); dist/ 
               daemon-computed absolute source_path (NEVER a client-side join);
               the relative path is display/selection only.
 scripts/build-web.sh   build the SPA + embed it into bin/ (-tags embedui)
-Dockerfile             multi-stage: node build -> go build (embedui) -> debian-slim
-                       runtime that apt-installs ffmpeg/ffprobe (so toolfetch never
-                       auto-downloads in the container)
+Dockerfile             multi-stage: node build -> go build (embedui) -> two runtime
+                       targets from the SAME shared stages: `runtime` (debian-slim,
+                       CPU, the default) and `runtime-cuda` (nvidia/cuda, GPU - the
+                       CUDA whisper-cli is toolfetched at runtime, not baked in).
+                       Both apt-install ffmpeg (so toolfetch never downloads it) and
+                       run non-root with a chown'd /data. image.yml builds both via
+                       `--target`.
+.goreleaser.yml        M8: native-binary release config (draft, embedui, archives+checksums)
 ```
 
 **Dependency direction** (transport-only rule): `server -> {api, auth, secrets,
@@ -665,10 +670,41 @@ Milestones from the workspace plan; each is shippable.
   trip (park -> modal -> add-work issue -> merged-PR slug resolve -> readmit ->
   done), local export + zip download, 401s on unauthed endpoints, auto-purge +
   startup GC, and a headless-Chrome drive of chips/preview/modal/settings.
-- **M8 (planned):** packaging (GoReleaser + Docker matrix). See the plan for the
-  full table.
+- **M8 (done):** packaging. On every `v*` tag two pipelines run, mirroring
+  audiosilo-server's split:
+  - **Native binaries** - `.goreleaser.yml` (v2, CGO-free cross-compile for
+    linux/darwin/windows x amd64/arm64, `-tags=embedui`, version via
+    `-X main.version`) + `.github/workflows/release.yml` (a **draft** GitHub
+    Release; the workflow runs `scripts/build-web.sh` to populate the gitignored
+    `internal/web/dist` for the embed BEFORE GoReleaser, so no `before` hook and
+    the clean-tree check stays happy; `dist/` is gitignored). Archives + checksums
+    only (no deb/rpm/systemd - it is a user-run, keychain-using tool, not a system
+    service). ffmpeg/ffprobe/whisper.cpp/models stay runtime-fetched.
+  - **Container images** - `.github/workflows/image.yml` (a two-variant matrix to
+    GHCR): both variants build from ONE `Dockerfile` via multi-stage `--target`
+    (shared web/go build stages, defined once) - `runtime` (CPU, `:latest`) and
+    `runtime-cuda` (`:latest-cuda`, `nvidia/cuda:*-runtime` base). The `-cuda` tags
+    come from the metadata-action `suffix` flavor; both legs are `linux/amd64` (arm64
+    is a follow-up). The CUDA whisper-cli is **toolfetched at runtime** (it bundles
+    its own cudart/cublas; the image only needs the driver injected by the
+    nvidia-container-toolkit) - NOT baked in. Hardening fix landed here: both runtime
+    stages `mkdir -p /data && chown nonroot:nonroot /data` before `USER nonroot`, so
+    a volume mounted at `/data` is writable (a volume over a missing image dir is
+    root-owned - the daemon could not write config/db there and failed to boot).
+  - **whisper.cpp binaries stay decoupled**: they ship on their own cadence via
+    `whisper-binaries.yml` (a separate release `toolfetch` consumes), so a whisper
+    rebuild never forces a daemon re-release. This is deliberate - do not couple them
+    into `release.yml`/`image.yml`.
+  Gate verified: full Go gate green; `goreleaser check` clean + a single-target
+  snapshot build produced a working versioned binary; the CPU image builds and boots
+  end-to-end (real embedded UI served, one-time password printed, whisper-cpp ASR
+  available, `/api/v1/system` 401s unauth); the `runtime-cuda` target passes `docker
+  buildx build --check` (a full GPU build + live NVIDIA transcription is manual -
+  needs NVIDIA hardware, matching the whisper-binaries CUDA leg).
 
-Still **not built**: M8 packaging. The contributing stage submits sidecars but never
+Still **not built**: signed installers / a friendlier packaged client (a possible
+follow-up per the meta EXTRACTION roadmap); a separately-deployable UI-only image
+(scoped out of M8, deferred). The contributing stage submits sidecars but never
 retracts them - cancelling a core_pending book leaves its already-opened add-work
 issue for a maintainer to close. All four tabs report `ready` on `/system`. Keep
 this file honest as milestones land.
