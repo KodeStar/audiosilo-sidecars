@@ -140,3 +140,25 @@ func (db *DB) GetRate(ctx context.Context, stage string) (float64, bool, error) 
 	}
 	return r, true, nil
 }
+
+// ListRates returns every stored per-stage unit-rate keyed by stage, in one query.
+// The scheduler seeds its in-memory rate cache from it at startup so the ETA engine
+// and the EWMA update read/write rates without a per-stage round trip. Stages with
+// no observed rate yet are simply absent (callers fall back to the in-code seed).
+func (db *DB) ListRates(ctx context.Context) (map[string]float64, error) {
+	rows, err := db.sql.QueryContext(ctx, `SELECT stage, unit_rate FROM rates`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]float64{}
+	for rows.Next() {
+		var stage string
+		var rate float64
+		if err := rows.Scan(&stage, &rate); err != nil {
+			return nil, err
+		}
+		out[stage] = rate
+	}
+	return out, rows.Err()
+}

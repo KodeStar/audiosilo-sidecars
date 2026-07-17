@@ -2,18 +2,43 @@
 // stage.progress) into the books list fetched on mount. Kept React-free and
 // unit-tested; the panel holds the list in state and applies these on each event.
 
-import type { BookStateEvent, BookView, StageProgressEvent } from '@/api/types';
+import type { BookStateEvent, BookView, EtaUpdateEvent, StageProgressEvent } from '@/api/types';
 
-// applyBookState patches the matching book's state + lane + status + error. An
-// event for a book not in the list is ignored (a newly created book arrives via a
-// list refetch, which carries its full identity/coverage; SSE only patches what we
-// already hold).
+// applyBookState patches the matching book's state + lane + status + error +
+// park_code. An event for a book not in the list is ignored (a newly created
+// book arrives via a list refetch, which carries its full identity/coverage; SSE
+// only patches what we already hold). park_code rides along the patch (empty/
+// absent on an advance, so a retry/resume clears a prior park reason).
 export function applyBookState(books: BookView[], ev: BookStateEvent): BookView[] {
   let changed = false;
   const next = books.map((b) => {
     if (b.id !== ev.book_id) return b;
     changed = true;
-    return { ...b, state: ev.state, lane: ev.lane, status: ev.status, error: ev.error };
+    return {
+      ...b,
+      state: ev.state,
+      lane: ev.lane,
+      status: ev.status,
+      error: ev.error,
+      park_code: ev.park_code,
+    };
+  });
+  return changed ? next : books;
+}
+
+// applyEtaUpdate folds the daemon-wide eta.update frame into the list: each
+// listed book gets its eta_seconds; a book NOT listed has its eta_seconds cleared
+// (it lost its ETA - it parked or reached a terminal/idle state). Unknown book
+// ids in the event are ignored. Returns the same array reference when nothing
+// changed so a memoized row list can skip re-rendering.
+export function applyEtaUpdate(books: BookView[], ev: EtaUpdateEvent): BookView[] {
+  const etas = new Map<number, number>(ev.books.map((b) => [b.book_id, b.eta_seconds]));
+  let changed = false;
+  const next = books.map((b) => {
+    const eta = etas.get(b.id); // number, or undefined when not listed
+    if (eta === b.eta_seconds) return b; // no change (undefined === undefined too)
+    changed = true;
+    return { ...b, eta_seconds: eta };
   });
   return changed ? next : books;
 }
@@ -100,6 +125,16 @@ export function formatBytes(bytes: number): string {
   return `${text} ${units[unit]}`;
 }
 
+// compareByTimestampDesc orders two records newest-first by a daemon timestamp,
+// with the id as a stable descending tiebreak for equal timestamps. The daemon's
+// timestamps are fixed-width UTC (nine fractional digits + Z), so a lexicographic
+// string compare is exactly chronological. Shared by sortBooks (created_at) and the
+// Done board's filterDoneBooks (updated_at).
+export function compareByTimestampDesc(aTs: string, bTs: string, aId: number, bId: number): number {
+  if (aTs !== bTs) return aTs < bTs ? 1 : -1;
+  return bId - aId;
+}
+
 // sortBooks orders the list newest-created first, keeping done books last so the
 // active work stays at the top of the Running tab.
 export function sortBooks(books: BookView[]): BookView[] {
@@ -107,10 +142,7 @@ export function sortBooks(books: BookView[]): BookView[] {
     const ad = isDone(a) ? 1 : 0;
     const bd = isDone(b) ? 1 : 0;
     if (ad !== bd) return ad - bd;
-    // Newest first within each group. created_at is the daemon's fixed-width UTC
-    // timestamp (nine fractional digits + Z), so a lexicographic compare is exactly
-    // chronological; the id is a stable tiebreak for equal timestamps.
-    if (a.created_at !== b.created_at) return a.created_at < b.created_at ? 1 : -1;
-    return b.id - a.id;
+    // Newest first within each group.
+    return compareByTimestampDesc(a.created_at, b.created_at, a.id, b.id);
   });
 }

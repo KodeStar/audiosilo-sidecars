@@ -42,7 +42,7 @@ func TestPurgeScratchAllowedStates(t *testing.T) {
 	if err := db.UpdateScratchBytes(ctx, b.ID, 999999); err != nil { // pre-purge accounting
 		t.Fatal(err)
 	}
-	if err := db.SetBookState(ctx, b.ID, string(state.Done), "", ""); err != nil {
+	if err := db.SetBookState(ctx, b.ID, string(state.Done), "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.PurgeScratch(ctx, b.ID); err != nil {
@@ -60,7 +60,7 @@ func TestPurgeScratchAllowedStates(t *testing.T) {
 	// A paused book is also purgeable.
 	p := h.addBook(t, db, "paused-book", "", "")
 	pch := seedChapters(t, p.WorkDir)
-	if err := db.SetBookStatus(ctx, p.ID, string(state.StatusPaused), ""); err != nil {
+	if err := db.SetBookStatus(ctx, p.ID, string(state.StatusPaused), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.PurgeScratch(ctx, p.ID); err != nil {
@@ -80,7 +80,7 @@ func TestPurgeScratchRefusesRunning(t *testing.T) {
 	// A running book (status none, non-terminal) must not be purgeable.
 	b := h.addBook(t, db, "running-book", "", "")
 	chapters := seedChapters(t, b.WorkDir)
-	if err := db.SetBookState(ctx, b.ID, string(state.ASR), "", ""); err != nil {
+	if err := db.SetBookState(ctx, b.ID, string(state.ASR), "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.PurgeScratch(ctx, b.ID); err != ErrInvalidOp {
@@ -107,7 +107,7 @@ func TestPurgeReservationBusy(t *testing.T) {
 
 	p := h.addBook(t, db, "reserved", "", "")
 	seedChapters(t, p.WorkDir)
-	if err := db.SetBookStatus(ctx, p.ID, string(state.StatusPaused), ""); err != nil {
+	if err := db.SetBookStatus(ctx, p.ID, string(state.StatusPaused), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if !s.reserve(p.ID) {
@@ -160,7 +160,7 @@ func TestReservationBlocksDispatchUntilReleased(t *testing.T) {
 	b := h.addBook(t, db, "reserved-dispatch", "", "")
 	// Park it paused at a runnable mechanical stage with chapters present.
 	seedChapters(t, b.WorkDir)
-	if err := db.SetBookState(ctx, b.ID, string(state.Splitting), string(state.StatusPaused), ""); err != nil {
+	if err := db.SetBookState(ctx, b.ID, string(state.Splitting), string(state.StatusPaused), "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -249,7 +249,7 @@ func TestPurgeInvalidatesSplitSentinel(t *testing.T) {
 	if err := WriteSentinel(b.WorkDir, string(state.Splitting), happyPath()); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SetBookState(ctx, b.ID, string(state.Splitting), string(state.StatusPaused), ""); err != nil {
+	if err := db.SetBookState(ctx, b.ID, string(state.Splitting), string(state.StatusPaused), "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -328,7 +328,7 @@ func TestPurgeThenRetryReSplitsWithoutRestart(t *testing.T) {
 	if err := WriteSentinel(b.WorkDir, string(state.ASR), happyPath()); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SetBookState(ctx, b.ID, string(state.ASR), string(state.StatusFailed), "boom"); err != nil {
+	if err := db.SetBookState(ctx, b.ID, string(state.ASR), string(state.StatusFailed), "boom", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -399,7 +399,7 @@ func TestPurgeDoneBookNotReconciled(t *testing.T) {
 
 	chapters := seedChapters(t, b.WorkDir)
 	recordSuccess(t, db, b.ID, state.Splitting) // ok=1 but no sentinel written
-	if err := db.SetBookState(ctx, b.ID, string(state.Done), "", ""); err != nil {
+	if err := db.SetBookState(ctx, b.ID, string(state.Done), "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 

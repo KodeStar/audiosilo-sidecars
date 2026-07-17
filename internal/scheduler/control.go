@@ -41,10 +41,12 @@ func (s *Scheduler) Pause(ctx context.Context, id int64) error {
 	case state.StatusPaused:
 		return nil
 	case state.StatusNone:
-		if err := s.db.SetBookStatus(ctx, id, string(state.StatusPaused), b.Error); err != nil {
+		// Preserve error/park_code (a pause is not a status clear); a pausable book
+		// has no park code anyway, but mirror b.Error's preservation.
+		if err := s.db.SetBookStatus(ctx, id, string(state.StatusPaused), b.Error, b.ParkCode); err != nil {
 			return err
 		}
-		s.publishState(id, b.State, string(state.StatusPaused), b.Error)
+		s.publishState(id, b.State, string(state.StatusPaused), b.Error, b.ParkCode)
 		return nil
 	default:
 		return ErrInvalidOp
@@ -60,10 +62,11 @@ func (s *Scheduler) Resume(ctx context.Context, id int64) error {
 	if state.Status(b.Status) != state.StatusPaused {
 		return ErrInvalidOp
 	}
-	if err := s.db.SetBookStatus(ctx, id, string(state.StatusNone), ""); err != nil {
+	// Clearing the status clears the error and the typed park_code together.
+	if err := s.db.SetBookStatus(ctx, id, string(state.StatusNone), "", ""); err != nil {
 		return err
 	}
-	s.publishState(id, b.State, "", "")
+	s.publishState(id, b.State, "", "", "")
 	s.notify()
 	return nil
 }
@@ -84,10 +87,11 @@ func (s *Scheduler) Retry(ctx context.Context, id int64) error {
 		if err := s.db.DeleteStageSuccess(ctx, id, stage); err != nil {
 			return err
 		}
-		if err := s.db.SetBookStatus(ctx, id, string(state.StatusNone), ""); err != nil {
+		// Clearing the status clears the error and the typed park_code together.
+		if err := s.db.SetBookStatus(ctx, id, string(state.StatusNone), "", ""); err != nil {
 			return err
 		}
-		s.publishState(id, b.State, "", "")
+		s.publishState(id, b.State, "", "", "")
 		s.notify()
 		return nil
 	default:
@@ -106,11 +110,12 @@ func (s *Scheduler) Cancel(ctx context.Context, id int64) error {
 	if state.IsTerminal(state.State(b.State)) {
 		return ErrInvalidOp
 	}
-	if err := s.db.SetBookStatus(ctx, id, string(state.StatusFailed), "cancelled by user"); err != nil {
+	// Cancel is not a park (no typed reason), so the park_code stays empty.
+	if err := s.db.SetBookStatus(ctx, id, string(state.StatusFailed), "cancelled by user", ""); err != nil {
 		return err
 	}
 	s.cancelInflight(id)
-	s.publishState(id, b.State, string(state.StatusFailed), "cancelled by user")
+	s.publishState(id, b.State, string(state.StatusFailed), "cancelled by user", "")
 	return nil
 }
 

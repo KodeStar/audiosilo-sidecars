@@ -7,7 +7,10 @@
 // styling. The daemon is authoritative for which state runs in which lane.
 export type Lane = 'asr' | 'agent' | 'mechanical' | 'none';
 
-const LABELS: Record<string, string> = {
+// LABELS is the canonical map of pipeline stage/waypoint tokens to human labels.
+// Exported so the timeline module's stage graph can be drift-guarded against it in
+// a test (every timeline stage must be a known label here).
+export const LABELS: Record<string, string> = {
   queued: 'Queued',
   inspecting: 'Inspecting',
   markers_normalizing: 'Normalizing markers',
@@ -42,15 +45,20 @@ export function normalizeLane(lane: string): Lane {
   }
 }
 
-// stateLabel returns a human label for a pipeline state, falling back to a
-// title-cased version of the raw token for a state we have not mapped.
-export function stateLabel(state: string): string {
-  const known = LABELS[state];
-  if (known) return known;
-  return state
+// titleCaseToken renders a snake_case token as spaced Title Case ("some_new_stage"
+// -> "Some New Stage"). It is the shared fallback both the full state label and the
+// compact timeline label use for a token they have not mapped.
+export function titleCaseToken(token: string): string {
+  return token
     .split('_')
     .map((w) => (w.length > 0 ? w[0].toUpperCase() + w.slice(1) : w))
     .join(' ');
+}
+
+// stateLabel returns a human label for a pipeline state, falling back to a
+// title-cased version of the raw token for a state we have not mapped.
+export function stateLabel(state: string): string {
+  return LABELS[state] ?? titleCaseToken(state);
 }
 
 // Chip styling keyed by lane, plus the distinct waypoint colors. Uses Tailwind

@@ -21,13 +21,17 @@ func DefaultBackoff() []time.Duration {
 }
 
 // RunWithRetry runs req through r with the default backoff schedule. See
-// RunWithBackoff for the policy.
-func RunWithRetry(ctx context.Context, r Runner, req Request, validate func(Result) error, onUsage func(Usage)) (Result, error) {
+// RunWithBackoff for the policy. The returned duration is the total time spent
+// sleeping in rate-limit backoff, so a caller measuring wall-clock cost can subtract
+// it and charge only the productive agent time (validation retries included, backoff
+// excluded) to its per-stage rate.
+func RunWithRetry(ctx context.Context, r Runner, req Request, validate func(Result) error, onUsage func(Usage)) (Result, time.Duration, error) {
 	return RunWithBackoff(ctx, r, req, validate, onUsage, DefaultBackoff())
 }
 
 // RunWithBackoff runs req through r, retrying on invalid output and backing off on
-// rate limits. The backoff schedule is injectable so tests need not sleep.
+// rate limits. The backoff schedule is injectable so tests need not sleep. The second
+// return value is the total time slept in rate-limit backoff (see RunWithRetry).
 //
 // Policy:
 //   - onUsage is called after EVERY invocation (success or failure) so spend is
@@ -39,11 +43,12 @@ func RunWithRetry(ctx context.Context, r Runner, req Request, validate func(Resu
 //     retries, NOT counting against the output-retry budget; after len(backoff)
 //     rate-limit rounds the RateLimitError is returned.
 //   - Any other error (including a *NotAvailableError or a timeout) fails immediately.
-func RunWithBackoff(ctx context.Context, r Runner, req Request, validate func(Result) error, onUsage func(Usage), backoff []time.Duration) (Result, error) {
+func RunWithBackoff(ctx context.Context, r Runner, req Request, validate func(Result) error, onUsage func(Usage), backoff []time.Duration) (Result, time.Duration, error) {
 	basePrompt := req.Prompt
 	prompt := basePrompt
 	outputRetries := 0
 	rateLimitRounds := 0
+	var slept time.Duration
 
 	for {
 		attempt := req
@@ -58,21 +63,22 @@ func RunWithBackoff(ctx context.Context, r Runner, req Request, validate func(Re
 			var rl *RateLimitError
 			if errors.As(err, &rl) {
 				if rateLimitRounds >= len(backoff) {
-					return Result{}, err
+					return Result{}, slept, err
 				}
 				delay := backoff[rateLimitRounds]
 				rateLimitRounds++
 				if werr := sleepCtx(ctx, delay); werr != nil {
-					return Result{}, werr
+					return Result{}, slept, werr
 				}
+				slept += delay
 				continue
 			}
-			return Result{}, err
+			return Result{}, slept, err
 		}
 
 		if verr := validate(res); verr != nil {
 			if outputRetries >= maxOutputRetries {
-				return res, verr
+				return res, slept, verr
 			}
 			outputRetries++
 			prompt = basePrompt + "\n\nYour previous attempt failed validation:\n" + verr.Error() +
@@ -80,7 +86,7 @@ func RunWithBackoff(ctx context.Context, r Runner, req Request, validate func(Re
 			continue
 		}
 
-		return res, nil
+		return res, slept, nil
 	}
 }
 

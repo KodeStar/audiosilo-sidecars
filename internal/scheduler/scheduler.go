@@ -23,11 +23,11 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/kodestar/audiosilo-sidecars/internal/eta"
 	"github.com/kodestar/audiosilo-sidecars/internal/events"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
@@ -67,6 +67,21 @@ type Scheduler struct {
 	// touched from the single scheduler goroutine (dispatch), so it needs no lock.
 	lastStats queueStats
 	haveStats bool
+
+	// rateMu guards the in-memory per-stage unit-rate cache (seconds per unit). It is
+	// seeded from the rates table at Start and updated (EWMA) by worker goroutines on
+	// each successful stage run, and read by dispatch to recompute ETAs - so it needs
+	// a lock even though rates persist via SetRate.
+	rateMu sync.Mutex
+	rates  map[string]float64
+
+	// etaMu guards the latest published ETA snapshot: per-book remaining seconds
+	// (rounded to 10s, active unparked books only) and the queue makespan. dispatch
+	// writes it; the API getters read it. haveETA gates first publish.
+	etaMu    sync.Mutex
+	bookETA  map[int64]int64
+	queueETA int64
+	haveETA  bool
 }
 
 // queueStats is the published queue.stats snapshot, compared to suppress
@@ -95,6 +110,8 @@ func New(db *store.DB, hub *events.Hub, exec Executor, agentCap int, workRoot st
 		workRoot: workRoot,
 		wake:     make(chan struct{}, 1),
 		inflight: map[int64]*inflightBook{},
+		rates:    map[string]float64{},
+		bookETA:  map[int64]int64{},
 	}
 }
 
@@ -103,6 +120,13 @@ func New(db *store.DB, hub *events.Hub, exec Executor, agentCap int, workRoot st
 func (s *Scheduler) Start(ctx context.Context) error {
 	s.ctx = ctx
 	s.haveStats = false // force the first pass to publish a fresh queue.stats
+	// Seed the in-memory rate cache from the persisted EWMA rates so ETAs use learned
+	// rates immediately (missing stages fall back to eta's in-code seeds).
+	if rates, err := s.db.ListRates(ctx); err == nil {
+		s.rateMu.Lock()
+		s.rates = rates
+		s.rateMu.Unlock()
+	}
 	if err := s.Reconcile(ctx); err != nil {
 		return fmt.Errorf("reconcile: %w", err)
 	}
@@ -206,7 +230,9 @@ func (s *Scheduler) reconcileBook(ctx context.Context, b store.Book, succeeded m
 			}
 		}
 	}
-	return s.db.SetBookState(ctx, b.ID, rewind, b.Status, b.Error)
+	// Preserve status/error/park_code exactly (a rewind is a position change, not a
+	// status change): a parked book keeps its typed reason across a restart.
+	return s.db.SetBookState(ctx, b.ID, rewind, b.Status, b.Error, b.ParkCode)
 }
 
 // --- dispatch ---
@@ -277,6 +303,7 @@ func (s *Scheduler) dispatch() {
 	counts[state.LaneMechanical] += s.fillLane(mech, state.LaneMechanical, mechCapacity-counts[state.LaneMechanical])
 
 	s.publishQueueStats(books, counts)
+	s.publishETAs(ctx, books)
 }
 
 func sortByID(b []store.Book) {
@@ -370,9 +397,9 @@ func (s *Scheduler) runStage(ctx context.Context, b store.Book) {
 		// stage), so park the book needs_attention rather than flag a hard failure.
 		var pe *ParkError
 		if errors.As(err, &pe) {
-			s.setStatus(b.ID, state.StatusNeedsAttention, pe.Error())
+			s.setStatus(b.ID, state.StatusNeedsAttention, pe.Error(), pe.Code)
 		} else {
-			s.setStatus(b.ID, state.StatusFailed, err.Error())
+			s.setStatus(b.ID, state.StatusFailed, err.Error(), "")
 		}
 		return
 	}
@@ -384,17 +411,23 @@ func (s *Scheduler) runStage(ctx context.Context, b store.Book) {
 	if !SentinelExists(b.WorkDir, stageName) {
 		serr := fmt.Errorf("stage %q returned success without writing its sentinel - bug in the stage implementation", stageName)
 		_ = s.db.FinishStageRun(ctx, runID, false, metricsErr(serr))
-		s.setStatus(b.ID, state.StatusFailed, serr.Error())
+		s.setStatus(b.ID, state.StatusFailed, serr.Error(), "")
 		return
 	}
 	if ferr := s.db.FinishStageRun(ctx, runID, true, result.Metrics); ferr != nil {
 		return
 	}
+	// Fold this run's observed unit-rate into the EWMA cache from the stage's own
+	// RateSample - the units it actually processed and the productive seconds it spent
+	// (setup, tool/model downloads and rate-limit backoff excluded), so a resumed run
+	// measures only what it did. nil sample = no observation.
+	s.recordRate(ctx, stageName, result.RateSample)
 	s.advance(ctx, b, stage, result)
 }
 
 // execute runs the injected executor with a progress reporter that persists and
-// publishes stage.progress.
+// publishes stage.progress. Progress is display-only now (the learned rate comes from
+// the stage's StageResult.RateSample), so the reporter no longer tracks a span.
 func (s *Scheduler) execute(ctx context.Context, b store.Book, stage state.State) (StageResult, error) {
 	report := func(done, total int) {
 		_ = s.db.SetProgress(ctx, b.ID, string(stage), done, total)
@@ -403,6 +436,25 @@ func (s *Scheduler) execute(ctx context.Context, b store.Book, stage state.State
 		})
 	}
 	return s.exec.Execute(ctx, b, stage, report)
+}
+
+// recordRate folds one successful stage run's RateSample into the per-stage EWMA rate
+// cache and persists it. It fires ONLY when the stage reported a sample with positive
+// units and seconds; a nil or non-positive sample is a no-op. Safe for concurrent
+// worker goroutines (guarded by rateMu).
+func (s *Scheduler) recordRate(ctx context.Context, stage string, sample *RateSample) {
+	if sample == nil || sample.Units <= 0 || sample.Seconds <= 0 {
+		return
+	}
+	s.rateMu.Lock()
+	newRate, ok := eta.Observe(stage, sample.Seconds, sample.Units, s.rates)
+	if ok {
+		s.rates[stage] = newRate
+	}
+	s.rateMu.Unlock()
+	if ok {
+		_ = s.db.SetRate(ctx, stage, newRate)
+	}
 }
 
 // advance computes the next state from the completed stage's result and applies
@@ -424,12 +476,13 @@ func (s *Scheduler) advance(ctx context.Context, b store.Book, stage state.State
 
 	next, status, err := state.NextState(stage, out)
 	if err != nil {
-		s.setStatus(b.ID, state.StatusFailed, err.Error())
+		s.setStatus(b.ID, state.StatusFailed, err.Error(), "")
 		return
 	}
 	if status == state.StatusNeedsAttention {
-		// Park: keep the state, flag needs_attention (audit unresolved after cap).
-		s.setStatus(b.ID, state.StatusNeedsAttention, "audit failed after maximum fix attempts")
+		// Park: keep the state, flag needs_attention (audit unresolved after the fix
+		// loop is exhausted), carrying the typed fix-loop-exhausted park code.
+		s.setStatus(b.ID, state.StatusNeedsAttention, "audit failed after maximum fix attempts", state.ParkFixLoopExhausted)
 		return
 	}
 
@@ -448,7 +501,7 @@ func (s *Scheduler) advance(ctx context.Context, b store.Book, stage state.State
 	if err := s.db.SetBookPipelineState(ctx, b.ID, string(next)); err != nil {
 		return
 	}
-	s.publishState(b.ID, string(next), "", "")
+	s.publishState(b.ID, string(next), "", "", "")
 }
 
 // advanceWaypoints promotes queued/ready books (no lane, no executor) to their
@@ -474,11 +527,11 @@ func (s *Scheduler) advanceWaypoints(ctx context.Context) ([]store.Book, error) 
 			if err != nil {
 				continue
 			}
-			if err := s.db.SetBookState(ctx, b.ID, string(next), "", ""); err != nil {
+			if err := s.db.SetBookState(ctx, b.ID, string(next), "", "", ""); err != nil {
 				continue
 			}
 			books[i].State = string(next) // mirror the persisted advance in memory
-			s.publishState(b.ID, string(next), "", "")
+			s.publishState(b.ID, string(next), "", "", "")
 			advanced = true
 		}
 		if !advanced {
@@ -524,48 +577,27 @@ func lockHolders(books []store.Book) map[int64]bool {
 	return holders
 }
 
-// seriesLess orders two books of the same series by numeric position, then id.
+// seriesLess orders two books of the same series by numeric position, then id. It
+// parses positions with state.ParseSeriesPos (the pure leaf the scheduler, the ETA
+// queue simulation, and the pipeline's series-carryover discovery all share).
 func seriesLess(a, b store.Book) bool {
-	pa, pb := ParseSeriesPos(a.SeriesPos), ParseSeriesPos(b.SeriesPos)
+	pa, pb := state.ParseSeriesPos(a.SeriesPos), state.ParseSeriesPos(b.SeriesPos)
 	if pa != pb {
 		return pa < pb
 	}
 	return a.ID < b.ID
 }
 
-// ParseSeriesPos extracts the leading number of a position string ("1", "2.5",
-// "1-3.5" -> 1). Unparseable positions sort last (+Inf). Exported so the pipeline's
-// series-carryover discovery shares one parse of a series position.
-func ParseSeriesPos(pos string) float64 {
-	pos = strings.TrimSpace(pos)
-	if pos == "" {
-		return 1e18
-	}
-	end := 0
-	for end < len(pos) {
-		c := pos[end]
-		if (c >= '0' && c <= '9') || c == '.' {
-			end++
-			continue
-		}
-		break
-	}
-	f, err := strconv.ParseFloat(pos[:end], 64)
-	if err != nil {
-		return 1e18
-	}
-	return f
-}
-
 // --- events ---
 
-func (s *Scheduler) publishState(bookID int64, st, status, errMsg string) {
+func (s *Scheduler) publishState(bookID int64, st, status, errMsg, parkCode string) {
 	_ = s.hub.PublishBook("book.state", bookID, map[string]any{
-		"book_id": bookID,
-		"state":   st,
-		"lane":    string(state.LaneOf(state.State(st))),
-		"status":  status,
-		"error":   errMsg,
+		"book_id":   bookID,
+		"state":     st,
+		"lane":      string(state.LaneOf(state.State(st))),
+		"status":    status,
+		"error":     errMsg,
+		"park_code": parkCode,
 	})
 }
 
@@ -600,18 +632,21 @@ func (s *Scheduler) publishQueueStats(books []store.Book, counts map[state.Lane]
 	})
 }
 
-// setStatus writes an orthogonal status flag and publishes book.state, carrying
-// the error message so a client can surface it (a failed stage, a park reason).
-func (s *Scheduler) setStatus(bookID int64, status state.Status, errMsg string) {
+// setStatus writes an orthogonal status flag (plus the free-text error and the
+// typed park code) and publishes book.state, so a client can surface both the
+// reason string and the machine-readable park class. parkCode is the typed reason
+// for a needs_attention park; callers pass "" for a plain failure or a clear, so
+// the code stays in sync with the status (set on a park, empty otherwise).
+func (s *Scheduler) setStatus(bookID int64, status state.Status, errMsg string, parkCode state.ParkCode) {
 	ctx := context.Background()
 	b, err := s.db.GetBook(ctx, bookID)
 	if err != nil {
 		return
 	}
-	if err := s.db.SetBookStatus(ctx, bookID, string(status), errMsg); err != nil {
+	if err := s.db.SetBookStatus(ctx, bookID, string(status), errMsg, string(parkCode)); err != nil {
 		return
 	}
-	s.publishState(bookID, b.State, string(status), errMsg)
+	s.publishState(bookID, b.State, string(status), errMsg, string(parkCode))
 }
 
 func metricsErr(err error) json.RawMessage {

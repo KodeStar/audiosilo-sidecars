@@ -6,6 +6,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -272,6 +273,17 @@ func Run(ctx context.Context, opts Options) error {
 				Version:   av.Version,
 				Detail:    av.Detail,
 			}
+		},
+		// SidecarLoader composes a book's characters/recaps preview from its work dir.
+		// The logic lives in pipeline (which api must not import); this adapter marshals
+		// it to JSON and translates pipeline's no-sidecars sentinel into the api's so the
+		// handler maps it to 404.
+		SidecarLoader: func(workDir string) (json.RawMessage, error) {
+			raw, err := pipeline.SidecarsViewJSON(workDir)
+			if errors.Is(err, pipeline.ErrNoSidecars) {
+				return nil, api.ErrNoSidecars
+			}
+			return raw, err
 		},
 	}).Handler()
 

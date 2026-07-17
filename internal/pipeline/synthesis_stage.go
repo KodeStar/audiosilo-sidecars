@@ -96,7 +96,7 @@ func (e *Executor) synthesize(ctx context.Context, book store.Book, report sched
 	m["cards"] = cards
 	m["recaps"] = recaps
 	m["warnings"] = warnings
-	result := scheduler.StageResult{Metrics: metrics(m)}
+	result := scheduler.StageResult{Metrics: metrics(m), RateSample: usage.rateSample()}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.Synthesizing), result); err != nil {
 		return scheduler.StageResult{}, err
 	}

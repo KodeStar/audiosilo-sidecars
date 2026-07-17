@@ -291,9 +291,19 @@ export interface BookView {
   lane: string;
   status: string;
   error?: string;
+  // Typed machine-readable park reason beside the free-text error (see the
+  // internal/state ParkCode enum). Present (non-empty) only while parked
+  // (status === 'needs_attention'); cleared on retry/resume/cancel. omitempty.
+  park_code?: string;
   coverage?: Coverage;
   identity_sources?: Record<string, string>;
   progress: BookProgress[];
+  // Estimated seconds until the book reaches ready/done, from the scheduler's
+  // latest ETA snapshot. Present only for an active, unparked book. omitempty.
+  eta_seconds?: number;
+  // When the first stage run for the book began (RFC3339); MIN(stage_runs.started_at).
+  // Absent until the book has started running. omitempty.
+  started_at?: string;
   // Current on-disk size of the book's work dir in bytes (chapters + durables);
   // 0 when not yet created or already purged.
   scratch_bytes: number;
@@ -354,6 +364,8 @@ export interface BookStateEvent {
   status: string;
   // The book's error string (a failed stage or cancel reason); '' when none.
   error: string;
+  // The typed park reason (see the internal/state ParkCode enum); '' when none.
+  park_code?: string;
 }
 
 export interface StageProgressEvent {
@@ -368,4 +380,76 @@ export interface QueueStatsEvent {
   agent_active: number;
   mechanical_active: number;
   queued: number;
+}
+
+// EtaUpdateEvent is the daemon-wide `eta.update` SSE frame (book_id 0). books
+// lists only books that currently have an ETA (active, unparked). queue_seconds
+// is the estimated makespan for the whole queue, or null when it cannot be
+// estimated.
+export interface EtaUpdateEvent {
+  queue_seconds: number | null;
+  books: { book_id: number; eta_seconds: number }[];
+}
+
+// --- Done tab: sidecar preview (GET /books/{id}/sidecars) ---
+// These mirror the metaserve-API-shaped preview the daemon serves so the vendored
+// expressive.ts (src/lib/expressive.ts) consumes them unchanged. Field names/
+// optionality track audiosilo-meta site/src/lib/api.ts.
+
+// A spoiler position on a work's own (edition-independent) timeline. chapter is
+// the logical book chapter; 0 = front matter / prior-book knowledge.
+export interface Position {
+  chapter: number;
+}
+
+// A community-authored, spoiler-tagged character entry (the CC BY-SA layer).
+export interface Character {
+  id: string;
+  name: string;
+  aliases?: string[];
+  role?: 'protagonist' | 'antagonist' | 'supporting' | 'minor';
+  reveal: Position;
+  description?: string;
+  xref?: { wikidata?: string; goodreads?: string };
+}
+
+// A position-keyed "story so far" recap. through = safe once that chapter is done.
+export interface Recap {
+  through: Position;
+  scope?: 'book' | 'series';
+  text: string;
+}
+
+// A work's whole-book recap summary (the CC BY-SA layer). in_short is the whole
+// book in one paragraph, ending included; ending is a plain statement of how the
+// book closes. Both optional and FULL spoilers - distinct from the position-gated
+// chaptered recaps above.
+export interface RecapSummary {
+  in_short?: string;
+  ending?: string;
+}
+
+// SidecarsView is GET /books/{id}/sidecars: the extracted characters/recaps
+// preview for the Done tab. work is the matched work slug (or empty); the sidecar
+// arrays/summary are omitempty on the wire.
+export interface SidecarsView {
+  work: string;
+  characters?: Character[];
+  recaps?: Recap[];
+  recap_summary?: RecapSummary;
+}
+
+// --- Done tab: per-book event log (GET /books/{id}/events) ---
+
+// LoggedEvent is one durable event-log row (newest first). payload is the event's
+// JSON body, shape-varying by type, so it stays unknown.
+export interface LoggedEvent {
+  id: number;
+  ts: string;
+  type: string;
+  payload?: unknown;
+}
+
+export interface BookEventsResponse {
+  events: LoggedEvent[];
 }

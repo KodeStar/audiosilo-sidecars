@@ -128,6 +128,46 @@ func (db *DB) SumStageRunCost(ctx context.Context, bookID int64) (float64, error
 	return total, nil
 }
 
+// StageRunStarts returns each book's earliest stage-run start (MIN(started_at))
+// bucketed by book id, in ONE grouped query so the book-list endpoint attaches a
+// per-book "started at" without an N+1. started_at is the store's fixed-width UTC
+// form, so MIN is chronological. Books with no runs are absent from the map (a
+// queued book that has not begun any stage yet).
+func (db *DB) StageRunStarts(ctx context.Context) (map[int64]string, error) {
+	rows, err := db.sql.QueryContext(ctx,
+		`SELECT book_id, MIN(started_at) FROM stage_runs GROUP BY book_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[int64]string{}
+	for rows.Next() {
+		var bookID int64
+		var started string
+		if err := rows.Scan(&bookID, &started); err != nil {
+			return nil, err
+		}
+		out[bookID] = started
+	}
+	return out, rows.Err()
+}
+
+// FirstStageRunStart returns one book's earliest stage-run start - the single-book
+// form of StageRunStarts for the book-detail/create paths. ok is false when the
+// book has no runs yet (MIN over an empty set is NULL).
+func (db *DB) FirstStageRunStart(ctx context.Context, bookID int64) (string, bool, error) {
+	var started sql.NullString
+	err := db.sql.QueryRowContext(ctx,
+		`SELECT MIN(started_at) FROM stage_runs WHERE book_id=?`, bookID).Scan(&started)
+	if err != nil {
+		return "", false, err
+	}
+	if !started.Valid {
+		return "", false, nil
+	}
+	return started.String, true, nil
+}
+
 // CountStageRuns returns how many runs of stage exist for a book (all attempts),
 // used to compute the next attempt number and the fix-loop count.
 func (db *DB) CountStageRuns(ctx context.Context, bookID int64, stage string) (int, error) {

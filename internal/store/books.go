@@ -19,6 +19,24 @@ import (
 // very long title cannot produce an unwieldy path component.
 const workDirSlugMax = 48
 
+// statusNeedsAttention is the one status value that may carry a park code. The
+// store treats State/Status as opaque strings (internal/state owns their meaning),
+// but the park_code invariant - "a code is set ONLY while status is needs_attention"
+// - is enforced here at the write so it can never be violated regardless of caller
+// ceremony. Kept as a local literal rather than importing internal/state, preserving
+// the store's opaque-string decoupling; it must match state.StatusNeedsAttention.
+const statusNeedsAttention = "needs_attention"
+
+// enforceParkCode drops a park code that does not belong to the status being written:
+// park_code is meaningful only alongside needs_attention, so any other status writes
+// an empty code. Centralized so SetBookState/SetBookStatus can't drift.
+func enforceParkCode(status, parkCode string) string {
+	if status != statusNeedsAttention {
+		return ""
+	}
+	return parkCode
+}
+
 // DeriveWorkDir returns a unique per-book scratch directory under root. The
 // source_path hash guarantees uniqueness (two books may share a title), while the
 // title slug keeps the path human-readable. An empty/all-symbol title falls back
@@ -87,8 +105,15 @@ type Book struct {
 	// ScratchBytes is the accounted on-disk size of the book's work dir, written by
 	// the split stage and PurgeScratch so reads never have to walk the dir.
 	ScratchBytes int64
-	CreatedAt    string
-	UpdatedAt    string
+	// Chapters is the manifest chapter count, written by the pipeline right after
+	// inspect succeeds (0 = not yet known). The ETA engine reads it as the per-book
+	// chapter total for the per-chapter stages.
+	Chapters int
+	// ParkCode is the typed park reason (empty = none): set when status becomes
+	// needs_attention, cleared whenever status clears. It rides beside Error.
+	ParkCode  string
+	CreatedAt string
+	UpdatedAt string
 }
 
 // NewBook is the input to CreateBook: the identity/metadata fields a caller
@@ -193,14 +218,15 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 
 const bookCols = `id, source_path, work_dir, title, authors, series, series_pos,
 	asin, isbn, identity_sources, work_id, state, status, error, coverage, scratch_bytes,
-	created_at, updated_at`
+	chapters, park_code, created_at, updated_at`
 
 func scanBook(sc interface{ Scan(...any) error }) (Book, error) {
 	var b Book
 	var authors, idsrc, coverage string
 	if err := sc.Scan(&b.ID, &b.SourcePath, &b.WorkDir, &b.Title, &authors,
 		&b.Series, &b.SeriesPos, &b.ASIN, &b.ISBN, &idsrc, &b.WorkID, &b.State, &b.Status,
-		&b.Error, &coverage, &b.ScratchBytes, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		&b.Error, &coverage, &b.ScratchBytes, &b.Chapters, &b.ParkCode,
+		&b.CreatedAt, &b.UpdatedAt); err != nil {
 		return Book{}, err
 	}
 	if authors != "" {
@@ -247,12 +273,27 @@ func (db *DB) ListBooks(ctx context.Context) ([]Book, error) {
 	return out, rows.Err()
 }
 
-// SetBookState updates a book's state, status, and error together (the fields the
-// scheduler mutates on every transition) and bumps updated_at.
-func (db *DB) SetBookState(ctx context.Context, id int64, state, status, errMsg string) error {
+// SetBookState updates a book's state, status, error, and typed park code together
+// (the fields the scheduler mutates on every transition) and bumps updated_at. The
+// park_code invariant is enforced here: a code is written only alongside a
+// needs_attention status, so a status-clearing write always wipes any prior code
+// even if the caller passes one.
+func (db *DB) SetBookState(ctx context.Context, id int64, state, status, errMsg, parkCode string) error {
 	res, err := db.sql.ExecContext(ctx,
-		`UPDATE books SET state=?, status=?, error=?, updated_at=? WHERE id=?`,
-		state, status, errMsg, timestamp(nowFn()), id)
+		`UPDATE books SET state=?, status=?, error=?, park_code=?, updated_at=? WHERE id=?`,
+		state, status, errMsg, enforceParkCode(status, parkCode), timestamp(nowFn()), id)
+	return checkAffected(res, err)
+}
+
+// SetBookChapters records a book's manifest chapter count (written by the pipeline
+// once inspect succeeds), which the ETA engine reads as the per-chapter stages'
+// unit total. It is a pure gauge write and deliberately does NOT bump updated_at
+// (mirroring UpdateScratchBytes): the chapter count is bookkeeping derived from the
+// source, not a change to the book's pipeline position, and a spurious updated_at
+// bump would reorder the Running list.
+func (db *DB) SetBookChapters(ctx context.Context, id int64, chapters int) error {
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE books SET chapters=? WHERE id=?`, chapters, id)
 	return checkAffected(res, err)
 }
 
@@ -269,12 +310,14 @@ func (db *DB) SetBookPipelineState(ctx context.Context, id int64, state string) 
 }
 
 // SetBookStatus updates only the orthogonal status flag (paused/needs_attention/
-// failed and back), preserving the pipeline state. errMsg is stored as-is
-// (callers pass "" to clear it).
-func (db *DB) SetBookStatus(ctx context.Context, id int64, status, errMsg string) error {
+// failed and back), preserving the pipeline state. The park_code invariant is
+// enforced here: a code is written only alongside a needs_attention status, so any
+// other status (including a clear) always wipes a prior code even if the caller
+// passes one.
+func (db *DB) SetBookStatus(ctx context.Context, id int64, status, errMsg, parkCode string) error {
 	res, err := db.sql.ExecContext(ctx,
-		`UPDATE books SET status=?, error=?, updated_at=? WHERE id=?`,
-		status, errMsg, timestamp(nowFn()), id)
+		`UPDATE books SET status=?, error=?, park_code=?, updated_at=? WHERE id=?`,
+		status, errMsg, enforceParkCode(status, parkCode), timestamp(nowFn()), id)
 	return checkAffected(res, err)
 }
 

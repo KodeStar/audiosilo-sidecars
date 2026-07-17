@@ -219,19 +219,41 @@ internal/
             (go-keyring) with a 0600 secrets.json fallback; read API is presence-only
   store/    SQLite (modernc, pure Go; single writer + WAL) + append-only migrations:
             books, stage_runs, progress, events (durable log, 30-day prune), rates
-            (EWMA seed, create-only in M1), settings KV, sessions. M5's migration 0004
-            added stage_runs.{model,input_tokens,output_tokens,cost_usd} +
+            (per-stage EWMA unit rates - LIVE since M6), settings KV, sessions. M5's
+            migration 0004 added stage_runs.{model,input_tokens,output_tokens,cost_usd} +
             AddOpenStageRunUsage (accumulates per agent invocation onto the open run) so
-            per-stage cost rides on the book view. Plain tested CRUD; AuthStore adapts it
-            to auth.Store. Holds the SCHEDULING truth.
+            per-stage cost rides on the book view. M6's 0005 added books.{chapters,
+            park_code}; the park_code invariant (non-empty iff status is
+            needs_attention) is enforced INSIDE SetBookState/SetBookStatus, not by
+            caller discipline. Plain tested CRUD; AuthStore adapts it to auth.Store.
+            Holds the SCHEDULING truth.
   state/    per-book pipeline state machine: table-driven states/lanes/transitions,
-            CanStart/NextState guards, the audit fix-loop cap. Pure, no I/O.
+            CanStart/NextState guards, the audit fix-loop cap. Pure, no I/O. M6 added
+            ParkCode (the 10 typed park reasons), MainlineNext (the optimistic mainline
+            successor the ETA engine walks - the table's Next ordering is load-bearing:
+            conditional/loop target first, mainline continuation LAST), and
+            ParseSeriesPos (moved here from scheduler so eta/scheduler share one parser).
+  eta/      the PURE ETA engine (no I/O, no clock): per-stage unit kinds
+            (chapter/chunk/book) + seed rates from the historical extraction metrics,
+            EWMA Observe (alpha 0.3), book ETA = rate x remaining units over the
+            optimistic mainline (loops are not predicted - documented), queue ETA = a
+            greedy three-lane event simulation (LaneCaps injected from the scheduler,
+            series locks via state.HoldsSeriesLock, retranscribe-first ASR ordering).
   scheduler/ one wake-on-event goroutine over three lanes (ASR cap 1 / agent cap =
             config, series-locked / mechanical cap 2) over an injected Executor +
             _done/<stage>.json sentinels (the CONTENT truth) and crash reconcile.
             Pause/resume/retry/cancel/delete + PurgeScratch (reclaim chapters/ when
             done/paused/failed). Publishes book.state/stage.progress/queue.stats.
             M2 runs the pipeline composite executor (real inspect/split, stubs beyond).
+            M6: records EWMA rates from each stage's explicit StageResult.RateSample
+            (units processed this run + productive seconds, measured by the stage AFTER
+            setup and excluding agent rate-limit backoff - first-run tool/model
+            downloads never contaminate learned rates; a nil sample records nothing),
+            recomputes ETAs on every dispatch pass (idle-gated: no active books = no
+            query/sim) and publishes deduped eta.update SSE (queue_seconds is null when
+            idle); ETASnapshot/ETASeconds feed the books API. Progress reporting is
+            display-only and resume-aware (a resumable stage's FIRST report is the
+            already-complete baseline; skipped units never tick).
   metaops/  meta.audiosilo.app client (coverage/lookup, capped 1h TTL caches,
             graceful degrade) + async folder-scan job manager over audiosilo-meta
             pkg/scan + the library_roots PathAllowed check. Coverage resolves
@@ -256,14 +278,22 @@ internal/
             durable-sink persister (feeds store.events)
   api/      transport-only HTTP: auth/system/settings/events + M1 scans/books/control
             handlers + middleware (bearer auth, allow-list CORS, security headers).
-            NO business logic here.
+            NO business logic here. M6 added GET /books/{id}/sidecars (the preview
+            envelope is composed in internal/pipeline.SidecarsView and INJECTED as a
+            loader func - api never imports pipeline; 404 via ErrNoSidecars when no
+            sidecar files exist) and GET /books/{id}/events (per-book durable log,
+            limit clamped 1..500); bookView carries eta_seconds/started_at/park_code.
   web/      go:embed of the SPA (build-tag selected) + SPA-fallback static serving
   server/   http.Server wiring, graceful shutdown, the startup banner
 web/          the SPA: Vite + React 19 + TS + Tailwind v4 (npm, Node 24); dist/ is embedded
               src/lib/ holds pure, vitest-tested logic (apiClient, candidates, books,
-              pipelineState, recentRoots, useEventStream, scanStore); src/components/
-              {library,running}/ are the Library/Running tab views; components stay
-              thin over src/lib. The Library tab's scan + selection state lives in
+              pipelineState, recentRoots, useEventStream, scanStore; M6 added timeline,
+              duration, bookLog, parkReasons, doneBoard, time, useLazyDetail, and
+              expressive.ts - VENDORED from audiosilo-meta site/src/lib/expressive.ts
+              with its tests, keep it tracking upstream); src/components/
+              {library,running,done}/ are the Library/Running/Done tab views; components
+              stay thin over src/lib. The timeline's stage graph is a hand-mirror of the
+              Go state table - a drift-guard test pins its stage set to the label maps. The Library tab's scan + selection state lives in
               scanStore.ts - a module-level external store (useSyncExternalStore)
               owning the 700ms poll loop, so tab switches (AppShell unmounts
               panels) and reloads (GET /scans reattach) never lose a running scan;
@@ -278,7 +308,8 @@ Dockerfile             multi-stage: node build -> go build (embedui) -> debian-s
 
 **Dependency direction** (transport-only rule): `server -> {api, auth, secrets,
 events, config, store, scheduler, metaops, pipeline, web}`; `api -> {auth, secrets,
-events, config, store, scheduler, metaops}`; `scheduler -> {store, state, events}`;
+events, config, store, scheduler, metaops}`; `scheduler -> {store, state, eta, events}`; `eta -> state` (pure, imported BY
+scheduler - never the reverse);
 `pipeline -> {audio, asr, transcript, qa, spelling, agent, repair, toolfetch, scratch,
 secrets, fsutil, store, state, scheduler}`; `agent`/`repair` are leaf helpers (no
 scheduler/store deps; `repair -> qa` for the shared Python-compat gram/repr helpers);
@@ -501,14 +532,46 @@ Milestones from the workspace plan; each is shippable.
   markers_normalizing -> a dirty-QA -> adjudicate-retranscribe -> clean re-sweep ->
   spelling/fact/synthesis -> an audit-fail fix loop -> done, asserting the cleared-sentinel
   re-runs and per-stage usage) plus the focused per-stage/invariant/loop tests.
-- **M6-M8 (planned):** the **Done** board (M6), the Running-tab richer board (stage
-  timeline / ETA, M6), contribution (intake issue / PR / keep-local, M7), auto-purge /
-  startup-GC of scratch (M7), and packaging (GoReleaser + Docker matrix, M8). See the plan
-  for the full table.
+- **M6 (done):** the **Done board**, the **richer Running board**, and the **ETA
+  engine**. `internal/eta` (pure) owns per-stage EWMA unit rates (chapter/chunk/book
+  units, alpha 0.3, seeded from the historical extraction metrics, persisted in the
+  `rates` table), book ETA (rate x remaining units over the optimistic mainline derived
+  from `state.MainlineNext` - loops are not predicted), and queue ETA (a greedy
+  three-lane simulation with injected LaneCaps, `state.HoldsSeriesLock` series locks,
+  and retranscribe-first ASR ordering). Rate observation is stage-owned: each stage
+  returns a `StageResult.RateSample` (units actually processed this run + productive
+  seconds measured after setup, agent rate-limit backoff excluded via the runner's
+  slept-time return) so resumes, first-run tool/model downloads, and backoff never
+  contaminate learned rates; progress reporting is display-only and starts at the
+  resume baseline. The scheduler recomputes on each dispatch pass (idle-gated) and
+  publishes deduped `eta.update` SSE (`queue_seconds` null when idle);
+  `eta_seconds`/`started_at` ride on bookView. **Typed park reasons**: `state.ParkCode`
+  (10 codes) flows ParkWithCode -> books.park_code (migration 0005; invariant enforced
+  in the store) -> the `book.state` event -> per-class affordance hints in the UI.
+  New endpoints: `GET /books/{id}/sidecars` (metaserve-shaped preview envelope,
+  composed in pipeline, injected into api) and `GET /books/{id}/events` (durable log);
+  both have allowed + denied tests. The **Done tab is real** (`/system` reports it
+  `ready`): rows with finished date/total cost/scratch, per-stage cost columns
+  (stage/model/tokens/cost/elapsed - closes Library-UX feedback item 6), a sidecars
+  preview modal rendering characters/recaps like meta.audiosilo.app (vendored
+  `expressive.ts`; spoiler accordions closed by default), a "Local only" contribution
+  chip (until M7), purge + delete. The **Running tab** gained the stage-chip timeline
+  (mainline + off-mainline insertion), elapsed + ETA chips (hidden while
+  paused/parked), a Queue-ETA strip stat, a live per-book event log in the details
+  expansion, and park-code hints. `books.chapters` records the manifest count after
+  inspect; pre-M6 books fall back to their progress-row totals. Gate verified: full Go
+  + web gates green after /simplify (14 applied) and /code-review (10 verified
+  findings applied), plus a live smoke (real say-synthesized m4b live on the board -
+  timeline/ETA/elapsed/log, agent-unavailable park with the typed hint, kill -9
+  resume without re-transcribing, done-book cost table/preview/purge through the real
+  API, SSE `eta.update` frames, idle null queue ETA).
+- **M7-M8 (planned):** contribution (intake issue / PR / keep-local, M7 - includes
+  resolving the workSlug placeholder to the real meta work slug), auto-purge /
+  startup-GC of scratch (M7), and packaging (GoReleaser + Docker matrix, M8). See the
+  plan for the full table.
 
-Still **not built**: the **Done** tab (full board is M6), the Running tab's richer
-board (stage timeline / ETA, M6), and the `contributing` stage (M7) - the only pipeline
-stage still a stub, so a `ready` book advances straight to `done` without opening an
-intake issue/PR yet. Auto-purge/startup-GC of scratch is M7 (M2 is manual purge only).
-`/system` reports Library/Running/Settings as `ready` and only Done as `planned` (the
-Go-side tab labels). Keep this file honest as milestones land.
+Still **not built**: the `contributing` stage (M7) - the only pipeline stage still a
+stub, so a `ready` book advances straight to `done` without opening an intake issue/PR
+yet (the Done tab shows a "Local only" contribution chip until then). Auto-purge/
+startup-GC of scratch is M7 (manual purge only). All four tabs now report `ready` on
+`/system`. Keep this file honest as milestones land.

@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import type { BookView } from '@/api/types';
 import {
   applyBookState,
+  applyEtaUpdate,
   applyStageProgress,
   availableActions,
   formatBytes,
@@ -57,6 +58,28 @@ describe('applyBookState', () => {
     expect(out[0].error).toBe('');
   });
 
+  it('carries park_code from the event (set on park, cleared on advance)', () => {
+    const books = [bk({ id: 1, state: 'markers_normalizing', status: '' })];
+    const parked = applyBookState(books, {
+      book_id: 1,
+      state: 'markers_normalizing',
+      lane: 'agent',
+      status: 'needs_attention',
+      error: 'no confident markers',
+      park_code: 'markers_not_confident',
+    });
+    expect(parked[0].park_code).toBe('markers_not_confident');
+    // A later advance with no park_code clears it.
+    const advanced = applyBookState(parked, {
+      book_id: 1,
+      state: 'splitting',
+      lane: 'mechanical',
+      status: '',
+      error: '',
+    });
+    expect(advanced[0].park_code).toBeUndefined();
+  });
+
   it('returns the same array reference when no book matches', () => {
     const books = [bk({ id: 1 })];
     const out = applyBookState(books, {
@@ -65,6 +88,34 @@ describe('applyBookState', () => {
       lane: '',
       status: '',
       error: '',
+    });
+    expect(out).toBe(books);
+  });
+});
+
+describe('applyEtaUpdate', () => {
+  it('patches listed books and clears the ETA on unlisted books', () => {
+    const books = [bk({ id: 1, eta_seconds: 100 }), bk({ id: 2, eta_seconds: 200 }), bk({ id: 3 })];
+    const out = applyEtaUpdate(books, {
+      queue_seconds: 5400,
+      books: [
+        { book_id: 1, eta_seconds: 150 },
+        { book_id: 3, eta_seconds: 300 },
+      ],
+    });
+    expect(out[0].eta_seconds).toBe(150); // updated
+    expect(out[1].eta_seconds).toBeUndefined(); // unlisted -> cleared (parked/terminal)
+    expect(out[2].eta_seconds).toBe(300); // newly gained an ETA
+  });
+
+  it('ignores unknown book ids and returns the same reference when unchanged', () => {
+    const books = [bk({ id: 1, eta_seconds: 100 })];
+    const out = applyEtaUpdate(books, {
+      queue_seconds: null,
+      books: [
+        { book_id: 1, eta_seconds: 100 }, // same value
+        { book_id: 99, eta_seconds: 500 }, // unknown, ignored
+      ],
     });
     expect(out).toBe(books);
   });

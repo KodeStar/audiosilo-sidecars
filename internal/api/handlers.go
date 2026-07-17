@@ -111,7 +111,7 @@ type systemResponse struct {
 var tabs = []tabInfo{
 	{ID: "library", Label: "Library", Status: "ready"},
 	{ID: "running", Label: "Running", Status: "ready"},
-	{ID: "done", Label: "Done", Status: "planned"},
+	{ID: "done", Label: "Done", Status: "ready"},
 	{ID: "settings", Label: "Settings", Status: "ready"},
 }
 

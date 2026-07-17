@@ -181,6 +181,64 @@ func TestHappyPathToDone(t *testing.T) {
 	}
 }
 
+// TestMainlineNextIsDeclaredSuccessor guards the derivation the ETA engine relies
+// on: for every non-terminal state MainlineNext returns a declared successor (a
+// member of table[s].Next), and for the terminal state it returns "".
+func TestMainlineNextIsDeclaredSuccessor(t *testing.T) {
+	for _, s := range All() {
+		next := MainlineNext(s)
+		if IsTerminal(s) {
+			if next != "" {
+				t.Errorf("MainlineNext(%q terminal) = %q, want \"\"", s, next)
+			}
+			continue
+		}
+		if !legalNext(s, next) {
+			t.Errorf("MainlineNext(%q) = %q, not a declared successor %v", s, next, table[s].Next)
+		}
+	}
+}
+
+// TestMainlineNextWalksMainlineToDone follows MainlineNext from Queued and asserts it
+// reaches Done visiting exactly the mainline stages (skipping the bracketed
+// conditional/loop stages), matching the NextState happy path in TestHappyPathToDone.
+func TestMainlineNextWalksMainlineToDone(t *testing.T) {
+	want := []State{
+		Queued, Inspecting, Splitting, ASR, Sanitizing, QASweep,
+		SpellingResearch, Correcting, FactPass, Synthesizing, Validating,
+		Auditing, Ready, Contributing, Done,
+	}
+	cur := Queued
+	got := []State{cur}
+	for !IsTerminal(cur) {
+		next := MainlineNext(cur)
+		if next == "" {
+			t.Fatalf("MainlineNext(%q) = \"\" before reaching Done", cur)
+		}
+		got = append(got, next)
+		cur = next
+		if len(got) > len(table)+1 {
+			t.Fatalf("MainlineNext walk did not terminate: %v", got)
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("mainline walk %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("step %d: got %q, want %q (full %v)", i, got[i], want[i], got)
+		}
+	}
+	// The conditional/loop stages must NOT appear on the mainline.
+	for _, cond := range []State{MarkersNormalizing, QAAdjudicating, Retranscribing, Fixing} {
+		for _, s := range got {
+			if s == cond {
+				t.Errorf("conditional stage %q appeared on the mainline walk", cond)
+			}
+		}
+	}
+}
+
 // TestHoldsSeriesLock asserts the predicate is true for every state before Ready
 // and false from Ready onward (the finished-for-lock-purposes boundary).
 func TestHoldsSeriesLock(t *testing.T) {

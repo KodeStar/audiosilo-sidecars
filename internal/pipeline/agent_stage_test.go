@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
@@ -90,6 +91,48 @@ func TestMarkersNormalizeHappyPath(t *testing.T) {
 	// The agent stage requested the routed model.
 	if r, ok := fake.lastRequest(string(state.MarkersNormalizing)); !ok || r.Model != "sonnet" || r.Web {
 		t.Errorf("agent request model=%q web=%v, want sonnet/false", r.Model, r.Web)
+	}
+}
+
+// TestAgentStageRateSampleExcludesBackoff drives markers_normalizing through a
+// rate-limit backoff (first attempt rate-limited, second succeeds) with a short
+// injected backoff, and asserts the reported RateSample charges only productive agent
+// time: 1 unit, and Seconds well below the backoff the run actually slept through.
+func TestAgentStageRateSampleExcludesBackoff(t *testing.T) {
+	work := t.TempDir()
+	seedProbe(t, work)
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x/book.m4b", Style: audio.StyleMarkers, Duration: 6, ChapterCount: 3, Chapters: markerChapters(1, 2, 4)})
+
+	const backoff = 300 * time.Millisecond
+	fake := newFakeRunner()
+	fake.act = func(f *fakeRunner, req agent.Request, attempt int) (agent.Result, error) {
+		if attempt == 1 {
+			// Rate-limit the first attempt: RunWithBackoff sleeps `backoff`, then retries.
+			return agent.Result{}, &agent.RateLimitError{Detail: "429"}
+		}
+		writeOut(t, req, audio.ManifestName, correctedManifest())
+		writeOut(t, req, "verdict.json", markerVerdict{Confident: true, Reason: "ok"})
+		return agent.Result{Usage: agent.Usage{Model: "sonnet"}}, nil
+	}
+	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
+	exe.backoff = []time.Duration{backoff} // tiny schedule so the test does not sleep for minutes
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.MarkersNormalizing, nil)
+	if err != nil {
+		t.Fatalf("markers_normalize: %v", err)
+	}
+	if fake.count(string(state.MarkersNormalizing)) != 2 {
+		t.Fatalf("agent ran %d times, want 2 (one rate-limited + one success)", fake.count(string(state.MarkersNormalizing)))
+	}
+	if res.RateSample == nil {
+		t.Fatal("no RateSample; want one")
+	}
+	if res.RateSample.Units != 1 {
+		t.Errorf("RateSample.Units = %d, want 1 (one whole-book agent stage)", res.RateSample.Units)
+	}
+	// The stage's wall-clock spanned the ~300ms backoff, but the rate charges only
+	// productive agent time, so Seconds must be well under the backoff it slept through.
+	if res.RateSample.Seconds >= backoff.Seconds() {
+		t.Errorf("RateSample.Seconds = %v, want < %v (rate-limit backoff excluded)", res.RateSample.Seconds, backoff.Seconds())
 	}
 }
 

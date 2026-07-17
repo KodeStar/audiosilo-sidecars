@@ -4,8 +4,13 @@ export type EventStreamStatus = 'connecting' | 'open' | 'closed';
 
 // The named SSE events the daemon publishes for the pipeline (besides the
 // ephemeral heartbeat). See internal/scheduler's publish sites.
-export type PipelineEventType = 'book.state' | 'stage.progress' | 'queue.stats';
-const PIPELINE_EVENTS: PipelineEventType[] = ['book.state', 'stage.progress', 'queue.stats'];
+export type PipelineEventType = 'book.state' | 'stage.progress' | 'queue.stats' | 'eta.update';
+const PIPELINE_EVENTS: PipelineEventType[] = [
+  'book.state',
+  'stage.progress',
+  'queue.stats',
+  'eta.update',
+];
 
 export interface EventStreamState {
   status: EventStreamStatus;

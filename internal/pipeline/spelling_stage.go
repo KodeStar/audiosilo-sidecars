@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
@@ -159,7 +160,7 @@ func (e *Executor) spellingResearch(ctx context.Context, book store.Book, report
 	m := usage.metricsMap()
 	m["rules"] = rules
 	m["ledger_entries"] = ledgerEntries
-	result := scheduler.StageResult{Metrics: metrics(m)}
+	result := scheduler.StageResult{Metrics: metrics(m), RateSample: usage.rateSample()}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.SpellingResearch), result); err != nil {
 		return scheduler.StageResult{}, err
 	}
@@ -371,6 +372,7 @@ func (e *Executor) correcting(ctx context.Context, book store.Book, report sched
 	if report != nil {
 		report(0, 1)
 	}
+	start := time.Now()
 	applyRes, err := spelling.Apply(book.WorkDir, corr)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("correcting: apply corrections: %w", err)
@@ -380,12 +382,13 @@ func (e *Executor) correcting(ctx context.Context, book store.Book, report sched
 		return scheduler.StageResult{}, fmt.Errorf("correcting: check corrections: %w", err)
 	}
 	if !checkRes.Ok() {
-		return scheduler.StageResult{}, scheduler.Park(SpellingGateFailurePrefix + ":\n" + checkRes.Summary())
+		return scheduler.StageResult{}, scheduler.ParkWithCode(state.ParkSpellingGateFailure, SpellingGateFailurePrefix+":\n"+checkRes.Summary())
 	}
 	sheetsRes, err := spelling.GenerateSheets(book.WorkDir, sp)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("correcting: generate spelling sheets: %w", err)
 	}
+	correctSeconds := time.Since(start).Seconds()
 	// NOTE: spelling.CheckFirstUse (the first-use-before-attestation cross-check) is
 	// deliberately NOT wired here. It needs the fact-pass ROSTER, which does not exist
 	// yet at correcting time (correcting runs before fact_pass), so every call landed in
@@ -406,6 +409,7 @@ func (e *Executor) correcting(ctx context.Context, book store.Book, report sched
 			"rules_fired":  applyRes.RulesFired,
 			"sheets":       len(sheetsRes.Sheets),
 		}),
+		RateSample: rateSample(1, correctSeconds),
 	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.Correcting), result); err != nil {
 		return scheduler.StageResult{}, err

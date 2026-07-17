@@ -89,6 +89,7 @@ func (e *Executor) audit(ctx context.Context, book store.Book, report scheduler.
 	result := scheduler.StageResult{
 		AuditPassed: effectivePass,
 		Metrics:     metrics(m),
+		RateSample:  usage.rateSample(),
 	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.Auditing), result); err != nil {
 		return scheduler.StageResult{}, err

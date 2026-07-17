@@ -214,8 +214,17 @@ type bookView struct {
 	Lane            string            `json:"lane"`
 	Status          string            `json:"status"`
 	Error           string            `json:"error,omitempty"`
-	Coverage        json.RawMessage   `json:"coverage,omitempty"`
-	Progress        []store.Progress  `json:"progress"`
+	// ParkCode is the typed park reason beside Error (empty = none), from books.park_code.
+	ParkCode string          `json:"park_code,omitempty"`
+	Coverage json.RawMessage `json:"coverage,omitempty"`
+	// ETASeconds is the scheduler's latest estimated remaining seconds for this book
+	// (0/omitted when the book has no active ETA - terminal/paused/parked/failed, or
+	// before the first ETA pass). The api reads it from the scheduler; it never computes.
+	ETASeconds int64 `json:"eta_seconds,omitempty"`
+	// StartedAt is the book's earliest stage-run start (MIN(stage_runs.started_at)),
+	// omitted when the book has not begun any stage yet.
+	StartedAt string           `json:"started_at,omitempty"`
+	Progress  []store.Progress `json:"progress"`
 	// ScratchBytes is the current on-disk size of the book's work dir (chapters +
 	// durables), so the UI can show disk usage and offer a purge. 0 when the work
 	// dir does not exist yet (or was purged).
@@ -234,20 +243,45 @@ type bookDetail struct {
 	StageRuns []store.StageRun `json:"stage_runs"`
 }
 
-// bookToView builds the detail view for one book, fetching its progress and summed
-// agent cost. The list endpoint uses buildBookView with pre-fetched progress + totals
-// to avoid an N+1.
+// bookToView builds the detail view for one book, fetching its progress, summed
+// agent cost, earliest stage-run start, and the scheduler's latest ETA. The list
+// endpoint uses buildBookView with pre-fetched values to avoid an N+1.
 func (a *API) bookToView(ctx context.Context, b store.Book) bookView {
 	progress, _ := a.store.ListProgress(ctx, b.ID)
 	totalCost, _ := a.store.SumStageRunCost(ctx, b.ID)
-	return buildBookView(b, progress, totalCost)
+	startedAt, _, _ := a.store.FirstStageRunStart(ctx, b.ID)
+	return buildBookView(b, progress, totalCost, startedAt, a.bookETA(b.ID))
 }
 
-// buildBookView assembles a bookView from a book, its (possibly nil) progress rows, and
-// its summed agent cost, normalizing the always-present JSON fields. scratch_bytes is
-// served from the persisted column (written by the split stage / PurgeScratch), so no
-// read walks the work dir.
-func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64) bookView {
+// bookETA reads a book's latest ETA from the scheduler (never computed here). It
+// returns 0 when the scheduler is absent (nil in M0-only tests) or the book has no
+// active ETA; the bookView's omitempty then drops the field.
+func (a *API) bookETA(bookID int64) int64 {
+	if a.sched == nil {
+		return 0
+	}
+	if v, ok := a.sched.ETASeconds(bookID); ok {
+		return v
+	}
+	return 0
+}
+
+// bookETASnapshot returns the whole per-book ETA map in one scheduler lock, for the
+// list endpoint (so it does not take the ETA lock once per book). Nil when the
+// scheduler is absent (M0-only tests); a missing key means no active ETA, which the
+// bookView's omitempty drops.
+func (a *API) bookETASnapshot() map[int64]int64 {
+	if a.sched == nil {
+		return nil
+	}
+	return a.sched.ETASnapshot()
+}
+
+// buildBookView assembles a bookView from a book, its (possibly nil) progress rows,
+// summed agent cost, earliest stage-run start, and ETA seconds, normalizing the
+// always-present JSON fields. scratch_bytes is served from the persisted column
+// (written by the split stage / PurgeScratch), so no read walks the work dir.
+func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64, startedAt string, etaSeconds int64) bookView {
 	authors := b.Authors
 	if authors == nil {
 		authors = []string{}
@@ -264,7 +298,8 @@ func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64
 		Series: b.Series, SeriesPos: b.SeriesPos, ASIN: b.ASIN, ISBN: b.ISBN,
 		IdentitySources: idsrc, WorkID: b.WorkID,
 		State: b.State, Lane: string(state.LaneOf(state.State(b.State))),
-		Status: b.Status, Error: b.Error, Coverage: b.Coverage,
+		Status: b.Status, Error: b.Error, ParkCode: b.ParkCode, Coverage: b.Coverage,
+		ETASeconds: etaSeconds, StartedAt: startedAt,
 		Progress: progress, ScratchBytes: b.ScratchBytes, TotalCostUSD: totalCostUSD,
 		CreatedAt: b.CreatedAt, UpdatedAt: b.UpdatedAt,
 	}
@@ -293,9 +328,18 @@ func (a *API) handleListBooks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not list costs")
 		return
 	}
+	// One grouped MIN(started_at) query for the whole list (no N+1).
+	startsByBook, err := a.store.StageRunStarts(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not list stage-run starts")
+		return
+	}
+	// One ETA snapshot for the whole list (a single scheduler lock, not one per book).
+	etaByBook := a.bookETASnapshot()
 	views := make([]bookView, 0, len(books))
 	for _, b := range books {
-		views = append(views, buildBookView(b, progressByBook[b.ID], costByBook[b.ID]))
+		views = append(views, buildBookView(b, progressByBook[b.ID], costByBook[b.ID],
+			startsByBook[b.ID], etaByBook[b.ID]))
 	}
 	writeJSON(w, http.StatusOK, listBooksResponse{Books: views})
 }

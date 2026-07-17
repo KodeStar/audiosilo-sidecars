@@ -481,6 +481,33 @@ func TestASRStageResumesSkippingCompleted(t *testing.T) {
 	}
 }
 
+// TestASRStageResumeRateSampleUnits asserts the RateSample a resumed ASR run reports
+// counts ONLY the chapters transcribed this run (1 of 3), not the whole book, so a
+// resume can never corrupt the learned per-chapter rate with a whole-book count.
+func TestASRStageResumeRateSampleUnits(t *testing.T) {
+	work := t.TempDir()
+	writeManifest(t, work, 3)
+	seedFLACs(t, work, 3)
+	seedRawTranscript(t, work, 1)
+	seedRawTranscript(t, work, 2)
+
+	fake := newFakeBackend()
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, func(int, int) {})
+	if err != nil {
+		t.Fatalf("asr stage: %v", err)
+	}
+	if res.RateSample == nil {
+		t.Fatal("asr stage reported no RateSample; want one for the chapter it transcribed")
+	}
+	if res.RateSample.Units != 1 {
+		t.Errorf("RateSample.Units = %d, want 1 (only chapter 3 transcribed this run, not all 3)", res.RateSample.Units)
+	}
+	if res.RateSample.Seconds <= 0 {
+		t.Errorf("RateSample.Seconds = %v, want > 0", res.RateSample.Seconds)
+	}
+}
+
 // TestASRStageUnavailableParks asserts a book PARKS needs_attention (not a hard
 // failure) when no ASR backend is available, carrying the capability detail so a
 // human knows what to fix before retrying.
@@ -1083,5 +1110,50 @@ func TestQASweepMissingManifestErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "inspect") {
 		t.Errorf("error = %q, want it to name the inspect stage", err)
+	}
+}
+
+// TestASRStageResumeProgressBaseline is the M6 resume-baseline regression: on a resume
+// with K of N chapters already transcribed, the FIRST progress report reflects the K
+// already-complete chapters (not 0) and the counter ends at N, never dipping below the
+// baseline or re-counting a skipped chapter. This makes the scheduler's EWMA unit span
+// (first..last reported done) measure only the N-K chapters THIS run transcribed, so a
+// resumed run does not inflate the learned per-chapter rate.
+func TestASRStageResumeProgressBaseline(t *testing.T) {
+	work := t.TempDir()
+	const n, k = 5, 3
+	writeManifest(t, work, n)
+	seedFLACs(t, work, n)
+	for i := 1; i <= k; i++ {
+		seedRawTranscript(t, work, i)
+	}
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(newFakeBackend()), Fallback: scheduler.NewStubExecutor(0, 0)})
+
+	var reports []int
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, func(done, total int) {
+		if total != n {
+			t.Errorf("total = %d, want %d", total, n)
+		}
+		reports = append(reports, done)
+	})
+	if err != nil {
+		t.Fatalf("asr stage: %v", err)
+	}
+	if len(reports) == 0 {
+		t.Fatal("no progress reports")
+	}
+	if reports[0] != k {
+		t.Errorf("first report done = %d, want the already-complete baseline %d", reports[0], k)
+	}
+	if last := reports[len(reports)-1]; last != n {
+		t.Errorf("last report done = %d, want %d", last, n)
+	}
+	for i, d := range reports {
+		if d < k {
+			t.Errorf("report[%d] = %d dipped below the baseline %d", i, d, k)
+		}
+		if i > 0 && d < reports[i-1] {
+			t.Errorf("report[%d] = %d < previous %d (progress not monotonic)", i, d, reports[i-1])
+		}
 	}
 }

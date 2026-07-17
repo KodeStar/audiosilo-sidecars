@@ -164,6 +164,30 @@ describe('ApiClient', () => {
     expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/meta/search?q=dune%20%26%20sand');
   });
 
+  it('GETs a book sidecars preview', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { work: 'dune', characters: [] }));
+    const client = pipelineClient();
+
+    await expect(client.getBookSidecars(7)).resolves.toEqual({ work: 'dune', characters: [] });
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/books/7/sidecars');
+  });
+
+  it('GETs a book event log without a limit', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { events: [] }));
+    const client = pipelineClient();
+
+    await expect(client.getBookEvents(7)).resolves.toEqual({ events: [] });
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/books/7/events');
+  });
+
+  it('GETs a book event log with a limit query', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { events: [] }));
+    const client = pipelineClient();
+
+    await client.getBookEvents(7, 25);
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/books/7/events?limit=25');
+  });
+
   it('routes book control actions to the right endpoints', async () => {
     fetchMock.mockResolvedValue(new Response(null, { status: 204 }));
     const client = pipelineClient();

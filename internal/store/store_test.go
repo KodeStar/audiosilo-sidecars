@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/auth"
+	"github.com/kodestar/audiosilo-sidecars/internal/state"
 )
 
 func open(t *testing.T) *DB {
@@ -70,10 +71,10 @@ func TestBookCRUDAndDedup(t *testing.T) {
 	}
 
 	// State + status + coverage mutations.
-	if err := db.SetBookState(ctx, b.ID, "inspecting", "", ""); err != nil {
+	if err := db.SetBookState(ctx, b.ID, "inspecting", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SetBookStatus(ctx, b.ID, "paused", ""); err != nil {
+	if err := db.SetBookStatus(ctx, b.ID, "paused", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.SetBookCoverage(ctx, b.ID, json.RawMessage(`{"known":true}`)); err != nil {
@@ -151,7 +152,7 @@ func TestSetBookPipelineStateLeavesStatusAndError(t *testing.T) {
 	ctx := context.Background()
 	b, _ := db.CreateBook(ctx, NewBook{SourcePath: "/p", WorkDir: "/w", Title: "P"})
 	// Put the book in a paused-with-error condition.
-	if err := db.SetBookStatus(ctx, b.ID, "paused", "boom"); err != nil {
+	if err := db.SetBookStatus(ctx, b.ID, "paused", "boom", ""); err != nil {
 		t.Fatal(err)
 	}
 	// A pipeline-state advance must move ONLY state, leaving status and error intact.
@@ -178,7 +179,7 @@ func TestStatusCheckConstraint(t *testing.T) {
 	db := open(t)
 	ctx := context.Background()
 	b, _ := db.CreateBook(ctx, NewBook{SourcePath: "/x", WorkDir: "/w", Title: "X"})
-	if err := db.SetBookStatus(ctx, b.ID, "bogus", ""); err == nil {
+	if err := db.SetBookStatus(ctx, b.ID, "bogus", "", ""); err == nil {
 		t.Fatal("status CHECK constraint should reject 'bogus'")
 	}
 }
@@ -622,5 +623,205 @@ func TestDeriveWorkDir(t *testing.T) {
 	// Same input is deterministic.
 	if DeriveWorkDir(root, "/books/one", "Same Title") != a {
 		t.Error("DeriveWorkDir is not deterministic")
+	}
+}
+
+// TestChaptersAndParkCodeColumns covers the M6 books columns: SetBookChapters (a
+// gauge write, no updated_at bump) and park_code riding with the status setters.
+func TestChaptersAndParkCodeColumns(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	b, _ := db.CreateBook(ctx, NewBook{SourcePath: "/p", WorkDir: "/w", Title: "P"})
+	if b.Chapters != 0 || b.ParkCode != "" {
+		t.Fatalf("new book: chapters=%d park_code=%q, want 0/\"\"", b.Chapters, b.ParkCode)
+	}
+
+	// SetBookChapters records the count and does NOT bump updated_at (a pure gauge).
+	before, _ := db.GetBook(ctx, b.ID)
+	if err := db.SetBookChapters(ctx, b.ID, 42); err != nil {
+		t.Fatalf("SetBookChapters: %v", err)
+	}
+	got, _ := db.GetBook(ctx, b.ID)
+	if got.Chapters != 42 {
+		t.Errorf("chapters = %d, want 42", got.Chapters)
+	}
+	if got.UpdatedAt != before.UpdatedAt {
+		t.Errorf("SetBookChapters bumped updated_at (%q -> %q); it must not", before.UpdatedAt, got.UpdatedAt)
+	}
+	if err := db.SetBookChapters(ctx, 9999, 1); !errors.Is(err, ErrNotFound) {
+		t.Errorf("SetBookChapters(missing) = %v, want ErrNotFound", err)
+	}
+
+	// park_code is set on a needs_attention write and cleared when status clears.
+	if err := db.SetBookStatus(ctx, b.ID, "needs_attention", "agent down", "agent_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = db.GetBook(ctx, b.ID)
+	if got.Status != "needs_attention" || got.Error != "agent down" || got.ParkCode != "agent_unavailable" {
+		t.Fatalf("after park: %+v", got)
+	}
+	if err := db.SetBookStatus(ctx, b.ID, "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = db.GetBook(ctx, b.ID)
+	if got.Status != "" || got.Error != "" || got.ParkCode != "" {
+		t.Fatalf("after clear: %+v", got)
+	}
+
+	// SetBookState carries park_code too (set + clear).
+	if err := db.SetBookState(ctx, b.ID, "auditing", "needs_attention", "boom", "fix_loop_exhausted"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = db.GetBook(ctx, b.ID)
+	if got.State != "auditing" || got.ParkCode != "fix_loop_exhausted" {
+		t.Fatalf("after SetBookState park: %+v", got)
+	}
+	if err := db.SetBookState(ctx, b.ID, "ready", "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = db.GetBook(ctx, b.ID)
+	if got.ParkCode != "" {
+		t.Errorf("park_code = %q after clear, want empty", got.ParkCode)
+	}
+}
+
+// TestParkCodeInvariantEnforced proves the store enforces "park_code is set only
+// while status is needs_attention": a write with any other status wipes a
+// previously-set code EVEN when the caller passes a non-empty one, so the code can
+// never linger beside a paused/failed/cleared status regardless of caller ceremony.
+func TestParkCodeInvariantEnforced(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	b, _ := db.CreateBook(ctx, NewBook{SourcePath: "/p", WorkDir: "/w", Title: "P"})
+
+	// Park it, then SetBookStatus to a non-needs_attention status while (wrongly)
+	// still passing a code: the store must drop the code.
+	if err := db.SetBookStatus(ctx, b.ID, "needs_attention", "boom", "fix_loop_exhausted"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetBookStatus(ctx, b.ID, "failed", "cancelled", "fix_loop_exhausted"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := db.GetBook(ctx, b.ID)
+	if got.Status != "failed" || got.ParkCode != "" {
+		t.Fatalf("SetBookStatus(failed, code) = status %q park_code %q, want failed/\"\"", got.Status, got.ParkCode)
+	}
+
+	// Re-park, then SetBookState to a non-needs_attention status still passing a code:
+	// again the code must be dropped.
+	if err := db.SetBookStatus(ctx, b.ID, "needs_attention", "boom", "agent_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetBookState(ctx, b.ID, "ready", "", "", "agent_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = db.GetBook(ctx, b.ID)
+	if got.Status != "" || got.ParkCode != "" {
+		t.Fatalf("SetBookState(ready,\"\",code) = status %q park_code %q, want \"\"/\"\"", got.Status, got.ParkCode)
+	}
+
+	// A genuine needs_attention write still keeps the code (the invariant is directional).
+	if err := db.SetBookStatus(ctx, b.ID, "needs_attention", "boom", "agent_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = db.GetBook(ctx, b.ID)
+	if got.ParkCode != "agent_unavailable" {
+		t.Fatalf("needs_attention write dropped the code: %q", got.ParkCode)
+	}
+}
+
+// TestListRates covers the rates seed table read the scheduler loads at startup.
+func TestListRates(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	got, err := db.ListRates(ctx)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("ListRates(empty) = %v (err %v), want empty map", got, err)
+	}
+	if err := db.SetRate(ctx, "asr", 35.5); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetRate(ctx, "splitting", 4.0); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetRate(ctx, "asr", 30.0); err != nil { // upsert overwrites
+		t.Fatal(err)
+	}
+	got, err = db.ListRates(ctx)
+	if err != nil {
+		t.Fatalf("ListRates: %v", err)
+	}
+	if got["asr"] != 30.0 || got["splitting"] != 4.0 || len(got) != 2 {
+		t.Fatalf("ListRates = %v, want asr=30, splitting=4", got)
+	}
+}
+
+// TestStageRunStarts covers the per-book MIN(started_at) queries the book views use
+// for started_at.
+func TestStageRunStarts(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	a, _ := db.CreateBook(ctx, NewBook{SourcePath: "/a", WorkDir: "/wa", Title: "A"})
+	b, _ := db.CreateBook(ctx, NewBook{SourcePath: "/b", WorkDir: "/wb", Title: "B"})
+
+	// No runs yet: absent from the map, and the single-book form reports ok=false.
+	starts, err := db.StageRunStarts(ctx)
+	if err != nil || len(starts) != 0 {
+		t.Fatalf("StageRunStarts(empty) = %v (err %v)", starts, err)
+	}
+	if s, ok, err := db.FirstStageRunStart(ctx, a.ID); err != nil || ok || s != "" {
+		t.Fatalf("FirstStageRunStart(no runs) = %q,%v,%v", s, ok, err)
+	}
+
+	// a: two runs across two stages; the earliest start is the first one opened.
+	r1, _ := db.StartStageRun(ctx, a.ID, "inspecting", 1)
+	_ = r1
+	if _, err := db.StartStageRun(ctx, a.ID, "splitting", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.StartStageRun(ctx, b.ID, "inspecting", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	starts, err = db.StageRunStarts(ctx)
+	if err != nil {
+		t.Fatalf("StageRunStarts: %v", err)
+	}
+	single, ok, err := db.FirstStageRunStart(ctx, a.ID)
+	if err != nil || !ok {
+		t.Fatalf("FirstStageRunStart(a) = %q,%v,%v", single, ok, err)
+	}
+	if starts[a.ID] != single {
+		t.Errorf("grouped start %q != single-book start %q", starts[a.ID], single)
+	}
+	if _, ok := starts[b.ID]; !ok {
+		t.Errorf("b missing from StageRunStarts: %v", starts)
+	}
+}
+
+// TestEnforceParkCode pins the pure park-code guard directly: a code survives only
+// alongside a needs_attention status; every other status (including a clear) drops it.
+// This is the invariant SetBookState/SetBookStatus route through, kept honest here so a
+// refactor of either setter cannot quietly change the rule.
+func TestEnforceParkCode(t *testing.T) {
+	if got := enforceParkCode("needs_attention", "agent_unavailable"); got != "agent_unavailable" {
+		t.Errorf("enforceParkCode(needs_attention, code) = %q, want it kept", got)
+	}
+	// Denied branch: a non-needs_attention status wipes the code even when one is passed.
+	for _, status := range []string{"", "paused", "failed", "bogus"} {
+		if got := enforceParkCode(status, "fix_loop_exhausted"); got != "" {
+			t.Errorf("enforceParkCode(%q, code) = %q, want empty", status, got)
+		}
+	}
+}
+
+// TestStatusNeedsAttentionLiteral pins the store's local needs_attention literal to
+// state.StatusNeedsAttention: the store keeps State/Status opaque (it deliberately does
+// not import internal/state in production) so this test is the guard that the copied
+// literal cannot drift from the source of truth.
+func TestStatusNeedsAttentionLiteral(t *testing.T) {
+	if statusNeedsAttention != string(state.StatusNeedsAttention) {
+		t.Errorf("statusNeedsAttention = %q, want %q (state.StatusNeedsAttention)",
+			statusNeedsAttention, string(state.StatusNeedsAttention))
 	}
 }

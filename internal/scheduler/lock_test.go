@@ -129,7 +129,7 @@ func TestReconcileClosesOpenRunsAndRewindsOnMissingSentinel(t *testing.T) {
 
 	// Simulate a crash: an open (never-finished) run, a completed 'inspecting'
 	// with its sentinel, and a completed 'asr' whose sentinel is MISSING.
-	_ = db.SetBookState(ctx, b.ID, string(state.Sanitizing), "", "")
+	_ = db.SetBookState(ctx, b.ID, string(state.Sanitizing), "", "", "")
 	openID, _ := db.StartStageRun(ctx, b.ID, string(state.Sanitizing), 1) // left open
 	insID, _ := db.StartStageRun(ctx, b.ID, string(state.Inspecting), 1)
 	_ = db.FinishStageRun(ctx, insID, true, nil)

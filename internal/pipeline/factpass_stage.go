@@ -81,6 +81,7 @@ func (e *Executor) factPass(ctx context.Context, book store.Book, report schedul
 
 	var usageTotal agentUsage
 	needsReview := 0
+	chunksThisRun := 0
 	for i := range plan.Chunks {
 		if err := ctx.Err(); err != nil {
 			return scheduler.StageResult{}, err
@@ -92,11 +93,13 @@ func (e *Executor) factPass(ctx context.Context, book store.Book, report schedul
 		usage, chunkReview, cerr := e.factPassChunk(ctx, book, plan, i, hasCarryover, pred)
 		usageTotal.add(usage.Usage)
 		usageTotal.Invocations += usage.Invocations
+		usageTotal.Seconds += usage.Seconds
 		needsReview += chunkReview
 		if cerr != nil {
 			return scheduler.StageResult{}, cerr
 		}
 		completed++
+		chunksThisRun++
 		if report != nil {
 			report(completed, totalChunks)
 		}
@@ -113,7 +116,13 @@ func (e *Executor) factPass(ctx context.Context, book store.Book, report schedul
 	// Captured from each chunk's validated facts file this run. A mid-stage resume
 	// (already-complete chunks skipped) counts only the chunks (re)processed here.
 	m["needs_audio_review"] = needsReview
-	result := scheduler.StageResult{Metrics: metrics(m)}
+	// Units are the chunks (re)processed this run - a resume that skipped already-complete
+	// chunks records only the ones it actually ran - and seconds are the accumulated
+	// productive agent time (rate-limit backoff already excluded per chunk).
+	result := scheduler.StageResult{
+		Metrics:    metrics(m),
+		RateSample: rateSample(chunksThisRun, usageTotal.Seconds),
+	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.FactPass), result); err != nil {
 		return scheduler.StageResult{}, err
 	}

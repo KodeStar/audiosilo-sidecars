@@ -95,6 +95,11 @@ type Def struct {
 // shown in [brackets] in the package doc: markers_normalizing, qa_adjudicating,
 // retranscribing, and fixing. The skip/loop routing is encoded directly in
 // NextState's branch rules, so the classification needs no table column.
+//
+// Next ORDERING CONVENTION: when a state has more than one successor, the
+// conditional/loop target is listed FIRST and the mainline (happy-branch)
+// continuation LAST. MainlineNext depends on this ordering (it returns the last
+// successor), so keep the mainline entry last when editing a multi-successor row.
 var table = map[State]Def{
 	Queued:             {Lane: LaneNone, Next: []State{Inspecting}, order: 0},
 	Inspecting:         {Lane: LaneMechanical, Next: []State{MarkersNormalizing, Splitting}, order: 1},
@@ -149,6 +154,21 @@ func IsWaypoint(s State) bool {
 
 // Order returns the canonical linear index of s (for reconcile ordering).
 func Order(s State) int { return table[s].order }
+
+// MainlineNext returns s's happy-branch successor: the mainline continuation that
+// the pipeline follows when every conditional is skipped and no loop is taken. By
+// the table's Next ORDERING CONVENTION (conditional/loop target first, mainline
+// continuation last) that is always the LAST declared successor, so following
+// MainlineNext from Queued walks the pipeline's mainline to Done, skipping the
+// bracketed conditional stages. It returns "" for a terminal state (no successors).
+// It is the derivation the ETA engine's optimistic path uses.
+func MainlineNext(s State) State {
+	next := table[s].Next
+	if len(next) == 0 {
+		return ""
+	}
+	return next[len(next)-1]
+}
 
 // HoldsSeriesLock reports whether a book at state s still holds its series lock:
 // true for every state before Ready. A book that has reached Ready (or beyond)

@@ -1,6 +1,7 @@
 import type {
   BookCandidate,
   BookDetail,
+  BookEventsResponse,
   ChangePasswordBody,
   CreateBooksResponse,
   CreateScanResponse,
@@ -13,6 +14,7 @@ import type {
   SetOverrideResponse,
   Settings,
   SettingsUpdate,
+  SidecarsView,
   SystemInfo,
 } from '@/api/types';
 
@@ -187,6 +189,20 @@ export class ApiClient {
   // fetches this lazily when a row is expanded.
   getBook(id: number): Promise<BookDetail> {
     return this.request<BookDetail>(`/api/v1/books/${id}`);
+  }
+
+  // getBookSidecars fetches the extracted characters/recaps preview for the Done
+  // tab, in the metaserve-API shape the vendored expressive.ts consumes. 404 when
+  // the book has no sidecar files.
+  getBookSidecars(id: number): Promise<SidecarsView> {
+    return this.request<SidecarsView>(`/api/v1/books/${id}/sidecars`);
+  }
+
+  // getBookEvents fetches the book's durable event-log rows (newest first). limit
+  // clamps daemon-side to 1..500 (default 100 when omitted).
+  getBookEvents(id: number, limit?: number): Promise<BookEventsResponse> {
+    const query = limit === undefined ? '' : `?limit=${limit}`;
+    return this.request<BookEventsResponse>(`/api/v1/books/${id}/events${query}`);
   }
 
   pauseBook(id: number): Promise<void> {

@@ -48,9 +48,12 @@ func alwaysValid(Result) error { return nil }
 func TestRunWithRetryImmediateSuccess(t *testing.T) {
 	r := &scriptRunner{steps: []step{{res: Result{Text: "ok", Usage: Usage{Input: 5}}}}}
 	var usages []Usage
-	res, err := RunWithBackoff(context.Background(), r, Request{Prompt: "base"}, alwaysValid, func(u Usage) { usages = append(usages, u) }, tinyBackoff(3))
+	res, slept, err := RunWithBackoff(context.Background(), r, Request{Prompt: "base"}, alwaysValid, func(u Usage) { usages = append(usages, u) }, tinyBackoff(3))
 	if err != nil || res.Text != "ok" {
 		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	if slept != 0 {
+		t.Errorf("slept = %v, want 0 (no rate-limit backoff)", slept)
 	}
 	if r.calls != 1 || len(usages) != 1 || usages[0].Input != 5 {
 		t.Errorf("calls=%d usages=%v", r.calls, usages)
@@ -67,7 +70,7 @@ func TestRunWithRetryValidationThenSuccess(t *testing.T) {
 		}
 		return nil
 	}
-	res, err := RunWithBackoff(context.Background(), r, Request{Prompt: "base"}, validate, func(Usage) {}, tinyBackoff(3))
+	res, _, err := RunWithBackoff(context.Background(), r, Request{Prompt: "base"}, validate, func(Usage) {}, tinyBackoff(3))
 	if err != nil || res.Text != "good" {
 		t.Fatalf("res=%+v err=%v", res, err)
 	}
@@ -82,7 +85,7 @@ func TestRunWithRetryValidationThenSuccess(t *testing.T) {
 func TestRunWithRetryValidationExhausted(t *testing.T) {
 	r := &scriptRunner{steps: []step{{}, {}, {}, {}}}
 	validate := func(Result) error { return errors.New("still invalid") }
-	_, err := RunWithBackoff(context.Background(), r, Request{Prompt: "base"}, validate, func(Usage) {}, tinyBackoff(3))
+	_, _, err := RunWithBackoff(context.Background(), r, Request{Prompt: "base"}, validate, func(Usage) {}, tinyBackoff(3))
 	if err == nil || !strings.Contains(err.Error(), "still invalid") {
 		t.Fatalf("want validator error, got %v", err)
 	}
@@ -94,9 +97,12 @@ func TestRunWithRetryValidationExhausted(t *testing.T) {
 func TestRunWithRetryRateLimitBackoffThenSuccess(t *testing.T) {
 	r := &scriptRunner{steps: []step{{err: &RateLimitError{Detail: "429"}}, {res: Result{Text: "ok"}}}}
 	var usages int
-	res, err := RunWithBackoff(context.Background(), r, Request{Prompt: "base"}, alwaysValid, func(Usage) { usages++ }, tinyBackoff(3))
+	res, slept, err := RunWithBackoff(context.Background(), r, Request{Prompt: "base"}, alwaysValid, func(Usage) { usages++ }, tinyBackoff(3))
 	if err != nil || res.Text != "ok" {
 		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	if slept <= 0 {
+		t.Errorf("slept = %v, want > 0 (one rate-limit backoff round elapsed)", slept)
 	}
 	if r.calls != 2 || usages != 2 {
 		t.Errorf("calls=%d usages=%d (onUsage must fire on the rate-limited call too)", r.calls, usages)
@@ -110,7 +116,7 @@ func TestRunWithRetryRateLimitExhausted(t *testing.T) {
 		{err: &RateLimitError{Detail: "3"}},
 		{err: &RateLimitError{Detail: "4"}},
 	}}
-	_, err := RunWithBackoff(context.Background(), r, Request{Prompt: "base"}, alwaysValid, func(Usage) {}, tinyBackoff(3))
+	_, _, err := RunWithBackoff(context.Background(), r, Request{Prompt: "base"}, alwaysValid, func(Usage) {}, tinyBackoff(3))
 	var rl *RateLimitError
 	if !errors.As(err, &rl) {
 		t.Fatalf("want *RateLimitError, got %v", err)
@@ -129,7 +135,7 @@ func TestRunWithRetryRateLimitDoesNotConsumeOutputBudget(t *testing.T) {
 		{res: Result{Text: "x"}},
 		{res: Result{Text: "x"}},
 	}}
-	_, err := RunWithBackoff(context.Background(), r, Request{Prompt: "base"}, func(Result) error { return errors.New("invalid") }, func(Usage) {}, tinyBackoff(3))
+	_, _, err := RunWithBackoff(context.Background(), r, Request{Prompt: "base"}, func(Result) error { return errors.New("invalid") }, func(Usage) {}, tinyBackoff(3))
 	if err == nil {
 		t.Fatal("want validator error")
 	}
@@ -140,7 +146,7 @@ func TestRunWithRetryRateLimitDoesNotConsumeOutputBudget(t *testing.T) {
 
 func TestRunWithRetryOtherErrorFailsImmediately(t *testing.T) {
 	r := &scriptRunner{steps: []step{{err: errors.New("disk full")}}}
-	_, err := RunWithBackoff(context.Background(), r, Request{Prompt: "base"}, alwaysValid, func(Usage) {}, tinyBackoff(3))
+	_, _, err := RunWithBackoff(context.Background(), r, Request{Prompt: "base"}, alwaysValid, func(Usage) {}, tinyBackoff(3))
 	if err == nil || !strings.Contains(err.Error(), "disk full") {
 		t.Fatalf("want immediate failure, got %v", err)
 	}
@@ -153,7 +159,7 @@ func TestRunWithRetryContextCancelDuringBackoff(t *testing.T) {
 	r := &scriptRunner{steps: []step{{err: &RateLimitError{Detail: "rl"}}}}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already cancelled
-	_, err := RunWithBackoff(ctx, r, Request{Prompt: "base"}, alwaysValid, func(Usage) {}, []time.Duration{time.Hour})
+	_, _, err := RunWithBackoff(ctx, r, Request{Prompt: "base"}, alwaysValid, func(Usage) {}, []time.Duration{time.Hour})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("want context.Canceled, got %v", err)
 	}

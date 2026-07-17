@@ -6,8 +6,8 @@ import (
 	"strings"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
-	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/spelling"
+	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
 
@@ -17,7 +17,7 @@ import (
 // verified ledger and whole-book knowledge sheet). It returns (nil, false, nil) when
 // the book has no series, the store is nil, or no earlier volume qualifies.
 //
-// Position is parsed as a leading number via scheduler.ParseSeriesPos, so "2.5" sorts
+// Position is parsed as a leading number via state.ParseSeriesPos, so "2.5" sorts
 // between 2 and 3 and an unparseable position sorts last (and therefore never qualifies
 // as a predecessor). Ties on position break toward the higher id.
 //
@@ -31,7 +31,7 @@ func findSeriesPredecessor(ctx context.Context, db *store.DB, book store.Book) (
 	if err != nil {
 		return nil, false, err
 	}
-	target := scheduler.ParseSeriesPos(book.SeriesPos)
+	target := state.ParseSeriesPos(book.SeriesPos)
 	var best *store.Book
 	var bestPos float64
 	for i := range books {
@@ -39,7 +39,7 @@ func findSeriesPredecessor(ctx context.Context, db *store.DB, book store.Book) (
 		if cand.ID == book.ID || cand.Series != book.Series {
 			continue
 		}
-		pos := scheduler.ParseSeriesPos(cand.SeriesPos)
+		pos := state.ParseSeriesPos(cand.SeriesPos)
 		if pos >= target {
 			continue
 		}

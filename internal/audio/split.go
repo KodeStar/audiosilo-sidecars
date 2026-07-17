@@ -46,19 +46,28 @@ func Split(ctx context.Context, m Manifest, workDir, ffmpegPath string, report P
 		return err
 	}
 	total := len(m.Chapters)
-	if report != nil {
-		report(0, total)
+	// Progress baseline: count the chapters already split on entry (a resume) so the
+	// FIRST report reflects prior work and an already-present FLAC never ticks the
+	// counter. This keeps the scheduler's EWMA unit span (first..last reported done)
+	// measuring only what THIS run actually split. The predicate matches the loop's
+	// skip test (complete).
+	completed := 0
+	for _, ch := range m.Chapters {
+		if complete(filepath.Join(chaptersDir, ChapterFileName(ch.Chapter)), ch.Duration) {
+			completed++
+		}
 	}
-	for i, ch := range m.Chapters {
+	done := completed
+	if report != nil {
+		report(done, total)
+	}
+	for _, ch := range m.Chapters {
 		if err := ctx.Err(); err != nil {
 			return err // clean pause/cancel/shutdown; completed chapters remain
 		}
 		out := filepath.Join(chaptersDir, ChapterFileName(ch.Chapter))
 		if complete(out, ch.Duration) {
-			if report != nil {
-				report(i+1, total)
-			}
-			continue
+			continue // already split (counted in the baseline); do not re-tick progress
 		}
 		if err := splitChapter(ctx, m, ch, ffmpegPath, out); err != nil {
 			if ctx.Err() != nil {
@@ -66,8 +75,9 @@ func Split(ctx context.Context, m Manifest, workDir, ffmpegPath string, report P
 			}
 			return err
 		}
+		done++
 		if report != nil {
-			report(i+1, total)
+			report(done, total)
 		}
 	}
 	return nil

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/kodestar/audiosilo-meta/pkg/canonical"
 	"github.com/kodestar/audiosilo-meta/pkg/extract"
@@ -40,6 +41,7 @@ func (e *Executor) validateSidecarsStage(ctx context.Context, book store.Book, r
 	if report != nil {
 		report(0, 1)
 	}
+	start := time.Now()
 	manifest, seriesOpener, _, err := e.sidecarStageInputs(ctx, book)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("validating: %w", err)
@@ -84,11 +86,13 @@ func (e *Executor) validateSidecarsStage(ctx context.Context, book store.Book, r
 	if err := writeValidationReport(book.WorkDir, errs, warns); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("validating: write report: %w", err)
 	}
+	valSeconds := time.Since(start).Seconds()
 	if report != nil {
 		report(1, 1)
 	}
 	result := scheduler.StageResult{
-		Metrics: metrics(map[string]any{"errors": len(errs), "warnings": len(warns)}),
+		Metrics:    metrics(map[string]any{"errors": len(errs), "warnings": len(warns)}),
+		RateSample: rateSample(1, valSeconds),
 	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.Validating), result); err != nil {
 		return scheduler.StageResult{}, err

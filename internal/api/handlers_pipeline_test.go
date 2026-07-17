@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/config"
 	"github.com/kodestar/audiosilo-sidecars/internal/events"
 	"github.com/kodestar/audiosilo-sidecars/internal/metaops"
+	"github.com/kodestar/audiosilo-sidecars/internal/pipeline"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/secrets"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
@@ -66,6 +68,16 @@ func newPipelineEnv(t *testing.T, libraryRoots []string) *pipelineEnv {
 		Scans:     scans,
 		Meta:      meta,
 		Config:    cfg,
+		// SidecarLoader mirrors the server.go wiring: the real pipeline compose/flatten
+		// adapted to JSON, translating pipeline's no-sidecars sentinel to the api's so
+		// the handler maps it to 404.
+		SidecarLoader: func(workDir string) (json.RawMessage, error) {
+			raw, err := pipeline.SidecarsViewJSON(workDir)
+			if errors.Is(err, pipeline.ErrNoSidecars) {
+				return nil, ErrNoSidecars
+			}
+			return raw, err
+		},
 	})
 	env.srv = httptest.NewServer(env.api.Handler())
 	t.Cleanup(env.srv.Close)
@@ -420,6 +432,56 @@ func TestStageRunWireShapeSnakeCase(t *testing.T) {
 		if !strings.Contains(body, key) {
 			t.Errorf("stage-run JSON missing snake_case key %s: %s", key, body)
 		}
+	}
+}
+
+// TestBookViewETAParkStartedFields covers the M6 bookView additions: park_code and
+// started_at appear when set (and are omitted otherwise), and eta_seconds is omitted
+// when the scheduler has published no ETA snapshot.
+func TestBookViewETAParkStartedFields(t *testing.T) {
+	env := newPipelineEnv(t, nil)
+	token := env.login(t)
+	ctx := context.Background()
+
+	resp := env.do(t, http.MethodPost, "/api/v1/books", token,
+		`{"candidates":[{"source_path":"/b/f","title":"F"}]}`)
+	var cr createBooksResponse
+	_ = json.NewDecoder(resp.Body).Decode(&cr)
+	resp.Body.Close()
+	id := cr.Results[0].Book.ID
+
+	// A freshly created book: no stage run, no park, no ETA snapshot -> all three
+	// fields omitted (omitempty).
+	fresh := readAll(t, env.do(t, http.MethodGet, "/api/v1/books/"+strconv.FormatInt(id, 10), token, ""))
+	for _, key := range []string{`"started_at"`, `"park_code"`, `"eta_seconds"`} {
+		if strings.Contains(fresh, key) {
+			t.Errorf("fresh book JSON unexpectedly contains %s: %s", key, fresh)
+		}
+	}
+
+	// Give it a stage-run start and a typed park; both now surface on the detail view.
+	if _, err := env.db.StartStageRun(ctx, id, "inspecting", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.db.SetBookStatus(ctx, id, "needs_attention", "agent down", "agent_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	detailBody := readAll(t, env.do(t, http.MethodGet, "/api/v1/books/"+strconv.FormatInt(id, 10), token, ""))
+	if !strings.Contains(detailBody, `"started_at"`) {
+		t.Errorf("detail JSON missing started_at: %s", detailBody)
+	}
+	if !strings.Contains(detailBody, `"park_code":"agent_unavailable"`) {
+		t.Errorf("detail JSON missing park_code: %s", detailBody)
+	}
+	// eta_seconds stays omitted: the (unstarted) scheduler published no snapshot.
+	if strings.Contains(detailBody, `"eta_seconds"`) {
+		t.Errorf("eta_seconds present without a scheduler snapshot: %s", detailBody)
+	}
+
+	// The list view carries the same started_at + park_code (grouped queries).
+	listBody := readAll(t, env.do(t, http.MethodGet, "/api/v1/books", token, ""))
+	if !strings.Contains(listBody, `"started_at"`) || !strings.Contains(listBody, `"park_code":"agent_unavailable"`) {
+		t.Errorf("list JSON missing started_at/park_code: %s", listBody)
 	}
 }
 

@@ -7,6 +7,8 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"sync"
 
@@ -59,6 +61,12 @@ type Deps struct {
 	// /system. nil -> a zero AgentInfo (no backend, unavailable), mirroring the ASR
 	// LiveStatus pattern.
 	AgentStatus func() AgentInfo
+	// SidecarLoader composes a book's characters/recaps preview from its work dir,
+	// returning the metaserve-API-shaped JSON the Done panel renders. It must return
+	// ErrNoSidecars when neither sidecar file exists (mapped to 404). The loader lives
+	// in internal/pipeline and is injected here so the api never imports pipeline
+	// (dependency direction). nil -> the /sidecars endpoint 503s.
+	SidecarLoader func(workDir string) (json.RawMessage, error)
 }
 
 // ASRInfo is the resolved ASR backend capability shown on /system.
@@ -81,27 +89,33 @@ type AgentInfo struct {
 
 // API is the HTTP transport.
 type API struct {
-	auth        *auth.Manager
-	limiter     *auth.RateLimiter
-	secrets     secrets.Store
-	events      *events.Hub
-	version     string
-	dataDir     string
-	store       *store.DB
-	sched       *scheduler.Scheduler
-	scans       *metaops.ScanManager
-	meta        *metaops.Client
-	overrides   *metaops.OverrideService
-	ffmpeg      string
-	ffprobe     string
-	asr         ASRInfo
-	liveStatus  func() (ASRInfo, string, string)
-	agentStatus func() AgentInfo
+	auth          *auth.Manager
+	limiter       *auth.RateLimiter
+	secrets       secrets.Store
+	events        *events.Hub
+	version       string
+	dataDir       string
+	store         *store.DB
+	sched         *scheduler.Scheduler
+	scans         *metaops.ScanManager
+	meta          *metaops.Client
+	overrides     *metaops.OverrideService
+	ffmpeg        string
+	ffprobe       string
+	asr           ASRInfo
+	liveStatus    func() (ASRInfo, string, string)
+	agentStatus   func() AgentInfo
+	sidecarLoader func(workDir string) (json.RawMessage, error)
 
 	mu   sync.Mutex // guards cfg
 	cfg  config.Config
 	save func(config.Config) error
 }
+
+// ErrNoSidecars signals that a book's work dir holds no sidecar files yet, so the
+// /sidecars endpoint answers 404. The pipeline loader returns its own sentinel; the
+// server-side adapter translates it to this one so the api never imports pipeline.
+var ErrNoSidecars = errors.New("no sidecars")
 
 // New constructs an API from its dependencies.
 func New(d Deps) *API {
@@ -110,23 +124,24 @@ func New(d Deps) *API {
 		save = func(config.Config) error { return nil }
 	}
 	a := &API{
-		auth:        d.Auth,
-		limiter:     d.Limiter,
-		secrets:     d.Secrets,
-		events:      d.Events,
-		version:     d.Version,
-		dataDir:     d.DataDir,
-		store:       d.Store,
-		sched:       d.Scheduler,
-		scans:       d.Scans,
-		meta:        d.Meta,
-		ffmpeg:      d.FFmpegPath,
-		ffprobe:     d.FFprobePath,
-		asr:         d.ASR,
-		liveStatus:  d.LiveStatus,
-		agentStatus: d.AgentStatus,
-		cfg:         d.Config,
-		save:        save,
+		auth:          d.Auth,
+		limiter:       d.Limiter,
+		secrets:       d.Secrets,
+		events:        d.Events,
+		version:       d.Version,
+		dataDir:       d.DataDir,
+		store:         d.Store,
+		sched:         d.Scheduler,
+		scans:         d.Scans,
+		meta:          d.Meta,
+		ffmpeg:        d.FFmpegPath,
+		ffprobe:       d.FFprobePath,
+		asr:           d.ASR,
+		liveStatus:    d.LiveStatus,
+		agentStatus:   d.AgentStatus,
+		sidecarLoader: d.SidecarLoader,
+		cfg:           d.Config,
+		save:          save,
 	}
 	// The override-upsert workflow lives in metaops (transport-only handler over
 	// it). It needs the store + scan manager; requirePipeline gates the handler
@@ -180,6 +195,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/books", a.requireAuth(a.requirePipeline(a.handleCreateBooks)))
 	mux.HandleFunc("GET /api/v1/books", a.requireAuth(a.requirePipeline(a.handleListBooks)))
 	mux.HandleFunc("GET /api/v1/books/{id}", a.requireAuth(a.requirePipeline(a.handleGetBook)))
+	mux.HandleFunc("GET /api/v1/books/{id}/sidecars", a.requireAuth(a.requirePipeline(a.handleBookSidecars)))
+	mux.HandleFunc("GET /api/v1/books/{id}/events", a.requireAuth(a.requirePipeline(a.handleBookEvents)))
 	mux.HandleFunc("POST /api/v1/books/{id}/pause", a.requireAuth(a.requirePipeline(a.bookAction((*scheduler.Scheduler).Pause))))
 	mux.HandleFunc("POST /api/v1/books/{id}/resume", a.requireAuth(a.requirePipeline(a.bookAction((*scheduler.Scheduler).Resume))))
 	mux.HandleFunc("POST /api/v1/books/{id}/retry", a.requireAuth(a.requirePipeline(a.bookAction((*scheduler.Scheduler).Retry))))

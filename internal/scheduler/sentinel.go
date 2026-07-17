@@ -17,6 +17,11 @@ type StageResult struct {
 	RetranscribeNeeded bool            `json:"retranscribe_needed,omitempty"`
 	AuditPassed        bool            `json:"audit_passed,omitempty"`
 	Metrics            json.RawMessage `json:"metrics,omitempty"`
+	// RateSample is the stage's own report of how much work it did this run (see
+	// RateSample). nil = no rate observation, which the scheduler treats as "don't
+	// update the learned rate". It persists in the sentinel (additive, omitempty) but
+	// is never re-folded on a crash-resume skip, only on a genuine execution.
+	RateSample *RateSample `json:"rate_sample,omitempty"`
 }
 
 // Sentinel is the on-disk _done/<stage>.json marker: the CONTENT truth that a

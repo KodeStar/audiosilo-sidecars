@@ -71,7 +71,7 @@ func TestPipelineSpellingToSynthesisFlow(t *testing.T) {
 	}
 	// Fast-forward to a clean qa_sweep result: the mechanical stages before it are not
 	// under test here.
-	if err := db.SetBookState(context.Background(), b.ID, string(state.SpellingResearch), "", ""); err != nil {
+	if err := db.SetBookState(context.Background(), b.ID, string(state.SpellingResearch), "", "", ""); err != nil {
 		t.Fatalf("set state: %v", err)
 	}
 	sched.Notify()

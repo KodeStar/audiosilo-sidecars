@@ -59,7 +59,7 @@ func (e *Executor) fixSidecars(ctx context.Context, book store.Book, report sche
 	if report != nil {
 		report(1, 1)
 	}
-	result := scheduler.StageResult{Metrics: metrics(usage.metricsMap())}
+	result := scheduler.StageResult{Metrics: metrics(usage.metricsMap()), RateSample: usage.rateSample()}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.Fixing), result); err != nil {
 		return scheduler.StageResult{}, err
 	}

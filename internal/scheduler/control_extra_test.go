@@ -85,7 +85,7 @@ func TestPauseAfterSentinelBeforeAdvanceStaysPaused(t *testing.T) {
 	exec := &hookExecutor{after: func(bk store.Book, stage state.State) {
 		if stage == state.Inspecting {
 			once.Do(func() {
-				_ = db.SetBookStatus(context.Background(), bk.ID, string(state.StatusPaused), "")
+				_ = db.SetBookStatus(context.Background(), bk.ID, string(state.StatusPaused), "", "")
 			})
 		}
 	}}
@@ -244,7 +244,7 @@ func TestCrashWindowResumeNoExtraRun(t *testing.T) {
 
 	// Simulate the crash window: the book sits at 'inspecting', that stage's
 	// sentinel is on disk, but its run is still OPEN (never finished/advanced).
-	_ = db.SetBookState(ctx, b.ID, string(state.Inspecting), "", "")
+	_ = db.SetBookState(ctx, b.ID, string(state.Inspecting), "", "", "")
 	_, _ = db.StartStageRun(ctx, b.ID, string(state.Inspecting), 1)
 	_ = WriteSentinel(b.WorkDir, string(state.Inspecting), StageResult{MarkersContiguous: true})
 
@@ -309,5 +309,127 @@ func TestDeleteRemovesWorkDirWithinRoot(t *testing.T) {
 	}
 	if _, err := os.Stat(keep); err != nil {
 		t.Fatalf("delete wrongly removed a dir outside the work root: %v", err)
+	}
+}
+
+// parkCodeExecutor parks every stage with a fixed typed ParkCode (writing no
+// sentinel), so a test can assert the scheduler persists and publishes the code.
+type parkCodeExecutor struct{ code state.ParkCode }
+
+func (e parkCodeExecutor) Execute(_ context.Context, _ store.Book, _ state.State, _ ProgressFunc) (StageResult, error) {
+	return StageResult{}, ParkWithCode(e.code, "needs a human")
+}
+
+// TestParkCodePersistsAndClears is the M6 typed-ParkCode regression: an executor that
+// returns ParkWithCode parks the book needs_attention carrying the machine-readable
+// code on BOTH books.park_code and the book.state SSE event, and Retry clears it.
+func TestParkCodePersistsAndClears(t *testing.T) {
+	h := newHarness(t)
+	db := h.openDB(t)
+	b := h.addBook(t, db, "parkcode", "", "")
+
+	_, sub := h.hub.Subscribe(0)
+	defer sub.Close()
+
+	sched := New(db, h.hub, parkCodeExecutor{code: state.ParkAgentUnavailable}, 1, h.workRoot)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = sched.Start(ctx); close(done) }()
+	sched.Notify()
+
+	// Wait for the park to land in the DB.
+	deadline := time.Now().Add(3 * time.Second)
+	var cur store.Book
+	for time.Now().Before(deadline) {
+		cur, _ = db.GetBook(context.Background(), b.ID)
+		if cur.Status == string(state.StatusNeedsAttention) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if cur.Status != string(state.StatusNeedsAttention) {
+		t.Fatalf("book status = %q, want needs_attention", cur.Status)
+	}
+	if cur.ParkCode != string(state.ParkAgentUnavailable) {
+		t.Fatalf("park_code = %q, want %q", cur.ParkCode, state.ParkAgentUnavailable)
+	}
+
+	// The book.state event carried the typed code alongside the needs_attention status.
+	evDeadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ev := <-sub.C:
+			if ev.Type != "book.state" {
+				continue
+			}
+			var p struct {
+				Status   string `json:"status"`
+				ParkCode string `json:"park_code"`
+			}
+			if err := json.Unmarshal(ev.Data, &p); err != nil {
+				t.Fatalf("decode event: %v", err)
+			}
+			if p.Status == string(state.StatusNeedsAttention) {
+				if p.ParkCode != string(state.ParkAgentUnavailable) {
+					t.Fatalf("book.state park_code = %q, want %q", p.ParkCode, state.ParkAgentUnavailable)
+				}
+				goto parked
+			}
+		case <-evDeadline:
+			t.Fatal("no book.state event carrying the park code was observed")
+		}
+	}
+parked:
+	cancel()
+	<-done
+
+	// Retry clears both the status and the typed park code.
+	if err := sched.Retry(context.Background(), b.ID); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	cur, _ = db.GetBook(context.Background(), b.ID)
+	if cur.Status != "" || cur.ParkCode != "" {
+		t.Fatalf("after retry: status=%q park_code=%q, want both empty", cur.Status, cur.ParkCode)
+	}
+}
+
+// TestFixLoopExhaustedParksWithCode asserts the state-machine fix-loop cap parks the
+// book with the ParkFixLoopExhausted code: an audit that never passes loops
+// auditing->fixing->validating until MaxFixAttempts fix passes are spent, after which
+// advance() parks needs_attention at auditing carrying fix_loop_exhausted.
+func TestFixLoopExhaustedParksWithCode(t *testing.T) {
+	h := newHarness(t)
+	db := h.openDB(t)
+	b := h.addBook(t, db, "fixloop", "", "")
+
+	exec := NewStubExecutor(time.Millisecond, 2*time.Millisecond)
+	exec.Decide = func(_ store.Book, stage state.State) StageResult {
+		r := happyPath()
+		if stage == state.Auditing {
+			r.AuditPassed = false // never pass -> loop until the fix cap parks it
+		}
+		return r
+	}
+
+	books := runUntil(t, db, h.hub, exec, 2, func(bs []store.Book) bool {
+		for _, bk := range bs {
+			if bk.ID == b.ID && bk.Status == string(state.StatusNeedsAttention) {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second)
+
+	var got store.Book
+	for _, bk := range books {
+		if bk.ID == b.ID {
+			got = bk
+		}
+	}
+	if got.State != string(state.Auditing) {
+		t.Errorf("state = %q, want auditing (parked at the audit)", got.State)
+	}
+	if got.ParkCode != string(state.ParkFixLoopExhausted) {
+		t.Errorf("park_code = %q, want %q", got.ParkCode, state.ParkFixLoopExhausted)
 	}
 }

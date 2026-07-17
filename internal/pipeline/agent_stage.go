@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/agent/prompts"
@@ -82,11 +83,22 @@ func (e *Executor) AgentStatus() agent.Availability {
 }
 
 // agentUsage is the accumulated token/cost spend of all invocations in one agent
-// stage run plus the invocation count, returned by runAgent so a stage can fold it
-// into its metrics.
+// stage run plus the invocation count and the productive agent seconds, returned by
+// runAgent so a stage can fold it into its metrics and its StageResult.RateSample.
 type agentUsage struct {
 	agent.Usage
 	Invocations int
+	// Seconds is the productive agent wall-time this run: the time spent in the agent
+	// invocations (validation retries included) with rate-limit backoff sleep excluded,
+	// so it feeds a per-stage rate that reflects the model's work, not waiting.
+	Seconds float64
+}
+
+// rateSample builds the one-shot (whole-book) rate sample for an agent stage: 1 unit
+// spent in Seconds productive seconds, or nil when no agent work ran (e.g. an all-auto
+// qa_adjudicating pass) so the scheduler records nothing.
+func (u agentUsage) rateSample() *scheduler.RateSample {
+	return rateSample(1, u.Seconds)
 }
 
 // add folds one invocation's usage into the running total (the six spend fields plus
@@ -142,7 +154,7 @@ func (e *validationError) Error() string { return e.msg }
 func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.State, st *agent.Staging, promptName string, promptData any, web bool, validate func(agent.Result, *agent.Staging) error) (agentUsage, error) {
 	runner, av := e.ensureAgent(ctx)
 	if runner == nil || !av.Available {
-		return agentUsage{}, scheduler.Park(AgentUnavailableMsg)
+		return agentUsage{}, scheduler.ParkWithCode(state.ParkAgentUnavailable, AgentUnavailableMsg)
 	}
 	model := agent.ModelFor(e.agentModels.Claude, e.agentModels.OpenAI, runner.ID(), string(stage))
 
@@ -172,24 +184,35 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 		Web:     web,
 		Timeout: e.agentTimeout,
 	}
-	_, err = agent.RunWithRetry(ctx, runner, req, func(r agent.Result) error {
+	backoff := e.backoff
+	if backoff == nil {
+		backoff = agent.DefaultBackoff()
+	}
+	start := time.Now()
+	_, slept, err := agent.RunWithBackoff(ctx, runner, req, func(r agent.Result) error {
 		if verr := validate(r, st); verr != nil {
 			return &validationError{msg: verr.Error()}
 		}
 		return nil
-	}, onUsage)
+	}, onUsage, backoff)
+	// Charge only productive agent time to the rate: wall-clock minus the rate-limit
+	// backoff sleep RunWithRetry reports (validation retries stay counted - they are
+	// genuine model cost - only waiting out a rate limit is excluded).
+	if productive := time.Since(start) - slept; productive > 0 {
+		total.Seconds = productive.Seconds()
+	}
 	if err != nil {
 		var rl *agent.RateLimitError
 		if errors.As(err, &rl) {
-			return total, scheduler.Park(AgentRateLimitedPrefix + " (" + rl.Detail + ") - retry later")
+			return total, scheduler.ParkWithCode(state.ParkAgentRateLimited, AgentRateLimitedPrefix+" ("+rl.Detail+") - retry later")
 		}
 		var na *agent.NotAvailableError
 		if errors.As(err, &na) {
-			return total, scheduler.Park(AgentUnavailableMsg)
+			return total, scheduler.ParkWithCode(state.ParkAgentUnavailable, AgentUnavailableMsg)
 		}
 		var ve *validationError
 		if errors.As(err, &ve) {
-			return total, scheduler.Park(AgentValidationExhaustedPrefix + ": " + ve.msg)
+			return total, scheduler.ParkWithCode(state.ParkAgentValidationExhausted, AgentValidationExhaustedPrefix+": "+ve.msg)
 		}
 		return total, fmt.Errorf("%s: agent run: %w", stage, err)
 	}
@@ -302,7 +325,7 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, report
 		if reason == "" {
 			reason = "the agent could not produce a confident marker mapping"
 		}
-		return scheduler.StageResult{}, scheduler.Park(MarkersNotConfidentPrefix + ": " + reason)
+		return scheduler.StageResult{}, scheduler.ParkWithCode(state.ParkMarkersNotConfident, MarkersNotConfidentPrefix+": "+reason)
 	}
 
 	if err := agent.Harvest(st, []agent.HarvestSpec{{From: audio.ManifestName, To: audio.ManifestName}}); err != nil {
@@ -311,7 +334,7 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, report
 	if report != nil {
 		report(1, 1)
 	}
-	result := scheduler.StageResult{Metrics: metrics(usage.metricsMap())}
+	result := scheduler.StageResult{Metrics: metrics(usage.metricsMap()), RateSample: usage.rateSample()}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.MarkersNormalizing), result); err != nil {
 		return scheduler.StageResult{}, err
 	}
@@ -415,7 +438,7 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, report sch
 			return scheduler.StageResult{}, fmt.Errorf("qa_adjudicating: count rounds: %w", err)
 		}
 		if done >= 3 {
-			return scheduler.StageResult{}, scheduler.Park(QANoConvergeMsg)
+			return scheduler.StageResult{}, scheduler.ParkWithCode(state.ParkQANoConverge, QANoConvergeMsg)
 		}
 		round = done + 1
 	}
@@ -461,6 +484,9 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, report sch
 	result := scheduler.StageResult{
 		RetranscribeNeeded: plan.RetranscribeNeeded(),
 		Metrics:            metrics(m),
+		// nil when every flagged chapter was auto-accepted (no agent invocation ran), so
+		// a zero-work adjudication records no rate.
+		RateSample: usage.rateSample(),
 	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.QAAdjudicating), result); err != nil {
 		return scheduler.StageResult{}, err
@@ -652,31 +678,48 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, report sch
 	if cut == nil && planHasAction(plan, qa.ActionTailClip) {
 		ffmpeg, _ := e.ensureTools()
 		if ffmpeg == "" {
-			return scheduler.StageResult{}, scheduler.Park(MediaToolsUnavailableMsg)
+			return scheduler.StageResult{}, scheduler.ParkWithCode(state.ParkMediaToolsUnavailable, MediaToolsUnavailableMsg)
 		}
 		cut = repair.FFmpegClipCutter(ffmpeg)
 	}
 
-	total := 0
+	// total = the work entries (every non-accept entry). completed = the work entries a
+	// prior (interrupted) run already finished, so the FIRST report reflects prior work
+	// and an already-repaired entry never ticks the counter on resume - the scheduler's
+	// EWMA unit span then measures only the repairs THIS run actually did.
+	total, completed := 0, 0
 	for _, entry := range plan.Entries {
-		if entry.Action != qa.ActionAccept {
-			total++
+		if entry.Action == qa.ActionAccept {
+			continue
+		}
+		total++
+		if retranscribeEntryDone(book.WorkDir, entry) {
+			completed++
 		}
 	}
+	done := completed
 	if report != nil {
-		report(0, total)
+		report(done, total)
 	}
 
+	// Time only the repair loop (backend selection, model fetch via readyASR and the
+	// clip-cutter resolution are excluded) and count only entries processed THIS run
+	// (done - completed), so a resume is not charged for prior work.
+	loopStart := time.Now()
 	var retranscribed, adopted, kept, spliced, redegen, accepted int
-	done := 0
 	for _, entry := range plan.Entries {
 		if err := ctx.Err(); err != nil {
 			return scheduler.StageResult{}, err // clean pause/cancel; completed chapters remain
 		}
-		switch entry.Action {
-		case qa.ActionAccept:
+		if entry.Action == qa.ActionAccept {
 			accepted++
 			continue
+		}
+		// Capture whether this entry was already done BEFORE processing it (processing
+		// makes the predicate true), so a resumed entry re-runs idempotently but does not
+		// re-tick progress past the baseline.
+		wasDone := retranscribeEntryDone(book.WorkDir, entry)
+		switch entry.Action {
 		case qa.ActionRetranscribe:
 			ok, rerr := e.retranscribeChapter(ctx, setup, book, durations[entry.Chapter], entry.Chapter)
 			if rerr != nil {
@@ -701,12 +744,15 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, report sch
 		default:
 			return scheduler.StageResult{}, fmt.Errorf("retranscribing: chapter %d has unknown action %q", entry.Chapter, entry.Action)
 		}
-		done++
-		if report != nil {
-			report(done, total)
+		if !wasDone {
+			done++
+			if report != nil {
+				report(done, total)
+			}
 		}
 	}
 
+	loopSeconds := time.Since(loopStart).Seconds()
 	e.accountScratch(ctx, book)
 	result := scheduler.StageResult{
 		Metrics: metrics(map[string]any{
@@ -717,6 +763,7 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, report sch
 			"clips_redegenerated": redegen,
 			"accepted":            accepted,
 		}),
+		RateSample: rateSample(done-completed, loopSeconds),
 	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.Retranscribing), result); err != nil {
 		return scheduler.StageResult{}, err
@@ -732,6 +779,25 @@ func planHasAction(p *qa.Plan, a qa.PlanAction) bool {
 		}
 	}
 	return false
+}
+
+// retranscribeEntryDone reports whether a plan entry's repair already completed on a
+// prior (interrupted) run, so a resume neither re-counts it as processed work (the
+// EWMA span) nor re-ticks progress past the already-done baseline. It mirrors the
+// per-chapter resume tests the executors themselves use: a retranscribe entry is done
+// when its fresh raw parses complete (retranscribeChapter's reuse test), a tail-clip
+// entry when tailClipAlreadyDone finds both durable-evidence files. Accept entries are
+// not work and never reach here.
+func retranscribeEntryDone(workDir string, entry qa.PlanEntry) bool {
+	switch entry.Action {
+	case qa.ActionRetranscribe:
+		return rawComplete(filepath.Join(workDir, repair.RetranscribeDir, transcript.RawName(entry.Chapter)))
+	case qa.ActionTailClip:
+		done, err := tailClipAlreadyDone(workDir, entry.Chapter)
+		return err == nil && done
+	default:
+		return false
+	}
 }
 
 // retranscribeChapter re-transcribes one chapter FRESH into retranscribe/, then uses
@@ -831,7 +897,7 @@ func (e *Executor) tailClipChapter(ctx context.Context, setup ASRSetup, cut repa
 		return false, fmt.Errorf("retranscribing: read chapter %d transcript: %w", chapter, err)
 	}
 	if cut == nil {
-		return false, scheduler.Park(MediaToolsUnavailableMsg)
+		return false, scheduler.ParkWithCode(state.ParkMediaToolsUnavailable, MediaToolsUnavailableMsg)
 	}
 	transcribe := func(ctx context.Context, clipPath string) ([]byte, error) {
 		outDir := filepath.Join(book.WorkDir, repair.ClipsDir)

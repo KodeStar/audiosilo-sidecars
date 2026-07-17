@@ -154,6 +154,10 @@ type Executor struct {
 	// inject a fake so the retranscribing tail-clip path needs no real ffmpeg). nil in
 	// production - the retranscribing stage builds repair.FFmpegClipCutter.
 	clipCutter repair.ClipCutter
+	// backoff, when non-nil, overrides the agent rate-limit backoff schedule runAgent
+	// uses; nil uses agent.DefaultBackoff. A test injects a tiny schedule so a
+	// rate-limit retry path does not sleep for real minutes.
+	backoff []time.Duration
 }
 
 // NewExecutor builds a composite executor from cfg, delegating unimplemented stages
@@ -226,13 +230,13 @@ func (e *Executor) ensureASR(ctx context.Context) ASRSetup {
 func (e *Executor) readyASR(ctx context.Context) (ASRSetup, error) {
 	setup := e.ensureASR(ctx)
 	if setup.Backend == nil || !setup.Cap.Available {
-		return setup, scheduler.Park("ASR unavailable: " + asrUnavailableDetail(setup.Cap) + " - fix this, then retry")
+		return setup, scheduler.ParkWithCode(state.ParkASRUnavailable, "ASR unavailable: "+asrUnavailableDetail(setup.Cap)+" - fix this, then retry")
 	}
 	if err := setup.Backend.EnsureReady(ctx); err != nil {
 		if ctx.Err() != nil {
 			return setup, ctx.Err()
 		}
-		return setup, scheduler.Park("ASR setup failed (" + setup.Backend.ID() + "): " + err.Error() + " - fix this, then retry")
+		return setup, scheduler.ParkWithCode(state.ParkASRUnavailable, "ASR setup failed ("+setup.Backend.ID()+"): "+err.Error()+" - fix this, then retry")
 	}
 	return setup, nil
 }
@@ -338,11 +342,19 @@ type asrProvenance struct {
 func (e *Executor) inspect(ctx context.Context, book store.Book) (scheduler.StageResult, error) {
 	_, ffprobe := e.ensureTools()
 	if ffprobe == "" {
-		return scheduler.StageResult{}, scheduler.Park(MediaToolsUnavailableMsg)
+		return scheduler.StageResult{}, scheduler.ParkWithCode(state.ParkMediaToolsUnavailable, MediaToolsUnavailableMsg)
 	}
+	// Time only the productive body (after the tool-availability check) for the rate.
+	start := time.Now()
 	manifest, contiguous, err := audio.Inspect(ctx, book.SourcePath, book.WorkDir, ffprobe)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("inspect: %w", err)
+	}
+	// Record the manifest chapter count so the ETA engine has a real per-book total
+	// for the per-chapter stages instead of its default. Best-effort bookkeeping (nil
+	// db in tests, or a lost row); a failure never fails the stage.
+	if e.db != nil {
+		_ = e.db.SetBookChapters(context.WithoutCancel(ctx), book.ID, manifest.ChapterCount)
 	}
 	result := scheduler.StageResult{
 		MarkersContiguous: contiguous,
@@ -352,6 +364,7 @@ func (e *Executor) inspect(ctx context.Context, book store.Book) (scheduler.Stag
 			"duration_sec":  manifest.Duration,
 			"contiguous":    contiguous,
 		}),
+		RateSample: rateSample(1, time.Since(start).Seconds()),
 	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.Inspecting), result); err != nil {
 		return scheduler.StageResult{}, err
@@ -364,7 +377,7 @@ func (e *Executor) inspect(ctx context.Context, book store.Book) (scheduler.Stag
 func (e *Executor) split(ctx context.Context, book store.Book, report scheduler.ProgressFunc) (scheduler.StageResult, error) {
 	ffmpeg, _ := e.ensureTools()
 	if ffmpeg == "" {
-		return scheduler.StageResult{}, scheduler.Park(MediaToolsUnavailableMsg)
+		return scheduler.StageResult{}, scheduler.ParkWithCode(state.ParkMediaToolsUnavailable, MediaToolsUnavailableMsg)
 	}
 	manifest, err := audio.ReadManifest(book.WorkDir)
 	if err != nil {
@@ -378,7 +391,17 @@ func (e *Executor) split(ctx context.Context, book store.Book, report scheduler.
 	if !audio.Contiguous(manifest.Chapters) {
 		return scheduler.StageResult{}, fmt.Errorf("split: manifest is not contiguous - markers_normalizing must run first")
 	}
+	// Capture the resume baseline (first report) and final done so the rate counts only
+	// chapters split THIS run, not any a prior interrupted run already produced. Time the
+	// split loop itself (setup and the manifest read are excluded).
+	firstDone, lastDone := 0, 0
+	haveFirst := false
+	splitStart := time.Now()
 	if err := audio.Split(ctx, manifest, book.WorkDir, ffmpeg, func(done, total int) {
+		if !haveFirst {
+			firstDone, haveFirst = done, true
+		}
+		lastDone = done
 		if report != nil {
 			report(done, total)
 		}
@@ -391,6 +414,7 @@ func (e *Executor) split(ctx context.Context, book store.Book, report scheduler.
 			"style":         manifest.Style,
 			"chapter_count": manifest.ChapterCount,
 		}),
+		RateSample: rateSample(lastDone-firstDone, time.Since(splitStart).Seconds()),
 	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.Splitting), result); err != nil {
 		return scheduler.StageResult{}, err
@@ -439,7 +463,7 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, report schedul
 	}
 	prior := readASRProvenance(book.WorkDir)
 	if prior.ManifestSHA != "" && prior.ManifestSHA != fp {
-		return scheduler.StageResult{}, scheduler.Park(ManifestChangedMsg)
+		return scheduler.StageResult{}, scheduler.ParkWithCode(state.ParkManifestChanged, ManifestChangedMsg)
 	}
 	rawDir := filepath.Join(book.WorkDir, transcript.RawDir)
 	if err := os.MkdirAll(rawDir, 0o750); err != nil {
@@ -453,25 +477,40 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, report schedul
 		return scheduler.StageResult{}, fmt.Errorf("asr: write provenance: %w", err)
 	}
 	total := len(manifest.Chapters)
-	if report != nil {
-		report(0, total)
+	// Progress baseline: count the chapters already transcribed on entry (a resume) so
+	// the FIRST report reflects prior work and an already-complete chapter never ticks
+	// the counter. This keeps the scheduler's EWMA unit span (first..last reported done)
+	// measuring only what THIS run actually transcribed - a resume that did 3 of 84
+	// records 3 units, not 84. The predicate matches the loop's skip test (rawComplete).
+	completed := 0
+	for _, ch := range manifest.Chapters {
+		if rawComplete(filepath.Join(rawDir, transcript.RawName(ch.Chapter))) {
+			completed++
+		}
 	}
+	done := completed
+	if report != nil {
+		report(done, total)
+	}
+	// Time only the transcription loop (backend selection, model/binary download via
+	// readyASR, and the provenance write are excluded), and count only chapters this run
+	// actually transcribes (done - completed), so the learned rate is not skewed by a
+	// resume or a first-run model fetch.
+	asrStart := time.Now()
 	var emptyChapters []int
-	for i, ch := range manifest.Chapters {
+	for _, ch := range manifest.Chapters {
 		if err := ctx.Err(); err != nil {
 			return scheduler.StageResult{}, err // clean pause/cancel/shutdown; completed chapters remain
 		}
 		rawPath := filepath.Join(rawDir, transcript.RawName(ch.Chapter))
 		if rawComplete(rawPath) {
-			// Resume: this chapter is already done. Re-freeze it if a crash landed
-			// between the write and the chmod, so the immutability guard always holds.
+			// Resume: this chapter is already done (counted in the baseline above). Re-freeze
+			// it if a crash landed between the write and the chmod, so the immutability guard
+			// always holds, but do NOT re-tick progress - it was not processed this run.
 			if info, serr := os.Stat(rawPath); serr == nil && info.Mode().Perm() != 0o444 {
 				if err := os.Chmod(rawPath, 0o444); err != nil { //nolint:gosec // immutability guard on a non-secret artifact
 					e.log.Warn("asr: could not re-freeze completed raw", "path", rawPath, "err", err)
 				}
-			}
-			if report != nil {
-				report(i+1, total)
 			}
 			continue
 		}
@@ -494,10 +533,12 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, report schedul
 		if err := os.Chmod(rawPath, 0o444); err != nil { //nolint:gosec // immutability guard on a non-secret artifact
 			e.log.Warn("asr: could not freeze raw transcript", "path", rawPath, "err", err)
 		}
+		done++
 		if report != nil {
-			report(i+1, total)
+			report(done, total)
 		}
 	}
+	asrSeconds := time.Since(asrStart).Seconds()
 
 	if err := writeASRProvenance(book.WorkDir, asrProvenance{
 		Backend: setup.Backend.ID(), Model: setup.Model, Language: setup.Language,
@@ -513,6 +554,7 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, report schedul
 			"model":         setup.Model,
 			"chapter_count": total,
 		}),
+		RateSample: rateSample(done-completed, asrSeconds),
 	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.ASR), result); err != nil {
 		return scheduler.StageResult{}, err
@@ -607,6 +649,9 @@ func (e *Executor) sanitize(ctx context.Context, book store.Book, report schedul
 	if report != nil {
 		report(0, total)
 	}
+	// sanitize re-derives EVERY chapter each run, so its units are the whole chapter
+	// count; time just the derive loop.
+	deriveStart := time.Now()
 	for i, chNum := range chapters {
 		if err := ctx.Err(); err != nil {
 			return scheduler.StageResult{}, err
@@ -623,10 +668,12 @@ func (e *Executor) sanitize(ctx context.Context, book store.Book, report schedul
 			report(i+1, total)
 		}
 	}
+	deriveSeconds := time.Since(deriveStart).Seconds()
 	e.accountScratch(ctx, book)
 
 	result := scheduler.StageResult{
-		Metrics: metrics(map[string]any{"chapter_count": total}),
+		Metrics:    metrics(map[string]any{"chapter_count": total}),
+		RateSample: rateSample(total, deriveSeconds),
 	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.Sanitizing), result); err != nil {
 		return scheduler.StageResult{}, err
@@ -658,6 +705,7 @@ func (e *Executor) qaSweep(ctx context.Context, book store.Book, report schedule
 	if report != nil {
 		report(0, 1)
 	}
+	start := time.Now()
 	rep, err := qa.Run(qa.Input{WorkDir: book.WorkDir, Durations: durations})
 	if err != nil {
 		// The sweep reads transcripts-json/, which the sanitizing stage produces; a read
@@ -667,6 +715,7 @@ func (e *Executor) qaSweep(ctx context.Context, book store.Book, report schedule
 	if err := qa.WriteReport(book.WorkDir, rep); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("qa_sweep: write report: %w", err)
 	}
+	sweepSeconds := time.Since(start).Seconds()
 	if report != nil {
 		report(1, 1)
 	}
@@ -692,6 +741,7 @@ func (e *Executor) qaSweep(ctx context.Context, book store.Book, report schedule
 			"tail_rate":          len(rep.TailRate),
 			"retranscribe_queue": len(rep.RetranscribeQueue),
 		}),
+		RateSample: rateSample(1, sweepSeconds),
 	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.QASweep), result); err != nil {
 		return scheduler.StageResult{}, err
@@ -792,4 +842,15 @@ func metrics(m map[string]any) json.RawMessage {
 		return nil
 	}
 	return b
+}
+
+// rateSample builds the StageResult.RateSample a stage reports for the scheduler's EWMA
+// rate: units of work processed THIS run and the productive seconds spent on them. It
+// returns nil (no observation) for a non-positive units/seconds, so a resumed run that
+// did nothing new, or a stage that measured no productive time, updates no rate.
+func rateSample(units int, seconds float64) *scheduler.RateSample {
+	if units <= 0 || seconds <= 0 {
+		return nil
+	}
+	return &scheduler.RateSample{Units: units, Seconds: seconds}
 }
