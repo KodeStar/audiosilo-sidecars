@@ -358,6 +358,278 @@ func TestClipAndSplice_NearButDistinctWindowNotSkipped(t *testing.T) {
 	}
 }
 
+// --- mid_clip (ClipAndSpliceWindow / SpliceWindow) --------------------------
+
+// midSegTranscript builds a 4-segment chapter (A[0-10], B[10-20], C[20-30], D[30-40])
+// whose interior segments (B, C) carry a garbage loop and whose edges (A, D) are clean.
+func midSegTranscript(chapter int) transcript.Transcript {
+	return transcript.Transcript{
+		Schema: transcript.Schema, Chapter: chapter,
+		Segments: []transcript.Segment{
+			{ID: 0, Start: 0, End: 10, Text: " alpha one two"},
+			{ID: 1, Start: 10, End: 20, Text: " loop the loop the loop the"},
+			{ID: 2, Start: 20, End: 30, Text: " loop the loop the loop the"},
+			{ID: 3, Start: 30, End: 40, Text: " delta seven eight"},
+		},
+	}
+}
+
+// TestSpliceWindow_SnapsHeadWindowTail: a window [12, 28] straddling segments B and C
+// snaps OUTWARD to segment edges [10, 30], so the head is A (End <= 10), the tail is D
+// (Start >= 30), and the fresh window text replaces B+C - no straddling content lost, no
+// seam duplication. The word counts mirror Splice (len(text.split())).
+func TestSpliceWindow_SnapsHeadWindowTail(t *testing.T) {
+	tr := midSegTranscript(4)
+	text, before, after := SpliceWindow(tr, 12, 28, "he walked to the door quietly")
+	want := "alpha one two he walked to the door quietly delta seven eight"
+	if text != want {
+		t.Errorf("SpliceWindow text = %q, want %q", text, want)
+	}
+	if strings.Contains(text, "loop the loop") {
+		t.Error("the interior loop segments were not dropped by the window")
+	}
+	// before = words in the original (A 3 + B 6 + C 6 + D 3 = 18); after = head A 3 +
+	// window 6 + tail D 3 = 12.
+	if before != 18 {
+		t.Errorf("wordsBefore = %d, want 18", before)
+	}
+	if after != 12 {
+		t.Errorf("wordsAfter = %d, want 12", after)
+	}
+}
+
+// TestSpliceWindow_EmptyHeadCollapses: a window starting at the chapter head (before any
+// segment ends) yields an empty head, and the join collapses the leading gap cleanly.
+func TestSpliceWindow_EmptyHeadCollapses(t *testing.T) {
+	tr := midSegTranscript(4)
+	// [0, 28] -> snappedStart stays 0 (no segment ends at or before 0), snappedEnd 30:
+	// head empty, tail = D, window replaces A+B+C.
+	text, _, _ := SpliceWindow(tr, 0, 28, "fresh replacement narration here")
+	if strings.HasPrefix(text, " ") {
+		t.Errorf("text has a leading space (not collapsed): %q", text)
+	}
+	if text != "fresh replacement narration here delta seven eight" {
+		t.Errorf("text = %q", text)
+	}
+}
+
+// TestClipAndSpliceWindow_HealthySplices: a healthy fresh window is spliced between the
+// intact head and tail; the recorded verdict is MID-REPAIRED with BOTH bounds set (a mid
+// window), the clip filename is dot-free with the m-prefix, and repairs.log gets an entry.
+func TestClipAndSpliceWindow_HealthySplices(t *testing.T) {
+	dir := t.TempDir()
+	rc := &recordingCut{}
+	res, err := ClipAndSpliceWindow(context.Background(), ClipSpliceRequest{
+		WorkDir:          dir,
+		Chapter:          4,
+		Transcript:       midSegTranscript(4),
+		Cut:              rc.cut,
+		Transcribe:       fakeTranscribe("he walked to the door and left the room quietly"),
+		StartOverrideSec: 12,
+		EndOverrideSec:   28,
+		DecodeTag:        "nocontext-v1",
+	})
+	if err != nil {
+		t.Fatalf("ClipAndSpliceWindow: %v", err)
+	}
+	if !res.Spliced || res.Verdict != VerdictMidRepaired {
+		t.Fatalf("res = %+v, want a MID-REPAIRED splice", res)
+	}
+	// The window snapped to [10, 30]: one cut at 10 for 20s.
+	if len(rc.starts) != 1 || rc.starts[0] != 10 {
+		t.Fatalf("cut window starts = %v, want [10] (snapped from 12)", rc.starts)
+	}
+	if res.ClipStart != 10 {
+		t.Errorf("res.ClipStart = %.1f, want 10 (snapped)", res.ClipStart)
+	}
+	// The repaired text has the head + fresh window + tail, and no loop.
+	body := readFile(t, filepath.Join(dir, transcript.RepairedDir, transcript.TextName(4)))
+	if strings.Contains(body, "loop the loop") {
+		t.Error("repaired text still contains the interior loop")
+	}
+	if !strings.Contains(body, "walked to the door") || !strings.Contains(body, "alpha one two") || !strings.Contains(body, "delta seven eight") {
+		t.Errorf("repaired text missing head/window/tail: %q", body)
+	}
+	// The verdict records BOTH bounds (a mid window) - ClipEnd is what the residual
+	// auto-accept keys on.
+	vs, err := LoadTailVerdicts(dir)
+	if err != nil || len(vs) != 1 {
+		t.Fatalf("verdicts = %+v (%v)", vs, err)
+	}
+	if vs[0].ClipStart != 10 || vs[0].ClipEnd != 30 || vs[0].Verdict != VerdictMidRepaired {
+		t.Errorf("verdict = %+v, want ClipStart 10 ClipEnd 30 MID-REPAIRED", vs[0])
+	}
+	// The clip stem must be dot-free (the ASR raw-output round-trip) with the m-prefix and
+	// both bounds in deciseconds.
+	base := filepath.Base(rc.dsts[0])
+	if n := strings.Count(base, "."); n != 1 {
+		t.Errorf("clip filename %q has %d dots, want exactly 1 (the extension)", base, n)
+	}
+	if base != "m004-100-300.flac" {
+		t.Errorf("clip filename = %q, want m004-100-300.flac (m-prefix, deciseconds bounds)", base)
+	}
+	log := readFile(t, filepath.Join(dir, RepairsLogName))
+	if !strings.Contains(log, "- ch004 [MID-REPAIRED]: spliced mid-window") {
+		t.Errorf("repairs.log missing mid entry:\n%s", log)
+	}
+}
+
+// TestClipAndSpliceWindow_RedegeneratedKeepsOriginal: an unhealthy fresh window (it loops
+// too) records a mid CLIP-REDEGENERATED verdict (with ClipEnd) and keeps the original - no
+// repaired file, no repairs.log entry.
+func TestClipAndSpliceWindow_RedegeneratedKeepsOriginal(t *testing.T) {
+	dir := t.TempDir()
+	res, err := ClipAndSpliceWindow(context.Background(), ClipSpliceRequest{
+		WorkDir:          dir,
+		Chapter:          4,
+		Transcript:       midSegTranscript(4),
+		Cut:              fakeCut,
+		Transcribe:       fakeTranscribe(strings.Repeat("and then he ran away fast ", 5)),
+		StartOverrideSec: 12,
+		EndOverrideSec:   28,
+		DecodeTag:        "nocontext-v1",
+	})
+	if err != nil {
+		t.Fatalf("ClipAndSpliceWindow: %v", err)
+	}
+	if res.ClipHealthy {
+		t.Error("expected the looping fresh window to be unhealthy")
+	}
+	if res.Spliced || res.Verdict != VerdictClipRedegenerated {
+		t.Errorf("res = %+v, want no splice + CLIP-REDEGENERATED", res)
+	}
+	if _, err := os.Stat(filepath.Join(dir, transcript.RepairedDir, transcript.TextName(4))); !os.IsNotExist(err) {
+		t.Error("expected no repaired file on a re-degenerated mid window")
+	}
+	if _, err := os.Stat(filepath.Join(dir, RepairsLogName)); !os.IsNotExist(err) {
+		t.Error("expected no repairs.log entry on a re-degenerated mid window")
+	}
+	vs, _ := LoadTailVerdicts(dir)
+	if len(vs) != 1 || vs[0].ClipEnd != 30 || vs[0].Verdict != VerdictClipRedegenerated {
+		t.Errorf("verdict = %+v, want a mid CLIP-REDEGENERATED with ClipEnd 30", vs)
+	}
+}
+
+// TestClipAndSpliceWindow_KnownFailedMidSkipped: a mid window matching a prior mid
+// CLIP-REDEGENERATED verdict (BOTH bounds within tolerance, same decode tag) is skipped -
+// no cut, no re-transcribe - and returns SkippedKnownFailed.
+func TestClipAndSpliceWindow_KnownFailedMidSkipped(t *testing.T) {
+	dir := t.TempDir()
+	const tag = "nocontext-v1"
+	// The prior round's mid failure at the SAME snapped window [10, 30] under the same tag.
+	if err := MergeTailVerdict(dir, TailVerdict{Chapter: 4, ClipStart: 10, ClipEnd: 30, Verdict: VerdictClipRedegenerated, DecodeTag: tag}); err != nil {
+		t.Fatal(err)
+	}
+	rc := &recordingCut{}
+	rt := &recordingTranscribe{}
+	res, err := ClipAndSpliceWindow(context.Background(), ClipSpliceRequest{
+		WorkDir:          dir,
+		Chapter:          4,
+		Transcript:       midSegTranscript(4),
+		Cut:              rc.cut,
+		Transcribe:       rt.fn,
+		StartOverrideSec: 12, // snaps to 10 == the recorded window
+		EndOverrideSec:   28, // snaps to 30 == the recorded window
+		DecodeTag:        tag,
+	})
+	if err != nil {
+		t.Fatalf("ClipAndSpliceWindow: %v", err)
+	}
+	if !res.SkippedKnownFailed {
+		t.Error("expected SkippedKnownFailed for a known-failed mid window")
+	}
+	if res.Spliced {
+		t.Error("expected no splice on a known-failed mid skip")
+	}
+	if rt.calls != 0 {
+		t.Errorf("Transcribe called %d times, want 0 (known-failed mid skip must not re-transcribe)", rt.calls)
+	}
+	if len(rc.starts) != 0 {
+		t.Errorf("Cut called %d times, want 0 (known-failed mid skip must not re-cut)", len(rc.starts))
+	}
+}
+
+// TestClipAndSpliceWindow_DistinctMidWindowNotSkipped: a prior mid verdict whose END is far
+// from the requested window's end does NOT trigger the skip (both bounds must match), so a
+// genuinely relocated interior window is re-attempted.
+func TestClipAndSpliceWindow_DistinctMidWindowNotSkipped(t *testing.T) {
+	dir := t.TempDir()
+	const tag = "nocontext-v1"
+	// Same start (10) but a very different end (60) - a distinct window, must not skip.
+	if err := MergeTailVerdict(dir, TailVerdict{Chapter: 4, ClipStart: 10, ClipEnd: 60, Verdict: VerdictClipRedegenerated, DecodeTag: tag}); err != nil {
+		t.Fatal(err)
+	}
+	rt := &recordingTranscribe{}
+	res, err := ClipAndSpliceWindow(context.Background(), ClipSpliceRequest{
+		WorkDir:          dir,
+		Chapter:          4,
+		Transcript:       midSegTranscript(4),
+		Cut:              fakeCut,
+		Transcribe:       rt.fn,
+		StartOverrideSec: 12, // snaps to 10, but the recorded end (60) differs from 30
+		EndOverrideSec:   28,
+		DecodeTag:        tag,
+	})
+	if err != nil {
+		t.Fatalf("ClipAndSpliceWindow: %v", err)
+	}
+	if res.SkippedKnownFailed {
+		t.Error("a distinct mid window (different end) must not be skipped as known-failed")
+	}
+	if rt.calls != 1 {
+		t.Errorf("Transcribe called %d times, want 1 (the distinct window is re-attempted)", rt.calls)
+	}
+}
+
+// TestClipAndSpliceWindow_InvalidWindow: a non-positive start or an end not past the start
+// is a loud error (Validate guards this upstream, but the repair layer defends too).
+func TestClipAndSpliceWindow_InvalidWindow(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct{ start, end float64 }{{0, 10}, {20, 10}, {20, 20}} {
+		_, err := ClipAndSpliceWindow(context.Background(), ClipSpliceRequest{
+			WorkDir: dir, Chapter: 4, Transcript: midSegTranscript(4),
+			Cut: fakeCut, Transcribe: fakeTranscribe("x"),
+			StartOverrideSec: tc.start, EndOverrideSec: tc.end,
+		})
+		if err == nil {
+			t.Errorf("window [%g, %g] should be rejected", tc.start, tc.end)
+		}
+	}
+}
+
+// TestClipAndSplice_MidVerdictDoesNotBlockTail is the ClipEnd==0-guard regression: a mid
+// CLIP-REDEGENERATED verdict (ClipEnd > 0) must NOT satisfy the TAIL known-failed skip, so
+// a tail clip at the same start still runs its one fresh attempt.
+func TestClipAndSplice_MidVerdictDoesNotBlockTail(t *testing.T) {
+	dir := t.TempDir()
+	const override = 150.0
+	const tag = "nocontext-v1"
+	// A MID verdict at the same clip_start (but with a ClipEnd) - a tail request must ignore it.
+	if err := MergeTailVerdict(dir, TailVerdict{Chapter: 4, ClipStart: override, ClipEnd: 175, Verdict: VerdictClipRedegenerated, DecodeTag: tag}); err != nil {
+		t.Fatal(err)
+	}
+	rt := &recordingTranscribe{}
+	res, err := ClipAndSplice(context.Background(), ClipSpliceRequest{
+		WorkDir:          dir,
+		Chapter:          4,
+		Transcript:       locatedTranscript(),
+		ChapterEnd:       200.0,
+		Cut:              fakeCut,
+		Transcribe:       rt.fn,
+		StartOverrideSec: override,
+		DecodeTag:        tag,
+	})
+	if err != nil {
+		t.Fatalf("ClipAndSplice: %v", err)
+	}
+	if res.SkippedKnownFailed {
+		t.Error("a MID verdict (ClipEnd > 0) must not block a tail clip via the known-failed skip")
+	}
+	if rt.calls != 1 {
+		t.Errorf("Transcribe called %d times, want 1 (the tail window runs its fresh attempt)", rt.calls)
+	}
+}
+
 // --- AppendRepairLog / MergeTailVerdict -------------------------------------
 
 func TestAppendRepairLog_HeaderThenAppend(t *testing.T) {
@@ -400,6 +672,18 @@ func TestMergeTailVerdict_UpsertsAndSorts(t *testing.T) {
 	}
 	if vs[1].Verdict != VerdictClipRedegenerated || vs[1].InClip != 4 {
 		t.Errorf("ch5 not upserted: %+v", vs[1])
+	}
+}
+
+// TestTailVerdictIsMidWindow pins the single ClipEnd-sentinel reading the known-failed
+// skips and the residual auto-accept share: a mid verdict carries a bounded window
+// (ClipEnd > 0), a tail verdict runs to the chapter end (ClipEnd == 0).
+func TestTailVerdictIsMidWindow(t *testing.T) {
+	if (TailVerdict{ClipStart: 10, ClipEnd: 30}).IsMidWindow() != true {
+		t.Error("a verdict with ClipEnd > 0 must be a mid window")
+	}
+	if (TailVerdict{ClipStart: 10}).IsMidWindow() != false {
+		t.Error("a verdict with ClipEnd == 0 must be a tail window")
 	}
 }
 

@@ -825,8 +825,7 @@ func rawIsEmpty(path string) (bool, error) {
 
 // hexSHA256 returns the hex-encoded sha256 over the concatenation of parts (one digest
 // over all of them, in order). A nil part contributes nothing, so a missing optional
-// input hashes as empty. It is the shared fingerprint primitive for manifestFingerprint
-// and qaRoundFingerprint.
+// input hashes as empty. It is the fingerprint primitive for manifestFingerprint.
 func hexSHA256(parts ...[]byte) string {
 	h := sha256.New()
 	for _, p := range parts {

@@ -139,6 +139,82 @@ func TestPlanValidate_ClipStartSecOnNonTailClip(t *testing.T) {
 	}
 }
 
+// TestPlanValidate_MidClipValid: a mid_clip entry with a bounded [start, end] window
+// (end > start > 0) on a flagged chapter is accepted. Chapter 5 (a mid-chapter run) is
+// re-dispositioned as a mid_clip.
+func TestPlanValidate_MidClipValid(t *testing.T) {
+	p := fullPlan()
+	p.Entries[1] = PlanEntry{Chapter: 5, Action: ActionMidClip, Reason: "interior loop", ClipStartSec: 1180, ClipEndSec: 1205}
+	if err := p.Validate(baseReport()); err != nil {
+		t.Fatalf("expected a valid mid_clip entry, got %v", err)
+	}
+}
+
+// TestPlanValidate_MidClipMissingEnd: a mid_clip with a start but no clip_end_sec (0) is
+// rejected - the window is unbounded.
+func TestPlanValidate_MidClipMissingEnd(t *testing.T) {
+	p := fullPlan()
+	p.Entries[1] = PlanEntry{Chapter: 5, Action: ActionMidClip, Reason: "interior loop", ClipStartSec: 1180}
+	err := p.Validate(baseReport())
+	if err == nil || !strings.Contains(err.Error(), "clip_end_sec") {
+		t.Fatalf("expected a missing-clip_end_sec error, got %v", err)
+	}
+}
+
+// TestPlanValidate_MidClipEndNotAfterStart: a mid_clip whose clip_end_sec is not strictly
+// past clip_start_sec is rejected (an empty or inverted window).
+func TestPlanValidate_MidClipEndNotAfterStart(t *testing.T) {
+	p := fullPlan()
+	p.Entries[1] = PlanEntry{Chapter: 5, Action: ActionMidClip, Reason: "interior loop", ClipStartSec: 1200, ClipEndSec: 1180}
+	err := p.Validate(baseReport())
+	if err == nil || !strings.Contains(err.Error(), "must be greater than clip_start_sec") {
+		t.Fatalf("expected an end<=start error, got %v", err)
+	}
+}
+
+// TestPlanValidate_MidClipMissingStart: a mid_clip with an end but no clip_start_sec (0)
+// is rejected - the window has no start.
+func TestPlanValidate_MidClipMissingStart(t *testing.T) {
+	p := fullPlan()
+	p.Entries[1] = PlanEntry{Chapter: 5, Action: ActionMidClip, Reason: "interior loop", ClipEndSec: 1200}
+	err := p.Validate(baseReport())
+	if err == nil || !strings.Contains(err.Error(), "no clip_start_sec > 0") {
+		t.Fatalf("expected a missing-clip_start_sec error, got %v", err)
+	}
+}
+
+// TestPlanValidate_MidClipNegativeEnd: a negative clip_end_sec is rejected before the
+// window-bounds checks.
+func TestPlanValidate_MidClipNegativeEnd(t *testing.T) {
+	p := fullPlan()
+	p.Entries[1] = PlanEntry{Chapter: 5, Action: ActionMidClip, Reason: "interior loop", ClipStartSec: 1180, ClipEndSec: -5}
+	err := p.Validate(baseReport())
+	if err == nil || !strings.Contains(err.Error(), "negative clip_end_sec") {
+		t.Fatalf("expected a negative-clip_end_sec error, got %v", err)
+	}
+}
+
+// TestPlanValidate_ClipEndSecOnNonMidClip: clip_end_sec set on a non-mid_clip entry
+// (chapter 5 is a tail_clip in fullPlan) is rejected - only mid_clip cuts a bounded window.
+func TestPlanValidate_ClipEndSecOnNonMidClip(t *testing.T) {
+	p := fullPlan()
+	p.Entries[1].ClipEndSec = 1200 // chapter 5 is the tail_clip entry
+	err := p.Validate(baseReport())
+	if err == nil || !strings.Contains(err.Error(), "clip_end_sec on a") {
+		t.Fatalf("expected a clip_end_sec-on-non-mid_clip error, got %v", err)
+	}
+}
+
+// TestPlanValidate_ClipStartSecOnMidClip: clip_start_sec is allowed on a mid_clip entry
+// (it starts the interior window), the relaxation of the tail_clip-only rule.
+func TestPlanValidate_ClipStartSecOnMidClip(t *testing.T) {
+	p := fullPlan()
+	p.Entries[1] = PlanEntry{Chapter: 5, Action: ActionMidClip, Reason: "interior loop", ClipStartSec: 1180, ClipEndSec: 1205}
+	if err := p.Validate(baseReport()); err != nil {
+		t.Fatalf("expected clip_start_sec allowed on a mid_clip, got %v", err)
+	}
+}
+
 func TestPlanValidate_NilReport(t *testing.T) {
 	if err := fullPlan().Validate(nil); err == nil {
 		t.Fatal("expected error for nil report")
@@ -152,6 +228,11 @@ func TestPlanRetranscribeNeeded(t *testing.T) {
 	allAccept := &Plan{Entries: []PlanEntry{{Chapter: 2, Action: ActionAccept, Reason: "ok"}}}
 	if allAccept.RetranscribeNeeded() {
 		t.Error("expected RetranscribeNeeded=false when all accept")
+	}
+	// A mid_clip is repair work (Action != accept), so it counts as non-accept.
+	midOnly := &Plan{Entries: []PlanEntry{{Chapter: 5, Action: ActionMidClip, Reason: "loop", ClipStartSec: 10, ClipEndSec: 20}}}
+	if !midOnly.RetranscribeNeeded() || len(midOnly.NonAcceptEntries()) != 1 {
+		t.Error("expected a mid_clip to count as non-accept repair work")
 	}
 }
 

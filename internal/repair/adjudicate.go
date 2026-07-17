@@ -16,6 +16,12 @@ const (
 	// VerdictClipRedegenerated: the unit is present more than twice - the fresh clip
 	// degenerated identically, so the clip is not trustworthy; keep the original.
 	VerdictClipRedegenerated Verdict = "CLIP-REDEGENERATED"
+	// VerdictMidRepaired: a bounded MID-CHAPTER interior window was cut, re-transcribed
+	// prompt-free, health-checked, and spliced between the intact head and tail. Unlike
+	// the tail verdicts it is not an authenticity judgment (there is no closing line to
+	// adjudicate) - the ClipHealthy check is the guard, and this records that a healthy
+	// interior window replaced an interior degeneration loop.
+	VerdictMidRepaired Verdict = "MID-REPAIRED"
 )
 
 // adjRedegenMax is adjudicate_tails.py's boundary: in_clip <= 2 is a real echoed

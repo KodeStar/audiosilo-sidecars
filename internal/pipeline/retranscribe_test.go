@@ -190,6 +190,128 @@ func TestRetranscribeTailClipSplices(t *testing.T) {
 	}
 }
 
+// midSegLoopTranscript builds a 4-segment chapter (A[0-10], B[10-20], C[20-30], D[30-40])
+// with an interior loop in B+C and clean edges A/D, so a mid_clip window [12,28] snaps to
+// [10,30] and splices the fresh window between the intact head and tail.
+func midSegLoopTranscript(chapter int) (transcript.Transcript, float64) {
+	return transcript.Transcript{
+		Schema: transcript.Schema, Chapter: chapter,
+		Segments: []transcript.Segment{
+			{ID: 0, Start: 0, End: 10, Text: " alpha one two"},
+			{ID: 1, Start: 10, End: 20, Text: " loop the loop the loop the"},
+			{ID: 2, Start: 20, End: 30, Text: " loop the loop the loop the"},
+			{ID: 3, Start: 30, End: 40, Text: " delta seven eight"},
+		},
+	}, 40
+}
+
+// TestRetranscribeMidClipSplices: a chapter with an INTERIOR degeneration loop is mid-
+// clipped - the agent-supplied [clip_start_sec, clip_end_sec] window is cut (fake cutter),
+// re-transcribed prompt-free (NoContext), and spliced between the intact head and tail,
+// writing transcripts-repaired and a mid repairs.log line. It counts under clips_spliced
+// (the same bucket as a tail splice), so it feeds the stall/progress convergence signal.
+func TestRetranscribeMidClipSplices(t *testing.T) {
+	work := t.TempDir()
+	tr, dur := midSegLoopTranscript(2)
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: dur, ChapterCount: 1, Chapters: []audio.Chapter{{Chapter: 2, Start: 0, End: dur, Duration: dur}}})
+	seedNormalized(t, work, tr)
+	seedFLACs(t, work, 2)
+	seedPlan(t, work, qa.PlanEntry{Chapter: 2, Action: qa.ActionMidClip, Reason: "interior loop", ClipStartSec: 12, ClipEndSec: 28})
+
+	fake := newFakeBackend()
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	exe.clipCutter = func(_ context.Context, _, dstFlac string, _, _ float64) error {
+		return os.WriteFile(dstFlac, []byte("clip"), 0o644) //nolint:gosec // test artifact
+	}
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{})
+	if err != nil {
+		t.Fatalf("retranscribing: %v", err)
+	}
+	assertRetranscribeMetrics(t, res.Metrics, map[string]int{"clips_spliced": 1, "clips_redegenerated": 0})
+	body, err := os.ReadFile(filepath.Join(work, transcript.RepairedDir, transcript.TextName(2)))
+	if err != nil {
+		t.Fatalf("transcripts-repaired/ch002.txt missing after mid splice: %v", err)
+	}
+	if strings.Contains(string(body), "loop the loop") {
+		t.Errorf("repaired text still contains the interior loop: %q", body)
+	}
+	if !strings.Contains(string(body), "fake chapter 2") {
+		t.Errorf("repaired text missing the fresh window: %q", body)
+	}
+	// The mid re-transcription must disable context-conditioning (same rationale as tail).
+	if !fake.sawNoContext(2) {
+		t.Error("midClipChapter did not set NoContext on the clip re-transcription Job")
+	}
+	// The verdict records a mid window (ClipEnd set), which the residual auto-accept keys on.
+	vs, err := repair.LoadTailVerdicts(work)
+	if err != nil || len(vs) != 1 {
+		t.Fatalf("verdicts = %+v (%v)", vs, err)
+	}
+	if vs[0].ClipEnd == 0 || vs[0].Verdict != repair.VerdictMidRepaired {
+		t.Errorf("verdict = %+v, want a mid MID-REPAIRED with ClipEnd set", vs[0])
+	}
+	log, err := os.ReadFile(filepath.Join(work, repair.RepairsLogName))
+	if err != nil || !strings.Contains(string(log), "ch002 [MID-REPAIRED]") {
+		t.Errorf("repairs.log missing the mid ch002 entry: %s (%v)", log, err)
+	}
+}
+
+// TestRetranscribeMidClipClampsEndToChapter: an agent clip_end_sec past the chapter end is
+// clamped so the cut never runs past EOF (which would empty the tail and silently degrade
+// the interior splice into a tail-to-EOF one).
+func TestRetranscribeMidClipClampsEndToChapter(t *testing.T) {
+	work := t.TempDir()
+	tr, dur := midSegLoopTranscript(2)
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: dur, ChapterCount: 1, Chapters: []audio.Chapter{{Chapter: 2, Start: 0, End: dur, Duration: dur}}})
+	seedNormalized(t, work, tr)
+	seedFLACs(t, work, 2)
+	// clip_end_sec well past the chapter duration.
+	seedPlan(t, work, qa.PlanEntry{Chapter: 2, Action: qa.ActionMidClip, Reason: "interior loop", ClipStartSec: 12, ClipEndSec: dur + 500})
+
+	fake := newFakeBackend()
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	var cutStart, cutDur float64
+	exe.clipCutter = func(_ context.Context, _, dstFlac string, startSec, durSec float64) error {
+		cutStart, cutDur = startSec, durSec
+		return os.WriteFile(dstFlac, []byte("clip"), 0o644) //nolint:gosec // test artifact
+	}
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{}); err != nil {
+		t.Fatalf("retranscribing: %v", err)
+	}
+	if cutEnd := cutStart + cutDur; cutEnd > dur+0.01 {
+		t.Errorf("cut window end %.1f exceeds chapter duration %.1f (endSec not clamped)", cutEnd, dur)
+	}
+}
+
+// TestRetranscribeMidClipStallMarkerClearedOnProgress: a mid splice makes progress
+// (spliced > 0), so it clears any stale stall marker - a mid repair converges the QA loop
+// exactly like a tail splice.
+func TestRetranscribeMidClipStallMarkerClearedOnProgress(t *testing.T) {
+	work := t.TempDir()
+	tr, dur := midSegLoopTranscript(2)
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: dur, ChapterCount: 1, Chapters: []audio.Chapter{{Chapter: 2, Start: 0, End: dur, Duration: dur}}})
+	seedNormalized(t, work, tr)
+	seedFLACs(t, work, 2)
+	seedPlan(t, work, qa.PlanEntry{Chapter: 2, Action: qa.ActionMidClip, Reason: "interior loop", ClipStartSec: 12, ClipEndSec: 28})
+	if err := os.WriteFile(filepath.Join(work, retranscribeStalledMarker), []byte("1\n"), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+
+	fake := newFakeBackend()
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	exe.clipCutter = func(_ context.Context, _, dstFlac string, _, _ float64) error {
+		return os.WriteFile(dstFlac, []byte("clip"), 0o644) //nolint:gosec // test artifact
+	}
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{})
+	if err != nil {
+		t.Fatalf("retranscribing: %v", err)
+	}
+	assertRetranscribeMetrics(t, res.Metrics, map[string]int{"clips_spliced": 1})
+	if fileExistsT(filepath.Join(work, retranscribeStalledMarker)) {
+		t.Error("a mid splice (progress) did not clear the stall marker")
+	}
+}
+
 // seedFreshRaw writes a structurally-complete fresh raw into a retranscribe/ dir, as if a
 // prior run had produced it (used to exercise the decode-params marker's stale-raw purge).
 func seedFreshRaw(t *testing.T, dir string, chapter int) {
@@ -312,6 +434,61 @@ func TestRetranscribeAcceptSkips(t *testing.T) {
 	assertRetranscribeMetrics(t, res.Metrics, map[string]int{"accepted": 1, "retranscribed": 0})
 	if fake.count(2) != 0 {
 		t.Errorf("an accept entry transcribed chapter 2 %d times, want 0", fake.count(2))
+	}
+}
+
+// TestRetranscribeStallMarkerWrittenWhenNoProgress is the convergence-signal regression:
+// a repair round that neither splices nor adopts anything (here a retranscribe entry whose
+// fresh run is implausible for the chapter duration, so it is KEPT) writes the
+// retranscribe_stalled marker qaAdjudicate parks on - the loop achieved nothing.
+func TestRetranscribeStallMarkerWrittenWhenNoProgress(t *testing.T) {
+	work := t.TempDir()
+	// A 60s chapter: the fake backend's 3-word fresh run is implausibly slow -> kept (not
+	// adopted), so spliced == 0 && adopted == 0 -> no progress.
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: 60, ChapterCount: 1, Chapters: []audio.Chapter{{Chapter: 2, Start: 0, End: 60, Duration: 60}}})
+	orig := transcript.Transcript{Schema: transcript.Schema, Chapter: 2, Segments: []transcript.Segment{{ID: 0, Start: 0, End: 60, Text: " ORIGINAL KEEP ME"}}}
+	seedNormalized(t, work, orig)
+	seedFLACs(t, work, 2)
+	seedPlan(t, work, qa.PlanEntry{Chapter: 2, Action: qa.ActionRetranscribe, Reason: "check"})
+
+	fake := newFakeBackend()
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{})
+	if err != nil {
+		t.Fatalf("retranscribing: %v", err)
+	}
+	assertRetranscribeMetrics(t, res.Metrics, map[string]int{"adopted": 0, "kept": 1, "clips_spliced": 0})
+	if !fileExistsT(filepath.Join(work, retranscribeStalledMarker)) {
+		t.Error("a no-progress round did not write the stall marker")
+	}
+}
+
+// TestRetranscribeStallMarkerClearedOnProgress: a round that DOES make progress (a splice)
+// removes any stale stall marker, so a productive loop never falsely parks the next round.
+func TestRetranscribeStallMarkerClearedOnProgress(t *testing.T) {
+	work := t.TempDir()
+	loop, dur := tailLoopTranscript(2)
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: dur, ChapterCount: 1, Chapters: []audio.Chapter{{Chapter: 2, Start: 0, End: dur, Duration: dur}}})
+	seedNormalized(t, work, loop)
+	seedFLACs(t, work, 2)
+	seedPlan(t, work, qa.PlanEntry{Chapter: 2, Action: qa.ActionTailClip, Reason: "tail loop"})
+	// A stale marker from a prior no-progress round: this productive round must clear it.
+	if err := os.WriteFile(filepath.Join(work, retranscribeStalledMarker), []byte("1\n"), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+
+	fake := newFakeBackend()
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	exe.clipCutter = func(_ context.Context, _, dstFlac string, _, _ float64) error {
+		return os.WriteFile(dstFlac, []byte("clip"), 0o644) //nolint:gosec // test artifact
+	}
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{})
+	if err != nil {
+		t.Fatalf("retranscribing: %v", err)
+	}
+	assertRetranscribeMetrics(t, res.Metrics, map[string]int{"clips_spliced": 1})
+	if fileExistsT(filepath.Join(work, retranscribeStalledMarker)) {
+		t.Error("a progress round (splice) did not clear the stall marker")
 	}
 }
 

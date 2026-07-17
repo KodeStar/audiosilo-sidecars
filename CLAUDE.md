@@ -207,7 +207,28 @@ internal/
             (SkippedKnownFailed), so a re-queued identical tail_clip is free instead of
             minutes of ASR - the verdict records a DecodeTag, so a legacy verdict written
             under different (context-conditioned) params never blocks the chapter's one
-            fresh NoContext attempt.
+            fresh NoContext attempt. MID-CHAPTER interior repair (ClipAndSpliceWindow, for
+            an interior loop with real narration resuming AFTER it): the agent supplies a
+            bounded [clip_start_sec, clip_end_sec] window (EndOverrideSec), which
+            snapWindow snaps OUTWARD to segment edges (no straddling content lost), the
+            stage cuts+re-transcribes prompt-free/NoContext, ClipHealthy gates it (no
+            rotation-adjudication - there is no closing line), and SpliceWindow splices the
+            fresh window BETWEEN the intact head (before start) and tail (after end).
+            TailVerdict.ClipEnd (>0) records the window as a MID-REPAIRED (or mid
+            CLIP-REDEGENERATED) verdict; the mid clip file is m%03d-<start>-<end>.flac
+            (both bounds in deciseconds, dot-free, distinct from the tail t-prefix). The
+            known-failed skip and the residual auto-accept both key on ClipEnd (a mid
+            verdict never blocks a tail re-attempt, and vice versa). LIMITATION (known,
+            deferred): the repair model is ONE clip per chapter - a single repaired
+            overlay + one verdict per chapter (MergeTailVerdict upserts by chapter) + a
+            chapter-level resume guard (tailClipAlreadyDone). So a chapter needing TWO
+            windows (two separate loops, or a mis-covered mid window that must be widened)
+            cannot compose: a second clip re-splices from the ORIGINAL transcript (losing
+            the first) or is skipped as already-done. Mitigated by prompting the agent to
+            bound mid windows GENEROUSLY (a mid_clip cannot be refined) and to use
+            retranscribe for a multi-loop chapter; the endSec is clamped to the chapter
+            duration. A proper fix (per-window verdicts + splice composition) is a
+            follow-up.
   pipeline/ composite scheduler.Executor: routes inspecting -> audio.Inspect,
             splitting -> audio.Split, asr -> the per-chapter internal/asr loop
             (resumable: skip complete raws, delete+retry malformed, freeze each raw
@@ -234,28 +255,33 @@ internal/
             an unavailable agent backend PARK a book needs_attention (a human-fixable
             precondition Retry re-admits) instead of hard-failing. The qa_adjudicating ->
             retranscribing -> qa_sweep loop has three convergence guards beyond the
-            3-round cap: (1) a FIXED-POINT park - qaAdjudicate fingerprints (sha256, in
-            qa_round_fingerprint) the qa_report.json PLUS tail_verdicts.json it
-            adjudicated (the report alone is not enough: detectors read the raw layer a
-            splice never touches, so a successful splice can leave the report
-            bit-identical while the verdict ledger moved - real progress, not a fixed
-            point); if the next round's report+ledger state is bit-identical AND a plan
-            exists, the repairs moved nothing, so it
-            parks ParkQANoConverge naming the stuck chapters. The fingerprint is DELETED on
-            ANY qa_adjudicating park (both the fixed-point park and the 3-round-cap park) and
-            whenever the round count is 0 (a stale-leftover guard: a fingerprint is only ever
-            written at the end of a successful round, so done==0 with one present means a
-            Retry/purge-rewind/crash left it - drop it), so a Retry always gets exactly ONE
-            fresh agent round before re-parking (keyed on fingerprint+plan, not the round
-            count, so a Retry-reset CountStageSuccesses cannot dodge it); (2) a WIDENED
-            tail-residual auto-accept - tailOnlyChapters now also accepts a repaired chapter
-            whose cross-segment / non-mid multi-loop hits are themselves tail residuals
-            covered by the recorded splice (the WHOLE located span starts within
-            [clip_start - 15s, end], or position >= 95% when the hit has no usable time); (3)
-            plan clip_start_sec (per tail_clip entry) feeds the repair known-failed skip
-            above. wph outliers, within-segment hits, non-end-fade runs, MID-CHAPTER
-            multi-loops, and spans that straddle mid-chapter into the tail still always
-            disqualify a chapter from tail-only. The repair re-transcription is decode-tagged
+            maxQARounds (5) round cap: (1) a progress-based STALL park - the retranscribing
+            stage writes a retranscribe_stalled marker whenever a repair round splices AND
+            adopts nothing (it made no real progress) and removes it on any progress;
+            qaAdjudicate reads the marker and parks ParkQANoConverge naming the stuck
+            chapters instead of burning another paid agent round on a book the repairs
+            cannot move. This REPLACED an earlier report+ledger sha256 fingerprint, which
+            thrashed on the exact incident it was meant to catch: a re-degenerating tail
+            clip rewrites tail_verdicts.json every round (each CLIP-REDEGENERATED verdict
+            relocates its clip_start), so the fingerprint changed every round, the fixed
+            point never fired, and the book burned its whole round budget (~$1.5/round). The
+            marker is DELETED on ANY qa_adjudicating park (the stall park and the round-cap
+            park) and on the done==0 reset (a Retry/purge-rewind must not inherit a stale
+            marker), so a Retry always gets exactly ONE fresh agent round before it can
+            re-park. A mid_clip splice increments spliced (it reuses the tail buckets), so
+            an interior repair counts as progress too; (2) a WIDENED residual auto-accept -
+            tailOnlyChapters (via spanCovered) accepts a repaired chapter whose
+            cross-segment / multi-loop hits are residuals the recorded splice window covers:
+            the window is [clip_start, clip_end] for a MID splice (both bounds constrain the
+            span within +/-15s) or [clip_start, +Inf] for a TAIL splice (only the start,
+            with a position>=95% fallback when the hit has no usable time). A MID-CHAPTER
+            multi-loop is covered ONLY by a recorded MID window (never a tail window); a mid
+            window with an untimed hit is conservatively NOT covered; (3) plan
+            clip_start_sec/clip_end_sec (per tail_clip/mid_clip entry) feeds the repair
+            known-failed skip above. wph outliers, within-segment hits, non-end-fade runs, a
+            MID-CHAPTER multi-loop NOT covered by a mid window, and spans that straddle
+            mid-chapter into the tail still always disqualify a chapter from residual-only.
+            The repair re-transcription is decode-tagged
             (retranscribe/decode_params marker): a stale pre-NoContext fresh raw is discarded
             so the chapter is re-transcribed under the current params rather than reused, and
             a free known-failed skip is excluded from the stage's rate sample.

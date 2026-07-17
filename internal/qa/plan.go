@@ -17,14 +17,22 @@ import (
 const PlanFile = "qa_plan.json"
 
 // PlanAction is how one flagged chapter is dispositioned. "retranscribe" re-runs ASR
-// on the whole chapter; "tail_clip" cuts and re-transcribes only the loop window and
-// splices it; "accept" leaves the chapter as-is (a benign finding).
+// on the whole chapter; "tail_clip" cuts and re-transcribes only the loop window at the
+// chapter END and splices it; "mid_clip" cuts and re-transcribes a bounded INTERIOR
+// window and splices it between the intact head and tail; "accept" leaves the chapter
+// as-is (a benign finding).
 type PlanAction string
 
 const (
 	ActionRetranscribe PlanAction = "retranscribe"
 	ActionTailClip     PlanAction = "tail_clip"
-	ActionAccept       PlanAction = "accept"
+	// ActionMidClip cuts a bounded interior window [clip_start_sec, clip_end_sec], re-
+	// transcribes just that window prompt-free, and splices the fresh window between the
+	// intact head (before start) and tail (after end). It is for a MID-CHAPTER
+	// degeneration loop with real narration resuming AFTER it, which tail_clip (loop runs
+	// to the chapter end) and retranscribe (pervasive/whole-chapter) cannot fix.
+	ActionMidClip PlanAction = "mid_clip"
+	ActionAccept  PlanAction = "accept"
 )
 
 // PlanEntry is one chapter's disposition with the agent's justification.
@@ -32,13 +40,20 @@ type PlanEntry struct {
 	Chapter int        `json:"chapter"`
 	Action  PlanAction `json:"action"`
 	Reason  string     `json:"reason"`
-	// ClipStartSec is an OPTIONAL agent-supplied tail-clip window start (seconds from
-	// chapter start) for a "tail_clip" entry. When set (> 0) the repair stage cuts the
-	// window from this point instead of deriving it from the transcript - the agent uses
-	// it to relocate a window whose prior derived cut re-degenerated (CLIP-REDEGENERATED),
-	// so a re-queued tail_clip does not replay the identical failed window. 0 (the default,
-	// omitted) means "derive as usual". Only a tail_clip entry may carry it (Validate).
+	// ClipStartSec is an OPTIONAL agent-supplied clip window start (seconds from chapter
+	// start). On a "tail_clip" entry (> 0) the repair stage cuts the tail window from this
+	// point instead of deriving it from the transcript - the agent uses it to relocate a
+	// window whose prior derived cut re-degenerated (CLIP-REDEGENERATED), so a re-queued
+	// tail_clip does not replay the identical failed window. On a "mid_clip" entry it is
+	// REQUIRED (> 0) and marks where the interior loop begins. 0 (the default, omitted)
+	// means "derive as usual" for a tail_clip. Only a tail_clip or mid_clip entry may
+	// carry it (Validate).
 	ClipStartSec float64 `json:"clip_start_sec,omitempty"`
+	// ClipEndSec is the agent-supplied interior window END (seconds from chapter start)
+	// for a "mid_clip" entry, where real narration resumes after the loop. It is REQUIRED
+	// on a mid_clip (> ClipStartSec) and forbidden on any other action (Validate). Only
+	// mid_clip cuts a bounded [start, end] window; tail_clip runs to the chapter end.
+	ClipEndSec float64 `json:"clip_end_sec,omitempty"`
 }
 
 // Plan is the qa_adjudicating agent's output: one entry per actionable finding plus
@@ -49,8 +64,8 @@ type Plan struct {
 }
 
 // NonAcceptEntries returns the entries that ask for actual repair work (Action !=
-// "accept": the retranscribe/tail_clip dispositions). It is nil when every entry is an
-// accept (or the plan is empty), which callers read as "no work queued".
+// "accept": the retranscribe/tail_clip/mid_clip dispositions). It is nil when every
+// entry is an accept (or the plan is empty), which callers read as "no work queued".
 func (p *Plan) NonAcceptEntries() []PlanEntry {
 	var out []PlanEntry
 	for _, e := range p.Entries {
@@ -123,7 +138,7 @@ func (p *Plan) Validate(rep *Report) error {
 	seen := make(map[int]int, len(p.Entries))
 	for _, e := range p.Entries {
 		switch e.Action {
-		case ActionRetranscribe, ActionTailClip, ActionAccept:
+		case ActionRetranscribe, ActionTailClip, ActionMidClip, ActionAccept:
 		default:
 			return fmt.Errorf("qa plan: chapter %d has invalid action %q", e.Chapter, e.Action)
 		}
@@ -133,8 +148,26 @@ func (p *Plan) Validate(rep *Report) error {
 		if e.ClipStartSec < 0 {
 			return fmt.Errorf("qa plan: chapter %d has a negative clip_start_sec %.1f", e.Chapter, e.ClipStartSec)
 		}
-		if e.ClipStartSec != 0 && e.Action != ActionTailClip {
-			return fmt.Errorf("qa plan: chapter %d sets clip_start_sec on a %q entry (only tail_clip may)", e.Chapter, e.Action)
+		if e.ClipEndSec < 0 {
+			return fmt.Errorf("qa plan: chapter %d has a negative clip_end_sec %.1f", e.Chapter, e.ClipEndSec)
+		}
+		// clip_start_sec relocates a tail_clip window OR starts a mid_clip window; it is
+		// forbidden on any other action.
+		if e.ClipStartSec != 0 && e.Action != ActionTailClip && e.Action != ActionMidClip {
+			return fmt.Errorf("qa plan: chapter %d sets clip_start_sec on a %q entry (only tail_clip or mid_clip may)", e.Chapter, e.Action)
+		}
+		// clip_end_sec only bounds a mid_clip's interior window.
+		if e.ClipEndSec != 0 && e.Action != ActionMidClip {
+			return fmt.Errorf("qa plan: chapter %d sets clip_end_sec on a %q entry (only mid_clip may)", e.Chapter, e.Action)
+		}
+		// A mid_clip needs a bounded interior window: a positive start and an end past it.
+		if e.Action == ActionMidClip {
+			if e.ClipStartSec <= 0 {
+				return fmt.Errorf("qa plan: chapter %d is a mid_clip but has no clip_start_sec > 0", e.Chapter)
+			}
+			if e.ClipEndSec <= e.ClipStartSec {
+				return fmt.Errorf("qa plan: chapter %d mid_clip clip_end_sec %.1f must be greater than clip_start_sec %.1f", e.Chapter, e.ClipEndSec, e.ClipStartSec)
+			}
 		}
 		if !allowed[e.Chapter] {
 			return fmt.Errorf("qa plan: chapter %d has an entry but the QA sweep flagged nothing for it", e.Chapter)

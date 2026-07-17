@@ -46,17 +46,34 @@ web access.
 
 - `retranscribe` - re-run ASR on the whole chapter (lost content, low-wph
   collapse, mid-chapter loop that ate a large span).
-- `tail_clip` - the corruption is confined to a tail loop; the repair stage cuts
-  the affected window, retranscribes just that clip prompt-free, and splices it.
-  You MAY add an optional `"clip_start_sec"` (seconds from the chapter start) to a
-  tail_clip entry to tell the repair stage where the trailing garbage really begins.
-  Only supply it when re-queuing a tail_clip whose prior verdict in
+- `tail_clip` - the corruption is confined to a loop running to the chapter END;
+  the repair stage cuts the affected window, retranscribes just that clip prompt-free,
+  and splices it. You MAY add an optional `"clip_start_sec"` (seconds from the chapter
+  start) to a tail_clip entry to tell the repair stage where the trailing garbage
+  really begins. Only supply it when re-queuing a tail_clip whose prior verdict in
   `tail_verdicts.json` is `CLIP-REDEGENERATED`: the repair stage already tried the
   window it derived on its own and it re-degenerated, so re-cutting the SAME window
   will fail identically and is skipped as known-failed. Read the transcript, find
   where the real narration ends and the loop starts, and give that timestamp so the
   stage cuts a DIFFERENT (usually narrower) window. Omit it otherwise (the stage
   derives the window itself).
+- `mid_clip` - the corruption is a MID-CHAPTER loop: an interior repeated span with
+  REAL narration resuming AFTER it (the classic "...the two of the two of the two
+  [x80] the pixie queen was still hovering..."). tail_clip cannot reach an interior
+  loop and a full retranscribe just reproduces it, so this cuts a bounded interior
+  window, retranscribes it prompt-free, and splices the fresh window between the
+  intact head (before the loop) and tail (after it). Supply BOTH `"clip_start_sec"`
+  and `"clip_end_sec"` (seconds from the chapter start) bounding the looping span: use
+  the cross-segment finding's "(A-Bs)" time range plus the transcript to locate where
+  the loop STARTS and where real narration RESUMES. Use mid_clip ONLY for a bounded
+  interior loop with intact content after it; use `retranscribe` for pervasive or
+  whole-chapter degeneration, `tail_clip` for a loop that runs to the chapter end.
+  Bound the window GENEROUSLY - make it cover the WHOLE loop with a little margin on
+  each side; a mid_clip that lands cannot be refined on a later round, so an
+  under-covering window that leaves loop text behind will keep the chapter flagged.
+  If a chapter has TWO OR MORE separate loops (in different parts of the chapter), do
+  NOT queue multiple clips for it - a chapter takes only ONE clip repair, so queue a
+  full `retranscribe` instead.
 - `accept` - the flag is a false positive or a genuinely harmless end-fade echo;
   give the argued reason.
 {{if .AutoAccepted}}
@@ -78,6 +95,7 @@ disposition ONLY the other flagged chapters.
     { "chapter": 12, "action": "retranscribe", "reason": "argued reason in your own words" },
     { "chapter": 5, "action": "tail_clip", "reason": "..." },
     { "chapter": 16, "action": "tail_clip", "reason": "prior clip re-degenerated; the loop starts later", "clip_start_sec": 1180.0 },
+    { "chapter": 8, "action": "mid_clip", "reason": "interior loop 1684-1705s; real narration resumes after", "clip_start_sec": 1684.0, "clip_end_sec": 1705.0 },
     { "chapter": 3, "action": "accept", "reason": "..." }
   ],
   "notes": "any cross-chapter observations, or empty"

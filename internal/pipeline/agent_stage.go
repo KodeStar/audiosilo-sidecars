@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -45,17 +46,24 @@ const (
 	// MarkersNotConfidentPrefix prefixes the park reason when marker normalization
 	// needs a human (the agent's verdict reason follows).
 	MarkersNotConfidentPrefix = "marker normalization needs a human"
-	// QANoConvergeMsg is the park reason when QA adjudication does not converge.
-	QANoConvergeMsg = "QA adjudication did not converge after 3 rounds - see qa_report.md"
-	// QAFixedPointPrefix prefixes the park reason when a QA adjudication round's repairs
-	// changed nothing (the report is bit-identical to the round that was already
-	// adjudicated), so a further agent round would cost money to reach the same result.
-	// The stuck (non-accept) chapters follow.
-	QAFixedPointPrefix = "QA adjudication reached a fixed point - repairs changed nothing"
+	// QAStalledPrefix prefixes the park reason when a QA repair round made no progress
+	// (the retranscribing stage neither spliced nor adopted any chapter), so the loop is
+	// stuck: the next qa_sweep re-flags the same chapters and another agent round would
+	// cost money to reach the same no-op. The stuck chapters follow. This progress-based
+	// signal (see retranscribeStalledMarker) replaced the old report+ledger fingerprint,
+	// which mutated on every futile re-attempt (each CLIP-REDEGENERATED verdict relocated
+	// its clip_start) so the fixed point never fired and the book burned its round budget.
+	QAStalledPrefix = "QA adjudication stalled - repairs stopped making progress"
 	// SpellingGateFailurePrefix prefixes the park reason when the spelling gate Check
 	// fails (the gate summary follows).
 	SpellingGateFailurePrefix = "spelling corrections failed the gates - fix spelling_research and retry"
 )
+
+// QANoConvergeMsg is the park reason when QA adjudication hits the hard round cap
+// (maxQARounds) without converging - the backstop for a book that makes real progress
+// every round (the cheaper stall park, QAStalledPrefix, handles a genuinely-stuck book
+// after ~2 rounds). Built from maxQARounds so the message can never drift from the cap.
+var QANoConvergeMsg = fmt.Sprintf("QA adjudication did not converge after %d rounds - see qa_report.md", maxQARounds)
 
 // ensureAgent re-selects an agent runner when the frozen one is unavailable, adopting
 // a now-available result for this and future runs (the operator installs a CLI, then
@@ -448,88 +456,70 @@ type adjudicatePromptData struct {
 	AutoAccepted string
 }
 
-// autoAcceptTailReason is the fixed reason on a pipeline-authored auto-accept entry.
-const autoAcceptTailReason = "already repaired via tail_clip - splice present in transcripts-repaired"
+// autoAcceptTailReason is the fixed reason on a pipeline-authored auto-accept entry (a
+// tail_clip or mid_clip splice already landed; the residual reads the untouched raw layer).
+const autoAcceptTailReason = "already repaired via clip splice - splice present in transcripts-repaired"
 
-// qaFingerprintName is the work-dir file holding the sha256 of the QA-round state the
-// last qa_adjudicating round dispositioned - the round's findings AND repair ledger -
-// used to detect a fixed point (a subsequent round whose inputs the repairs did not
-// move at all). It is not a pipeline sentinel and never gates the state machine.
-const qaFingerprintName = "qa_round_fingerprint"
+// retranscribeStalledMarker is the work-dir file the retranscribing stage writes when a
+// repair round made no progress (it neither spliced nor adopted any chapter) and removes
+// when a round DID make progress. It is the pipeline's QA-loop convergence signal:
+// qaAdjudicate reads it (retranscribeStalled) and parks ParkQANoConverge rather than
+// burning another paid agent round on a book the repairs cannot move. It is not a
+// pipeline sentinel and never gates the state machine.
+//
+// Why a progress tally and not a report/ledger fingerprint (the design this replaced): a
+// book whose tail-clip repairs keep re-degenerating rewrites tail_verdicts.json every
+// round - each futile CLIP-REDEGENERATED verdict carries a fresh clip_start - so a
+// fingerprint over qa_report.json + the verdict ledger changed every round, the fixed
+// point never fired, and the book burned its whole round budget (~$1.5 per agent round)
+// before the cap. A round that splices AND adopts nothing is the true "no progress"
+// signal, cheap to compute and immune to a churning ledger.
+const retranscribeStalledMarker = "retranscribe_stalled"
 
-// qaFingerprintPath is the fingerprint file's path in the book's work dir.
-func qaFingerprintPath(workDir string) string {
-	return filepath.Join(workDir, qaFingerprintName)
+// retranscribeStalledPath is the stall marker's path in the book's work dir.
+func retranscribeStalledPath(workDir string) string {
+	return filepath.Join(workDir, retranscribeStalledMarker)
 }
 
-// qaRoundFingerprint is the hex sha256 over the concatenation of the current
-// qa_report.json bytes AND the tail_verdicts.json bytes (a missing ledger hashes as
-// empty). The report alone is NOT a sufficient identity: the tail_rate/cross_segment
-// detectors read the raw transcripts-json layer by golden contract, which a splice does
-// not touch - so a round whose tail_clips all SUCCEEDED (real progress: repaired files +
-// BENIGN/FABRICATED verdicts) can leave qa_report.json bit-identical, and a report-only
-// fingerprint would falsely park it even though the widened auto-accept (which reads the
-// verdicts) would now accept those chapters and advance the book. Every repair outcome
-// moves at least one of the two inputs: a splice or a new/relocated CLIP-REDEGENERATED
-// verdict changes tail_verdicts.json; a retranscribe adoption changes the raw layer and
-// hence the report. Only a genuinely zero-change round (KEEP decisions + known-failed
-// skips) leaves both untouched - the true fixed point.
-func qaRoundFingerprint(workDir string) (string, error) {
-	report, err := os.ReadFile(filepath.Join(workDir, qa.ReportJSONName)) //nolint:gosec // path derives from the book's own work dir
-	if err != nil {
-		return "", err
-	}
-	verdicts, err := os.ReadFile(filepath.Join(workDir, repair.TailVerdictsName)) //nolint:gosec // path derives from the book's own work dir
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return "", err
-		}
-		verdicts = nil // no ledger yet - hash it as empty
-	}
-	return hexSHA256(report, verdicts), nil
+// retranscribeStalled reports whether the previous repair round left the stall marker
+// (it made no progress), the signal qaAdjudicate parks on.
+func retranscribeStalled(workDir string) bool {
+	return fsutil.IsFile(retranscribeStalledPath(workDir))
 }
 
-// writeQAFingerprint records the QA-round fingerprint for the next round. It takes the
-// precomputed fingerprint (qaAdjudicate computes it once, before the agent runs; nothing
-// in the round mutates qa_report.json or tail_verdicts.json, so the value is still
-// current) rather than recomputing it.
-func writeQAFingerprint(workDir, fp string) error {
-	return fsutil.WriteFileAtomic(qaFingerprintPath(workDir), []byte(fp+"\n"), 0o644)
-}
-
-// qaFixedPoint reports whether this round is a fixed point of the previous one, given the
-// current round fingerprint cur (computed once by the caller): the recorded fingerprint
-// exists, matches cur - the report+verdict-ledger state, see qaRoundFingerprint for why
-// both are part of the identity - AND a qa_plan.json exists (the previous round produced
-// a plan whose repairs moved nothing). stuck is the previous plan's non-accept entries
-// (the chapters the loop keeps failing to repair), for the park message. Any
-// missing/unreadable input is "not a fixed point" - the round proceeds.
-func qaFixedPoint(workDir, cur string) ([]qa.PlanEntry, bool) {
-	prev, err := os.ReadFile(qaFingerprintPath(workDir)) //nolint:gosec // path derives from the book's own work dir
-	if err != nil {
-		return nil, false
-	}
-	if strings.TrimSpace(string(prev)) != cur {
-		return nil, false
-	}
+// qaStalledEntries resolves the stuck chapter set naming the stall park message: the prior
+// round's plan's non-accept entries (the repair dispositions that keep failing). It is
+// naming-only; an empty result yields a chapter-less message. The plan is always present
+// and carries non-accept entries at the only call site: the stall marker is written only by
+// retranscribe (which runs only for a RetranscribeNeeded plan, i.e. one with non-accept
+// entries), qa_plan.json is never deleted before qaAdjudicate reads it, and the stall guard
+// runs before this round writes a new plan - so the plan on disk is still that stuck round's.
+func qaStalledEntries(workDir string) []qa.PlanEntry {
 	plan, err := qa.LoadPlan(workDir)
 	if err != nil {
-		return nil, false
+		return nil
 	}
-	return plan.NonAcceptEntries(), true
+	return plan.NonAcceptEntries()
 }
 
-// qaFixedPointMsg builds the fixed-point park reason, naming the stuck chapters.
-func qaFixedPointMsg(stuck []qa.PlanEntry) string {
+// qaStalledMsg builds the stall park reason, naming the stuck chapters.
+func qaStalledMsg(stuck []qa.PlanEntry) string {
 	if len(stuck) == 0 {
-		return QAFixedPointPrefix + " - see qa_report.md"
+		return QAStalledPrefix + " - see qa_report.md"
 	}
-	return fmt.Sprintf("%s; stuck chapters: %s - see qa_report.md", QAFixedPointPrefix, chaptersCSV(stuck))
+	return fmt.Sprintf("%s; stuck chapters: %s - see qa_report.md", QAStalledPrefix, chaptersCSV(stuck))
 }
+
+// maxQARounds is the hard cap on qa_adjudicating rounds. The cheap progress-based stall
+// park (retranscribeStalledMarker) now parks a genuinely-stuck book after ~2 rounds, so
+// this cap only bounds a book that makes real progress every round; 5 gives incremental
+// convergence more room than the old 3 without risking unbounded agent cost. It stays as
+// the backstop for the pathological "makes a little progress forever" case.
+const maxQARounds = 5
 
 // qaAdjudicate hands the QA sweep's findings to the agent, which writes a qa_plan.json
 // dispositioning every flagged chapter (retranscribe / tail_clip / accept). It caps at
-// 3 rounds (a plan that keeps re-queuing does not converge), stages only the flagged
+// maxQARounds (a plan that keeps re-queuing does not converge), stages only the flagged
 // chapters' transcripts, validates the plan against the report, and reports
 // RetranscribeNeeded so the state machine branches to retranscribing or
 // spelling_research.
@@ -547,28 +537,25 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, r schedule
 		r.Progress(0, 1)
 	}
 	// Round cap FIRST: CountStageSuccesses is completed rounds (the current run is still
-	// open, so not counted). 3 completed rounds without convergence -> park.
+	// open, so not counted). maxQARounds completed rounds without convergence -> park.
 	round := 1
 	if e.db != nil {
 		done, err := e.db.CountStageSuccesses(ctx, book.ID, string(state.QAAdjudicating))
 		if err != nil {
 			return scheduler.StageResult{}, fmt.Errorf("qa_adjudicating: count rounds: %w", err)
 		}
-		if done >= 3 {
-			// Round-cap park: clear the fixed-point signal too, so ANY ParkQANoConverge at
-			// this stage leaves a clean slate - a user Retry then gets one fresh round.
-			_ = os.Remove(qaFingerprintPath(book.WorkDir))
+		if done >= maxQARounds {
+			// Round-cap park: clear the stall marker too, so ANY ParkQANoConverge at this
+			// stage leaves a clean slate - a user Retry then gets one fresh round.
+			_ = os.Remove(retranscribeStalledPath(book.WorkDir))
 			return scheduler.StageResult{}, scheduler.ParkWithCode(state.ParkQANoConverge, QANoConvergeMsg)
 		}
-		// Stale-fingerprint guard: a fingerprint is ONLY ever written at the end of a
-		// successful round, so done==0 with a fingerprint present always means stale
-		// leftovers (a Retry that reset the stage_runs rows, a purge-rewind whose reconcile
-		// cleared them, or a crash between the fingerprint write and the sentinel write). The
-		// documented contract is that a reset round budget always gets one fresh agent round,
-		// so drop it here - the fixed-point check below therefore only ever fires when
-		// done >= 1.
+		// done==0 reset path: clear the stall marker for lifecycle parity - a Retry (which
+		// resets the stage_runs rows) or a purge-rewind must not inherit a stale marker, so
+		// the first round after a reset always runs the agent (the documented one-fresh-round
+		// contract) instead of parking on the previous life's signal.
 		if done == 0 {
-			_ = os.Remove(qaFingerprintPath(book.WorkDir))
+			_ = os.Remove(retranscribeStalledPath(book.WorkDir))
 		}
 		round = done + 1
 	}
@@ -576,25 +563,16 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, r schedule
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("qa_adjudicating: load report (qa_sweep must run first): %w", err)
 	}
-	// Compute this round's fingerprint ONCE (the report+verdict-ledger digest): the
-	// fixed-point guard tests it against the recorded value, and the end-of-round write
-	// records it. Nothing between here and that write mutates qa_report.json or
-	// tail_verdicts.json (the agent only writes qa_plan.json), so the two share one value.
-	fp, err := qaRoundFingerprint(book.WorkDir)
-	if err != nil {
-		return scheduler.StageResult{}, fmt.Errorf("qa_adjudicating: fingerprint: %w", err)
-	}
-	// Fixed-point guard (independent of the round count, so a Retry - which resets
-	// CountStageSuccesses - cannot dodge it): if the previous round already adjudicated a
-	// bit-identical report+verdict-ledger state AND left a plan, that round's repairs
-	// moved nothing (a successful splice would have changed tail_verdicts.json even when
-	// the report stayed identical - see qaRoundFingerprint), so another agent round would
-	// burn money to reach the same result. Park naming the stuck chapters, but first
-	// DELETE the fingerprint so a user Retry gets exactly one fresh agent round before
-	// the fixed point can re-park (it re-parks after 1, not 3, rounds).
-	if stuck, fixed := qaFixedPoint(book.WorkDir, fp); fixed {
-		_ = os.Remove(qaFingerprintPath(book.WorkDir))
-		return scheduler.StageResult{}, scheduler.ParkWithCode(state.ParkQANoConverge, qaFixedPointMsg(stuck))
+	// Stall guard: if the previous repair round made no progress (the retranscribing stage
+	// spliced AND adopted nothing, recorded as the stall marker), the loop is stuck - the
+	// re-sweep re-flagged the same chapters and another agent round would burn money to
+	// reach the same no-op. Park naming the stuck chapters, but first DELETE the marker so a
+	// user Retry gets exactly one fresh agent round before it can re-park (see the done==0
+	// reset above - the marker is cleared on both, so a Retry never inherits it).
+	if retranscribeStalled(book.WorkDir) {
+		stuck := qaStalledEntries(book.WorkDir)
+		_ = os.Remove(retranscribeStalledPath(book.WorkDir))
+		return scheduler.StageResult{}, scheduler.ParkWithCode(state.ParkQANoConverge, qaStalledMsg(stuck))
 	}
 	if r.Note != nil {
 		r.Note(fmt.Sprintf("adjudicating round %d: %s", round, countNoun(len(qa.FlaggedChapters(rep)), "flagged chapter")))
@@ -628,13 +606,6 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, r schedule
 
 	if err := qa.WritePlan(book.WorkDir, plan); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("qa_adjudicating: write plan: %w", err)
-	}
-	// Record the fingerprint of the report this round adjudicated (computed once above,
-	// still current), so the next round can detect a fixed point (a report unchanged by
-	// this round's repairs). The all-auto-accept path writes it too - harmless (that path
-	// advances the book), and consistent.
-	if err := writeQAFingerprint(book.WorkDir, fp); err != nil {
-		return scheduler.StageResult{}, fmt.Errorf("qa_adjudicating: write fingerprint: %w", err)
 	}
 	if r.Progress != nil {
 		r.Progress(1, 1)
@@ -745,30 +716,34 @@ func (e *Executor) autoAcceptRepairedTails(rep *qa.Report, workDir string) []qa.
 	return out
 }
 
-// tailZone thresholds for classifying a cross-segment / multi-loop finding as a tail
-// residual the chapter's recorded splice already covers.
+// tailZone thresholds for classifying a cross-segment / multi-loop finding as a residual
+// the chapter's recorded splice window already covers.
 const (
-	// tailZoneEpsilon is the slack (seconds) below a chapter's recorded tail_clip start
-	// within which a hit still counts as inside the tail the splice replaced. One real
+	// tailZoneEpsilon is the slack (seconds) around a chapter's recorded splice window
+	// within which a hit still counts as inside the window the splice replaced. One real
 	// case: a cross-segment hit spanning 814-845s against a clip_start of 826.1.
 	tailZoneEpsilon = 15.0
 	// tailZonePctFloor is the position-percent tail floor used when a hit carries no
-	// usable segment time (the report's "-1.0% (?)" entries): at or above it the hit is
-	// in the tail zone; below it (a not-located -1 included) it disqualifies.
+	// usable segment time (the report's "-1.0% (?)" entries) AND the window is a TAIL
+	// window: at or above it the hit is in the tail zone; below it (a not-located -1
+	// included) it disqualifies. A MID window never uses this fallback (conservative).
 	tailZonePctFloor = 95.0
 )
 
 // tailOnlyChapters is the set of flagged (required-disposition) chapters whose findings
-// are all addressable by a tail_clip splice: a tail_rate hit, a benign end_fade run, or a
-// cross-segment / tail-classified multi-loop finding that is itself a TAIL RESIDUAL the
-// chapter's recorded splice covers (its time overlaps [clip_start - epsilon, end], or -
-// when the report carries no usable time - its position is in the tail >= 95%). A chapter
-// carrying any wph outlier, any within-segment hit, any non-end-fade run, any MID-CHAPTER
-// multi-loop, or any cross/multi finding NOT tail-covered is disqualified (those are not
-// fixed by a splice). verdicts maps a chapter to its recorded tail_verdicts entry (the
-// ClipStart is read for the residual test); a chapter with no entry cannot have a
-// tail-covered residual. It reads the report + verdicts only; it never touches the
-// golden-tested qa detectors.
+// are all addressable by a clip splice: a tail_rate hit, a benign end_fade run, or a
+// cross-segment / tail-classified multi-loop finding that is itself a RESIDUAL the
+// chapter's recorded splice window covers. The window is [clip_start, windowEnd] where
+// windowEnd is the verdict's ClipEnd for a MID splice (a bounded interior window) or the
+// chapter end (unbounded above) for a TAIL splice; a finding is covered when its whole
+// located span sits within [clip_start - epsilon, windowEnd + epsilon] (or, for a tail
+// window with no usable time, its position is in the tail >= 95%). A chapter carrying any
+// wph outlier, any within-segment hit, any non-end-fade run, or any cross/multi finding
+// NOT window-covered is disqualified. A MID-CHAPTER multi-loop is disqualified UNLESS it
+// is covered by a recorded MID window for the chapter (a tail window never covers it).
+// verdicts maps a chapter to its recorded tail_verdicts entry (ClipStart/ClipEnd are read
+// for the residual test); a chapter with no entry cannot have a covered residual. It reads
+// the report + verdicts only; it never touches the golden-tested qa detectors.
 func tailOnlyChapters(rep *qa.Report, verdicts map[int]repair.TailVerdict) map[int]bool {
 	disq := map[int]bool{}
 	for _, o := range rep.WPHOutliers {
@@ -783,12 +758,12 @@ func tailOnlyChapters(rep *qa.Report, verdicts map[int]repair.TailVerdict) map[i
 		disq[h.Chapter] = true
 	}
 	for _, h := range rep.CrossSegment {
-		if v, ok := verdicts[h.Chapter]; !ok || !crossHitTailCovered(h, v.ClipStart) {
+		if v, ok := verdicts[h.Chapter]; !ok || !crossHitTailCovered(h, v) {
 			disq[h.Chapter] = true
 		}
 	}
 	for _, f := range rep.MultiLoop {
-		if v, ok := verdicts[f.Chapter]; !ok || !multiLoopTailCovered(f, v.ClipStart) {
+		if v, ok := verdicts[f.Chapter]; !ok || !multiLoopTailCovered(f, v) {
 			disq[f.Chapter] = true
 		}
 	}
@@ -801,38 +776,58 @@ func tailOnlyChapters(rep *qa.Report, verdicts map[int]repair.TailVerdict) map[i
 	return out
 }
 
-// tailCovered is the shared tail-residual rule: a finding is covered by a splice at
-// clipStart when its located START time (atSec) reaches at or past clipStart-epsilon (the
-// WHOLE located span begins inside the tail zone, so a hit that straddles mid-chapter into
-// the tail is NOT covered), or - when it carries no located time (atSec == nil) - its
-// position pos is at or above the tail floor. Note the untimed fallback compares only
-// position (pos), not clipStart: an untimed hit carries no seconds to test against the
-// window, so a position deep in the tail (>= 95%) is the best available signal - an
-// accepted residual imprecision. crossHitTailCovered and multiLoopTailCovered both delegate.
-func tailCovered(atSec *float64, pos, clipStart float64) bool {
-	if atSec != nil {
-		return *atSec >= clipStart-tailZoneEpsilon
+// coverWindowEnd is the upper bound of a recorded verdict's coverage window: the mid
+// window's clip_end when set (> 0), else +Inf for a TAIL window. A tail splice runs to the
+// chapter end and every located hit time falls within the chapter, so an unbounded upper
+// limit is exactly equivalent to the chapter end - and avoids plumbing per-chapter
+// durations the QA report does not carry.
+func coverWindowEnd(v repair.TailVerdict) float64 {
+	if v.IsMidWindow() {
+		return v.ClipEnd
 	}
-	return pos >= tailZonePctFloor
+	return math.Inf(1)
 }
 
-// crossHitTailCovered reports whether a cross-segment hit is a tail residual covered by a
-// splice at clipStart. A CrossSegmentHit sets FirstSec/LastSec as a pair, and Pos derives
-// from FirstSec, so the located start time is FirstSec: the whole span must begin within
-// the tail zone (a mid-chapter+tail straddling hit is therefore NOT covered). The
-// located-time-vs-position rule is tailCovered.
-func crossHitTailCovered(h qa.CrossSegmentHit, clipStart float64) bool {
-	return tailCovered(h.FirstSec, h.Pos, clipStart)
+// spanCovered is the shared residual-coverage rule: a finding's located span [startSec,
+// endSec] is covered by the recorded splice window when its START sits at or past
+// clip_start - epsilon (the WHOLE span begins inside the window, so a hit that straddles
+// mid-chapter into the tail is NOT covered) AND its END sits at or before windowEnd +
+// epsilon. For a TAIL window windowEnd is +Inf, so only the lower bound constrains -
+// preserving the pre-mid-clip behavior exactly. When the span has no located time
+// (startSec == nil) only a tail window falls back to the position floor; a mid window is
+// conservative (an untimed hit is not covered). crossHitTailCovered / multiLoopTailCovered
+// delegate here.
+func spanCovered(startSec, endSec *float64, pos float64, v repair.TailVerdict) bool {
+	end := coverWindowEnd(v)
+	if startSec == nil {
+		return math.IsInf(end, 1) && pos >= tailZonePctFloor
+	}
+	spanEnd := *startSec
+	if endSec != nil {
+		spanEnd = *endSec
+	}
+	return *startSec >= v.ClipStart-tailZoneEpsilon && spanEnd <= end+tailZoneEpsilon
 }
 
-// multiLoopTailCovered reports whether a multi-loop finding is a tail residual covered by
-// a splice at clipStart. A MID-CHAPTER finding never qualifies (it overwrote real
-// narration); otherwise the shared tailCovered rule applies to its located time (AtSec).
-func multiLoopTailCovered(f qa.MultiLoopFinding, clipStart float64) bool {
-	if f.MidChapter {
+// crossHitTailCovered reports whether a cross-segment hit is a residual covered by the
+// chapter's recorded splice window v. A CrossSegmentHit sets FirstSec/LastSec as a pair
+// (Pos derives from FirstSec), so the located span is [FirstSec, LastSec] and spanCovered
+// applies. For a MID window both bounds constrain; for a TAIL window only the start.
+func crossHitTailCovered(h qa.CrossSegmentHit, v repair.TailVerdict) bool {
+	return spanCovered(h.FirstSec, h.LastSec, h.Pos, v)
+}
+
+// multiLoopTailCovered reports whether a multi-loop finding is a residual covered by the
+// chapter's recorded splice window v. A MID-CHAPTER loop overwrote interior narration, so
+// only a recorded MID window (IsMidWindow) can cover it - a tail window never does.
+// Otherwise the shared spanCovered rule applies to its single located time: a multi-loop
+// finding carries no independent end time, so it passes a nil end (spanCovered defaults the
+// span end to the start).
+func multiLoopTailCovered(f qa.MultiLoopFinding, v repair.TailVerdict) bool {
+	if f.MidChapter && !v.IsMidWindow() {
 		return false
 	}
-	return tailCovered(f.AtSec, f.Pos, clipStart)
+	return spanCovered(f.AtSec, nil, f.Pos, v)
 }
 
 // mergePlans combines the daemon's auto-accept entries with the agent's plan, dropping
@@ -904,10 +899,10 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 		return scheduler.StageResult{}, err
 	}
 
-	// Resolve the clip cutter only if the plan needs one (a tail_clip entry). A test
-	// injects e.clipCutter; production uses ffmpeg.
+	// Resolve the clip cutter only if the plan needs one (a tail_clip OR mid_clip entry -
+	// both cut an audio window). A test injects e.clipCutter; production uses ffmpeg.
 	cut := e.clipCutter
-	if cut == nil && planHasAction(plan, qa.ActionTailClip) {
+	if cut == nil && (planHasAction(plan, qa.ActionTailClip) || planHasAction(plan, qa.ActionMidClip)) {
 		ffmpeg, _ := e.ensureTools()
 		if ffmpeg == "" {
 			return scheduler.StageResult{}, scheduler.ParkWithCode(state.ParkMediaToolsUnavailable, MediaToolsUnavailableMsg)
@@ -926,6 +921,19 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 		}
 	}
 
+	// Load the verdict ledger ONCE for the whole pass and thread the snapshot through every
+	// resume-idempotency check (retranscribeEntryDone / tailClipAlreadyDone, which each used
+	// to re-read tail_verdicts.json - up to three disk reads per clip entry). One pass's
+	// entries touch disjoint chapters and each entry's resume check runs BEFORE its own
+	// splice writes a verdict, so a top-of-pass snapshot is correct even though a splice
+	// mutates the on-disk ledger mid-pass. (The repair layer's own known-failed skip still
+	// reads disk inside ClipAndSplice*, so it never sees a stale snapshot.) A genuinely
+	// unreadable ledger fails the stage loudly.
+	verdicts, err := repair.TailVerdictsByChapter(book.WorkDir)
+	if err != nil {
+		return scheduler.StageResult{}, fmt.Errorf("retranscribing: load verdict ledger: %w", err)
+	}
+
 	// total = the work entries (every non-accept entry). completed = the work entries a
 	// prior (interrupted) run already finished, so the FIRST report reflects prior work
 	// and an already-repaired entry never ticks the counter on resume - the scheduler's
@@ -936,7 +944,7 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 			continue
 		}
 		total++
-		if retranscribeEntryDone(book.WorkDir, entry) {
+		if retranscribeEntryDone(book.WorkDir, entry, verdicts) {
 			completed++
 		}
 	}
@@ -955,6 +963,24 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 	// are excluded from the rate sample below - counting a free skip as a processed unit
 	// would inflate the learned per-unit rate.
 	skippedNew := 0
+	// recordClipOutcome buckets a clip repair's (spliced, skippedKnownFailed) result into
+	// the shared counters. Both the tail and mid clip actions feed it, so a mid splice reuses
+	// the SAME buckets as a tail splice - an interior repair counts as progress for the stall
+	// signal below. wasDone excludes a resumed known-failed skip from skippedNew (the
+	// rate-sample tally).
+	recordClipOutcome := func(spl, skipped, wasDone bool) {
+		switch {
+		case spl:
+			spliced++
+		case skipped:
+			skippedKnownFailed++
+			if !wasDone {
+				skippedNew++
+			}
+		default:
+			redegen++
+		}
+	}
 	for _, entry := range plan.Entries {
 		if err := ctx.Err(); err != nil {
 			return scheduler.StageResult{}, err // clean pause/cancel; completed chapters remain
@@ -966,7 +992,7 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 		// Capture whether this entry was already done BEFORE processing it (processing
 		// makes the predicate true), so a resumed entry re-runs idempotently but does not
 		// re-tick progress past the baseline.
-		wasDone := retranscribeEntryDone(book.WorkDir, entry)
+		wasDone := retranscribeEntryDone(book.WorkDir, entry, verdicts)
 		switch entry.Action {
 		case qa.ActionRetranscribe:
 			ok, rerr := e.retranscribeChapter(ctx, setup, book, durations[entry.Chapter], entry.Chapter)
@@ -980,21 +1006,17 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 				kept++
 			}
 		case qa.ActionTailClip:
-			spl, skipped, rerr := e.tailClipChapter(ctx, setup, cut, book, durations[entry.Chapter], entry.Chapter, entry.ClipStartSec)
+			spl, skipped, rerr := e.tailClipChapter(ctx, setup, cut, book, durations[entry.Chapter], entry.Chapter, entry.ClipStartSec, verdicts)
 			if rerr != nil {
 				return scheduler.StageResult{}, rerr
 			}
-			switch {
-			case spl:
-				spliced++
-			case skipped:
-				skippedKnownFailed++
-				if !wasDone {
-					skippedNew++
-				}
-			default:
-				redegen++
+			recordClipOutcome(spl, skipped, wasDone)
+		case qa.ActionMidClip:
+			spl, skipped, rerr := e.midClipChapter(ctx, setup, cut, book, durations[entry.Chapter], entry.Chapter, entry.ClipStartSec, entry.ClipEndSec, verdicts)
+			if rerr != nil {
+				return scheduler.StageResult{}, rerr
 			}
+			recordClipOutcome(spl, skipped, wasDone)
 		default:
 			return scheduler.StageResult{}, fmt.Errorf("retranscribing: chapter %d has unknown action %q", entry.Chapter, entry.Action)
 		}
@@ -1008,6 +1030,20 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 
 	loopSeconds := time.Since(loopStart).Seconds()
 	e.accountScratch(ctx, book)
+
+	// Convergence signal for qaAdjudicate: a repair round that neither spliced nor adopted
+	// anything achieved nothing - the qa_sweep re-run will re-flag the same chapters and the
+	// next adjudication round would burn a paid agent pass to reach the same no-op. Persist
+	// that stall as a marker so the next qaAdjudicate parks (ParkQANoConverge) instead of
+	// looping; clear it the moment a round makes real progress. A mid_clip splice increments
+	// spliced (it reuses the tail buckets), so an interior repair counts as progress too.
+	madeProgress := spliced > 0 || adopted > 0
+	if madeProgress {
+		_ = os.Remove(retranscribeStalledPath(book.WorkDir))
+	} else if err := fsutil.WriteFileAtomic(retranscribeStalledPath(book.WorkDir), []byte("1\n"), 0o644); err != nil {
+		return scheduler.StageResult{}, fmt.Errorf("retranscribing: write stall marker: %w", err)
+	}
+
 	result := scheduler.StageResult{
 		Metrics: metrics(map[string]any{
 			"retranscribed":              retranscribed,
@@ -1053,16 +1089,16 @@ func planHasAction(p *qa.Plan, a qa.PlanAction) bool {
 // prior (interrupted) run, so a resume neither re-counts it as processed work (the
 // EWMA span) nor re-ticks progress past the already-done baseline. It mirrors the
 // per-chapter resume tests the executors themselves use: a retranscribe entry is done
-// when its fresh raw parses complete (retranscribeChapter's reuse test), a tail-clip
-// entry when tailClipAlreadyDone finds both durable-evidence files. Accept entries are
-// not work and never reach here.
-func retranscribeEntryDone(workDir string, entry qa.PlanEntry) bool {
+// when its fresh raw parses complete (retranscribeChapter's reuse test), a tail-clip or
+// mid-clip entry when tailClipAlreadyDone finds both durable-evidence files (the same
+// repaired-file + verdict pair both splice paths write). Accept entries are not work and
+// never reach here.
+func retranscribeEntryDone(workDir string, entry qa.PlanEntry, verdicts map[int]repair.TailVerdict) bool {
 	switch entry.Action {
 	case qa.ActionRetranscribe:
 		return rawComplete(filepath.Join(workDir, repair.RetranscribeDir, transcript.RawName(entry.Chapter)))
-	case qa.ActionTailClip:
-		done, err := tailClipAlreadyDone(workDir, entry.Chapter)
-		return err == nil && done
+	case qa.ActionTailClip, qa.ActionMidClip:
+		return tailClipAlreadyDone(workDir, entry.Chapter, verdicts)
 	default:
 		return false
 	}
@@ -1188,25 +1224,22 @@ func (e *Executor) retranscribeChapter(ctx context.Context, setup ASRSetup, book
 	return true, nil
 }
 
-// tailClipChapter runs the mechanical tail-clip repair for one chapter (locate the
-// tail loop, cut+re-transcribe the window prompt-free, adjudicate, splice unless the
-// clip re-degenerated). startOverrideSec, when > 0, is the agent-supplied window start
-// (from the plan entry's clip_start_sec) that relocates a window whose derived cut kept
-// re-degenerating; 0 derives as usual. It returns whether a splice was written and
-// whether the attempt was skipped as a known-failed window (the effective window already
-// re-degenerated in a prior round, so no ASR ran). On a splice it drops the chapter's
-// stale corrected file (correcting re-runs fully).
-func (e *Executor) tailClipChapter(ctx context.Context, setup ASRSetup, cut repair.ClipCutter, book store.Book, chapterEnd float64, chapter int, startOverrideSec float64) (spliced, skippedKnownFailed bool, err error) {
-	// Resume-idempotent: an already-repaired chapter is skipped whole. The durable
-	// evidence pair is transcripts-repaired/<ch>.txt AND a tail_verdicts.json entry -
-	// both present means ClipAndSplice completed this chapter's splice, so re-running it
-	// would cut+re-transcribe+re-splice and append a DUPLICATE repairs.log line. A
-	// re-adjudication that wants this chapter redone must express it as "retranscribe"
-	// (a full re-run, whose adopt path drops the repaired file), never another
-	// "tail_clip" - so the skip cannot suppress a genuine new round's work.
-	if done, derr := tailClipAlreadyDone(book.WorkDir, chapter); derr != nil {
-		return false, false, derr
-	} else if done {
+// clipChapter runs one chapter's mechanical clip repair - the shared spine of the tail
+// (ClipAndSplice) and mid (ClipAndSpliceWindow) paths, which differ only in the request's
+// window-override fields and the repair func passed as splice. It is resume-idempotent (an
+// already-repaired chapter - repaired file + verdict, via the pass's ledger snapshot - is
+// skipped whole; re-running would re-cut/re-transcribe/re-splice and append a DUPLICATE
+// repairs.log line, so a re-adjudication that wants a chapter redone must express it as
+// "retranscribe", never another clip). It reads the chapter's normalized transcript, parks
+// when no clip cutter is available, re-transcribes the window prompt-free + NoContext (a
+// seeded prompt makes the model echo it over sparse audio; the loop being cut is a
+// context-conditioned collapse, so re-transcribing without context is what lets it resolve
+// differently instead of replaying), calls splice, and drops the chapter's stale corrected
+// file on a splice (correcting re-runs fully). label ("tail-clip" / "mid-clip") shapes the
+// wrapped error text. It returns whether a splice was written and whether the exact window
+// was skipped as known-failed (no ASR ran).
+func (e *Executor) clipChapter(ctx context.Context, setup ASRSetup, cut repair.ClipCutter, book store.Book, chapter int, verdicts map[int]repair.TailVerdict, label string, req repair.ClipSpliceRequest, splice func(context.Context, repair.ClipSpliceRequest) (repair.ClipResult, error)) (spliced, skippedKnownFailed bool, err error) {
+	if tailClipAlreadyDone(book.WorkDir, chapter, verdicts) {
 		return true, false, nil // a prior run already spliced this chapter
 	}
 	origT, err := transcript.ReadNormalized(filepath.Join(book.WorkDir, transcript.JSONDir), chapter)
@@ -1218,30 +1251,23 @@ func (e *Executor) tailClipChapter(ctx context.Context, setup ASRSetup, cut repa
 	}
 	transcribe := func(ctx context.Context, clipPath string) ([]byte, error) {
 		outDir := filepath.Join(book.WorkDir, repair.ClipsDir)
-		// Prompt-free clip transcription (contract: a seeded prompt makes the model echo
-		// it over sparse audio). The backend names the raw from the audio stem (see
-		// asr.RawOutputName), so the read derives from clipPath (t%03d.flac), not chNNN.
-		// NoContext-on: varying the decode params is the point of the repair - the tail
-		// loop we are cutting is a context-conditioned collapse, so re-transcribing the
-		// window without context is what lets it resolve differently instead of replaying.
+		// The backend names the raw from the audio stem (asr.RawOutputName), so the read
+		// derives from clipPath (t/m NNN...flac), not chNNN.
 		job := asr.Job{Audio: clipPath, OutDir: outDir, Chapter: chapter, Language: setup.Language, NoContext: true}
 		if terr := setup.Backend.Transcribe(ctx, job); terr != nil {
 			return nil, terr
 		}
 		return os.ReadFile(filepath.Join(outDir, asr.RawOutputName(clipPath))) //nolint:gosec // path derives from the book's work dir
 	}
-	res, err := repair.ClipAndSplice(ctx, repair.ClipSpliceRequest{
-		WorkDir:          book.WorkDir,
-		Chapter:          chapter,
-		Transcript:       origT,
-		ChapterEnd:       chapterEnd,
-		Cut:              cut,
-		Transcribe:       transcribe,
-		StartOverrideSec: startOverrideSec,
-		DecodeTag:        retranscribeDecodeTag,
-	})
+	req.WorkDir = book.WorkDir
+	req.Chapter = chapter
+	req.Transcript = origT
+	req.Cut = cut
+	req.Transcribe = transcribe
+	req.DecodeTag = retranscribeDecodeTag
+	res, err := splice(ctx, req)
 	if err != nil {
-		return false, false, fmt.Errorf("retranscribing: tail-clip chapter %d: %w", chapter, err)
+		return false, false, fmt.Errorf("retranscribing: %s chapter %d: %w", label, chapter, err)
 	}
 	if res.Spliced {
 		_ = os.Remove(filepath.Join(book.WorkDir, spelling.CorrectedDir, transcript.TextName(chapter)))
@@ -1249,23 +1275,50 @@ func (e *Executor) tailClipChapter(ctx context.Context, setup ASRSetup, cut repa
 	return res.Spliced, res.SkippedKnownFailed, nil
 }
 
-// tailClipAlreadyDone reports whether a prior tail-clip run already spliced this
-// chapter: both transcripts-repaired/<ch>.txt (the splice) and a tail_verdicts.json
-// entry for the chapter (the adjudication record) are present. That pair is the
-// durable evidence ClipAndSplice writes on a successful splice, so its presence makes
-// re-running the entry a no-op (and prevents a duplicate repairs.log line on resume).
-// A CLIP-REDEGENERATED chapter writes only the verdict, not a repaired file, so it is
-// NOT skipped - a resume legitimately re-attempts it.
-func tailClipAlreadyDone(workDir string, chapter int) (bool, error) {
+// tailClipChapter is the thin tail-repair wrapper over clipChapter: locate the tail loop,
+// cut+re-transcribe the window prompt-free, adjudicate, splice unless the clip re-
+// degenerated. startOverrideSec, when > 0, is the agent-supplied window start (from the
+// plan entry's clip_start_sec) that relocates a window whose derived cut kept re-
+// degenerating; 0 derives as usual.
+func (e *Executor) tailClipChapter(ctx context.Context, setup ASRSetup, cut repair.ClipCutter, book store.Book, chapterEnd float64, chapter int, startOverrideSec float64, verdicts map[int]repair.TailVerdict) (spliced, skippedKnownFailed bool, err error) {
+	return e.clipChapter(ctx, setup, cut, book, chapter, verdicts, "tail-clip",
+		repair.ClipSpliceRequest{ChapterEnd: chapterEnd, StartOverrideSec: startOverrideSec},
+		repair.ClipAndSplice)
+}
+
+// midClipChapter is the thin MID-CHAPTER interior-repair wrapper over clipChapter: snap the
+// agent's [startSec, endSec] window to segment edges, cut+re-transcribe it prompt-free,
+// health-check, splice between the intact head and tail unless the clip re-degenerated. The
+// window comes from the plan entry's clip_start_sec/clip_end_sec (Validate guarantees
+// start>0 and end>start). chapterEnd rides on the request for parity with the tail path.
+func (e *Executor) midClipChapter(ctx context.Context, setup ASRSetup, cut repair.ClipCutter, book store.Book, chapterEnd float64, chapter int, startSec, endSec float64, verdicts map[int]repair.TailVerdict) (spliced, skippedKnownFailed bool, err error) {
+	// Clamp an over-long agent window to the chapter end: an endSec past EOF would leave an
+	// empty tail (no segment starts after it) and silently turn the interior splice into a
+	// tail-to-EOF one, discarding real narration the agent meant to keep. ChapterEnd > 0
+	// here (from the manifest); a degenerate clamped window (end <= start) surfaces as the
+	// ClipAndSpliceWindow validation error rather than a bad splice.
+	if chapterEnd > 0 && endSec > chapterEnd {
+		endSec = chapterEnd
+	}
+	return e.clipChapter(ctx, setup, cut, book, chapter, verdicts, "mid-clip",
+		repair.ClipSpliceRequest{ChapterEnd: chapterEnd, StartOverrideSec: startSec, EndOverrideSec: endSec},
+		repair.ClipAndSpliceWindow)
+}
+
+// tailClipAlreadyDone reports whether a prior clip run already spliced this chapter: both
+// transcripts-repaired/<ch>.txt (the splice) and a tail_verdicts.json entry for the chapter
+// (the adjudication record) are present. That pair is the durable evidence a successful
+// tail OR mid splice writes, so its presence makes re-running the entry a no-op (and
+// prevents a duplicate repairs.log line on resume). A CLIP-REDEGENERATED chapter writes
+// only the verdict, not a repaired file, so it is NOT skipped - a resume legitimately
+// re-attempts it. verdicts is the pass's one-shot ledger snapshot (see retranscribe), so
+// this is a pure file check plus a map lookup, no per-call disk read.
+func tailClipAlreadyDone(workDir string, chapter int, verdicts map[int]repair.TailVerdict) bool {
 	if !fsutil.IsFile(filepath.Join(workDir, transcript.RepairedDir, transcript.TextName(chapter))) {
-		return false, nil
+		return false
 	}
-	byCh, err := repair.TailVerdictsByChapter(workDir)
-	if err != nil {
-		return false, err
-	}
-	_, ok := byCh[chapter]
-	return ok, nil
+	_, ok := verdicts[chapter]
+	return ok
 }
 
 // removeChapterDerived drops a chapter's stale repaired and corrected text so a later

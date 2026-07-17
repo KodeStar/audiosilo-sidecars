@@ -47,6 +47,57 @@ func Splice(t transcript.Transcript, clipStart float64, clipText string) (text s
 	return newText, wordsBefore, wordsAfter
 }
 
+// snapWindow snaps an agent-supplied [startSec, endSec] interior window OUTWARD to the
+// nearest segment boundaries so a mid-window cut and splice never loses a straddling
+// segment's content. snappedStart = the largest segment End that is <= startSec (else
+// startSec); snappedEnd = the smallest segment Start that is >= endSec (else endSec). The
+// effect: the kept head (segments ending at or before snappedStart) and tail (segments
+// starting at or after snappedEnd) align with segment edges, and the cut window
+// [snappedStart, snappedEnd] covers exactly the dropped middle segments - no pad, no seam
+// duplication, no content lost. It is idempotent (a snapped bound re-snaps to itself, as
+// each is already a segment edge) so ClipAndSpliceWindow and SpliceWindow agree on the
+// window whether they pass raw or snapped inputs.
+func snapWindow(t transcript.Transcript, startSec, endSec float64) (snappedStart, snappedEnd float64) {
+	snappedStart, snappedEnd = startSec, endSec
+	startFound, endFound := false, false
+	for _, s := range t.Segments {
+		if s.End <= startSec && (!startFound || s.End > snappedStart) {
+			snappedStart, startFound = s.End, true
+		}
+		if s.Start >= endSec && (!endFound || s.Start < snappedEnd) {
+			snappedEnd, endFound = s.Start, true
+		}
+	}
+	return snappedStart, snappedEnd
+}
+
+// SpliceWindow splices a fresh interior-window transcription between the intact head and
+// tail of a chapter, for a mid_clip repair (the sibling of Splice's tail repair). It
+// snaps [startSec, endSec] to segment edges (see snapWindow), keeps the ORIGINAL text of
+// every segment ending at or before the snapped start as the head and of every segment
+// starting at or after the snapped end as the tail, and joins head + windowText + tail
+// with whitespace collapsed. It returns the repaired chapter text plus the before/after
+// word counts (len(text.split()), mirroring Splice). The dropped middle segments (whose
+// audio the window replaces) are exactly those not in the head or tail, so no content is
+// lost and none is duplicated across the seam.
+func SpliceWindow(t transcript.Transcript, startSec, endSec float64, windowText string) (text string, wordsBefore, wordsAfter int) {
+	snappedStart, snappedEnd := snapWindow(t, startSec, endSec)
+	var head, tail strings.Builder
+	for _, s := range t.Segments {
+		switch {
+		case s.End <= snappedStart:
+			head.WriteString(s.Text)
+		case s.Start >= snappedEnd:
+			tail.WriteString(s.Text)
+		}
+	}
+	joined := strings.TrimSpace(head.String()) + " " + strings.TrimSpace(windowText) + " " + strings.TrimSpace(tail.String())
+	newText := strings.Join(strings.Fields(joined), " ")
+	wordsBefore = len(strings.Fields(transcript.PlainText(t)))
+	wordsAfter = len(strings.Fields(newText))
+	return newText, wordsBefore, wordsAfter
+}
+
 // WriteRepaired writes the spliced chapter text to transcripts-repaired/chNNN.txt
 // (via transcript.WriteText, which appends the trailing newline and refuses the
 // immutable raw layer). apply_corrections prefers this layer over transcripts-text
@@ -78,6 +129,19 @@ func buildRepairLine(chapter int, verdict Verdict, unit string, count, loopWords
 		pyFloatStr(clipStart), pyFloatStr(clipSecs),
 		qa.PyRepr(qa.TruncateRunes(unit, repairUnitTrunc)), count,
 		loopWords, loopSecsStr, wpsStr,
+		before, after, after-before,
+	)
+}
+
+// buildMidRepairLine formats one repairs.log entry for a mid_clip interior repair (the
+// sibling of buildRepairLine's tail format). It notes the [start, end] window the stage
+// cut and the head/window/tail word delta, printing round(_,1) values via pyFloatStr so
+// the numbers read like the tail lines.
+func buildMidRepairLine(chapter int, start, end float64, before, after int) string {
+	return fmt.Sprintf(
+		"- ch%03d [%s]: spliced mid-window [%ss, %ss] (%ss). words %d -> %d (%+d)",
+		chapter, VerdictMidRepaired,
+		pyFloatStr(pyRound(start, 1)), pyFloatStr(pyRound(end, 1)), pyFloatStr(pyRound(end-start, 1)),
 		before, after, after-before,
 	)
 }
@@ -115,11 +179,17 @@ type TailVerdict struct {
 	LoopStartT float64 `json:"loop_start_t"`
 	LoopWords  int     `json:"loop_words"`
 	ClipStart  float64 `json:"clip_start"`
-	ClipSecs   float64 `json:"clip_secs"`
-	Unit       string  `json:"unit"`
-	Period     int     `json:"period"`
-	InClip     int     `json:"in_clip"`
-	Verdict    Verdict `json:"verdict"`
+	// ClipEnd is the interior window's END for a mid_clip (MID-REPAIRED / a mid
+	// CLIP-REDEGENERATED) verdict; 0 (omitted) means a TAIL verdict whose splice runs to
+	// the chapter end. It bounds the residual auto-accept window [clip_start, clip_end]
+	// (a tail window is unbounded above) and, with clip_start, keys the known-failed skip
+	// for a mid window.
+	ClipEnd  float64 `json:"clip_end,omitempty"`
+	ClipSecs float64 `json:"clip_secs"`
+	Unit     string  `json:"unit"`
+	Period   int     `json:"period"`
+	InClip   int     `json:"in_clip"`
+	Verdict  Verdict `json:"verdict"`
 	// DecodeTag records the decode parameters the re-transcription attempt ran under (the
 	// pipeline's retranscribeDecodeTag, e.g. "nocontext-v1"). The known-failed skip only
 	// fires when a re-queued window's tag matches, so a legacy verdict written under
@@ -127,6 +197,12 @@ type TailVerdict struct {
 	// verdicts and omitted from JSON when unset.
 	DecodeTag string `json:"decode_tag,omitempty"`
 }
+
+// IsMidWindow reports whether v records a mid-clip verdict: a bounded [clip_start,
+// clip_end] interior window (ClipEnd > 0). A tail verdict runs to the chapter end
+// (ClipEnd == 0), so it is false for one. It is the single reading of the ClipEnd
+// sentinel the known-failed skips and the residual auto-accept all share.
+func (v TailVerdict) IsMidWindow() bool { return v.ClipEnd > 0 }
 
 // LoadTailVerdicts reads workDir/tail_verdicts.json, returning an empty slice when the
 // file is absent (a first round).
