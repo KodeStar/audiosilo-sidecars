@@ -30,6 +30,13 @@ function settingsWith(agent: AgentConfig): Settings {
       auto_purge: true,
       poll_minutes: 10,
     },
+    supervisor: {
+      enabled: true,
+      automatic_actions: false,
+      model_assisted: false,
+      model_automatic_actions: false,
+      allow_backend_failover: false,
+    },
   };
 }
 
