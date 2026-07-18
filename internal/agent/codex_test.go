@@ -55,12 +55,16 @@ func TestCodexFallsBackToLastAgentMessage(t *testing.T) {
 }
 
 func TestCodexTurnFailed(t *testing.T) {
-	resp := `{"type":"turn.failed","error":"model produced an internal error"}`
+	resp := `{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":50}}
+{"type":"turn.failed","error":"model produced an internal error"}`
 	path, _ := fakeCLI(t, fakeCLIOpts{versionLine: "v", response: resp})
 	r := newCodexRunner(path, secrets.NewMemStore())
-	_, err := r.Run(context.Background(), Request{Dir: t.TempDir(), Prompt: "p"})
+	res, err := r.Run(context.Background(), Request{Dir: t.TempDir(), Prompt: "p", Model: "failed-model"})
 	if err == nil || !strings.Contains(err.Error(), "codex turn failed") {
 		t.Fatalf("want turn-failed error, got %v", err)
+	}
+	if res.Usage.Model != "failed-model" || res.Usage.Input != 100 || res.Usage.Output != 50 || res.Usage.CacheRead != 20 {
+		t.Fatalf("failed invocation usage lost: %+v", res.Usage)
 	}
 }
 
@@ -95,6 +99,9 @@ func TestCodexWebFlagAddsOverride(t *testing.T) {
 	}
 	if !r.SupportsWeb() {
 		t.Error("codex SupportsWeb should be true (documented -c override)")
+	}
+	if EnforcesNoTools(r) {
+		t.Error("read-only Codex must not be described as an enforced no-tools backend")
 	}
 }
 

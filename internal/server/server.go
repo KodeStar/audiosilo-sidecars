@@ -265,14 +265,14 @@ func Run(ctx context.Context, opts Options) error {
 		if err := os.MkdirAll(supervisorDir, 0o700); err != nil {
 			return fmt.Errorf("create supervisor context dir: %w", err)
 		}
-		if modelRunner != nil {
+		if modelRunner != nil && agent.EnforcesNoTools(modelRunner) {
 			supervisorModel = supervisor.NewAgentModel(modelRunner, cfg.Supervisor.Model, supervisorDir,
 				time.Duration(cfg.Supervisor.TimeoutSeconds)*time.Second, cfg.Supervisor.MaxTurns, cfg.Pricing)
 		}
 	}
 	supervisorSvc := supervisor.New(db, cfg.Supervisor, cfg.Pricing, supervisorModel, supervisor.Hooks{
-		Runtime: func() supervisor.Runtime {
-			r := sched.SupervisorRuntime()
+		Runtime: func(books []store.Book) supervisor.Runtime {
+			r := sched.SupervisorRuntime(books)
 			return supervisor.Runtime{ActiveBooks: r.ActiveBooks, AgentActive: r.AgentActive, AgentCapacity: r.AgentCapacity, EligibleAgentBooks: r.EligibleAgentBooks, EligibleAgentIDs: r.EligibleAgentIDs}
 		},
 		Apply: func(ctx context.Context, action supervisor.Action, incident supervisor.Incident) (string, error) {

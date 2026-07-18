@@ -572,12 +572,17 @@ func validateSupervisor(c SupervisorConfig) error {
 	if c.AttemptGrowthFactor < 1 {
 		return errors.New("supervisor.attempt_growth_factor must be >= 1")
 	}
-	for name, backend := range map[string]string{"model_backend": c.ModelBackend, "fallback_backend": c.FallbackBackend} {
-		switch strings.TrimSpace(backend) {
-		case "", AgentBackendClaude, AgentBackendCodex:
-		default:
-			return fmt.Errorf("supervisor.%s %q must be %q, %q, or empty", name, backend, AgentBackendClaude, AgentBackendCodex)
-		}
+	switch strings.TrimSpace(c.ModelBackend) {
+	case "", AgentBackendClaude:
+	case AgentBackendCodex:
+		return errors.New("supervisor.model_backend codex cannot enforce the required no-tools boundary")
+	default:
+		return fmt.Errorf("supervisor.model_backend %q must be %q or empty", c.ModelBackend, AgentBackendClaude)
+	}
+	switch strings.TrimSpace(c.FallbackBackend) {
+	case "", AgentBackendClaude, AgentBackendCodex:
+	default:
+		return fmt.Errorf("supervisor.fallback_backend %q must be %q, %q, or empty", c.FallbackBackend, AgentBackendClaude, AgentBackendCodex)
 	}
 	if c.ModelAutomaticActions && !c.ModelAssisted {
 		return errors.New("supervisor.model_automatic_actions requires model_assisted")

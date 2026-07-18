@@ -134,3 +134,30 @@ func TestSupervisorNeverRewindsReadyOrPublishedOutput(t *testing.T) {
 		t.Fatalf("published book rewound: %+v", got)
 	}
 }
+
+func TestSupervisorRerunPreservesDeliberatePause(t *testing.T) {
+	h := newHarness(t)
+	db := h.openDB(t)
+	b := h.addBook(t, db, "paused-rerun", "", "")
+	if err := db.SetBookState(context.Background(), b.ID, string(state.Validating), string(state.StatusPaused), "paused by operator", ""); err != nil {
+		t.Fatal(err)
+	}
+	runID, err := db.StartStageRun(context.Background(), b.ID, string(state.QASweep), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishStageRun(context.Background(), runID, true, json.RawMessage(`{"ok":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	s := New(db, events.NewHub(8), NewStubExecutor(0, 0), 2, h.workRoot, false)
+	if _, err := s.SupervisorApply(context.Background(), "supersede_rerun", b.ID, string(state.QASweep)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.GetBook(context.Background(), b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != string(state.QASweep) || got.Status != string(state.StatusPaused) || got.Error != "paused by operator" {
+		t.Fatalf("paused rerun changed operator status: %+v", got)
+	}
+}

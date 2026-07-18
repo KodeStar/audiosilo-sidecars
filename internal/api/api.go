@@ -239,10 +239,10 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/books/{id}/cancel", a.requireAuth(a.requirePipeline(a.bookAction((*scheduler.Scheduler).Cancel))))
 	mux.HandleFunc("POST /api/v1/books/{id}/purge-scratch", a.requireAuth(a.requirePipeline(a.handlePurgeScratch)))
 	mux.HandleFunc("DELETE /api/v1/books/{id}", a.requireAuth(a.requirePipeline(a.handleDeleteBook)))
-	mux.HandleFunc("GET /api/v1/supervisor/status", a.requireAuth(a.requirePipeline(a.handleSupervisorStatus)))
-	mux.HandleFunc("GET /api/v1/supervisor/incidents", a.requireAuth(a.requirePipeline(a.handleSupervisorIncidents)))
-	mux.HandleFunc("GET /api/v1/supervisor/costs", a.requireAuth(a.requirePipeline(a.handleSupervisorCosts)))
-	mux.HandleFunc("POST /api/v1/books/{id}/ask-supervisor", a.requireAuth(a.requirePipeline(a.handleAskSupervisor)))
+	mux.HandleFunc("GET /api/v1/supervisor/status", a.requireAuth(a.requirePipeline(a.requireSupervisor(a.handleSupervisorStatus))))
+	mux.HandleFunc("GET /api/v1/supervisor/incidents", a.requireAuth(a.requirePipeline(a.requireSupervisor(a.handleSupervisorIncidents))))
+	mux.HandleFunc("GET /api/v1/supervisor/costs", a.requireAuth(a.requirePipeline(a.requireSupervisor(a.handleSupervisorCosts))))
+	mux.HandleFunc("POST /api/v1/books/{id}/ask-supervisor", a.requireAuth(a.requirePipeline(a.requireSupervisor(a.handleAskSupervisor))))
 
 	// SSE authenticates itself (token in the query, since EventSource cannot set
 	// an Authorization header).

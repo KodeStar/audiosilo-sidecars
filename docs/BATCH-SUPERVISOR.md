@@ -22,7 +22,9 @@ recent attempts, heartbeat and progress timestamps, usage/cost fields, compact
 validation/QA/audit metrics, the error fingerprint and incident evidence, scheduler
 occupancy, and at most eight small durable event tails. It contains no production
 transcript. The runner uses a separate `<data>/supervisor` working directory, Claude's
-empty tool allow-list or Codex's read-only sandbox, and a strict JSON response schema.
+enforced empty tool catalogue, and a strict JSON response schema. Codex read-only mode
+still permits file inspection, so it fails closed as a supervisor backend rather than
+relying on prompt instructions as a security boundary.
 
 The model must return:
 
@@ -133,8 +135,13 @@ supervisor:
 `max_stage_tokens` and `max_stage_cost_usd` are disabled at zero; the wall-clock limit
 and comparison factor remain active. The 20-minute stale default is deliberately
 longer than the production runner's longest built-in 15-minute rate-limit backoff.
-`model_backend` empty means the configured
-production runner, but the supervisor invocation is still isolated and bounded.
+`model_backend` empty means the configured production runner when that runner can
+enforce an empty tool catalogue. Currently Claude can; a Codex production runner makes
+model supervision unavailable unless `model_backend: claude` is configured. An
+explicit `model_backend: codex` is rejected by validation.
+If model assistance is configured but no no-tools-capable backend is available,
+ambiguous incidents retain the deterministic park/escalate path and the UI disables
+manual model requests; deterministic monitoring never depends on model availability.
 Pricing keys are exact `backend/model` pairs or an explicit `backend/*` fallback. Rates
 are never fetched or silently updated by the daemon.
 
@@ -162,7 +169,7 @@ Provider-reported cost and API-equivalent estimated cost are different facts:
 - `provider_cost_usd`/production `cost_usd` are actual values reported by the runner;
 - `estimated_api_cost_usd` is calculated only from the explicitly versioned pricing
   table;
-- unavailable cost is null/incomplete, not silently zero. In particular, a Codex call
+- unavailable cost is null/incomplete, not silently zero. In particular, a Codex production call
   with no provider cost and no matching configured price is not treated as free, and a
   model supervisor call is blocked if neither cost source is available.
 

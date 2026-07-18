@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -31,18 +32,21 @@ type ModelContext struct {
 }
 
 type AttemptContext struct {
-	Stage           string          `json:"stage"`
-	Attempt         int             `json:"attempt"`
-	StartedAt       string          `json:"started_at"`
-	FinishedAt      string          `json:"finished_at,omitempty"`
-	OK              *bool           `json:"ok"`
-	HeartbeatAt     string          `json:"heartbeat_at,omitempty"`
-	ProgressAt      string          `json:"progress_at,omitempty"`
-	InputTokens     int64           `json:"input_tokens"`
-	OutputTokens    int64           `json:"output_tokens"`
-	CachedTokens    int64           `json:"cached_tokens"`
-	ReportedCostUSD float64         `json:"reported_cost_usd"`
-	Metrics         json.RawMessage `json:"metrics"`
+	Stage                string          `json:"stage"`
+	Attempt              int             `json:"attempt"`
+	StartedAt            string          `json:"started_at"`
+	FinishedAt           string          `json:"finished_at,omitempty"`
+	OK                   *bool           `json:"ok"`
+	HeartbeatAt          string          `json:"heartbeat_at,omitempty"`
+	ProgressAt           string          `json:"progress_at,omitempty"`
+	InputTokens          int64           `json:"input_tokens"`
+	OutputTokens         int64           `json:"output_tokens"`
+	CachedTokens         int64           `json:"cached_tokens"`
+	ProviderCostUSD      *float64        `json:"provider_cost_usd,omitempty"`
+	ProviderCostComplete bool            `json:"provider_cost_complete"`
+	EstimatedAPICostUSD  *float64        `json:"estimated_api_cost_usd,omitempty"`
+	EstimateComplete     bool            `json:"estimate_complete"`
+	Metrics              json.RawMessage `json:"metrics"`
 }
 
 type SchedulerContext struct {
@@ -96,6 +100,9 @@ func (m *AgentModel) Diagnose(ctx context.Context, bounded ModelContext) (ModelD
 	if m.runner == nil {
 		return ModelDecision{}, agent.Usage{}, errors.New("model supervisor backend unavailable")
 	}
+	if !agent.EnforcesNoTools(m.runner) {
+		return ModelDecision{}, agent.Usage{}, errors.New("model supervisor backend cannot enforce the no-tools boundary")
+	}
 	payload, err := json.Marshal(bounded)
 	if err != nil {
 		return ModelDecision{}, agent.Usage{}, err
@@ -119,6 +126,13 @@ Context:
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&d); err != nil {
 		return ModelDecision{}, res.Usage, fmt.Errorf("model supervisor output: %w", err)
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("additional JSON value")
+		}
+		return ModelDecision{}, res.Usage, fmt.Errorf("model supervisor output trailing content: %w", err)
 	}
 	if d.Diagnosis == "" || d.Confidence < 0 || d.Confidence > 1 || !IsAllowedAction(d.RecommendedAction) || d.RecommendedAction == ActionAskModel || d.SuggestedRetryLimit < 0 || d.SuggestedTerminationLimit < 0 {
 		return ModelDecision{}, res.Usage, errors.New("model supervisor output failed schema constraints")

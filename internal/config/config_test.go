@@ -247,10 +247,11 @@ func TestSupervisorDefaultsAreMonitorOnlyAndOldConfigsInheritThem(t *testing.T) 
 
 func TestSupervisorRejectsUnsafeOrUnpriceableConfiguration(t *testing.T) {
 	cases := map[string]func(*Config){
-		"model actions without model": func(c *Config) { c.Supervisor.ModelAutomaticActions = true },
-		"failover without fallback":   func(c *Config) { c.Supervisor.AllowBackendFailover = true },
-		"negative supervisor budget":  func(c *Config) { c.Supervisor.PerBookBudgetUSD = -1 },
-		"unversioned pricing":         func(c *Config) { c.Pricing.Version = "" },
+		"model actions without model":    func(c *Config) { c.Supervisor.ModelAutomaticActions = true },
+		"model backend without no-tools": func(c *Config) { c.Supervisor.ModelBackend = AgentBackendCodex },
+		"failover without fallback":      func(c *Config) { c.Supervisor.AllowBackendFailover = true },
+		"negative supervisor budget":     func(c *Config) { c.Supervisor.PerBookBudgetUSD = -1 },
+		"unversioned pricing":            func(c *Config) { c.Pricing.Version = "" },
 		"negative pricing": func(c *Config) {
 			c.Pricing.Rates["codex/*"] = pricing.Rate{InputUSDPerMillion: -1}
 		},

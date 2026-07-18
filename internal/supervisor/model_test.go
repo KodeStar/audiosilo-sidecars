@@ -15,11 +15,16 @@ type captureRunner struct {
 	usage agent.Usage
 }
 
+type unsafeCaptureRunner struct{ captureRunner }
+
+func (c *unsafeCaptureRunner) EnforcesNoTools() bool { return false }
+
 func (c *captureRunner) ID() string { return agent.IDCodex }
 func (c *captureRunner) Detect(context.Context) agent.Availability {
 	return agent.Availability{Available: true}
 }
-func (c *captureRunner) SupportsWeb() bool { return false }
+func (c *captureRunner) SupportsWeb() bool     { return false }
+func (c *captureRunner) EnforcesNoTools() bool { return true }
 func (c *captureRunner) Run(_ context.Context, r agent.Request) (agent.Result, error) {
 	c.req = r
 	return agent.Result{Text: c.text, Usage: c.usage}, nil
@@ -42,5 +47,24 @@ func TestAgentModelRejectsForbiddenOrMalformedAction(t *testing.T) {
 	m := NewAgentModel(r, "", t.TempDir(), time.Second, 2, pricing.Table{})
 	if _, _, err := m.Diagnose(context.Background(), ModelContext{}); err == nil {
 		t.Fatal("forbidden action accepted")
+	}
+}
+
+func TestAgentModelRejectsTrailingOutput(t *testing.T) {
+	r := &captureRunner{text: `{"diagnosis":"stalled","confidence":0.9,"evidence":[],"recommended_action":"observe","human_approval_required":false,"suggested_retry_limit":0,"suggested_termination_limit":0} {"extra":true}`}
+	m := NewAgentModel(r, "", t.TempDir(), time.Second, 2, pricing.Table{})
+	if _, _, err := m.Diagnose(context.Background(), ModelContext{}); err == nil {
+		t.Fatal("trailing model output was accepted")
+	}
+}
+
+func TestAgentModelRefusesBackendWithoutEnforcedNoTools(t *testing.T) {
+	r := &unsafeCaptureRunner{captureRunner: captureRunner{text: `{}`}}
+	m := NewAgentModel(r, "", t.TempDir(), time.Second, 2, pricing.Table{})
+	if _, _, err := m.Diagnose(context.Background(), ModelContext{}); err == nil {
+		t.Fatal("unsafe read-capable backend was invoked")
+	}
+	if r.req.Prompt != "" {
+		t.Fatal("unsafe backend received bounded context despite failing isolation")
 	}
 }

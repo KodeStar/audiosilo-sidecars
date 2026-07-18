@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
+	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
 
 // SupervisorRuntimeSnapshot is a read-only view of scheduler ownership/capacity.
@@ -19,7 +20,7 @@ type SupervisorRuntimeSnapshot struct {
 	EligibleAgentIDs   []int64
 }
 
-func (s *Scheduler) SupervisorRuntime() SupervisorRuntimeSnapshot {
+func (s *Scheduler) SupervisorRuntime(books []store.Book) SupervisorRuntimeSnapshot {
 	out := SupervisorRuntimeSnapshot{ActiveBooks: map[int64]bool{}, AgentCapacity: s.agentCap}
 	s.mu.Lock()
 	for id, ib := range s.inflight {
@@ -29,10 +30,6 @@ func (s *Scheduler) SupervisorRuntime() SupervisorRuntimeSnapshot {
 		}
 	}
 	s.mu.Unlock()
-	books, err := s.db.ListBooks(context.Background())
-	if err != nil {
-		return out
-	}
 	holders := lockHolders(books)
 	for _, b := range books {
 		if out.ActiveBooks[b.ID] {
@@ -108,12 +105,16 @@ func (s *Scheduler) supervisorTerminateRequeue(ctx context.Context, bookID int64
 	closed := false
 	for _, r := range runs {
 		if r.BookID == bookID {
-			_ = s.db.FinishStageRun(ctx, r.ID, false, json.RawMessage(`{"interrupted":true,"supervisor":true}`))
+			if err := s.db.FinishStageRun(ctx, r.ID, false, json.RawMessage(`{"interrupted":true,"supervisor":true}`)); err != nil {
+				return "", err
+			}
 			closed = true
 		}
 	}
 	if b.Status != "" {
-		_ = s.db.SetBookStatus(ctx, b.ID, "", "", "")
+		if err := s.db.SetBookStatus(ctx, b.ID, "", "", ""); err != nil {
+			return "", err
+		}
 	}
 	s.notify()
 	if closed {
@@ -152,10 +153,14 @@ func (s *Scheduler) supervisorSupersedeRerun(ctx context.Context, bookID int64, 
 			_ = os.Remove(SentinelPath(b.WorkDir, string(candidate)))
 		}
 	}
-	if err := s.db.SetBookState(ctx, bookID, string(stage), "", "", ""); err != nil {
+	status, errMessage, parkCode := "", "", ""
+	if b.Status == string(state.StatusPaused) {
+		status, errMessage, parkCode = b.Status, b.Error, b.ParkCode
+	}
+	if err := s.db.SetBookState(ctx, bookID, string(stage), status, errMessage, parkCode); err != nil {
 		return "", err
 	}
-	s.publishState(bookID, string(stage), "", "", "", "")
+	s.publishState(bookID, string(stage), status, errMessage, parkCode, "")
 	s.notify()
 	return "invalidated stage and later sentinels; rerun queued with released inputs/code", nil
 }

@@ -10,19 +10,21 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/supervisor"
 )
 
-func (a *API) handleSupervisorStatus(w http.ResponseWriter, r *http.Request) {
-	if a.supervisor == nil {
-		writeError(w, http.StatusServiceUnavailable, "supervisor is not wired")
-		return
+func (a *API) requireSupervisor(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if a.supervisor == nil {
+			writeError(w, http.StatusServiceUnavailable, "supervisor is not wired")
+			return
+		}
+		next(w, r)
 	}
+}
+
+func (a *API) handleSupervisorStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a.supervisor.Status())
 }
 
 func (a *API) handleSupervisorIncidents(w http.ResponseWriter, r *http.Request) {
-	if a.supervisor == nil {
-		writeError(w, http.StatusServiceUnavailable, "supervisor is not wired")
-		return
-	}
 	limit := 50
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 200 {
@@ -41,10 +43,6 @@ func (a *API) handleSupervisorIncidents(w http.ResponseWriter, r *http.Request) 
 }
 
 func (a *API) handleSupervisorCosts(w http.ResponseWriter, r *http.Request) {
-	if a.supervisor == nil {
-		writeError(w, http.StatusServiceUnavailable, "supervisor is not wired")
-		return
-	}
 	batch := strings.TrimSpace(r.URL.Query().Get("batch_id"))
 	if batch == "" {
 		writeError(w, http.StatusBadRequest, "batch_id is required")
@@ -59,10 +57,6 @@ func (a *API) handleSupervisorCosts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleAskSupervisor(w http.ResponseWriter, r *http.Request) {
-	if a.supervisor == nil {
-		writeError(w, http.StatusServiceUnavailable, "supervisor is not wired")
-		return
-	}
 	id, ok := parseID(w, r)
 	if !ok {
 		return

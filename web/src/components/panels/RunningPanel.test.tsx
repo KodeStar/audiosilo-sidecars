@@ -186,6 +186,116 @@ describe('RunningPanel supervisor', () => {
     await fireEvent.click(screen.getByRole('button', { name: /ask supervisor/i }));
     await waitFor(() => expect(askSupervisor).toHaveBeenCalledWith(7));
   });
+
+  it('loads the newest active batch instead of an older legacy book', async () => {
+    const incidents = vi.fn().mockResolvedValue({ incidents: [] });
+    const costs = vi.fn().mockResolvedValue(null);
+    const client = fakeClient(
+      [
+        bk({ id: 1, batch_id: 'legacy', state: 'done', lane: '' }),
+        bk({ id: 9, batch_id: 'batch-current', state: 'fact_pass', lane: 'agent' }),
+      ],
+      {
+        supervisorStatus: vi.fn().mockResolvedValue({
+          state: 'monitoring',
+          enabled: true,
+          automatic_actions: false,
+          model_assisted: false,
+          model_available: false,
+          allow_backend_failover: false,
+          runtime: {
+            active_books: {},
+            agent_active: 0,
+            agent_capacity: 2,
+            eligible_agent_books: 1,
+          },
+        }),
+        supervisorIncidents: incidents,
+        supervisorCosts: costs,
+      },
+    );
+    render(<RunningPanel client={client} apiBase="" token="tok" />);
+    await waitFor(() => expect(incidents).toHaveBeenCalledWith('batch-current', 8));
+    expect(costs).toHaveBeenCalledWith('batch-current');
+  });
+
+  it('does not offer manual diagnosis when the configured model is unavailable', async () => {
+    const client = fakeClient([bk({ id: 4, batch_id: 'batch-4' })], {
+      supervisorStatus: vi.fn().mockResolvedValue({
+        state: 'monitoring',
+        enabled: true,
+        automatic_actions: false,
+        model_assisted: true,
+        model_available: false,
+        allow_backend_failover: false,
+        runtime: { active_books: {}, agent_active: 0, agent_capacity: 2, eligible_agent_books: 0 },
+      }),
+      supervisorIncidents: vi.fn().mockResolvedValue({ incidents: [] }),
+      supervisorCosts: vi.fn().mockResolvedValue(null),
+    });
+    render(<RunningPanel client={client} apiBase="" token="tok" />);
+    expect(await screen.findByText(/model unavailable/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /ask supervisor/i })).not.toBeInTheDocument();
+  });
+
+  it('coalesces supervisor decision bursts without reloading books', async () => {
+    const status = vi.fn().mockResolvedValue({
+      state: 'monitoring',
+      enabled: true,
+      automatic_actions: false,
+      model_assisted: false,
+      model_available: false,
+      allow_backend_failover: false,
+      runtime: { active_books: {}, agent_active: 0, agent_capacity: 2, eligible_agent_books: 1 },
+    });
+    const incidents = vi.fn().mockResolvedValue({ incidents: [] });
+    const costs = vi.fn().mockResolvedValue(null);
+    const client = fakeClient([bk({ id: 3, batch_id: 'batch-3' })], {
+      supervisorStatus: status,
+      supervisorIncidents: incidents,
+      supervisorCosts: costs,
+    });
+    render(<RunningPanel client={client} apiBase="" token="tok" />);
+    await waitFor(() => expect(status).toHaveBeenCalledTimes(1));
+    vi.mocked(client.listBooks).mockClear();
+    status.mockClear();
+    incidents.mockClear();
+    costs.mockClear();
+
+    const run = {
+      id: 10,
+      batch_id: 'batch-3',
+      trigger: 'health_tick',
+      diagnosis: 'burst',
+      confidence: 1,
+      evidence: [],
+      decision: 'rate_limit',
+      selected_action: 'readmit',
+      suggested_retry_limit: 1,
+      suggested_termination_limit: 0,
+      action_outcome: 'recorded',
+      automatic: false,
+      approval_required: false,
+      state: 'decided',
+      model_calls: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cached_tokens: 0,
+      provider_cost_complete: true,
+      estimate_complete: true,
+      started_at: '2026-01-01T00:00:00Z',
+    };
+    act(() => {
+      currentES?.emit('supervisor.decision', run);
+      currentES?.emit('supervisor.decision', { ...run, id: 11 });
+      currentES?.emit('supervisor.decision', { ...run, id: 12 });
+    });
+
+    await waitFor(() => expect(status).toHaveBeenCalledTimes(1));
+    expect(client.listBooks).not.toHaveBeenCalled();
+    expect(incidents).toHaveBeenCalledTimes(1);
+    expect(costs).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('RunningPanel stage timeline', () => {

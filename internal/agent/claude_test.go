@@ -91,12 +91,16 @@ func TestClaudeMaxTurnsOverride(t *testing.T) {
 }
 
 func TestClaudeIsErrorEnvelope(t *testing.T) {
-	resp := `{"type":"result","is_error":true,"result":"boom"}`
+	resp := `{"type":"result","is_error":true,"result":"boom","num_turns":2,"total_cost_usd":0.03,"usage":{"input_tokens":120,"output_tokens":30,"cache_read_input_tokens":10}}`
 	path, _ := fakeCLI(t, fakeCLIOpts{versionLine: "v", response: resp})
 	r := newClaudeRunner(path, secrets.NewMemStore())
-	_, err := r.Run(context.Background(), Request{Dir: t.TempDir(), Prompt: "p"})
+	res, err := r.Run(context.Background(), Request{Dir: t.TempDir(), Prompt: "p", Model: "failed-model"})
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("want is_error surfaced, got %v", err)
+	}
+	want := Usage{Model: "failed-model", Input: 120, Output: 30, CacheRead: 10, CostUSD: 0.03, CostReported: true, Turns: 2}
+	if res.Usage != want {
+		t.Fatalf("failed invocation usage=%+v want %+v", res.Usage, want)
 	}
 }
 
@@ -181,6 +185,9 @@ func TestClaudeDetect(t *testing.T) {
 	}
 	if r.SupportsWeb() != true {
 		t.Error("claude SupportsWeb should be true")
+	}
+	if !EnforcesNoTools(r) {
+		t.Error("claude should enforce an empty tool catalogue")
 	}
 }
 

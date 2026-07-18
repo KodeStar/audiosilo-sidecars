@@ -329,6 +329,25 @@ func (db *DB) ListStageRuns(ctx context.Context, bookID int64) ([]StageRun, erro
 	return out, rows.Err()
 }
 
+// StageRunsAll returns every stage run grouped by book in one catalogue query.
+// Periodic orchestration checks use this instead of issuing one query per book.
+func (db *DB) StageRunsAll(ctx context.Context) (map[int64][]StageRun, error) {
+	rows, err := db.sql.QueryContext(ctx, `SELECT `+runCols+` FROM stage_runs ORDER BY book_id, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[int64][]StageRun{}
+	for rows.Next() {
+		r, err := scanRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[r.BookID] = append(out[r.BookID], r)
+	}
+	return out, rows.Err()
+}
+
 // OpenStageRuns returns all runs still in flight (finished_at IS NULL) across all
 // books - the set startup reconcile must close as interrupted.
 func (db *DB) OpenStageRuns(ctx context.Context) ([]StageRun, error) {

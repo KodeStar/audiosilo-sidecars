@@ -162,6 +162,18 @@ type Runner interface {
 	SupportsWeb() bool
 }
 
+type noToolsCapability interface {
+	EnforcesNoTools() bool
+}
+
+// EnforcesNoTools reports whether NoTools removes the model's tool catalogue,
+// rather than merely preventing writes. Bounded model supervision fails closed
+// when a backend cannot enforce this boundary.
+func EnforcesNoTools(r Runner) bool {
+	capable, ok := r.(noToolsCapability)
+	return ok && capable.EnforcesNoTools()
+}
+
 // SelectConfig is the minimal, config-package-free view Select needs: the chosen
 // backend ("" = auto) and the optional explicit CLI paths. Kept deliberately small
 // so internal/config can add fields without touching internal/agent.

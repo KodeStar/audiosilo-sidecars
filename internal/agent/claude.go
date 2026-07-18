@@ -28,6 +28,8 @@ func newClaudeRunner(explicit string, sec secrets.Store) *claudeRunner {
 
 func (c *claudeRunner) ID() string { return IDClaude }
 
+func (c *claudeRunner) EnforcesNoTools() bool { return true }
+
 // SupportsWeb is always true for claude: WebSearch/WebFetch are first-class tools
 // enabled by adding them to --allowedTools.
 func (c *claudeRunner) SupportsWeb() bool { return true }
@@ -116,43 +118,42 @@ func (c *claudeRunner) Run(ctx context.Context, req Request) (Result, error) {
 		process:   req.Process,
 	})
 
-	if errors.Is(runErr, errTimeout) {
-		return Result{}, fmt.Errorf("claude timed out after %s", req.Timeout)
-	}
-	if runErr != nil && ctx.Err() != nil {
-		return Result{}, ctx.Err()
-	}
-
 	var res claudeResult
 	parseErr := json.Unmarshal([]byte(stdout), &res)
+
+	usage := Usage{
+		Model:        req.Model,
+		Input:        res.Usage.InputTokens,
+		Output:       res.Usage.OutputTokens,
+		CacheRead:    res.Usage.CacheReadInputTokens,
+		CostUSD:      res.TotalCostUSD,
+		CostReported: parseErr == nil && res.Type == "result",
+		Turns:        res.NumTurns,
+	}
+	result := Result{Text: res.Result, Usage: usage}
+	if errors.Is(runErr, errTimeout) {
+		return result, fmt.Errorf("claude timed out after %s", req.Timeout)
+	}
+	if runErr != nil && ctx.Err() != nil {
+		return result, ctx.Err()
+	}
 
 	// Classify a rate-limit before anything else: it can arrive as is_error with a
 	// rate-limit result, or as a nonzero exit with the message on stderr.
 	detail := firstNonEmpty(res.Result, stderr, stdout)
 	if isRateLimit(res.Result) || isRateLimit(stderr) {
-		return Result{}, newRateLimitError(detail, time.Now())
+		return result, newRateLimitError(detail, time.Now())
 	}
 
 	if runErr != nil {
-		return Result{}, fmt.Errorf("claude exited: %w: %s", runErr, truncate(detail))
+		return result, fmt.Errorf("claude exited: %w: %s", runErr, truncate(detail))
 	}
 	if parseErr != nil {
 		return Result{}, fmt.Errorf("claude: parse result json: %w: %s", parseErr, truncate(stdout))
 	}
 	if res.IsError {
-		return Result{}, fmt.Errorf("claude reported error: %s", truncate(firstNonEmpty(res.Result, res.Subtype)))
+		return result, fmt.Errorf("claude reported error: %s", truncate(firstNonEmpty(res.Result, res.Subtype)))
 	}
 
-	return Result{
-		Text: res.Result,
-		Usage: Usage{
-			Model:        req.Model,
-			Input:        res.Usage.InputTokens,
-			Output:       res.Usage.OutputTokens,
-			CacheRead:    res.Usage.CacheReadInputTokens,
-			CostUSD:      res.TotalCostUSD,
-			CostReported: true,
-			Turns:        res.NumTurns,
-		},
-	}, nil
+	return result, nil
 }

@@ -83,7 +83,7 @@ func TestRepeatedErrorAndKnownBackendClasses(t *testing.T) {
 		m, _ := json.Marshal(map[string]string{"error": msg})
 		return store.StageRun{ID: id, Stage: "fact_pass", Attempt: int(id), FinishedAt: time.Now().Format(time.RFC3339Nano), Ok: &ok, Metrics: m}
 	}
-	base := Snapshot{Book: store.Book{ID: 1, BatchID: "b"}}
+	base := Snapshot{Book: store.Book{ID: 1, BatchID: "b", State: "fact_pass"}}
 	base.Runs = []store.StageRun{makeRun(1, "open /tmp/a123 failed 99"), makeRun(2, "open /tmp/b456 failed 42")}
 	got := Classify(base, Policy{MaxErrorRepeats: 2})
 	if len(got) != 1 || got[0].Kind != IncidentRepeatedError {
@@ -107,9 +107,49 @@ func TestQAAndAuditNonConvergence(t *testing.T) {
 	ok := true
 	qaMetrics := json.RawMessage(`{"multi_loop":4,"cross_segment":2,"mid_chapter_runs":1,"retranscribe_queue":1,"tail_rate":2,"within_segment":0,"wph_outliers":1}`)
 	runs := []store.StageRun{{ID: 1, Stage: "qa_sweep", FinishedAt: "x", Ok: &ok, Metrics: qaMetrics}, {ID: 2, Stage: "qa_sweep", FinishedAt: "x", Ok: &ok, Metrics: qaMetrics}, {ID: 3, Stage: "qa_sweep", FinishedAt: "x", Ok: &ok, Metrics: qaMetrics}, {ID: 4, Stage: "auditing", FinishedAt: "x", Ok: &ok, Metrics: json.RawMessage(`{"pass":false,"fix":2}`)}, {ID: 5, Stage: "auditing", FinishedAt: "x", Ok: &ok, Metrics: json.RawMessage(`{"pass":false,"fix":3}`)}}
-	got := kinds(Classify(Snapshot{Book: store.Book{ID: 1, BatchID: "b"}, Runs: runs}, Policy{MaxErrorRepeats: 2}))
-	if !got[IncidentNonConvergingQA] || !got[IncidentNonConvergingAudit] {
-		t.Fatalf("incidents=%#v", got)
+	qaGot := kinds(Classify(Snapshot{Book: store.Book{ID: 1, BatchID: "b", State: "qa_adjudicating"}, Runs: runs}, Policy{MaxErrorRepeats: 2}))
+	auditGot := kinds(Classify(Snapshot{Book: store.Book{ID: 1, BatchID: "b", State: "fixing"}, Runs: runs}, Policy{MaxErrorRepeats: 2}))
+	if !qaGot[IncidentNonConvergingQA] || !auditGot[IncidentNonConvergingAudit] {
+		t.Fatalf("qa=%#v audit=%#v", qaGot, auditGot)
+	}
+}
+
+func TestResolvedHistoricalFailuresAndLoopsAreIgnored(t *testing.T) {
+	ok, failed := true, false
+	failure := store.StageRun{ID: 1, Stage: "fact_pass", FinishedAt: "1", Ok: &failed, Metrics: json.RawMessage(`{"error":"not logged in"}`)}
+	success := store.StageRun{ID: 2, Stage: "fact_pass", FinishedAt: "2", Ok: &ok, Metrics: json.RawMessage(`{}`)}
+	if got := Classify(Snapshot{Book: store.Book{ID: 1, BatchID: "b", State: "fact_pass"}, Runs: []store.StageRun{failure, success}}, Policy{MaxErrorRepeats: 2}); len(got) != 0 {
+		t.Fatalf("resolved failure remained actionable: %+v", got)
+	}
+	open := store.StageRun{ID: 2, Stage: "fact_pass"}
+	if got := Classify(Snapshot{Book: store.Book{ID: 1, BatchID: "b", State: "fact_pass"}, Runs: []store.StageRun{failure, open}, RuntimeActive: true}, Policy{MaxErrorRepeats: 2}); len(got) != 0 {
+		t.Fatalf("failure with retry in progress remained actionable: %+v", got)
+	}
+	audits := []store.StageRun{
+		{ID: 3, Stage: "auditing", FinishedAt: "3", Ok: &ok, Metrics: json.RawMessage(`{"pass":false,"fix":2}`)},
+		{ID: 4, Stage: "auditing", FinishedAt: "4", Ok: &ok, Metrics: json.RawMessage(`{"pass":false,"fix":2}`)},
+		{ID: 5, Stage: "auditing", FinishedAt: "5", Ok: &ok, Metrics: json.RawMessage(`{"pass":true,"fix":0}`)},
+	}
+	if got := kinds(Classify(Snapshot{Book: store.Book{ID: 1, BatchID: "b", State: "auditing"}, Runs: audits}, Policy{MaxErrorRepeats: 2})); got[IncidentNonConvergingAudit] {
+		t.Fatalf("passing audit did not resolve convergence incident: %#v", got)
+	}
+	qa := json.RawMessage(`{"multi_loop":4,"cross_segment":2,"mid_chapter_runs":1,"retranscribe_queue":1,"tail_rate":2,"within_segment":0,"wph_outliers":1}`)
+	qaRuns := []store.StageRun{{ID: 6, Stage: "qa_sweep", FinishedAt: "6", Ok: &ok, Metrics: qa}, {ID: 7, Stage: "qa_sweep", FinishedAt: "7", Ok: &ok, Metrics: qa}, {ID: 8, Stage: "qa_sweep", FinishedAt: "8", Ok: &ok, Metrics: qa}}
+	if got := kinds(Classify(Snapshot{Book: store.Book{ID: 1, BatchID: "b", State: "spelling"}, Runs: qaRuns}, Policy{MaxErrorRepeats: 2})); got[IncidentNonConvergingQA] {
+		t.Fatalf("historical QA loop remained actionable after phase exit: %#v", got)
+	}
+}
+
+func TestFailedQARunsDoNotCreateConvergenceIncident(t *testing.T) {
+	failed := false
+	runs := []store.StageRun{
+		{ID: 1, Stage: "qa_sweep", FinishedAt: "1", Ok: &failed, Metrics: json.RawMessage(`{"error":"first"}`)},
+		{ID: 2, Stage: "qa_sweep", FinishedAt: "2", Ok: &failed, Metrics: json.RawMessage(`{"error":"second"}`)},
+		{ID: 3, Stage: "qa_sweep", FinishedAt: "3", Ok: &failed, Metrics: json.RawMessage(`{"error":"third"}`)},
+	}
+	got := kinds(Classify(Snapshot{Book: store.Book{ID: 1, BatchID: "b", State: "qa_sweep"}, Runs: runs}, Policy{MaxErrorRepeats: 2}))
+	if got[IncidentNonConvergingQA] {
+		t.Fatalf("failed QA attempts treated as repair findings: %#v", got)
 	}
 }
 

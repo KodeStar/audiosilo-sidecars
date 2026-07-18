@@ -21,6 +21,19 @@ type fixedModel struct {
 	calls    int
 }
 
+type cancelUsageModel struct {
+	started chan struct{}
+}
+
+func (m *cancelUsageModel) Info() ModelInfo {
+	return ModelInfo{Backend: "claude", Model: "supervisor-test", ProviderReportsCost: true}
+}
+func (m *cancelUsageModel) Diagnose(ctx context.Context, _ ModelContext) (ModelDecision, agent.Usage, error) {
+	close(m.started)
+	<-ctx.Done()
+	return ModelDecision{}, agent.Usage{Model: "supervisor-test", Input: 200, Output: 20, CostUSD: .04, CostReported: true}, ctx.Err()
+}
+
 func (m *fixedModel) Info() ModelInfo {
 	return ModelInfo{Backend: "claude", Model: "supervisor-test", ProviderReportsCost: true}
 }
@@ -57,7 +70,7 @@ func TestSimulatedMultiBookRecoveryAndEscalation(t *testing.T) {
 	cfg.MaxStageMinutes = 999
 	var mu sync.Mutex
 	actions := map[int64][]Action{}
-	s := New(db, cfg, pricing.Table{Version: "test"}, nil, Hooks{Runtime: func() Runtime { return Runtime{ActiveBooks: map[int64]bool{}, AgentCapacity: 2} }, Apply: func(_ context.Context, a Action, i Incident) (string, error) {
+	s := New(db, cfg, pricing.Table{Version: "test"}, nil, Hooks{Runtime: func([]store.Book) Runtime { return Runtime{ActiveBooks: map[int64]bool{}, AgentCapacity: 2} }, Apply: func(_ context.Context, a Action, i Incident) (string, error) {
 		mu.Lock()
 		actions[i.BookID] = append(actions[i.BookID], a)
 		mu.Unlock()
@@ -122,6 +135,73 @@ func TestAskSupervisorPersistsReportedAndEstimatedCosts(t *testing.T) {
 	}
 	if m.calls != 1 {
 		t.Fatalf("calls=%d", m.calls)
+	}
+}
+
+func TestCancelledAskStillFinalizesUsageLedger(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	db := supervisorDB(t)
+	if err := db.EnsureBatch(ctx, "cancel", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	b, err := db.CreateBook(ctx, store.NewBook{BatchID: "cancel", SourcePath: "/cancel", WorkDir: t.TempDir(), Title: "Cancel"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &cancelUsageModel{started: make(chan struct{})}
+	cfg := config.Default().Supervisor
+	cfg.ModelAssisted = true
+	s := New(db, cfg, pricing.Table{Version: "test"}, m, Hooks{})
+	done := make(chan error, 1)
+	go func() {
+		_, askErr := s.Ask(ctx, b.ID)
+		done <- askErr
+	}()
+	<-m.started
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	runs, err := db.RecentSupervisorRuns(context.Background(), "cancel", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].CompletedAt == "" || runs[0].State != "failed" || runs[0].InputTokens != 200 || runs[0].ProviderCostUSD == nil || *runs[0].ProviderCostUSD != .04 {
+		t.Fatalf("cancelled model call was not fully accounted: %+v", runs)
+	}
+}
+
+func TestModelContextDistinguishesReportedAndEstimatedCost(t *testing.T) {
+	ctx := context.Background()
+	db := supervisorDB(t)
+	if err := db.EnsureBatch(ctx, "context-cost", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	b, err := db.CreateBook(ctx, store.NewBook{BatchID: "context-cost", SourcePath: "/context", WorkDir: t.TempDir(), Title: "Context"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := db.StartStageRun(ctx, b.ID, "fact_pass", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddOpenStageRunUsageDetailed(ctx, b.ID, "fact_pass", "codex-model", 100, 20, 10, 0, false, .03, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishStageRun(ctx, runID, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	runs, err := db.ListStageRuns(ctx, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(db, config.Default().Supervisor, pricing.Table{Version: "test"}, nil, Hooks{})
+	modelContext, err := s.modelContext(ctx, Incident{BookID: b.ID}, runs, Runtime{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(modelContext.Attempts) != 1 || modelContext.Attempts[0].ProviderCostUSD != nil || modelContext.Attempts[0].ProviderCostComplete || modelContext.Attempts[0].EstimatedAPICostUSD == nil || *modelContext.Attempts[0].EstimatedAPICostUSD != .03 || !modelContext.Attempts[0].EstimateComplete {
+		t.Fatalf("cost availability was misrepresented: %+v", modelContext.Attempts)
 	}
 }
 
@@ -220,6 +300,16 @@ func TestDisabledSupervisorDoesNotInspectOrMutateExistingProcessing(t *testing.T
 	}
 	if got.State != "fact_pass" || got.Status != "" {
 		t.Fatalf("book changed with supervision disabled: %+v", got)
+	}
+}
+
+func TestUnavailableModelKeepsDeterministicEscalation(t *testing.T) {
+	cfg := config.Default().Supervisor
+	cfg.ModelAssisted = true
+	s := New(supervisorDB(t), cfg, pricing.Table{Version: "test"}, nil, Hooks{})
+	decision := Decide(Incident{Kind: IncidentNoProgress}, 1, s.policy)
+	if decision.Action != ActionParkEscalate || !decision.ApprovalRequired || decision.Automatic {
+		t.Fatalf("unavailable model suppressed deterministic escalation: %+v", decision)
 	}
 }
 

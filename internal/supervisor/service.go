@@ -13,6 +13,7 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/config"
 	"github.com/kodestar/audiosilo-sidecars/internal/pricing"
+	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
 
@@ -27,7 +28,7 @@ type Runtime struct {
 }
 
 type Hooks struct {
-	Runtime func() Runtime
+	Runtime func([]store.Book) Runtime
 	Apply   func(context.Context, Action, Incident) (string, error)
 	Publish func(eventType string, bookID int64, payload any)
 }
@@ -52,21 +53,23 @@ type Service struct {
 	hooks   Hooks
 	policy  Policy
 
-	checkMu   sync.Mutex
-	mu        sync.Mutex
-	modelMu   sync.Mutex
-	lastCheck time.Time
-	lastErr   string
+	checkMu       sync.Mutex
+	mu            sync.Mutex
+	modelMu       sync.Mutex
+	artifactMu    sync.Mutex
+	artifactCache map[string]artifactCacheEntry
+	lastCheck     time.Time
+	lastErr       string
 }
 
 func New(db *store.DB, cfg config.SupervisorConfig, prices pricing.Table, model Model, hooks Hooks) *Service {
-	return &Service{db: db, cfg: cfg, pricing: prices, model: model, hooks: hooks, policy: Policy{
+	return &Service{db: db, cfg: cfg, pricing: prices, model: model, hooks: hooks, artifactCache: map[string]artifactCacheEntry{}, policy: Policy{
 		StaleAfter:       time.Duration(cfg.StaleMinutes) * time.Minute,
 		NoProgressAfter:  time.Duration(cfg.NoProgressMinutes) * time.Minute,
 		MaxStageDuration: time.Duration(cfg.MaxStageMinutes) * time.Minute,
 		MaxAttempts:      cfg.MaxAttempts, MaxErrorRepeats: cfg.MaxErrorRepeats,
 		MaxStageTokens: cfg.MaxStageTokens, MaxStageCostUSD: cfg.MaxStageCostUSD, AttemptGrowthFactor: cfg.AttemptGrowthFactor,
-		AutomaticActions: cfg.AutomaticActions, ModelAssisted: cfg.ModelAssisted,
+		AutomaticActions: cfg.AutomaticActions, ModelAssisted: cfg.ModelAssisted && model != nil,
 		ModelAutomaticActions: cfg.ModelAutomaticActions, AllowBackendFailover: cfg.AllowBackendFailover,
 	}}
 }
@@ -104,9 +107,14 @@ func (s *Service) check(ctx context.Context, trigger string) {
 		s.setCheck(err)
 		return
 	}
+	runsByBook, err := s.db.StageRunsAll(ctx)
+	if err != nil {
+		s.setCheck(err)
+		return
+	}
 	runtime := Runtime{ActiveBooks: map[int64]bool{}}
 	if s.hooks.Runtime != nil {
-		runtime = s.hooks.Runtime()
+		runtime = s.hooks.Runtime(books)
 		if runtime.ActiveBooks == nil {
 			runtime.ActiveBooks = map[int64]bool{}
 		}
@@ -115,17 +123,13 @@ func (s *Service) check(ctx context.Context, trigger string) {
 		if ctx.Err() != nil {
 			return
 		}
-		runs, rerr := s.db.ListStageRuns(ctx, book.ID)
-		if rerr != nil {
-			s.setCheck(rerr)
-			return
-		}
+		runs := runsByBook[book.ID]
 		eligibleCount := 0
 		if len(runtime.EligibleAgentIDs) > 0 && book.ID == runtime.EligibleAgentIDs[0] {
 			eligibleCount = runtime.EligibleAgentBooks
 		}
 		snap := Snapshot{Now: time.Now().UTC(), Book: book, Runs: runs, RuntimeActive: runtime.ActiveBooks[book.ID],
-			Artifacts: artifactStatuses(book, runs), AgentActive: runtime.AgentActive, AgentCapacity: runtime.AgentCapacity, EligibleAgentBooks: eligibleCount}
+			Artifacts: s.artifactStatuses(book, runs), AgentActive: runtime.AgentActive, AgentCapacity: runtime.AgentCapacity, EligibleAgentBooks: eligibleCount}
 		for i := range runs {
 			if runs[i].FinishedAt == "" && runs[i].ProcessActive && runs[i].ProcessID > 0 {
 				alive := processAlive(runs[i].ProcessID)
@@ -134,7 +138,10 @@ func (s *Service) check(ctx context.Context, trigger string) {
 			}
 		}
 		if incident, ok := primaryIncident(Classify(snap, s.policy)); ok {
-			s.handleIncident(ctx, trigger, incident, runs, runtime)
+			if err := s.handleIncident(ctx, trigger, incident, runs, runtime); err != nil {
+				s.setCheck(err)
+				return
+			}
 		}
 	}
 	s.mu.Lock()
@@ -169,10 +176,14 @@ func (s *Service) setCheck(err error) {
 	s.mu.Unlock()
 }
 
-func (s *Service) handleIncident(ctx context.Context, trigger string, i Incident, runs []store.StageRun, runtime Runtime) {
+func (s *Service) handleIncident(ctx context.Context, trigger string, i Incident, runs []store.StageRun, runtime Runtime) error {
 	key := incidentKey(i)
-	if seen, err := s.db.HasIncident(ctx, key); err != nil || seen {
-		return
+	seen, err := s.db.HasIncident(ctx, key)
+	if err != nil {
+		return err
+	}
+	if seen {
+		return nil
 	}
 	attempts := 0
 	for _, r := range runs {
@@ -194,12 +205,11 @@ func (s *Service) handleIncident(ctx context.Context, trigger string, i Incident
 		Automatic: d.Automatic, ApprovalRequired: d.ApprovalRequired, State: "decided", PricingVersion: s.pricing.Version}
 	id, err := s.db.StartSupervisorRun(ctx, r)
 	if err != nil {
-		return
+		return err
 	}
 	r.ID = id
 	if d.Action == ActionAskModel && s.cfg.ModelAssisted {
-		s.runModel(ctx, &r, i, runs, runtime)
-		return
+		return s.runModel(ctx, &r, i, runs, runtime)
 	}
 	if d.Automatic && s.hooks.Apply != nil {
 		outcome, aerr := s.hooks.Apply(ctx, d.Action, i)
@@ -216,37 +226,48 @@ func (s *Service) handleIncident(ctx context.Context, trigger string, i Incident
 	} else {
 		r.ActionOutcome = "automatic actions disabled; recommendation recorded"
 	}
-	_ = s.db.FinishSupervisorRun(ctx, r)
-	s.publish(r)
+	return s.finishRun(ctx, r)
 }
 
-func (s *Service) runModel(ctx context.Context, r *store.SupervisorRun, i Incident, runs []store.StageRun, runtime Runtime) {
+func (s *Service) finishRun(ctx context.Context, r store.SupervisorRun) error {
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := s.db.FinishSupervisorRun(persistCtx, r); err != nil {
+		return err
+	}
+	s.publish(r)
+	return nil
+}
+
+func (s *Service) runModel(ctx context.Context, r *store.SupervisorRun, i Incident, runs []store.StageRun, runtime Runtime) error {
 	s.modelMu.Lock()
 	defer s.modelMu.Unlock()
 	if s.model == nil {
 		r.State = "unavailable"
 		r.ActionOutcome = "model backend unavailable"
-		_ = s.db.FinishSupervisorRun(ctx, *r)
-		s.publish(*r)
-		return
+		return s.finishRun(ctx, *r)
 	}
 	info := s.model.Info()
 	r.Model, r.Backend = info.Model, info.Backend
 	if !info.ProviderReportsCost && !info.EstimateAvailable {
 		r.State = "budget_blocked"
 		r.ActionOutcome = "model call has neither provider cost nor configured estimate"
-		_ = s.db.FinishSupervisorRun(ctx, *r)
-		s.publish(*r)
-		return
+		return s.finishRun(ctx, *r)
 	}
 	if ok, reason := s.modelBudgetAllows(ctx, i.BatchID, &i.BookID); !ok {
 		r.State = "budget_blocked"
 		r.ActionOutcome = reason
-		_ = s.db.FinishSupervisorRun(ctx, *r)
-		s.publish(*r)
-		return
+		return s.finishRun(ctx, *r)
 	}
-	bounded := s.modelContext(ctx, i, runs, runtime)
+	bounded, contextErr := s.modelContext(ctx, i, runs, runtime)
+	if contextErr != nil {
+		r.State = "failed"
+		r.ActionOutcome = "build bounded model context: " + contextErr.Error()
+		if finishErr := s.finishRun(ctx, *r); finishErr != nil {
+			return finishErr
+		}
+		return contextErr
+	}
 	var total agent.Usage
 	var decision ModelDecision
 	var err error
@@ -257,15 +278,23 @@ func (s *Service) runModel(ctx context.Context, r *store.SupervisorRun, i Incide
 	if countErr != nil {
 		r.State = "failed"
 		r.ActionOutcome = countErr.Error()
-		_ = s.db.FinishSupervisorRun(ctx, *r)
-		s.publish(*r)
-		return
+		return s.finishRun(ctx, *r)
 	}
 	if remaining := s.cfg.InvocationsPerHour - usedCalls; remaining < maxCalls {
 		maxCalls = remaining
 	}
-	priorBookSpend, _, _ := s.db.SupervisorSpend(ctx, i.BatchID, &i.BookID)
-	priorBatchSpend, _, _ := s.db.SupervisorSpend(ctx, i.BatchID, nil)
+	priorBookSpend, _, spendErr := s.db.SupervisorSpend(ctx, i.BatchID, &i.BookID)
+	if spendErr != nil {
+		r.State = "failed"
+		r.ActionOutcome = spendErr.Error()
+		return s.finishRun(ctx, *r)
+	}
+	priorBatchSpend, _, spendErr := s.db.SupervisorSpend(ctx, i.BatchID, nil)
+	if spendErr != nil {
+		r.State = "failed"
+		r.ActionOutcome = spendErr.Error()
+		return s.finishRun(ctx, *r)
+	}
 	modelCtx, cancel := context.WithTimeout(ctx, time.Duration(s.cfg.TimeoutSeconds)*time.Second)
 	defer cancel()
 	for call := 0; call < maxCalls; call++ {
@@ -305,9 +334,7 @@ func (s *Service) runModel(ctx context.Context, r *store.SupervisorRun, i Incide
 	if err != nil {
 		r.State = "failed"
 		r.ActionOutcome = err.Error()
-		_ = s.db.FinishSupervisorRun(ctx, *r)
-		s.publish(*r)
-		return
+		return s.finishRun(ctx, *r)
 	}
 	r.Diagnosis = decision.Diagnosis
 	r.Confidence = decision.Confidence
@@ -342,8 +369,7 @@ func (s *Service) runModel(ctx context.Context, r *store.SupervisorRun, i Incide
 		r.State = "recommended"
 		r.ActionOutcome = "model automatic actions disabled"
 	}
-	_ = s.db.FinishSupervisorRun(ctx, *r)
-	s.publish(*r)
+	return s.finishRun(ctx, *r)
 }
 
 func modelUsageCost(u agent.Usage, info ModelInfo, prices pricing.Table) (float64, bool) {
@@ -401,8 +427,11 @@ func (s *Service) modelBudgetAllows(ctx context.Context, batch string, book *int
 	return true, ""
 }
 
-func (s *Service) modelContext(ctx context.Context, i Incident, runs []store.StageRun, runtime Runtime) ModelContext {
-	b, _ := s.db.GetBook(ctx, i.BookID)
+func (s *Service) modelContext(ctx context.Context, i Incident, runs []store.StageRun, runtime Runtime) (ModelContext, error) {
+	b, err := s.db.GetBook(ctx, i.BookID)
+	if err != nil {
+		return ModelContext{}, err
+	}
 	var c ModelContext
 	c.Incident = i
 	c.Book.ID = b.ID
@@ -421,10 +450,21 @@ func (s *Service) modelContext(ctx context.Context, i Incident, runs []store.Sta
 		if len(metrics) > 1200 {
 			metrics = json.RawMessage(`{"truncated":true}`)
 		}
-		c.Attempts = append(c.Attempts, AttemptContext{Stage: r.Stage, Attempt: r.Attempt, StartedAt: r.StartedAt, FinishedAt: r.FinishedAt, OK: r.Ok, HeartbeatAt: r.HeartbeatAt, ProgressAt: r.ProgressAt, InputTokens: r.InputTokens, OutputTokens: r.OutputTokens, CachedTokens: r.CacheReadTokens, ReportedCostUSD: r.CostUSD, Metrics: metrics})
+		attempt := AttemptContext{Stage: r.Stage, Attempt: r.Attempt, StartedAt: r.StartedAt, FinishedAt: r.FinishedAt, OK: r.Ok,
+			HeartbeatAt: r.HeartbeatAt, ProgressAt: r.ProgressAt, InputTokens: r.InputTokens, OutputTokens: r.OutputTokens,
+			CachedTokens: r.CacheReadTokens, ProviderCostComplete: r.CostReported, EstimatedAPICostUSD: r.EstimatedAPICostUSD,
+			EstimateComplete: r.EstimateComplete, Metrics: metrics}
+		if r.CostReported || r.CostUSD > 0 {
+			cost := r.CostUSD
+			attempt.ProviderCostUSD = &cost
+		}
+		c.Attempts = append(c.Attempts, attempt)
 	}
 	c.Scheduler = SchedulerContext{AgentActive: runtime.AgentActive, AgentCapacity: runtime.AgentCapacity, EligibleAgentBooks: runtime.EligibleAgentBooks}
-	events, _ := s.db.ListEvents(ctx, b.ID, 0, 8)
+	events, err := s.db.ListEvents(ctx, b.ID, 0, 8)
+	if err != nil {
+		return ModelContext{}, err
+	}
 	for _, e := range events {
 		p := e.Payload
 		if len(p) > 600 {
@@ -432,7 +472,7 @@ func (s *Service) modelContext(ctx context.Context, i Incident, runs []store.Sta
 		}
 		c.LogTail = append(c.LogTail, LogContext{TS: e.TS, Type: e.Type, Payload: p})
 	}
-	return c
+	return c, nil
 }
 
 func (s *Service) Ask(ctx context.Context, bookID int64) (store.SupervisorRun, error) {
@@ -449,7 +489,11 @@ func (s *Service) Ask(ctx context.Context, bookID int64) (store.SupervisorRun, e
 	}
 	runtime := Runtime{ActiveBooks: map[int64]bool{}}
 	if s.hooks.Runtime != nil {
-		runtime = s.hooks.Runtime()
+		books, listErr := s.db.ListBooks(ctx)
+		if listErr != nil {
+			return store.SupervisorRun{}, listErr
+		}
+		runtime = s.hooks.Runtime(books)
 	}
 	i := Incident{Kind: IncidentUnclassified, BookID: b.ID, BatchID: b.BatchID, Stage: b.State, Diagnosis: "manual supervisor request", Evidence: []string{"operator requested bounded diagnosis"}, Ambiguous: true}
 	e, _ := json.Marshal(i.Evidence)
@@ -460,8 +504,12 @@ func (s *Service) Ask(ctx context.Context, bookID int64) (store.SupervisorRun, e
 		return r, err
 	}
 	r.ID = id
-	s.runModel(ctx, &r, i, runs, runtime)
-	recent, err := s.db.RecentSupervisorRuns(ctx, b.BatchID, 20)
+	if err := s.runModel(ctx, &r, i, runs, runtime); err != nil {
+		return r, err
+	}
+	lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	recent, err := s.db.RecentSupervisorRuns(lookupCtx, b.BatchID, 20)
 	if err == nil {
 		for _, x := range recent {
 			if x.ID == id {
@@ -474,18 +522,28 @@ func (s *Service) Ask(ctx context.Context, bookID int64) (store.SupervisorRun, e
 
 func (s *Service) Status() Status {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	lastCheck, lastErr := s.lastCheck, s.lastErr
+	s.mu.Unlock()
 	st := "monitoring"
 	if !s.cfg.Enabled {
 		st = "disabled"
 	}
 	runtime := Runtime{ActiveBooks: map[int64]bool{}}
 	if s.hooks.Runtime != nil {
-		runtime = s.hooks.Runtime()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		books, err := s.db.ListBooks(ctx)
+		cancel()
+		if err != nil {
+			if lastErr == "" {
+				lastErr = err.Error()
+			}
+		} else {
+			runtime = s.hooks.Runtime(books)
+		}
 	}
-	out := Status{State: st, Enabled: s.cfg.Enabled, AutomaticActions: s.cfg.AutomaticActions, ModelAssisted: s.cfg.ModelAssisted, ModelAvailable: s.model != nil, AllowBackendFailover: s.cfg.AllowBackendFailover, Runtime: runtime, LastError: s.lastErr}
-	if !s.lastCheck.IsZero() {
-		out.LastCheckAt = s.lastCheck.Format(time.RFC3339Nano)
+	out := Status{State: st, Enabled: s.cfg.Enabled, AutomaticActions: s.cfg.AutomaticActions, ModelAssisted: s.cfg.ModelAssisted, ModelAvailable: s.model != nil, AllowBackendFailover: s.cfg.AllowBackendFailover, Runtime: runtime, LastError: lastErr}
+	if !lastCheck.IsZero() {
+		out.LastCheckAt = lastCheck.Format(time.RFC3339Nano)
 	}
 	return out
 }
@@ -509,7 +567,52 @@ func incidentKey(i Incident) string {
 	return fmt.Sprintf("%s/%d/%s/%d/%s", i.Kind, i.BookID, i.Stage, i.StageRunID, i.Fingerprint)
 }
 
+type artifactCacheEntry struct {
+	size       int64
+	modifiedNS int64
+	valid      bool
+	reason     string
+}
+
+func validateJSONArtifact(path string) (bool, string) {
+	artifact, err := os.ReadFile(path) //nolint:gosec // path is a stored work dir plus a compiled allow-list entry
+	if err != nil {
+		return false, err.Error()
+	}
+	if len(artifact) == 0 || !json.Valid(artifact) {
+		return false, "artifact is empty or invalid JSON"
+	}
+	return true, ""
+}
+
+func (s *Service) validateJSONArtifact(path string) (bool, string) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, err.Error()
+	}
+	modifiedNS := info.ModTime().UnixNano()
+	s.artifactMu.Lock()
+	cached, ok := s.artifactCache[path]
+	s.artifactMu.Unlock()
+	if ok && cached.size == info.Size() && cached.modifiedNS == modifiedNS {
+		return cached.valid, cached.reason
+	}
+	valid, reason := validateJSONArtifact(path)
+	s.artifactMu.Lock()
+	s.artifactCache[path] = artifactCacheEntry{size: info.Size(), modifiedNS: modifiedNS, valid: valid, reason: reason}
+	s.artifactMu.Unlock()
+	return valid, reason
+}
+
 func artifactStatuses(book store.Book, runs []store.StageRun) []ArtifactStatus {
+	return collectArtifactStatuses(book, runs, validateJSONArtifact)
+}
+
+func (s *Service) artifactStatuses(book store.Book, runs []store.StageRun) []ArtifactStatus {
+	return collectArtifactStatuses(book, runs, s.validateJSONArtifact)
+}
+
+func collectArtifactStatuses(book store.Book, runs []store.StageRun, validate func(string) (bool, string)) []ArtifactStatus {
 	var out []ArtifactStatus
 	seen := map[string]bool{}
 	for _, r := range runs {
@@ -520,15 +623,9 @@ func artifactStatuses(book store.Book, runs []store.StageRun) []ArtifactStatus {
 			continue // done-book scratch purge intentionally invalidates the splitting sentinel
 		}
 		seen[r.Stage] = true
-		path := filepath.Join(book.WorkDir, "_done", r.Stage+".json")
-		raw, err := os.ReadFile(path) //nolint:gosec // path is constrained to the stored book work dir and known sentinel name
-		var sentinel struct {
-			Stage string `json:"stage"`
-			Runs  int    `json:"runs"`
-			At    string `json:"at"`
-		}
-		decodeErr := json.Unmarshal(raw, &sentinel)
-		valid := err == nil && decodeErr == nil && sentinel.Stage == r.Stage && sentinel.Runs > 0 && sentinel.At != ""
+		path := scheduler.SentinelPath(book.WorkDir, r.Stage)
+		sentinel, err := scheduler.ReadSentinel(book.WorkDir, r.Stage)
+		valid := err == nil && sentinel.Stage == r.Stage && sentinel.Runs > 0 && sentinel.At != ""
 		reason := ""
 		if err != nil {
 			reason = err.Error()
@@ -538,14 +635,7 @@ func artifactStatuses(book store.Book, runs []store.StageRun) []ArtifactStatus {
 		out = append(out, ArtifactStatus{Stage: r.Stage, StageRunID: r.ID, Path: path, Valid: valid, Reason: reason})
 		for _, rel := range requiredArtifacts[r.Stage] {
 			p := filepath.Join(book.WorkDir, rel)
-			artifact, e := os.ReadFile(p) //nolint:gosec // rel comes from the compiled required-artifact allow-list
-			ok := e == nil && len(artifact) > 0 && json.Valid(artifact)
-			why := ""
-			if e != nil {
-				why = e.Error()
-			} else if !ok {
-				why = "artifact is empty or invalid JSON"
-			}
+			ok, why := validate(p)
 			out = append(out, ArtifactStatus{Stage: r.Stage, StageRunID: r.ID, Path: p, Valid: ok, Reason: why})
 		}
 	}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ApiClient } from '@/lib/apiClient';
 import { ApiError } from '@/lib/apiClient';
 import type {
@@ -33,6 +33,16 @@ import { CoreProposalModal } from '../running/CoreProposalModal';
 // The elapsed clock is coarse (rows show whole minutes/seconds), so a 30s tick is
 // plenty and keeps the panel cheap.
 const CLOCK_TICK_MS = 30_000;
+const SUPERVISOR_REFRESH_DEBOUNCE_MS = 100;
+
+function newestRelevantBatch(books: BookView[]): string | undefined {
+  const active = books.filter((book) => !isDone(book));
+  const candidates = active.length > 0 ? active : books;
+  return candidates.reduce<BookView | undefined>(
+    (newest, book) => (!newest || book.id > newest.id ? book : newest),
+    undefined,
+  )?.batch_id;
+}
 
 interface RunningPanelProps {
   client: ApiClient;
@@ -51,6 +61,7 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
   const [supervisorStatus, setSupervisorStatus] = useState<SupervisorStatus | null>(null);
   const [incidents, setIncidents] = useState<SupervisorRun[]>([]);
   const [batchCosts, setBatchCosts] = useState<BatchCostSummary | null>(null);
+  const supervisorRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // The book whose core (add-work) proposal modal is open, or null when closed.
   const [coreBook, setCoreBook] = useState<BookView | null>(null);
   // A single shared clock driving every row's elapsed display (no per-row timer).
@@ -58,6 +69,21 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
   // Per-book counter of durable book-scoped SSE frames, giving BookRow a changing
   // prop that retriggers its throttled log refetch. See bumpBookEventCount.
   const [bookEventCounts, setBookEventCounts] = useState<Record<number, number>>({});
+
+  const refreshSupervisor = useCallback(
+    async (batchId?: string) => {
+      if (typeof client.supervisorStatus !== 'function') return;
+      const [status, recent, costs] = await Promise.all([
+        client.supervisorStatus(),
+        client.supervisorIncidents(batchId, 8),
+        batchId ? client.supervisorCosts(batchId) : Promise.resolve(null),
+      ]);
+      setSupervisorStatus(status);
+      setIncidents(recent.incidents);
+      setBatchCosts(costs);
+    },
+    [client],
+  );
 
   // Reload the books AND the daemon-total scratch gauge together. Fetching the
   // gauge here (not just on mount) keeps it fresh after an action - notably a
@@ -72,20 +98,7 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
       const liveIds = new Set(list.map((b) => b.id));
       setBookEventCounts((prev) => pruneBookEventCounts(prev, liveIds));
       setLoadError(null);
-      if (typeof client.supervisorStatus === 'function') {
-        const batchId = list.find((b) => b.batch_id)?.batch_id;
-        void Promise.all([
-          client.supervisorStatus(),
-          client.supervisorIncidents(batchId, 8),
-          batchId ? client.supervisorCosts(batchId) : Promise.resolve(null),
-        ])
-          .then(([status, recent, costs]) => {
-            setSupervisorStatus(status);
-            setIncidents(recent.incidents);
-            setBatchCosts(costs);
-          })
-          .catch(() => undefined);
-      }
+      void refreshSupervisor(newestRelevantBatch(list)).catch(() => undefined);
     } catch (err) {
       setLoadError(err instanceof ApiError ? err.message : 'Could not load the pipeline.');
     }
@@ -95,7 +108,7 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
     } catch {
       // A gauge read failure is non-fatal; leave the previous value.
     }
-  }, [client]);
+  }, [client, refreshSupervisor]);
 
   useEffect(() => {
     void load();
@@ -106,6 +119,13 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
     const timer = setInterval(() => setNow(Date.now()), CLOCK_TICK_MS);
     return () => clearInterval(timer);
   }, []);
+
+  useEffect(
+    () => () => {
+      if (supervisorRefreshTimer.current) clearTimeout(supervisorRefreshTimer.current);
+    },
+    [],
+  );
 
   // Live-update from the SSE hub. book.state/stage.progress patch existing rows;
   // queue.stats feeds the header strip. Every durable book-scoped frame also bumps
@@ -137,10 +157,18 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
         setBooks((prev) => (prev ? applyEtaUpdate(prev, ev) : prev));
         setQueueSeconds(ev.queue_seconds);
       } else if (type === 'supervisor.decision') {
-        void load();
+        const run = data as SupervisorRun;
+        setIncidents((previous) =>
+          [run, ...previous.filter((item) => item.id !== run.id)].slice(0, 8),
+        );
+        if (supervisorRefreshTimer.current) clearTimeout(supervisorRefreshTimer.current);
+        supervisorRefreshTimer.current = setTimeout(() => {
+          supervisorRefreshTimer.current = null;
+          void refreshSupervisor(run.batch_id).catch(() => undefined);
+        }, SUPERVISOR_REFRESH_DEBOUNCE_MS);
       }
     },
-    [load],
+    [refreshSupervisor],
   );
 
   useEventStream(apiBase, token, { onEvent });
@@ -287,7 +315,9 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
               getEvents={getEvents}
               onCompleteCoreProposal={handleCompleteCoreProposal}
               onAskSupervisor={handleAskSupervisor}
-              modelSupervisorEnabled={!!supervisorStatus?.model_assisted}
+              modelSupervisorEnabled={
+                !!(supervisorStatus?.model_assisted && supervisorStatus.model_available)
+              }
             />
           ))}
         </div>

@@ -142,7 +142,9 @@ func (e *Executor) AgentStatus() agent.Availability {
 // invocations. Only the supervisor wiring calls this, and only when the explicit
 // allow_backend_failover configuration gate is enabled.
 func (e *Executor) ActivateFallback(ctx context.Context, backend, model string) error {
+	e.mu.Lock()
 	sel := e.agentSelect
+	e.mu.Unlock()
 	sel.Backend = backend
 	r, av, err := agent.Select(ctx, sel, e.secrets)
 	if err != nil {
@@ -338,7 +340,9 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 		// fires only while the child is running (never during rate-limit backoff).
 		Heartbeat: func(elapsed time.Duration) {
 			if e.db != nil {
-				_ = e.db.TouchOpenStageRun(context.WithoutCancel(ctx), book.ID, string(stage), false)
+				if err := e.db.TouchOpenStageRun(context.WithoutCancel(ctx), book.ID, string(stage), false); err != nil {
+					e.log.Warn("agent: persist heartbeat", "book", book.ID, "stage", string(stage), "err", err)
+				}
 			}
 			if r.Note != nil {
 				r.Note(fmt.Sprintf("%s: still running (%s elapsed)", stage, humanDuration(elapsed)))
@@ -346,7 +350,9 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 		},
 		Process: func(pid int, active bool) {
 			if e.db != nil {
-				_ = e.db.SetOpenStageRunProcess(context.WithoutCancel(ctx), book.ID, string(stage), pid, active)
+				if err := e.db.SetOpenStageRunProcess(context.WithoutCancel(ctx), book.ID, string(stage), pid, active); err != nil {
+					e.log.Warn("agent: persist process liveness", "book", book.ID, "stage", string(stage), "pid", pid, "active", active, "err", err)
+				}
 			}
 		},
 	}

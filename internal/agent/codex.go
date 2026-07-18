@@ -33,6 +33,10 @@ func newCodexRunner(explicit string, sec secrets.Store) *codexRunner {
 
 func (r *codexRunner) ID() string { return IDCodex }
 
+// Codex read-only sandboxing prevents edits but still permits file inspection, so
+// it is not an enforced no-tools boundary for bounded model supervision.
+func (r *codexRunner) EnforcesNoTools() bool { return false }
+
 // SupportsWeb is true: codex exec enables live web search via the documented config
 // override `-c web_search="live"` (the current top-level `web_search` key, string
 // modes disabled|cached|indexed|live). Verified against the Codex config reference
@@ -127,26 +131,27 @@ func (r *codexRunner) Run(ctx context.Context, req Request) (Result, error) {
 		process:   req.Process,
 	})
 
+	usage, lastAgentMsg, failDetail := parseCodexStream(stdout)
+	usage.Model = req.Model
+	result := Result{Text: lastAgentMsg, Usage: usage}
 	if errors.Is(runErr, errTimeout) {
-		return Result{}, fmt.Errorf("codex timed out after %s", req.Timeout)
+		return result, fmt.Errorf("codex timed out after %s", req.Timeout)
 	}
 	if runErr != nil && ctx.Err() != nil {
-		return Result{}, ctx.Err()
+		return result, ctx.Err()
 	}
-
-	usage, lastAgentMsg, failDetail := parseCodexStream(stdout)
 
 	if failDetail != "" {
 		if isRateLimit(failDetail) {
-			return Result{}, newRateLimitError(failDetail, time.Now())
+			return result, newRateLimitError(failDetail, time.Now())
 		}
-		return Result{}, fmt.Errorf("codex turn failed: %s", truncate(failDetail))
+		return result, fmt.Errorf("codex turn failed: %s", truncate(failDetail))
 	}
 	if isRateLimit(stderr) {
-		return Result{}, newRateLimitError(firstNonEmpty(stderr, stdout), time.Now())
+		return result, newRateLimitError(firstNonEmpty(stderr, stdout), time.Now())
 	}
 	if runErr != nil {
-		return Result{}, fmt.Errorf("codex exited: %w: %s", runErr, truncate(firstNonEmpty(stderr, stdout)))
+		return result, fmt.Errorf("codex exited: %w: %s", runErr, truncate(firstNonEmpty(stderr, stdout)))
 	}
 
 	text := lastAgentMsg
@@ -154,7 +159,6 @@ func (r *codexRunner) Run(ctx context.Context, req Request) (Result, error) {
 		text = strings.TrimSpace(string(fileText))
 	}
 
-	usage.Model = req.Model
 	return Result{Text: text, Usage: usage}, nil
 }
 
