@@ -10,6 +10,7 @@ const agent: AgentConfig = {
   backend: '',
   concurrency: 2,
   timeout_minutes: 60,
+  book_budget_usd: 75,
   claude_models: {},
   openai_models: {},
 };
