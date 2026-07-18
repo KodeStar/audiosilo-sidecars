@@ -15,6 +15,7 @@ describe('PIPELINE_EVENTS', () => {
       'queue.stats',
       'eta.update',
       'contrib.update',
+      'supervisor.decision',
     ]);
   });
 });

@@ -6,6 +6,7 @@ import { ChangePasswordForm } from './settings/ChangePasswordForm';
 import { SecretRow } from './settings/SecretRow';
 import { AgentSettingsForm } from './settings/AgentSettingsForm';
 import { ContributionSettingsForm } from './settings/ContributionSettingsForm';
+import { SupervisorSettingsForm } from './settings/SupervisorSettingsForm';
 
 interface SettingsPanelProps {
   client: ApiClient;
@@ -148,6 +149,11 @@ export function SettingsPanel({ client }: SettingsPanelProps) {
       <Card>
         <SectionTitle>Contribution</SectionTitle>
         <ContributionSettingsForm client={client} initial={settings.contribution} />
+      </Card>
+
+      <Card>
+        <SectionTitle>Batch supervisor</SectionTitle>
+        <SupervisorSettingsForm client={client} initial={settings.supervisor} />
       </Card>
     </div>
   );

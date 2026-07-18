@@ -44,6 +44,26 @@ export interface AgentInfo {
   detail?: string;
 }
 
+export interface SupervisorRuntime {
+  active_books: Record<string, boolean>;
+  agent_active: number;
+  agent_capacity: number;
+  eligible_agent_books: number;
+  eligible_agent_book_ids?: number[];
+}
+
+export interface SupervisorStatus {
+  state: string;
+  enabled: boolean;
+  automatic_actions: boolean;
+  model_assisted: boolean;
+  model_available: boolean;
+  allow_backend_failover: boolean;
+  last_check_at?: string;
+  last_error?: string;
+  runtime: SupervisorRuntime;
+}
+
 export interface SystemInfo {
   version: string;
   data_dir: string;
@@ -52,6 +72,7 @@ export interface SystemInfo {
   tools: ToolsInfo;
   asr: AsrInfo;
   agent: AgentInfo;
+  supervisor?: SupervisorStatus;
   // Daemon-total on-disk scratch (sum of every book's work dir), the disk gauge.
   scratch_bytes: number;
 }
@@ -90,6 +111,14 @@ export interface ContributionConfig {
   poll_minutes: number;
 }
 
+export interface SupervisorConfig {
+  enabled: boolean;
+  automatic_actions: boolean;
+  model_assisted: boolean;
+  model_automatic_actions: boolean;
+  allow_backend_failover: boolean;
+}
+
 export interface Settings {
   listen: string;
   cors_origins: string[];
@@ -97,6 +126,7 @@ export interface Settings {
   asr: AsrConfig;
   agent: AgentConfig;
   contribution: ContributionConfig;
+  supervisor: SupervisorConfig;
 }
 
 // ContributionUpdate is the optional contribution envelope of PUT /settings. Each
@@ -122,6 +152,8 @@ export interface AgentUpdate {
   openai_models?: Record<string, string>;
 }
 
+export type SupervisorUpdate = Partial<SupervisorConfig>;
+
 // Keys understood by PUT /settings. A non-empty secret string sets it, an empty
 // string clears it, an omitted key is left untouched.
 export interface SettingsUpdate {
@@ -129,6 +161,7 @@ export interface SettingsUpdate {
   secrets?: Partial<Record<keyof SecretsPresence, string>>;
   agent?: AgentUpdate;
   contribution?: ContributionUpdate;
+  supervisor?: SupervisorUpdate;
 }
 
 export interface ChangePasswordBody {
@@ -349,6 +382,7 @@ export interface ContributionRow {
 
 export interface BookView {
   id: number;
+  batch_id?: string;
   source_path: string;
   title: string;
   authors: string[];
@@ -418,7 +452,15 @@ export interface StageRun {
   model: string;
   input_tokens: number;
   output_tokens: number;
+  cache_read_tokens?: number;
   cost_usd: number;
+  cost_reported?: boolean;
+  estimated_api_cost_usd?: number;
+  estimate_complete?: boolean;
+  heartbeat_at?: string;
+  progress_at?: string;
+  process_id?: number;
+  process_active?: boolean;
 }
 
 // BookDetail is GET /books/{id}: a BookView plus the per-execution stage-run ledger
@@ -476,7 +518,59 @@ export interface BookCreateResult {
 }
 
 export interface CreateBooksResponse {
+  batch_id: string;
   results: BookCreateResult[];
+}
+
+export interface SupervisorRun {
+  id: number;
+  incident_key?: string;
+  batch_id: string;
+  book_id?: number;
+  stage_run_id?: number;
+  trigger: string;
+  diagnosis: string;
+  confidence: number;
+  evidence: string[];
+  decision: string;
+  selected_action: string;
+  suggested_retry_limit: number;
+  suggested_termination_limit: number;
+  action_outcome: string;
+  automatic: boolean;
+  approval_required: boolean;
+  state: string;
+  model?: string;
+  backend?: string;
+  model_calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+  provider_cost_usd?: number;
+  provider_cost_complete: boolean;
+  estimated_api_cost_usd?: number;
+  estimate_complete: boolean;
+  pricing_version?: string;
+  started_at: string;
+  completed_at?: string;
+}
+
+export interface BatchCostSummary {
+  batch_id: string;
+  production_reported_usd: number;
+  production_reported_incomplete: boolean;
+  production_estimated_api_usd: number;
+  production_estimate_incomplete: boolean;
+  book_supervisor_reported_usd: number;
+  book_supervisor_estimated_api_usd: number;
+  batch_supervisor_reported_usd: number;
+  batch_supervisor_estimated_api_usd: number;
+  supervisor_reported_incomplete: boolean;
+  supervisor_estimate_incomplete: boolean;
+  overall_reported_usd: number;
+  overall_reported_incomplete: boolean;
+  overall_estimated_api_usd: number;
+  overall_estimate_incomplete: boolean;
 }
 
 export interface ListBooksResponse {

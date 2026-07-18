@@ -43,6 +43,10 @@ const (
 	// human decision: raise the budget in config.yaml (restart to apply), then Retry -
 	// so, unlike the transient agent parks, it carries no auto-readmit time.
 	ParkBudgetExceeded ParkCode = "budget_exceeded"
+	// Supervisor containment parks never authorize content/code changes; a human
+	// may inspect the persisted decision and explicitly Retry when satisfied.
+	ParkSupervisorEscalated ParkCode = "supervisor_escalated"
+	ParkSupervisorBudget    ParkCode = "supervisor_budget"
 )
 
 // IsParkedWith reports whether a book carrying the given status/park code is parked

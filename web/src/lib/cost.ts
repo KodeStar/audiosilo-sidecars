@@ -29,7 +29,13 @@ export function formatCost(n: number): string {
 // hasSpend reports whether a run recorded any agent usage (tokens or cost), i.e.
 // it is an agent stage that actually ran, not a mechanical/ASR stage.
 export function hasSpend(run: StageRun): boolean {
-  return run.input_tokens > 0 || run.output_tokens > 0 || run.cost_usd > 0;
+  return (
+    run.input_tokens > 0 ||
+    run.output_tokens > 0 ||
+    (run.cache_read_tokens ?? 0) > 0 ||
+    run.cost_usd > 0 ||
+    run.estimated_api_cost_usd !== undefined
+  );
 }
 
 // agentSpendRuns filters a book's runs to those with recorded agent usage, in the
@@ -39,8 +45,47 @@ export function agentSpendRuns(runs: StageRun[]): StageRun[] {
   return runs.filter(hasSpend);
 }
 
-// bookTotalCost sums cost_usd across every run of a book. Codex runs contribute 0,
-// so the total is a Claude-cost figure until a codex pricing feed exists.
+// bookTotalCost is the backward-compatible provider-reported subtotal used by older
+// cards. Detailed ledgers use bookCostSummary so an unavailable provider figure is
+// shown separately from a configured API-equivalent estimate.
 export function bookTotalCost(runs: StageRun[]): number {
   return runs.reduce((sum, r) => sum + (Number.isFinite(r.cost_usd) ? r.cost_usd : 0), 0);
+}
+
+export function formatRunCost(run: StageRun): string {
+  if (run.cost_reported === true || (run.cost_reported === undefined && run.cost_usd > 0)) {
+    return `${formatCost(run.cost_usd)} reported`;
+  }
+  if (run.cost_usd > 0) {
+    return `${formatCost(run.cost_usd)} reported (partial)`;
+  }
+  if (run.estimated_api_cost_usd !== undefined) {
+    return `${formatCost(run.estimated_api_cost_usd)} API-equivalent estimate${run.estimate_complete === false ? ' (partial)' : ''}`;
+  }
+  return hasSpend(run) ? 'cost unavailable' : '-';
+}
+
+export interface BookCostSummary {
+  reported: number;
+  estimated: number;
+  reportedIncomplete: boolean;
+  estimateIncomplete: boolean;
+}
+
+export function bookCostSummary(runs: StageRun[]): BookCostSummary {
+  return runs.reduce<BookCostSummary>(
+    (total, run) => {
+      if (!hasSpend(run)) return total;
+      total.reported += Number.isFinite(run.cost_usd) ? run.cost_usd : 0;
+      total.estimated += Number.isFinite(run.estimated_api_cost_usd)
+        ? (run.estimated_api_cost_usd ?? 0)
+        : 0;
+      const legacyReported = run.cost_reported === undefined && run.cost_usd > 0;
+      total.reportedIncomplete ||= run.cost_reported !== true && !legacyReported;
+      total.estimateIncomplete ||=
+        run.estimated_api_cost_usd === undefined || run.estimate_complete === false;
+      return total;
+    },
+    { reported: 0, estimated: 0, reportedIncomplete: false, estimateIncomplete: false },
+  );
 }

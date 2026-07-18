@@ -59,7 +59,9 @@ type claudeUsage struct {
 // omitted when empty so the CLI default applies.
 func (c *claudeRunner) buildArgs(req Request) []string {
 	tools := baseAllowedTools
-	if req.Web {
+	if req.NoTools {
+		tools = ""
+	} else if req.Web {
 		tools += "," + webTools
 	}
 	turns := req.MaxTurns
@@ -111,6 +113,7 @@ func (c *claudeRunner) Run(ctx context.Context, req Request) (Result, error) {
 		stdin:     req.Prompt,
 		timeout:   req.Timeout,
 		heartbeat: req.Heartbeat,
+		process:   req.Process,
 	})
 
 	if errors.Is(runErr, errTimeout) {
@@ -143,12 +146,13 @@ func (c *claudeRunner) Run(ctx context.Context, req Request) (Result, error) {
 	return Result{
 		Text: res.Result,
 		Usage: Usage{
-			Model:     req.Model,
-			Input:     res.Usage.InputTokens,
-			Output:    res.Usage.OutputTokens,
-			CacheRead: res.Usage.CacheReadInputTokens,
-			CostUSD:   res.TotalCostUSD,
-			Turns:     res.NumTurns,
+			Model:        req.Model,
+			Input:        res.Usage.InputTokens,
+			Output:       res.Usage.OutputTokens,
+			CacheRead:    res.Usage.CacheReadInputTokens,
+			CostUSD:      res.TotalCostUSD,
+			CostReported: true,
+			Turns:        res.NumTurns,
 		},
 	}, nil
 }

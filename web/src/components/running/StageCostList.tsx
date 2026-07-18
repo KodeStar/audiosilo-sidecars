@@ -1,5 +1,11 @@
 import type { StageRun } from '@/api/types';
-import { agentSpendRuns, bookTotalCost, formatCost, formatTokens } from '@/lib/cost';
+import {
+  agentSpendRuns,
+  bookCostSummary,
+  formatCost,
+  formatRunCost,
+  formatTokens,
+} from '@/lib/cost';
 import { stateLabel } from '@/lib/pipelineState';
 
 // StageCostList renders a book's agent-stage spend: one compact line per stage with
@@ -10,7 +16,7 @@ export function StageCostList({ runs }: { runs: StageRun[] }) {
   if (spend.length === 0) {
     return <p className="text-xs text-dim">No agent spend recorded yet.</p>;
   }
-  const total = bookTotalCost(runs);
+  const total = bookCostSummary(runs);
   return (
     <div className="flex flex-col gap-1 text-xs">
       {spend.map((r) => (
@@ -19,13 +25,20 @@ export function StageCostList({ runs }: { runs: StageRun[] }) {
           <span className="font-mono text-dim">{r.model || '-'}</span>
           <span className="text-dim">
             {formatTokens(r.input_tokens)} in / {formatTokens(r.output_tokens)} out
+            {(r.cache_read_tokens ?? 0) > 0 &&
+              ` / ${formatTokens(r.cache_read_tokens ?? 0)} cached`}
           </span>
-          <span className="ml-auto font-mono text-body">{formatCost(r.cost_usd)}</span>
+          <span className="ml-auto font-mono text-body">{formatRunCost(r)}</span>
         </div>
       ))}
       <div className="mt-1 flex items-baseline justify-between border-t border-edge/50 pt-1">
         <span className="text-dim">Total</span>
-        <span className="font-mono font-semibold text-hi">{formatCost(total)}</span>
+        <span className="text-right font-mono font-semibold text-hi">
+          {formatCost(total.reported)} reported{total.reportedIncomplete ? ' (partial)' : ''}
+          <br />
+          {formatCost(total.estimated)} API-equivalent
+          {total.estimateIncomplete ? ' (partial)' : ''}
+        </span>
       </div>
     </div>
   );

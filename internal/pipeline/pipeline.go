@@ -41,6 +41,7 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/asr"
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
+	"github.com/kodestar/audiosilo-sidecars/internal/pricing"
 	"github.com/kodestar/audiosilo-sidecars/internal/qa"
 	"github.com/kodestar/audiosilo-sidecars/internal/repair"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
@@ -116,6 +117,7 @@ type Config struct {
 	// this, before spending more. 0 disables the guard (config seeds a large default; set
 	// a very large value to effectively disable). From config.agent.book_budget_usd.
 	BookBudgetUSD float64
+	Pricing       pricing.Table
 	Secrets       secrets.Store
 
 	// Contribution (M7) drives the contributing stage. Meta resolves a book's work
@@ -164,6 +166,7 @@ type Executor struct {
 	agentWorkers  int
 	agentSlots    chan struct{}
 	bookBudgetUSD float64
+	pricing       pricing.Table
 	secrets       secrets.Store
 	log           *slog.Logger
 	fallback      scheduler.Executor
@@ -223,6 +226,7 @@ func NewExecutor(cfg Config) *Executor {
 		agentWorkers:  agentWorkers,
 		agentSlots:    make(chan struct{}, agentWorkers),
 		bookBudgetUSD: cfg.BookBudgetUSD,
+		pricing:       cfg.Pricing,
 		secrets:       cfg.Secrets,
 		log:           log,
 		fallback:      cfg.Fallback,

@@ -121,6 +121,7 @@ type bookCreateResult struct {
 }
 
 type createBooksResponse struct {
+	BatchID string             `json:"batch_id"`
 	Results []bookCreateResult `json:"results"`
 }
 
@@ -134,6 +135,11 @@ func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	batch, err := a.store.CreateBatch(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not create batch")
+		return
+	}
 	// Enforce the same library_roots allow-list scans use (empty list = allow any
 	// local path), so a book can only be enqueued from a permitted location.
 	roots := a.snapshot().LibraryRoots
@@ -157,6 +163,7 @@ func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
 			sources = map[string]string{}
 		}
 		nb := store.NewBook{
+			BatchID:         batch.ID,
 			SourcePath:      sp,
 			WorkDir:         store.DeriveWorkDir(a.workRoot(), sp, c.Title),
 			Title:           strings.TrimSpace(c.Title),
@@ -188,7 +195,7 @@ func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
 	if created > 0 {
 		a.sched.Notify()
 	}
-	writeJSON(w, http.StatusOK, createBooksResponse{Results: results})
+	writeJSON(w, http.StatusOK, createBooksResponse{BatchID: batch.ID, Results: results})
 }
 
 // workRoot is the daemon's per-book scratch-dir root (<data>/work). The
@@ -203,6 +210,7 @@ func (a *API) workRoot() string {
 // mirror the state->lane table.
 type bookView struct {
 	ID              int64             `json:"id"`
+	BatchID         string            `json:"batch_id"`
 	SourcePath      string            `json:"source_path"`
 	Title           string            `json:"title"`
 	Authors         []string          `json:"authors"`
@@ -321,7 +329,7 @@ func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64
 		contribution = &contributionSummaryView{Status: status, URL: url}
 	}
 	return bookView{
-		ID: b.ID, SourcePath: b.SourcePath, Title: b.Title, Authors: authors,
+		ID: b.ID, BatchID: b.BatchID, SourcePath: b.SourcePath, Title: b.Title, Authors: authors,
 		Series: b.Series, SeriesPos: b.SeriesPos, ASIN: b.ASIN, ISBN: b.ISBN,
 		IdentitySources: idsrc, WorkID: b.WorkID,
 		State: b.State, Lane: string(state.LaneOf(state.State(b.State))),

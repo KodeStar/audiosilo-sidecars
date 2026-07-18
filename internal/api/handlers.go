@@ -10,6 +10,7 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/config"
 	"github.com/kodestar/audiosilo-sidecars/internal/events"
 	"github.com/kodestar/audiosilo-sidecars/internal/secrets"
+	"github.com/kodestar/audiosilo-sidecars/internal/supervisor"
 )
 
 // --- auth ---
@@ -103,7 +104,8 @@ type systemResponse struct {
 	Agent AgentInfo `json:"agent"`
 	// ScratchBytes is the daemon-total on-disk scratch (the sum of every book's
 	// work dir under <data>/work), the disk gauge the UI shows.
-	ScratchBytes int64 `json:"scratch_bytes"`
+	ScratchBytes int64              `json:"scratch_bytes"`
+	Supervisor   *supervisor.Status `json:"supervisor,omitempty"`
 }
 
 // tabs is the static tab list. Library/Running/Settings are functional as of
@@ -135,6 +137,11 @@ func (a *API) handleSystem(w http.ResponseWriter, r *http.Request) {
 	if a.agentStatus != nil {
 		agentInfo = a.agentStatus()
 	}
+	var supervisorInfo *supervisor.Status
+	if a.supervisor != nil {
+		v := a.supervisor.Status()
+		supervisorInfo = &v
+	}
 	writeJSON(w, http.StatusOK, systemResponse{
 		Version:      a.version,
 		DataDir:      a.dataDir,
@@ -144,6 +151,7 @@ func (a *API) handleSystem(w http.ResponseWriter, r *http.Request) {
 		ASR:          asrInfo,
 		Agent:        agentInfo,
 		ScratchBytes: scratchTotal,
+		Supervisor:   supervisorInfo,
 	})
 }
 
@@ -169,6 +177,14 @@ type contributionView struct {
 	PollMinutes int    `json:"poll_minutes"`
 }
 
+type supervisorView struct {
+	Enabled               bool `json:"enabled"`
+	AutomaticActions      bool `json:"automatic_actions"`
+	ModelAssisted         bool `json:"model_assisted"`
+	ModelAutomaticActions bool `json:"model_automatic_actions"`
+	AllowBackendFailover  bool `json:"allow_backend_failover"`
+}
+
 type settingsResponse struct {
 	Listen       string           `json:"listen"`
 	CORSOrigins  []string         `json:"cors_origins"`
@@ -176,6 +192,7 @@ type settingsResponse struct {
 	ASR          asrView          `json:"asr"`
 	Agent        agentView        `json:"agent"`
 	Contribution contributionView `json:"contribution"`
+	Supervisor   supervisorView   `json:"supervisor"`
 }
 
 // settingsView composes the read model. Secrets are presence booleans ONLY - the
@@ -213,6 +230,9 @@ func (a *API) settingsView() (settingsResponse, error) {
 			AutoPurge:   cfg.Contribution.AutoPurge,
 			PollMinutes: cfg.Contribution.PollMinutes,
 		},
+		Supervisor: supervisorView{Enabled: cfg.Supervisor.Enabled, AutomaticActions: cfg.Supervisor.AutomaticActions,
+			ModelAssisted: cfg.Supervisor.ModelAssisted, ModelAutomaticActions: cfg.Supervisor.ModelAutomaticActions,
+			AllowBackendFailover: cfg.Supervisor.AllowBackendFailover},
 	}, nil
 }
 
@@ -245,6 +265,33 @@ type settingsUpdate struct {
 	Secrets      map[string]string   `json:"secrets"`
 	Agent        *agentUpdate        `json:"agent"`
 	Contribution *contributionUpdate `json:"contribution"`
+	Supervisor   *supervisorUpdate   `json:"supervisor"`
+}
+
+type supervisorUpdate struct {
+	Enabled               *bool `json:"enabled"`
+	AutomaticActions      *bool `json:"automatic_actions"`
+	ModelAssisted         *bool `json:"model_assisted"`
+	ModelAutomaticActions *bool `json:"model_automatic_actions"`
+	AllowBackendFailover  *bool `json:"allow_backend_failover"`
+}
+
+func applySupervisorUpdate(cfg *config.SupervisorConfig, u *supervisorUpdate) {
+	if u.Enabled != nil {
+		cfg.Enabled = *u.Enabled
+	}
+	if u.AutomaticActions != nil {
+		cfg.AutomaticActions = *u.AutomaticActions
+	}
+	if u.ModelAssisted != nil {
+		cfg.ModelAssisted = *u.ModelAssisted
+	}
+	if u.ModelAutomaticActions != nil {
+		cfg.ModelAutomaticActions = *u.ModelAutomaticActions
+	}
+	if u.AllowBackendFailover != nil {
+		cfg.AllowBackendFailover = *u.AllowBackendFailover
+	}
 }
 
 // agentUpdate carries the optional agent-config mutations. Scalar fields are
@@ -318,7 +365,7 @@ func (a *API) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 	// Apply config-backed fields (cors_origins + agent) onto one copy, validate the
 	// whole thing, then persist. Agent maps replace wholesale when present; a nil map
 	// in the update leaves the existing map untouched.
-	if req.CORSOrigins != nil || req.Agent != nil || req.Contribution != nil {
+	if req.CORSOrigins != nil || req.Agent != nil || req.Contribution != nil || req.Supervisor != nil {
 		next := a.snapshot()
 		if req.CORSOrigins != nil {
 			origins := *req.CORSOrigins
@@ -332,6 +379,9 @@ func (a *API) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.Contribution != nil {
 			applyContributionUpdate(&next.Contribution, req.Contribution)
+		}
+		if req.Supervisor != nil {
+			applySupervisorUpdate(&next.Supervisor, req.Supervisor)
 		}
 		if err := next.Validate(); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())

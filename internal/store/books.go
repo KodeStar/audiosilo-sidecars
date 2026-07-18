@@ -96,6 +96,7 @@ var ErrDuplicate = errors.New("duplicate source_path")
 // store never interprets them); internal/state owns their meaning.
 type Book struct {
 	ID         int64
+	BatchID    string
 	SourcePath string
 	WorkDir    string
 	Title      string
@@ -143,6 +144,7 @@ type Book struct {
 // NewBook is the input to CreateBook: the identity/metadata fields a caller
 // supplies. State defaults to "queued".
 type NewBook struct {
+	BatchID    string
 	SourcePath string
 	WorkDir    string
 	Title      string
@@ -215,13 +217,17 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 	if st == "" {
 		st = "queued"
 	}
+	batchID := nb.BatchID
+	if batchID == "" {
+		batchID = LegacyBatchID
+	}
 	now := timestamp(nowFn())
 	res, err := db.sql.ExecContext(ctx,
 		`INSERT INTO books
-		 (source_path, work_dir, title, authors, narrators, series, series_pos, asin, isbn,
+		 (batch_id, source_path, work_dir, title, authors, narrators, series, series_pos, asin, isbn,
 		  identity_sources, work_id, state, status, error, coverage, created_at, updated_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'','',?,?,?)`,
-		nb.SourcePath, nb.WorkDir, nb.Title, authors, narrators, nb.Series, nb.SeriesPos,
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'','',?,?,?)`,
+		batchID, nb.SourcePath, nb.WorkDir, nb.Title, authors, narrators, nb.Series, nb.SeriesPos,
 		nb.ASIN, nb.ISBN, idsrc, nb.WorkID, st, string(nb.Coverage), now, now)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -237,6 +243,7 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 	// second round-trip SELECT: the row was just inserted from exactly these values.
 	return Book{
 		ID:              id,
+		BatchID:         batchID,
 		SourcePath:      nb.SourcePath,
 		WorkDir:         nb.WorkDir,
 		Title:           nb.Title,
@@ -255,14 +262,14 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 	}, nil
 }
 
-const bookCols = `id, source_path, work_dir, title, authors, narrators, series, series_pos,
+const bookCols = `id, batch_id, source_path, work_dir, title, authors, narrators, series, series_pos,
 	asin, isbn, identity_sources, work_id, state, status, error, coverage, scratch_bytes,
 	chapters, duration_sec, park_code, retry_at, created_at, updated_at`
 
 func scanBook(sc interface{ Scan(...any) error }) (Book, error) {
 	var b Book
 	var authors, narrators, idsrc, coverage string
-	if err := sc.Scan(&b.ID, &b.SourcePath, &b.WorkDir, &b.Title, &authors, &narrators,
+	if err := sc.Scan(&b.ID, &b.BatchID, &b.SourcePath, &b.WorkDir, &b.Title, &authors, &narrators,
 		&b.Series, &b.SeriesPos, &b.ASIN, &b.ISBN, &idsrc, &b.WorkID, &b.State, &b.Status,
 		&b.Error, &coverage, &b.ScratchBytes, &b.Chapters, &b.DurationSec, &b.ParkCode,
 		&b.RetryAt, &b.CreatedAt, &b.UpdatedAt); err != nil {

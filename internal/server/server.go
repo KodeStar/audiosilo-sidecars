@@ -29,6 +29,7 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/secrets"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
+	"github.com/kodestar/audiosilo-sidecars/internal/supervisor"
 	"github.com/kodestar/audiosilo-sidecars/internal/toolfetch"
 	"github.com/kodestar/audiosilo-sidecars/internal/web"
 )
@@ -217,6 +218,7 @@ func Run(ctx context.Context, opts Options) error {
 		AgentTimeout:     time.Duration(cfg.Agent.TimeoutMinutes) * time.Minute,
 		AgentConcurrency: cfg.Agent.Concurrency,
 		BookBudgetUSD:    cfg.Agent.BookBudgetUSD,
+		Pricing:          cfg.Pricing,
 		Secrets:          sec,
 		Log:              toolLog,
 		Fallback:         scheduler.NewStubExecutor(0, 0),
@@ -242,6 +244,60 @@ func Run(ctx context.Context, opts Options) error {
 			fmt.Fprintf(opts.Out, "[error] scheduler stopped: %v\n", err)
 		}
 	}()
+
+	// Supervision is a separate orchestration ledger/service, not a production stage.
+	// The deterministic monitor is safe by default; mutations/model calls remain behind
+	// explicit configuration gates.
+	var supervisorModel supervisor.Model
+	if cfg.Supervisor.ModelAssisted {
+		modelRunner := agentRunner
+		requestedBackend := cfg.Supervisor.ModelBackend
+		if requestedBackend != "" && (modelRunner == nil || modelRunner.ID() != requestedBackend) {
+			modelSelect := agentSelect
+			modelSelect.Backend = requestedBackend
+			if selected, available, selectErr := agent.Select(ctx, modelSelect, sec); selectErr == nil && selected != nil && available.Available {
+				modelRunner = selected
+			} else {
+				modelRunner = nil
+			}
+		}
+		supervisorDir := filepath.Join(opts.DataDir, "supervisor")
+		if err := os.MkdirAll(supervisorDir, 0o700); err != nil {
+			return fmt.Errorf("create supervisor context dir: %w", err)
+		}
+		if modelRunner != nil {
+			supervisorModel = supervisor.NewAgentModel(modelRunner, cfg.Supervisor.Model, supervisorDir,
+				time.Duration(cfg.Supervisor.TimeoutSeconds)*time.Second, cfg.Supervisor.MaxTurns, cfg.Pricing)
+		}
+	}
+	supervisorSvc := supervisor.New(db, cfg.Supervisor, cfg.Pricing, supervisorModel, supervisor.Hooks{
+		Runtime: func() supervisor.Runtime {
+			r := sched.SupervisorRuntime()
+			return supervisor.Runtime{ActiveBooks: r.ActiveBooks, AgentActive: r.AgentActive, AgentCapacity: r.AgentCapacity, EligibleAgentBooks: r.EligibleAgentBooks, EligibleAgentIDs: r.EligibleAgentIDs}
+		},
+		Apply: func(ctx context.Context, action supervisor.Action, incident supervisor.Incident) (string, error) {
+			if action == supervisor.ActionFallbackBackend {
+				if !cfg.Supervisor.AllowBackendFailover {
+					return "", errors.New("backend failover is not pre-approved")
+				}
+				if err := exec.ActivateFallback(ctx, cfg.Supervisor.FallbackBackend, cfg.Supervisor.FallbackModel); err != nil {
+					return "", err
+				}
+				sched.Notify()
+				return "pre-approved fallback backend activated within configured concurrency", nil
+			}
+			return sched.SupervisorApply(ctx, string(action), incident.BookID, incident.Stage)
+		},
+		Publish: func(eventType string, bookID int64, payload any) {
+			if bookID > 0 {
+				_ = hub.PublishBook(eventType, bookID, payload)
+			} else {
+				_ = hub.Publish(eventType, payload)
+			}
+		},
+	})
+	supervisorDone := make(chan struct{})
+	go func() { defer close(supervisorDone); supervisorSvc.Run(schedCtx) }()
 
 	// Contribution service (M7): the core add-work submit endpoint and the intake
 	// poller share it. It reaches the scheduler (re-admit) and the event hub (SSE)
@@ -285,6 +341,7 @@ func Run(ctx context.Context, opts Options) error {
 		DataDir:     opts.DataDir,
 		Store:       db,
 		Scheduler:   sched,
+		Supervisor:  supervisorSvc,
 		Scans:       scanMgr,
 		Meta:        metaClient,
 		Config:      cfg,
@@ -393,6 +450,7 @@ func Run(ctx context.Context, opts Options) error {
 	cancelSched()
 	<-schedDone
 	<-pollerDone
+	<-supervisorDone
 	// Drain and stop the durable event persister (its queue may hold late events).
 	persister.Close()
 	return runErr

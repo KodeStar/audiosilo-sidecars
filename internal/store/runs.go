@@ -23,18 +23,26 @@ import (
 // spend is spend, and a Retry must not erase a book's recorded cost. This replaced the
 // old DeleteStageSuccess, which DELETED the rows and destroyed the cost history.
 type StageRun struct {
-	ID           int64           `json:"id"`
-	BookID       int64           `json:"book_id"`
-	Stage        string          `json:"stage"`
-	Attempt      int             `json:"attempt"`
-	StartedAt    string          `json:"started_at"`
-	FinishedAt   string          `json:"finished_at"` // "" while running
-	Ok           *bool           `json:"ok"`
-	Metrics      json.RawMessage `json:"metrics"`
-	Model        string          `json:"model"`
-	InputTokens  int64           `json:"input_tokens"`
-	OutputTokens int64           `json:"output_tokens"`
-	CostUSD      float64         `json:"cost_usd"`
+	ID                  int64           `json:"id"`
+	BookID              int64           `json:"book_id"`
+	Stage               string          `json:"stage"`
+	Attempt             int             `json:"attempt"`
+	StartedAt           string          `json:"started_at"`
+	FinishedAt          string          `json:"finished_at"` // "" while running
+	Ok                  *bool           `json:"ok"`
+	Metrics             json.RawMessage `json:"metrics"`
+	Model               string          `json:"model"`
+	InputTokens         int64           `json:"input_tokens"`
+	OutputTokens        int64           `json:"output_tokens"`
+	CacheReadTokens     int64           `json:"cache_read_tokens"`
+	CostUSD             float64         `json:"cost_usd"`
+	CostReported        bool            `json:"cost_reported"`
+	EstimatedAPICostUSD *float64        `json:"estimated_api_cost_usd,omitempty"`
+	EstimateComplete    bool            `json:"estimate_complete"`
+	HeartbeatAt         string          `json:"heartbeat_at,omitempty"`
+	ProgressAt          string          `json:"progress_at,omitempty"`
+	ProcessID           int             `json:"process_id,omitempty"`
+	ProcessActive       bool            `json:"process_active"`
 	// Superseded is true when a Retry reset this stage: the run's success no longer
 	// counts for scheduling (round/fix counters, crash-resume set) but its cost still
 	// counts. Failed runs are never superseded.
@@ -45,10 +53,12 @@ type StageRun struct {
 // returns its id. attempt should be the 1-based count of prior runs of this
 // stage + 1 (the caller computes it from CountStageRuns).
 func (db *DB) StartStageRun(ctx context.Context, bookID int64, stage string, attempt int) (int64, error) {
+	started := timestamp(nowFn())
 	res, err := db.sql.ExecContext(ctx,
-		`INSERT INTO stage_runs (book_id, stage, attempt, started_at, metrics)
-		 VALUES (?,?,?,?, '{}')`,
-		bookID, stage, attempt, timestamp(nowFn()))
+		`INSERT INTO stage_runs
+		 (book_id, stage, attempt, started_at, metrics, cost_reported, estimate_complete, heartbeat_at, progress_at)
+		 VALUES (?,?,?,?, '{}', 1, 1, ?, ?)`,
+		bookID, stage, attempt, started, started, started)
 	if err != nil {
 		return 0, err
 	}
@@ -62,7 +72,7 @@ func (db *DB) FinishStageRun(ctx context.Context, runID int64, ok bool, metrics 
 		m = "{}"
 	}
 	res, err := db.sql.ExecContext(ctx,
-		`UPDATE stage_runs SET finished_at=?, ok=?, metrics=? WHERE id=?`,
+		`UPDATE stage_runs SET finished_at=?, ok=?, metrics=?, process_active=0 WHERE id=?`,
 		timestamp(nowFn()), boolToInt(ok), m, runID)
 	return checkAffected(res, err)
 }
@@ -85,14 +95,30 @@ func boolToInt(b bool) int {
 // spend. No open run for (book, stage) is a programming error (usage was reported
 // outside a started run) and returns a descriptive error naming the book and stage.
 func (db *DB) AddOpenStageRunUsage(ctx context.Context, bookID int64, stage, model string, in, out int64, cost float64) error {
+	return db.AddOpenStageRunUsageDetailed(ctx, bookID, stage, model, in, out, 0, cost, cost > 0, 0, false)
+}
+
+// AddOpenStageRunUsageDetailed preserves the provider/estimate distinction and cached
+// tokens for one invocation. estimatedKnown=false marks the run's estimate incomplete;
+// a later priced invocation cannot make an earlier unknown invocation disappear.
+func (db *DB) AddOpenStageRunUsageDetailed(ctx context.Context, bookID int64, stage, model string,
+	in, out, cached int64, providerCost float64, providerReported bool, estimated float64, estimatedKnown bool,
+) error {
 	res, err := db.sql.ExecContext(ctx,
 		`UPDATE stage_runs
 		 SET input_tokens = input_tokens + ?,
 		     output_tokens = output_tokens + ?,
+		     cache_read_tokens = cache_read_tokens + ?,
 		     cost_usd = cost_usd + ?,
+		     cost_reported = CASE WHEN ? THEN cost_reported ELSE 0 END,
+		     estimated_api_cost_usd = CASE
+		       WHEN ? THEN COALESCE(estimated_api_cost_usd, 0) + ?
+		       ELSE estimated_api_cost_usd END,
+		     estimate_complete = CASE WHEN ? THEN estimate_complete ELSE 0 END,
 		     model = CASE WHEN ? <> '' THEN ? ELSE model END
 		 WHERE book_id=? AND stage=? AND finished_at IS NULL`,
-		in, out, cost, model, model, bookID, stage)
+		in, out, cached, providerCost, providerReported,
+		estimatedKnown, estimated, estimatedKnown, model, model, bookID, stage)
 	if err != nil {
 		return err
 	}
@@ -104,6 +130,28 @@ func (db *DB) AddOpenStageRunUsage(ctx context.Context, bookID int64, stage, mod
 		return fmt.Errorf("AddOpenStageRunUsage: no open stage_run for book %d stage %q", bookID, stage)
 	}
 	return nil
+}
+
+// TouchOpenStageRun records either meaningful progress or a liveness heartbeat.
+func (db *DB) TouchOpenStageRun(ctx context.Context, bookID int64, stage string, progress bool) error {
+	now := timestamp(nowFn())
+	query := `UPDATE stage_runs SET heartbeat_at=? WHERE book_id=? AND stage=? AND finished_at IS NULL`
+	args := []any{now, bookID, stage}
+	if progress {
+		query = `UPDATE stage_runs SET heartbeat_at=?, progress_at=? WHERE book_id=? AND stage=? AND finished_at IS NULL`
+		args = []any{now, now, bookID, stage}
+	}
+	_, err := db.sql.ExecContext(ctx, query, args...)
+	return err
+}
+
+// SetOpenStageRunProcess tracks the actual CLI pid while an invocation is active.
+func (db *DB) SetOpenStageRunProcess(ctx context.Context, bookID int64, stage string, pid int, active bool) error {
+	_, err := db.sql.ExecContext(ctx,
+		`UPDATE stage_runs SET process_id=?, process_active=?, heartbeat_at=?
+		 WHERE book_id=? AND stage=? AND finished_at IS NULL`,
+		pid, boolToInt(active), timestamp(nowFn()), bookID, stage)
+	return err
 }
 
 // StageRunTotals returns the summed agent cost_usd per book across all stage runs,
@@ -142,6 +190,25 @@ func (db *DB) SumStageRunCost(ctx context.Context, bookID int64) (float64, error
 		return 0, err
 	}
 	return total, nil
+}
+
+// SumStageRunBudgetCost returns the best available expenditure basis for a book:
+// provider-reported cost when complete, otherwise a complete configured API-equivalent
+// estimate. complete=false means at least one token-bearing invocation had neither;
+// callers must not describe the returned known subtotal as the whole book cost.
+func (db *DB) SumStageRunBudgetCost(ctx context.Context, bookID int64) (cost float64, complete bool, err error) {
+	var unknown int
+	err = db.sql.QueryRowContext(ctx, `SELECT
+		COALESCE(SUM(CASE
+			WHEN cost_reported=1 THEN cost_usd
+			WHEN estimate_complete=1 AND estimated_api_cost_usd IS NOT NULL THEN estimated_api_cost_usd
+			ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN
+			(input_tokens+output_tokens+cache_read_tokens)>0 AND cost_reported=0 AND
+			(estimate_complete=0 OR estimated_api_cost_usd IS NULL)
+			THEN 1 ELSE 0 END),0)
+		FROM stage_runs WHERE book_id=?`, bookID).Scan(&cost, &unknown)
+	return cost, unknown == 0, err
 }
 
 // StageRunStarts returns each book's earliest stage-run start (MIN(started_at))
@@ -205,7 +272,8 @@ func (db *DB) CountStageSuccesses(ctx context.Context, bookID int64, stage strin
 }
 
 const runCols = `id, book_id, stage, attempt, started_at, finished_at, ok, metrics, ` +
-	`model, input_tokens, output_tokens, cost_usd, superseded`
+	`model, input_tokens, output_tokens, cost_usd, superseded, cache_read_tokens, ` +
+	`cost_reported, estimated_api_cost_usd, estimate_complete, heartbeat_at, progress_at, process_id, process_active`
 
 func scanRun(sc interface{ Scan(...any) error }) (StageRun, error) {
 	var r StageRun
@@ -213,11 +281,22 @@ func scanRun(sc interface{ Scan(...any) error }) (StageRun, error) {
 	var ok sql.NullInt64
 	var metrics string
 	var superseded int64
+	var costReported, estimateComplete, processActive int64
+	var estimated sql.NullFloat64
 	if err := sc.Scan(&r.ID, &r.BookID, &r.Stage, &r.Attempt, &r.StartedAt,
-		&finished, &ok, &metrics, &r.Model, &r.InputTokens, &r.OutputTokens, &r.CostUSD, &superseded); err != nil {
+		&finished, &ok, &metrics, &r.Model, &r.InputTokens, &r.OutputTokens, &r.CostUSD, &superseded,
+		&r.CacheReadTokens, &costReported, &estimated, &estimateComplete, &r.HeartbeatAt, &r.ProgressAt,
+		&r.ProcessID, &processActive); err != nil {
 		return StageRun{}, err
 	}
 	r.Superseded = superseded == 1
+	r.CostReported = costReported == 1
+	r.EstimateComplete = estimateComplete == 1
+	r.ProcessActive = processActive == 1
+	if estimated.Valid {
+		v := estimated.Float64
+		r.EstimatedAPICostUSD = &v
+	}
 	if finished.Valid {
 		r.FinishedAt = finished.String
 	}

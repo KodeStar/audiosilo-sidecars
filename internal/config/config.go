@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
+	"github.com/kodestar/audiosilo-sidecars/internal/pricing"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"gopkg.in/yaml.v3"
 )
@@ -44,6 +45,22 @@ const DefaultTimeoutMinutes = 60
 // $62 before parking). Set a very large value in config.yaml to effectively disable the
 // guard. Restart-to-apply, like the rest of agent.*.
 const DefaultBookBudgetUSD = 75.0
+
+const (
+	DefaultSupervisorIntervalSeconds = 30
+	DefaultSupervisorStaleMinutes    = 20
+	DefaultSupervisorNoProgressMins  = 30
+	DefaultSupervisorMaxStageMinutes = 180
+	DefaultSupervisorMaxAttempts     = 3
+	DefaultSupervisorMaxRepeats      = 2
+	DefaultSupervisorAttemptGrowth   = 3.0
+	DefaultSupervisorMaxModelCalls   = 1
+	DefaultSupervisorMaxTurns        = 8
+	DefaultSupervisorTimeoutSeconds  = 90
+	DefaultSupervisorCallsPerHour    = 4
+	DefaultSupervisorBookBudgetUSD   = 2.0
+	DefaultSupervisorBatchBudgetUSD  = 10.0
+)
 
 // Agent backend selector values. An empty backend means "auto" (claude when
 // detectable, else codex, else unavailable); the two explicit values force one
@@ -141,6 +158,38 @@ type AgentConfig struct {
 	OpenAI        map[string]string `yaml:"openai"` // agent-stage name -> model (empty = codex default)
 }
 
+// SupervisorConfig controls the bounded orchestration monitor. Enabled defaults on,
+// but AutomaticActions, ModelAssisted and backend failover default off. Thus an old
+// config gains cheap incident visibility without changing production scheduling.
+type SupervisorConfig struct {
+	Enabled               bool   `yaml:"enabled"`
+	AutomaticActions      bool   `yaml:"automatic_actions"`
+	ModelAssisted         bool   `yaml:"model_assisted"`
+	ModelAutomaticActions bool   `yaml:"model_automatic_actions"`
+	AllowBackendFailover  bool   `yaml:"allow_backend_failover"`
+	FallbackBackend       string `yaml:"fallback_backend"`
+	FallbackModel         string `yaml:"fallback_model"`
+
+	IntervalSeconds     int     `yaml:"interval_seconds"`
+	StaleMinutes        int     `yaml:"stale_heartbeat_minutes"`
+	NoProgressMinutes   int     `yaml:"no_progress_minutes"`
+	MaxStageMinutes     int     `yaml:"max_stage_minutes"`
+	MaxAttempts         int     `yaml:"max_attempts"`
+	MaxErrorRepeats     int     `yaml:"max_error_repeats"`
+	MaxStageTokens      int64   `yaml:"max_stage_tokens"`
+	MaxStageCostUSD     float64 `yaml:"max_stage_cost_usd"`
+	AttemptGrowthFactor float64 `yaml:"attempt_growth_factor"`
+
+	ModelBackend          string  `yaml:"model_backend"`
+	Model                 string  `yaml:"model"`
+	MaxModelCalls         int     `yaml:"max_model_calls"`
+	MaxTurns              int     `yaml:"max_turns"`
+	TimeoutSeconds        int     `yaml:"timeout_seconds"`
+	InvocationsPerHour    int     `yaml:"invocations_per_hour"`
+	PerBookBudgetUSD      float64 `yaml:"per_book_budget_usd"`
+	OverallBatchBudgetUSD float64 `yaml:"overall_batch_budget_usd"`
+}
+
 // ContributionConfig controls the contributing stage + the intake poller (M7). Mode
 // selects how a book's sidecars are published; Repo is the upstream meta repository
 // (owner/name); AutoPurge reclaims a book's scratch once it reaches done; PollMinutes
@@ -212,6 +261,11 @@ type Config struct {
 	// is live in M1).
 	ASR   ASRConfig   `yaml:"asr"`
 	Agent AgentConfig `yaml:"agent"`
+	// Pricing is versioned and operator supplied. Empty rates mean an unavailable
+	// estimate, never a zero-cost model call.
+	Pricing pricing.Table `yaml:"pricing"`
+	// Supervisor is orchestration-only and never appears in the pipeline state table.
+	Supervisor SupervisorConfig `yaml:"supervisor"`
 	// Contribution configures the contributing stage + intake poller (M7).
 	Contribution ContributionConfig `yaml:"contribution"`
 }
@@ -231,6 +285,23 @@ func Default() Config {
 			BookBudgetUSD:  DefaultBookBudgetUSD,
 			Claude:         defaultClaudeModels(),
 			OpenAI:         map[string]string{},
+		},
+		Pricing: pricing.Table{Version: "unconfigured-v1", Rates: map[string]pricing.Rate{}},
+		Supervisor: SupervisorConfig{
+			Enabled:               true,
+			IntervalSeconds:       DefaultSupervisorIntervalSeconds,
+			StaleMinutes:          DefaultSupervisorStaleMinutes,
+			NoProgressMinutes:     DefaultSupervisorNoProgressMins,
+			MaxStageMinutes:       DefaultSupervisorMaxStageMinutes,
+			MaxAttempts:           DefaultSupervisorMaxAttempts,
+			MaxErrorRepeats:       DefaultSupervisorMaxRepeats,
+			AttemptGrowthFactor:   DefaultSupervisorAttemptGrowth,
+			MaxModelCalls:         DefaultSupervisorMaxModelCalls,
+			MaxTurns:              DefaultSupervisorMaxTurns,
+			TimeoutSeconds:        DefaultSupervisorTimeoutSeconds,
+			InvocationsPerHour:    DefaultSupervisorCallsPerHour,
+			PerBookBudgetUSD:      DefaultSupervisorBookBudgetUSD,
+			OverallBatchBudgetUSD: DefaultSupervisorBatchBudgetUSD,
 		},
 		Contribution: ContributionConfig{
 			Mode:        DefaultContributionMode,
@@ -286,6 +357,10 @@ func Load(dataDir string) (Config, error) {
 	// how a user effectively disables the guard, so only the zero sentinel is normalized.
 	if cfg.Agent.BookBudgetUSD == 0 {
 		cfg.Agent.BookBudgetUSD = DefaultBookBudgetUSD
+	}
+	normalizeSupervisor(&cfg.Supervisor)
+	if cfg.Pricing.Rates == nil {
+		cfg.Pricing.Rates = map[string]pricing.Rate{}
 	}
 	// Normalize ASR defaults so an older/partial config.yaml (or one predating M3a)
 	// resolves to a working backend without an explicit edit.
@@ -383,6 +458,21 @@ func applyEnv(cfg *Config) {
 			cfg.Agent.BookBudgetUSD = f
 		}
 	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_SUPERVISOR_ENABLED"); ok {
+		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			cfg.Supervisor.Enabled = b
+		}
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_SUPERVISOR_AUTOMATIC_ACTIONS"); ok {
+		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			cfg.Supervisor.AutomaticActions = b
+		}
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_SUPERVISOR_MODEL_ASSISTED"); ok {
+		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			cfg.Supervisor.ModelAssisted = b
+		}
+	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_MODE"); ok {
 		cfg.Contribution.Mode = strings.TrimSpace(v)
 	}
@@ -416,6 +506,88 @@ func splitList(v string) []string {
 	return out
 }
 
+func normalizeSupervisor(c *SupervisorConfig) {
+	if c.IntervalSeconds == 0 {
+		c.IntervalSeconds = DefaultSupervisorIntervalSeconds
+	}
+	if c.StaleMinutes == 0 {
+		c.StaleMinutes = DefaultSupervisorStaleMinutes
+	}
+	if c.NoProgressMinutes == 0 {
+		c.NoProgressMinutes = DefaultSupervisorNoProgressMins
+	}
+	if c.MaxStageMinutes == 0 {
+		c.MaxStageMinutes = DefaultSupervisorMaxStageMinutes
+	}
+	if c.MaxAttempts == 0 {
+		c.MaxAttempts = DefaultSupervisorMaxAttempts
+	}
+	if c.MaxErrorRepeats == 0 {
+		c.MaxErrorRepeats = DefaultSupervisorMaxRepeats
+	}
+	if c.AttemptGrowthFactor == 0 {
+		c.AttemptGrowthFactor = DefaultSupervisorAttemptGrowth
+	}
+	if c.MaxModelCalls == 0 {
+		c.MaxModelCalls = DefaultSupervisorMaxModelCalls
+	}
+	if c.MaxTurns == 0 {
+		c.MaxTurns = DefaultSupervisorMaxTurns
+	}
+	if c.TimeoutSeconds == 0 {
+		c.TimeoutSeconds = DefaultSupervisorTimeoutSeconds
+	}
+	if c.InvocationsPerHour == 0 {
+		c.InvocationsPerHour = DefaultSupervisorCallsPerHour
+	}
+	if c.PerBookBudgetUSD == 0 {
+		c.PerBookBudgetUSD = DefaultSupervisorBookBudgetUSD
+	}
+	if c.OverallBatchBudgetUSD == 0 {
+		c.OverallBatchBudgetUSD = DefaultSupervisorBatchBudgetUSD
+	}
+}
+
+func validateSupervisor(c SupervisorConfig) error {
+	positive := map[string]int{
+		"interval_seconds":        c.IntervalSeconds,
+		"stale_heartbeat_minutes": c.StaleMinutes,
+		"no_progress_minutes":     c.NoProgressMinutes,
+		"max_stage_minutes":       c.MaxStageMinutes,
+		"max_attempts":            c.MaxAttempts,
+		"max_error_repeats":       c.MaxErrorRepeats,
+		"max_model_calls":         c.MaxModelCalls,
+		"max_turns":               c.MaxTurns,
+		"timeout_seconds":         c.TimeoutSeconds,
+		"invocations_per_hour":    c.InvocationsPerHour,
+	}
+	for name, value := range positive {
+		if value < 1 {
+			return fmt.Errorf("supervisor.%s must be >= 1, got %d", name, value)
+		}
+	}
+	if c.MaxStageTokens < 0 || c.MaxStageCostUSD < 0 || c.PerBookBudgetUSD < 0 || c.OverallBatchBudgetUSD < 0 {
+		return errors.New("supervisor token and cost limits must be >= 0")
+	}
+	if c.AttemptGrowthFactor < 1 {
+		return errors.New("supervisor.attempt_growth_factor must be >= 1")
+	}
+	for name, backend := range map[string]string{"model_backend": c.ModelBackend, "fallback_backend": c.FallbackBackend} {
+		switch strings.TrimSpace(backend) {
+		case "", AgentBackendClaude, AgentBackendCodex:
+		default:
+			return fmt.Errorf("supervisor.%s %q must be %q, %q, or empty", name, backend, AgentBackendClaude, AgentBackendCodex)
+		}
+	}
+	if c.ModelAutomaticActions && !c.ModelAssisted {
+		return errors.New("supervisor.model_automatic_actions requires model_assisted")
+	}
+	if c.AllowBackendFailover && strings.TrimSpace(c.FallbackBackend) == "" {
+		return errors.New("supervisor.allow_backend_failover requires fallback_backend")
+	}
+	return nil
+}
+
 // Validate reports whether the configuration is internally consistent.
 func (c Config) Validate() error {
 	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
@@ -435,6 +607,20 @@ func (c Config) Validate() error {
 	}
 	if c.Agent.BookBudgetUSD < 0 {
 		return fmt.Errorf("agent.book_budget_usd must be >= 0, got %v", c.Agent.BookBudgetUSD)
+	}
+	if err := validateSupervisor(c.Supervisor); err != nil {
+		return err
+	}
+	if strings.TrimSpace(c.Pricing.Version) == "" {
+		return errors.New("pricing.version is required")
+	}
+	for key, rate := range c.Pricing.Rates {
+		if !strings.Contains(key, "/") {
+			return fmt.Errorf("pricing.rates key %q must be backend/model", key)
+		}
+		if rate.InputUSDPerMillion < 0 || rate.OutputUSDPerMillion < 0 || rate.CachedInputUSDPerMillion < 0 {
+			return fmt.Errorf("pricing.rates[%q] values must be >= 0", key)
+		}
 	}
 	// Model-map keys must name agent-lane stages; a typo would silently never route.
 	for key := range c.Agent.Claude {

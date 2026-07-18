@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/kodestar/audiosilo-sidecars/internal/pricing"
 )
 
 func TestLoadDefaultsOnFirstRun(t *testing.T) {
@@ -223,6 +225,44 @@ func TestDefaultSeedsClaudeModels(t *testing.T) {
 	// Every seeded key must be an agent stage (validation would reject otherwise).
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Default() config invalid: %v", err)
+	}
+}
+
+func TestSupervisorDefaultsAreMonitorOnlyAndOldConfigsInheritThem(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, FileName), []byte("listen: 127.0.0.1:8090\nagent:\n  concurrency: 2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Supervisor.Enabled || cfg.Supervisor.AutomaticActions || cfg.Supervisor.ModelAssisted || cfg.Supervisor.ModelAutomaticActions || cfg.Supervisor.AllowBackendFailover {
+		t.Fatalf("supervisor defaults are not monitor-only: %+v", cfg.Supervisor)
+	}
+	if cfg.Pricing.Version == "" || cfg.Pricing.Rates == nil {
+		t.Fatalf("pricing defaults unavailable: %+v", cfg.Pricing)
+	}
+}
+
+func TestSupervisorRejectsUnsafeOrUnpriceableConfiguration(t *testing.T) {
+	cases := map[string]func(*Config){
+		"model actions without model": func(c *Config) { c.Supervisor.ModelAutomaticActions = true },
+		"failover without fallback":   func(c *Config) { c.Supervisor.AllowBackendFailover = true },
+		"negative supervisor budget":  func(c *Config) { c.Supervisor.PerBookBudgetUSD = -1 },
+		"unversioned pricing":         func(c *Config) { c.Pricing.Version = "" },
+		"negative pricing": func(c *Config) {
+			c.Pricing.Rates["codex/*"] = pricing.Rate{InputUSDPerMillion: -1}
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg := Default()
+			mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("Validate() = nil, want error")
+			}
+		})
 	}
 }
 

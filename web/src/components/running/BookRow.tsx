@@ -32,6 +32,8 @@ interface BookRowProps {
   // Opens the core (add-work) proposal modal for a book parked core_needed. The
   // panel owns the modal; the row only surfaces the affordance.
   onCompleteCoreProposal: (book: BookView) => void;
+  onAskSupervisor: (book: BookView) => Promise<void>;
+  modelSupervisorEnabled: boolean;
 }
 
 const ACTION_LABEL: Record<BookAction, string> = {
@@ -70,6 +72,8 @@ export const BookRow = memo(function BookRow({
   getDetail,
   getEvents,
   onCompleteCoreProposal,
+  onAskSupervisor,
+  modelSupervisorEnabled,
 }: BookRowProps) {
   const done = isDone(book);
   // A book only actively advertises live readouts (a ticking elapsed clock and an
@@ -91,6 +95,7 @@ export const BookRow = memo(function BookRow({
   // each open. The live log below is a BookRow-specific addition.
   const { expanded, toggle, detail, detailState } = useLazyDetail<BookDetail>(getDetail, book.id);
   const [logEvents, setLogEvents] = useState<LoggedEvent[] | null>(null);
+  const [asking, setAsking] = useState(false);
   const lastLogFetch = useRef(0);
 
   // refetchLog reloads the compact event log (cheap, limit 50). Non-fatal on
@@ -179,8 +184,11 @@ export const BookRow = memo(function BookRow({
               </span>
             )}
             {book.total_cost_usd > 0 && (
-              <span className="text-[11px] text-dim" title="Total agent spend for this book">
-                {formatCost(book.total_cost_usd)}
+              <span
+                className="text-[11px] text-dim"
+                title="Provider-reported agent spend; details may also include API-equivalent estimates"
+              >
+                {formatCost(book.total_cost_usd)} reported
               </span>
             )}
           </div>
@@ -200,6 +208,19 @@ export const BookRow = memo(function BookRow({
         </div>
 
         <div className="flex shrink-0 flex-wrap gap-2">
+          {modelSupervisorEnabled && !done && (
+            <button
+              type="button"
+              disabled={asking || busy}
+              onClick={() => {
+                setAsking(true);
+                void onAskSupervisor(book).finally(() => setAsking(false));
+              }}
+              className="rounded-md border border-edge px-3 py-1.5 text-xs font-medium text-body transition-colors hover:border-pink-600 hover:text-hi disabled:opacity-50"
+            >
+              {asking ? 'Asking...' : 'Ask supervisor'}
+            </button>
+          )}
           <button
             type="button"
             aria-expanded={expanded}

@@ -30,6 +30,7 @@ type cliSpec struct {
 	stdin     string
 	timeout   time.Duration
 	heartbeat func(elapsed time.Duration) // optional; called every heartbeatInterval while the child runs
+	process   func(pid int, active bool)
 }
 
 // runCLI starts the process (never via a shell - argv only), feeds stdin, and
@@ -68,6 +69,10 @@ func runCLI(ctx context.Context, spec cliSpec) (stdout, stderr string, err error
 	start := time.Now()
 	if serr := cmd.Start(); serr != nil {
 		return "", "", fmt.Errorf("start %s: %w", spec.path, serr)
+	}
+	if spec.process != nil {
+		spec.process(cmd.Process.Pid, true)
+		defer spec.process(cmd.Process.Pid, false)
 	}
 
 	done := make(chan error, 1)

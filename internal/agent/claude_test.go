@@ -22,7 +22,7 @@ func TestClaudeRunSuccessParsesUsage(t *testing.T) {
 	if res.Text != "all done" {
 		t.Errorf("Text = %q", res.Text)
 	}
-	want := Usage{Model: "sonnet", Input: 200, Output: 80, CacheRead: 10, CostUSD: 0.0123, Turns: 3}
+	want := Usage{Model: "sonnet", Input: 200, Output: 80, CacheRead: 10, CostUSD: 0.0123, CostReported: true, Turns: 3}
 	if res.Usage != want {
 		t.Errorf("Usage = %+v, want %+v", res.Usage, want)
 	}

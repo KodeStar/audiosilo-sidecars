@@ -31,18 +31,45 @@ describe('StageCostList', () => {
         input_tokens: 12345,
         output_tokens: 6789,
         cost_usd: 0.0123,
+        cost_reported: true,
       }),
-      run({ id: 3, stage: 'auditing', model: 'opus', input_tokens: 200, cost_usd: 0.03 }),
+      run({
+        id: 3,
+        stage: 'auditing',
+        model: 'opus',
+        input_tokens: 200,
+        cost_usd: 0.03,
+        cost_reported: true,
+      }),
     ];
     render(<StageCostList runs={runs} />);
 
     expect(screen.getByText('Fact pass')).toBeInTheDocument();
     expect(screen.getByText('12.3k in / 6.8k out')).toBeInTheDocument();
-    expect(screen.getByText('$0.0123')).toBeInTheDocument();
+    expect(screen.getByText('$0.0123 reported')).toBeInTheDocument();
     // The mechanical stage is not shown.
     expect(screen.queryByText('Splitting')).not.toBeInTheDocument();
     // Total is the sum.
-    expect(screen.getByText('$0.0423')).toBeInTheDocument();
+    expect(screen.getByText(/\$0\.0423 reported/)).toBeInTheDocument();
+    expect(screen.getByText(/\$0\.0000 API-equivalent.*partial/)).toBeInTheDocument();
+  });
+
+  it('labels unreported Codex usage with a configured API-equivalent estimate', () => {
+    render(
+      <StageCostList
+        runs={[
+          run({
+            model: 'gpt-test',
+            input_tokens: 100,
+            estimated_api_cost_usd: 0.004,
+            estimate_complete: true,
+            cost_reported: false,
+          }),
+        ]}
+      />,
+    );
+    expect(screen.getByText('$0.0040 API-equivalent estimate')).toBeInTheDocument();
+    expect(screen.getByText(/\$0\.0000 reported.*partial/)).toBeInTheDocument();
   });
 
   it('shows a muted note when there is no agent spend', () => {

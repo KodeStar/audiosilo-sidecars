@@ -31,6 +31,10 @@ const PARK_HINTS: Record<string, string> = {
     'Work proposal submitted - waiting for the metadata PR to merge; resumes automatically.',
   budget_exceeded:
     "This book reached its agent cost budget. Raise agent.book_budget_usd (Settings > Agent, restart to apply) if it's worth more, then Retry.",
+  supervisor_escalated:
+    'The supervisor contained a repeated or ambiguous failure. Inspect its decision before Retry.',
+  supervisor_budget:
+    'The supervisor stopped this stage at a configured limit. Increasing a budget requires an explicit operator change.',
 };
 
 // parkHint returns the actionable hint for a park code, or null for an unknown or empty

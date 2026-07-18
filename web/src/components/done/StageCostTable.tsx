@@ -1,5 +1,5 @@
 import type { StageRun } from '@/api/types';
-import { bookTotalCost, formatCost, formatTokens } from '@/lib/cost';
+import { bookCostSummary, formatCost, formatRunCost, formatTokens } from '@/lib/cost';
 import { stageRunRows } from '@/lib/doneBoard';
 
 // StageCostTable renders a book's full stage-run ledger as a table: one row per
@@ -12,7 +12,7 @@ export function StageCostTable({ runs }: { runs: StageRun[] }) {
     return <p className="text-xs text-dim">No stage runs recorded.</p>;
   }
   const rows = stageRunRows(runs);
-  const total = bookTotalCost(runs);
+  const total = bookCostSummary(runs);
   return (
     <div className="overflow-x-auto">
       <table className="w-full min-w-[34rem] text-left text-xs">
@@ -26,7 +26,7 @@ export function StageCostTable({ runs }: { runs: StageRun[] }) {
           </tr>
         </thead>
         <tbody>
-          {rows.map((r) => (
+          {rows.map((r, index) => (
             <tr key={r.id} className="border-b border-edge/30 last:border-0">
               <td className="py-1.5 pr-3 text-body">
                 <span className="flex items-center gap-1.5">
@@ -53,7 +53,9 @@ export function StageCostTable({ runs }: { runs: StageRun[] }) {
               <td className="py-1.5 pr-3 text-right text-dim">
                 {formatTokens(r.inTokens)} / {formatTokens(r.outTokens)}
               </td>
-              <td className="py-1.5 pr-3 text-right font-mono text-body">{formatCost(r.cost)}</td>
+              <td className="py-1.5 pr-3 text-right font-mono text-body">
+                {formatRunCost(runs[index])}
+              </td>
               <td className="py-1.5 text-right font-mono text-dim">{r.elapsed}</td>
             </tr>
           ))}
@@ -64,7 +66,10 @@ export function StageCostTable({ runs }: { runs: StageRun[] }) {
               Total
             </td>
             <td className="py-1.5 pr-3 text-right font-mono font-semibold text-hi">
-              {formatCost(total)}
+              {formatCost(total.reported)} reported{total.reportedIncomplete ? ' (partial)' : ''}
+              <br />
+              {formatCost(total.estimated)} API-equivalent
+              {total.estimateIncomplete ? ' (partial)' : ''}
             </td>
             <td />
           </tr>

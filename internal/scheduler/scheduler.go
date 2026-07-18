@@ -491,6 +491,7 @@ func (s *Scheduler) execute(ctx context.Context, b store.Book, stage state.State
 	r := StageReport{
 		Progress: func(done, total int) {
 			_ = s.db.SetProgress(ctx, b.ID, string(stage), done, total)
+			_ = s.db.TouchOpenStageRun(ctx, b.ID, string(stage), true)
 			_ = s.hub.PublishBook("stage.progress", b.ID, map[string]any{
 				"book_id": b.ID, "stage": string(stage), "done": done, "total": total,
 			})

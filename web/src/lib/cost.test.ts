@@ -1,5 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { formatTokens, formatCost, hasSpend, agentSpendRuns, bookTotalCost } from './cost';
+import {
+  formatTokens,
+  formatCost,
+  hasSpend,
+  agentSpendRuns,
+  bookTotalCost,
+  bookCostSummary,
+  formatRunCost,
+} from './cost';
 import type { StageRun } from '@/api/types';
 
 function run(partial: Partial<StageRun>): StageRun {
@@ -76,5 +84,45 @@ describe('bookTotalCost', () => {
 
   it('is zero for an empty ledger', () => {
     expect(bookTotalCost([])).toBe(0);
+  });
+});
+
+describe('reported versus estimated costs', () => {
+  it('keeps reported and API-equivalent totals separate with completeness', () => {
+    const summary = bookCostSummary([
+      run({
+        input_tokens: 10,
+        cost_usd: 0.02,
+        cost_reported: true,
+        estimated_api_cost_usd: 0.03,
+        estimate_complete: true,
+      }),
+      run({
+        input_tokens: 10,
+        cost_reported: false,
+        estimated_api_cost_usd: 0.01,
+        estimate_complete: true,
+      }),
+    ]);
+    expect(summary).toEqual({
+      reported: 0.02,
+      estimated: 0.04,
+      reportedIncomplete: true,
+      estimateIncomplete: false,
+    });
+  });
+
+  it('does not label unreported usage as free', () => {
+    expect(formatRunCost(run({ input_tokens: 10, cost_reported: false }))).toBe('cost unavailable');
+    expect(
+      formatRunCost(
+        run({
+          input_tokens: 10,
+          cost_reported: false,
+          estimated_api_cost_usd: 0.012,
+          estimate_complete: true,
+        }),
+      ),
+    ).toBe('$0.0120 API-equivalent estimate');
   });
 });

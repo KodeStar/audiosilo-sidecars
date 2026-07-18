@@ -119,7 +119,7 @@ describe('DonePanel', () => {
     expect(screen.getByText('claude-opus')).toBeInTheDocument();
     // Elapsed 4m, cost formatted.
     expect(screen.getByText('4m')).toBeInTheDocument();
-    expect(screen.getAllByText('$0.0500').length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/\$0\.0500 reported/).length).toBeGreaterThan(0);
   });
 
   it('previews characters + recaps with the description hidden until clicked', async () => {

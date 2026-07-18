@@ -18,6 +18,9 @@ import type {
   SettingsUpdate,
   SidecarsView,
   SystemInfo,
+  SupervisorStatus,
+  SupervisorRun,
+  BatchCostSummary,
 } from '@/api/types';
 import { parseContentDispositionFilename } from '@/lib/download';
 
@@ -150,6 +153,26 @@ export class ApiClient {
 
   getSettings(): Promise<Settings> {
     return this.request<Settings>('/api/v1/settings');
+  }
+
+  supervisorStatus(): Promise<SupervisorStatus> {
+    return this.request<SupervisorStatus>('/api/v1/supervisor/status');
+  }
+
+  supervisorIncidents(batchId?: string, limit = 20): Promise<{ incidents: SupervisorRun[] }> {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (batchId) params.set('batch_id', batchId);
+    return this.request<{ incidents: SupervisorRun[] }>(`/api/v1/supervisor/incidents?${params}`);
+  }
+
+  supervisorCosts(batchId: string): Promise<BatchCostSummary> {
+    return this.request<BatchCostSummary>(
+      `/api/v1/supervisor/costs?batch_id=${encodeURIComponent(batchId)}`,
+    );
+  }
+
+  askSupervisor(id: number): Promise<SupervisorRun> {
+    return this.request<SupervisorRun>(`/api/v1/books/${id}/ask-supervisor`, { method: 'POST' });
   }
 
   updateSettings(update: SettingsUpdate): Promise<Settings> {

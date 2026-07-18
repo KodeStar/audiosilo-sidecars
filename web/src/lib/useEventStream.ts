@@ -10,7 +10,13 @@ export type EventStreamStatus = 'connecting' | 'open' | 'closed';
 // descriptors) - a long agent stage emits no stage.progress ticks, so the open
 // log panel relies on stage.note to refresh while a subprocess is running.
 export type PipelineEventType =
-  'book.state' | 'stage.progress' | 'stage.note' | 'queue.stats' | 'eta.update' | 'contrib.update';
+  | 'book.state'
+  | 'stage.progress'
+  | 'stage.note'
+  | 'queue.stats'
+  | 'eta.update'
+  | 'contrib.update'
+  | 'supervisor.decision';
 // Exported so a drift-guard test can assert every published event type is
 // registered (an unregistered type is silently discarded by the browser).
 export const PIPELINE_EVENTS: PipelineEventType[] = [
@@ -20,6 +26,7 @@ export const PIPELINE_EVENTS: PipelineEventType[] = [
   'queue.stats',
   'eta.update',
   'contrib.update',
+  'supervisor.decision',
 ];
 
 export interface EventStreamState {

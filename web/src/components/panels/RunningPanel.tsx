@@ -9,6 +9,9 @@ import type {
   QueueStatsEvent,
   StageNoteEvent,
   StageProgressEvent,
+  SupervisorStatus,
+  SupervisorRun,
+  BatchCostSummary,
 } from '@/api/types';
 import {
   applyBookState,
@@ -22,6 +25,7 @@ import {
   type BookAction,
 } from '@/lib/books';
 import { formatEta } from '@/lib/duration';
+import { formatCost } from '@/lib/cost';
 import { useEventStream, type PipelineEventType } from '@/lib/useEventStream';
 import { BookRow } from '../running/BookRow';
 import { CoreProposalModal } from '../running/CoreProposalModal';
@@ -44,6 +48,9 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
   const [scratchBytes, setScratchBytes] = useState<number | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [supervisorStatus, setSupervisorStatus] = useState<SupervisorStatus | null>(null);
+  const [incidents, setIncidents] = useState<SupervisorRun[]>([]);
+  const [batchCosts, setBatchCosts] = useState<BatchCostSummary | null>(null);
   // The book whose core (add-work) proposal modal is open, or null when closed.
   const [coreBook, setCoreBook] = useState<BookView | null>(null);
   // A single shared clock driving every row's elapsed display (no per-row timer).
@@ -65,6 +72,20 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
       const liveIds = new Set(list.map((b) => b.id));
       setBookEventCounts((prev) => pruneBookEventCounts(prev, liveIds));
       setLoadError(null);
+      if (typeof client.supervisorStatus === 'function') {
+        const batchId = list.find((b) => b.batch_id)?.batch_id;
+        void Promise.all([
+          client.supervisorStatus(),
+          client.supervisorIncidents(batchId, 8),
+          batchId ? client.supervisorCosts(batchId) : Promise.resolve(null),
+        ])
+          .then(([status, recent, costs]) => {
+            setSupervisorStatus(status);
+            setIncidents(recent.incidents);
+            setBatchCosts(costs);
+          })
+          .catch(() => undefined);
+      }
     } catch (err) {
       setLoadError(err instanceof ApiError ? err.message : 'Could not load the pipeline.');
     }
@@ -91,31 +112,36 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
   // the book's event counter so an open log panel refetches (eta.update/queue.stats
   // do not - they write no per-book log line). A book newly created elsewhere is
   // picked up on the next full load (e.g. after switching back to this tab).
-  const onEvent = useCallback((type: PipelineEventType, data: unknown) => {
-    if (type === 'book.state') {
-      const ev = data as BookStateEvent;
-      setBooks((prev) => (prev ? sortBooks(applyBookState(prev, ev)) : prev));
-      setBookEventCounts((prev) => bumpBookEventCount(prev, ev.book_id));
-    } else if (type === 'stage.progress') {
-      const ev = data as StageProgressEvent;
-      setBooks((prev) => (prev ? applyStageProgress(prev, ev) : prev));
-      setBookEventCounts((prev) => bumpBookEventCount(prev, ev.book_id));
-    } else if (type === 'stage.note') {
-      const ev = data as StageNoteEvent;
-      setBookEventCounts((prev) => bumpBookEventCount(prev, ev.book_id));
-    } else if (type === 'contrib.update') {
-      const ev = data as ContributionUpdateEvent;
-      setBookEventCounts((prev) => bumpBookEventCount(prev, ev.book_id));
-    } else if (type === 'queue.stats') {
-      setStats(data as QueueStatsEvent);
-    } else if (type === 'eta.update') {
-      const ev = data as EtaUpdateEvent;
-      // Patch each listed book's ETA and clear it on the rest (they lost their
-      // ETA - parked/terminal); keep the queue makespan for the strip.
-      setBooks((prev) => (prev ? applyEtaUpdate(prev, ev) : prev));
-      setQueueSeconds(ev.queue_seconds);
-    }
-  }, []);
+  const onEvent = useCallback(
+    (type: PipelineEventType, data: unknown) => {
+      if (type === 'book.state') {
+        const ev = data as BookStateEvent;
+        setBooks((prev) => (prev ? sortBooks(applyBookState(prev, ev)) : prev));
+        setBookEventCounts((prev) => bumpBookEventCount(prev, ev.book_id));
+      } else if (type === 'stage.progress') {
+        const ev = data as StageProgressEvent;
+        setBooks((prev) => (prev ? applyStageProgress(prev, ev) : prev));
+        setBookEventCounts((prev) => bumpBookEventCount(prev, ev.book_id));
+      } else if (type === 'stage.note') {
+        const ev = data as StageNoteEvent;
+        setBookEventCounts((prev) => bumpBookEventCount(prev, ev.book_id));
+      } else if (type === 'contrib.update') {
+        const ev = data as ContributionUpdateEvent;
+        setBookEventCounts((prev) => bumpBookEventCount(prev, ev.book_id));
+      } else if (type === 'queue.stats') {
+        setStats(data as QueueStatsEvent);
+      } else if (type === 'eta.update') {
+        const ev = data as EtaUpdateEvent;
+        // Patch each listed book's ETA and clear it on the rest (they lost their
+        // ETA - parked/terminal); keep the queue makespan for the strip.
+        setBooks((prev) => (prev ? applyEtaUpdate(prev, ev) : prev));
+        setQueueSeconds(ev.queue_seconds);
+      } else if (type === 'supervisor.decision') {
+        void load();
+      }
+    },
+    [load],
+  );
 
   useEventStream(apiBase, token, { onEvent });
 
@@ -131,6 +157,18 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
 
   // Stable across renders so the memoized BookRow only re-renders on its own props.
   const handleCompleteCoreProposal = useCallback((book: BookView) => setCoreBook(book), []);
+  const handleAskSupervisor = useCallback(
+    async (book: BookView) => {
+      setActionError(null);
+      try {
+        await client.askSupervisor(book.id);
+        await load();
+      } catch (err) {
+        setActionError(err instanceof ApiError ? err.message : 'Supervisor request failed.');
+      }
+    },
+    [client, load],
+  );
 
   // Stable across renders (deps: client, load) so the memoized BookRow only
   // re-renders when its own props change, not on every parent render.
@@ -215,6 +253,10 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
         scratchBytes={scratchBytes}
       />
 
+      {supervisorStatus && (
+        <SupervisorStrip status={supervisorStatus} incidents={incidents} costs={batchCosts} />
+      )}
+
       {actionError && (
         <p role="alert" className="text-sm text-pink-500">
           {actionError}
@@ -244,6 +286,8 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
               getDetail={getDetail}
               getEvents={getEvents}
               onCompleteCoreProposal={handleCompleteCoreProposal}
+              onAskSupervisor={handleAskSupervisor}
+              modelSupervisorEnabled={!!supervisorStatus?.model_assisted}
             />
           ))}
         </div>
@@ -259,6 +303,69 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
             void load();
           }}
         />
+      )}
+    </div>
+  );
+}
+
+function SupervisorStrip({
+  status,
+  incidents,
+  costs,
+}: {
+  status: SupervisorStatus;
+  incidents: SupervisorRun[];
+  costs: BatchCostSummary | null;
+}) {
+  return (
+    <div className="rounded-xl border border-edge bg-surface px-4 py-3 text-xs text-dim">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+        <span className="font-semibold text-hi">Supervisor: {status.state}</span>
+        <span>automatic {status.automatic_actions ? 'on' : 'off'}</span>
+        <span>
+          model {status.model_assisted ? (status.model_available ? 'on' : 'unavailable') : 'off'}
+        </span>
+        {costs && (
+          <span>
+            production {formatCost(costs.production_reported_usd)} reported
+            {costs.production_reported_incomplete ? ' (partial)' : ''}
+          </span>
+        )}
+        {costs && (
+          <span>
+            production {formatCost(costs.production_estimated_api_usd)} API-equivalent estimate
+            {costs.production_estimate_incomplete ? ' (partial)' : ''}
+          </span>
+        )}
+        {costs && (
+          <span>
+            book supervision {formatCost(costs.book_supervisor_reported_usd)} reported /{' '}
+            {formatCost(costs.book_supervisor_estimated_api_usd)} API-equivalent
+          </span>
+        )}
+        {costs && (
+          <span>
+            batch supervision {formatCost(costs.batch_supervisor_reported_usd)} reported /{' '}
+            {formatCost(costs.batch_supervisor_estimated_api_usd)} API-equivalent
+          </span>
+        )}
+        {costs && (
+          <span>
+            overall {formatCost(costs.overall_reported_usd)} reported
+            {costs.overall_reported_incomplete ? ' (partial)' : ''} /{' '}
+            {formatCost(costs.overall_estimated_api_usd)} API-equivalent
+            {costs.overall_estimate_incomplete ? ' (partial)' : ''}
+          </span>
+        )}
+      </div>
+      {incidents.length > 0 && (
+        <div className="mt-2 border-t border-edge/50 pt-2">
+          <span className="font-medium text-body">Recent: </span>
+          {incidents
+            .slice(0, 3)
+            .map((incident) => `${incident.diagnosis} → ${incident.selected_action}`)
+            .join(' · ')}
+        </div>
       )}
     </div>
   );

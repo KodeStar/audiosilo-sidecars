@@ -116,6 +116,11 @@ type Request struct {
 	// bounded value appropriate to their file set; zero retains maxTurns for callers
 	// outside the pipeline.
 	MaxTurns int
+	// NoTools is used by the orchestration supervisor: the model receives bounded
+	// structured context and must not inspect or edit the workspace.
+	NoTools bool
+	// Process reports the actual child pid lifecycle for liveness reconciliation.
+	Process func(pid int, active bool)
 	// Heartbeat, when non-nil, is called periodically (every heartbeatInterval) WHILE
 	// the CLI subprocess is genuinely running - between cmd.Start and cmd.Wait
 	// returning - with the elapsed wall-time since the process started. It is a real
@@ -133,7 +138,9 @@ type Usage struct {
 	Output    int64
 	CacheRead int64
 	CostUSD   float64
-	Turns     int
+	// CostReported distinguishes a provider-reported zero from an unavailable cost.
+	CostReported bool
+	Turns        int
 }
 
 // Result is a successful agent run: the final assistant text plus usage. The real

@@ -138,6 +138,43 @@ func (e *Executor) AgentStatus() agent.Availability {
 	return e.agentAvail
 }
 
+// ActivateFallback adopts a pre-approved backend/model for subsequent agent
+// invocations. Only the supervisor wiring calls this, and only when the explicit
+// allow_backend_failover configuration gate is enabled.
+func (e *Executor) ActivateFallback(ctx context.Context, backend, model string) error {
+	sel := e.agentSelect
+	sel.Backend = backend
+	r, av, err := agent.Select(ctx, sel, e.secrets)
+	if err != nil {
+		return err
+	}
+	if r == nil || !av.Available {
+		return fmt.Errorf("fallback backend %q unavailable: %s", backend, av.Detail)
+	}
+	e.mu.Lock()
+	e.agentRun, e.agentAvail, e.agentSelect = r, av, sel
+	if model != "" {
+		if e.agentModels.Claude == nil {
+			e.agentModels.Claude = map[string]string{}
+		}
+		if e.agentModels.OpenAI == nil {
+			e.agentModels.OpenAI = map[string]string{}
+		}
+		for _, st := range state.All() {
+			if !state.IsAgent(st) {
+				continue
+			}
+			if backend == agent.IDClaude {
+				e.agentModels.Claude[string(st)] = model
+			} else {
+				e.agentModels.OpenAI[string(st)] = model
+			}
+		}
+	}
+	e.mu.Unlock()
+	return nil
+}
+
 // agentUsage is the accumulated token/cost spend of all invocations in one agent
 // stage run plus the invocation count and the productive agent seconds, returned by
 // runAgent so a stage can fold it into its metrics and its StageResult.RateSample.
@@ -166,6 +203,12 @@ func (u *agentUsage) add(x agent.Usage) {
 	u.Output += x.Output
 	u.CacheRead += x.CacheRead
 	u.CostUSD += x.CostUSD
+	reported := x.CostReported || x.CostUSD > 0
+	if u.Invocations == 0 {
+		u.CostReported = reported
+	} else {
+		u.CostReported = u.CostReported && reported
+	}
 	u.Turns += x.Turns
 	if x.Model != "" {
 		u.Model = x.Model
@@ -181,6 +224,7 @@ func (u agentUsage) metricsMap() map[string]any {
 			"output_tokens": u.Output,
 			"cache_read":    u.CacheRead,
 			"cost_usd":      u.CostUSD,
+			"cost_reported": u.CostReported,
 			"turns":         u.Turns,
 			"invocations":   u.Invocations,
 		},
@@ -230,12 +274,17 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 	// Per-book budget preflight: park (with everything already recorded) BEFORE spending
 	// another invocation once the book's summed agent cost has reached the budget. It runs
 	// per runAgent call, so fact_pass (one runAgent per chunk) naturally checks between
-	// chunks; a single invocation is never aborted mid-flight. SumStageRunCost includes
-	// superseded rows, so a Retry that reset counters never lowers the spend the guard sees.
+	// chunks; a single invocation is never aborted mid-flight. The budget sum prefers
+	// provider cost and falls back to complete configured API-equivalent estimates, and
+	// includes superseded rows, so a Retry never lowers the spend the guard sees.
 	if e.db != nil && e.bookBudgetUSD > 0 {
-		spent, serr := e.db.SumStageRunCost(ctx, book.ID)
+		spent, complete, serr := e.db.SumStageRunBudgetCost(ctx, book.ID)
 		if serr != nil {
 			return agentUsage{}, fmt.Errorf("%s: read book cost: %w", stage, serr)
+		}
+		if !complete {
+			e.log.Warn("agent: book budget has unpriced usage; known subtotal is not treated as the complete cost",
+				"book", book.ID, "known_usd", spent, "pricing_version", e.pricing.Version)
 		}
 		if spent >= e.bookBudgetUSD {
 			return agentUsage{}, scheduler.ParkWithCode(state.ParkBudgetExceeded, budgetExceededMsg(spent, e.bookBudgetUSD))
@@ -251,7 +300,9 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 		// NotAvailableError branch below, which does schedule a short auto-readmit.)
 		return agentUsage{}, scheduler.ParkWithCode(state.ParkAgentUnavailable, AgentUnavailableMsg)
 	}
+	e.mu.Lock()
 	model := agent.ModelFor(e.agentModels.Claude, e.agentModels.OpenAI, runner.ID(), string(stage))
+	e.mu.Unlock()
 
 	prompt, err := prompts.Render(promptName, promptData)
 	if err != nil {
@@ -265,7 +316,10 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 		if e.db != nil {
 			// context.WithoutCancel: the invocation already happened, so record its spend
 			// even if ctx is being cancelled - crash/cancel must not lose the accounting.
-			if uerr := e.db.AddOpenStageRunUsage(context.WithoutCancel(ctx), book.ID, string(stage), u.Model, u.Input, u.Output, u.CostUSD); uerr != nil {
+			estimated, estimatedKnown := e.pricing.Estimate(runner.ID(), u.Model, u.Input, u.Output, u.CacheRead)
+			providerReported := u.CostReported || u.CostUSD > 0
+			if uerr := e.db.AddOpenStageRunUsageDetailed(context.WithoutCancel(ctx), book.ID, string(stage),
+				u.Model, u.Input, u.Output, u.CacheRead, u.CostUSD, providerReported, estimated, estimatedKnown); uerr != nil {
 				e.log.Warn("agent: record usage", "book", book.ID, "stage", string(stage), "err", uerr)
 			}
 		}
@@ -283,8 +337,16 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 		// long stage (a 6-minute qa_adjudicating) visibly proves the daemon is alive. It
 		// fires only while the child is running (never during rate-limit backoff).
 		Heartbeat: func(elapsed time.Duration) {
+			if e.db != nil {
+				_ = e.db.TouchOpenStageRun(context.WithoutCancel(ctx), book.ID, string(stage), false)
+			}
 			if r.Note != nil {
 				r.Note(fmt.Sprintf("%s: still running (%s elapsed)", stage, humanDuration(elapsed)))
+			}
+		},
+		Process: func(pid int, active bool) {
+			if e.db != nil {
+				_ = e.db.SetOpenStageRunProcess(context.WithoutCancel(ctx), book.ID, string(stage), pid, active)
 			}
 		},
 	}

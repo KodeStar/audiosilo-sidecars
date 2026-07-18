@@ -20,6 +20,7 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/secrets"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
+	"github.com/kodestar/audiosilo-sidecars/internal/supervisor"
 )
 
 // Deps are the collaborators the API needs.
@@ -33,9 +34,10 @@ type Deps struct {
 	// Store, Scheduler, and Scans back the M1 Library/pipeline endpoints. They may
 	// be nil in tests that only exercise the M0 auth/settings surface; the
 	// pipeline handlers guard on nil and return 503.
-	Store     *store.DB
-	Scheduler *scheduler.Scheduler
-	Scans     *metaops.ScanManager
+	Store      *store.DB
+	Scheduler  *scheduler.Scheduler
+	Supervisor *supervisor.Service
+	Scans      *metaops.ScanManager
 	// Meta is the community-metadata client backing the manual-match and
 	// meta-search endpoints. It may be nil (metadata unconfigured); the handlers
 	// that need it guard on nil / the disabled state and return 503.
@@ -110,6 +112,7 @@ type API struct {
 	dataDir       string
 	store         *store.DB
 	sched         *scheduler.Scheduler
+	supervisor    *supervisor.Service
 	scans         *metaops.ScanManager
 	meta          *metaops.Client
 	overrides     *metaops.OverrideService
@@ -155,6 +158,7 @@ func New(d Deps) *API {
 		dataDir:       d.DataDir,
 		store:         d.Store,
 		sched:         d.Scheduler,
+		supervisor:    d.Supervisor,
 		scans:         d.Scans,
 		meta:          d.Meta,
 		ffmpeg:        d.FFmpegPath,
@@ -235,6 +239,10 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/books/{id}/cancel", a.requireAuth(a.requirePipeline(a.bookAction((*scheduler.Scheduler).Cancel))))
 	mux.HandleFunc("POST /api/v1/books/{id}/purge-scratch", a.requireAuth(a.requirePipeline(a.handlePurgeScratch)))
 	mux.HandleFunc("DELETE /api/v1/books/{id}", a.requireAuth(a.requirePipeline(a.handleDeleteBook)))
+	mux.HandleFunc("GET /api/v1/supervisor/status", a.requireAuth(a.requirePipeline(a.handleSupervisorStatus)))
+	mux.HandleFunc("GET /api/v1/supervisor/incidents", a.requireAuth(a.requirePipeline(a.handleSupervisorIncidents)))
+	mux.HandleFunc("GET /api/v1/supervisor/costs", a.requireAuth(a.requirePipeline(a.handleSupervisorCosts)))
+	mux.HandleFunc("POST /api/v1/books/{id}/ask-supervisor", a.requireAuth(a.requirePipeline(a.handleAskSupervisor)))
 
 	// SSE authenticates itself (token in the query, since EventSource cannot set
 	// an Authorization header).

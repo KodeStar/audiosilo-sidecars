@@ -78,7 +78,7 @@ func (r *codexRunner) buildArgs(req Request, lastMsgFile string) []string {
 		"--ignore-user-config",
 		"--ignore-rules",
 		"--cd", req.Dir,
-		"--sandbox", "workspace-write",
+		"--sandbox", map[bool]string{true: "read-only", false: "workspace-write"}[req.NoTools],
 		"--skip-git-repo-check",
 		"--output-last-message", lastMsgFile,
 	}
@@ -124,6 +124,7 @@ func (r *codexRunner) Run(ctx context.Context, req Request) (Result, error) {
 		stdin:     req.Prompt,
 		timeout:   req.Timeout,
 		heartbeat: req.Heartbeat,
+		process:   req.Process,
 	})
 
 	if errors.Is(runErr, errTimeout) {

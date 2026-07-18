@@ -89,7 +89,9 @@ export const DoneRow = memo(function DoneRow({
               Finished {formatFinishedDate(book.updated_at)}
             </span>
             <span className="text-edge">|</span>
-            <span title="Total agent spend for this book">{formatCost(book.total_cost_usd)}</span>
+            <span title="Provider-reported agent spend; detailed costs may also include API-equivalent estimates">
+              {formatCost(book.total_cost_usd)} reported
+            </span>
             {book.scratch_bytes > 0 && (
               <>
                 <span className="text-edge">|</span>

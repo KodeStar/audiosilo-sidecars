@@ -62,6 +62,12 @@ Flags: `--data DIR` (config/auth/secrets, default `~/.audiosilo-sidecars`),
 `--listen HOST:PORT` (default `127.0.0.1:8090`, loopback only). `version` prints
 the build version.
 
+Long multi-book runs include a bounded, deterministic health monitor. Automatic
+recovery, model-assisted diagnosis, model actions, and backend failover are separate
+explicit opt-ins. See [Bounded batch supervisor](docs/BATCH-SUPERVISOR.md) for its
+safety boundary, configuration, cost accounting, API/UI controls, and copied-data
+testing procedure.
+
 ### Frontend dev loop
 
 ```sh
