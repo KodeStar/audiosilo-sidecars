@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
@@ -22,8 +23,9 @@ import (
 // sheets GenerateSheets writes).
 const factsDir = spelling.FactsDir
 
-// knowledgeFinalName is the whole-book roster/reveals/ENDING sheet the last chunk
-// writes: the seed the next book in a series inherits and the synthesis stage reads.
+// knowledgeFinalName is the compact whole-book roster/reveals/threads/ending sheet
+// assembled after every independent chunk is complete. It seeds the next book in a
+// series and gives synthesis a concise book-level view.
 const knowledgeFinalName = "knowledge-final.md"
 
 // knowledgeInheritedName is the staged filename for the SERIES PREDECESSOR's
@@ -39,7 +41,6 @@ const needsAudioReviewMarker = "NEEDS AUDIO REVIEW"
 var factsHeadingRe = regexp.MustCompile(`(?m)^##\s+Chapter\s+(\d+)\b`)
 
 func factsChunkName(from, to int) string { return fmt.Sprintf("facts-ch%d-%d.md", from, to) }
-func knowledgeThroughName(to int) string { return fmt.Sprintf("knowledge-through-ch%d.md", to) }
 
 // factPassPromptData feeds factpass.md. Field names MUST match the template (rendered
 // with missingkey=error).
@@ -47,19 +48,25 @@ type factPassPromptData struct {
 	Title         string
 	From          int
 	To            int
-	IsFirstChunk  bool
-	IsLastChunk   bool
 	HasInherited  bool
-	PriorSheet    string
 	SpellingSheet string
 }
 
-// factPass is the chunked, resumable fact-extraction pass: for each chunk of the plan
-// it stages ONLY that chunk's corrected chapters plus the prior cumulative knowledge
-// sheet and the chunk's spelling sheet, runs the agent, validates the notes and the
-// rolling sheet, and harvests them into facts/. A chunk whose outputs already exist is
-// skipped (crash/park resume), so a re-entry only runs the chunks that remain. Usage
-// accumulates across chunk invocations.
+// factAssemblePromptData feeds factpass_assemble.md after every independent chunk
+// has completed.
+type factAssemblePromptData struct {
+	Title         string
+	HasInherited  bool
+	ChapterCount  int
+	SpellingSheet string
+}
+
+// factPass is the chunked, resumable fact-extraction pass. Chunks are independent:
+// each sees only its chapter range, its spoiler-bounded spelling sheet, and (for a
+// later series book) the predecessor's compact final knowledge. They can therefore
+// run concurrently and write only chapter-attributed delta facts, instead of
+// repeatedly rewriting a growing cumulative sheet. Once every chunk exists, one
+// bounded assembly invocation writes knowledge-final.md from the notes only.
 func (e *Executor) factPass(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
 	plan, err := loadChunkPlan(book.WorkDir)
 	if err != nil {
@@ -82,30 +89,87 @@ func (e *Executor) factPass(ctx context.Context, book store.Book, r scheduler.St
 		r.Progress(completed, totalChunks)
 	}
 
-	var usageTotal agentUsage
-	needsReview := 0
-	chunksThisRun := 0
-	for i := range plan.Chunks {
-		if err := ctx.Err(); err != nil {
-			return scheduler.StageResult{}, err
-		}
-		isLast := i == len(plan.Chunks)-1
-		if chunkComplete(book.WorkDir, plan.Chunks[i], isLast) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobs := make(chan int)
+	var (
+		mu            sync.Mutex
+		usageTotal    agentUsage
+		needsReview   int
+		chunksThisRun int
+		firstErr      error
+		wg            sync.WaitGroup
+	)
+	workers := min(e.agentWorkers, totalChunks-completed)
+	workerSeconds := make([]float64, workers)
+	for workerID := range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				usage, chunkReview, chunkErr := e.factPassChunk(ctx, book, r, plan, idx, hasCarryover, pred)
+				workerSeconds[workerID] += usage.Seconds
+				mu.Lock()
+				usageTotal.add(usage.Usage)
+				usageTotal.Invocations += usage.Invocations
+				usageTotal.Seconds += usage.Seconds
+				if chunkErr != nil && firstErr == nil {
+					firstErr = chunkErr
+					cancel()
+				}
+				if chunkErr == nil {
+					needsReview += chunkReview
+					completed++
+					chunksThisRun++
+					if r.Progress != nil {
+						r.Progress(completed, totalChunks)
+					}
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+sendJobs:
+	for i, chunk := range plan.Chunks {
+		if chunkComplete(book.WorkDir, chunk) {
 			continue
 		}
-		usage, chunkReview, cerr := e.factPassChunk(ctx, book, r, plan, i, hasCarryover, pred)
+		select {
+		case jobs <- i:
+		case <-ctx.Done():
+			break sendJobs
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	if firstErr != nil {
+		return scheduler.StageResult{}, firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return scheduler.StageResult{}, err
+	}
+	// Parallel extraction throughput is governed by the busiest worker lane, not
+	// the sum of all concurrent invocation durations. Assembly is serial and is
+	// added below.
+	productiveSeconds := 0.0
+	for _, seconds := range workerSeconds {
+		productiveSeconds = max(productiveSeconds, seconds)
+	}
+
+	// The assembly is intentionally separate from extraction. It reads only the
+	// compact facts (never transcripts), runs once, and is resumable on re-entry.
+	assembledThisRun := false
+	if !fsutil.IsFile(filepath.Join(book.WorkDir, factsDir, knowledgeFinalName)) {
+		usage, aerr := e.assembleFacts(ctx, book, r, plan, hasCarryover, pred)
 		usageTotal.add(usage.Usage)
 		usageTotal.Invocations += usage.Invocations
 		usageTotal.Seconds += usage.Seconds
-		needsReview += chunkReview
-		if cerr != nil {
-			return scheduler.StageResult{}, cerr
+		productiveSeconds += usage.Seconds
+		if aerr != nil {
+			return scheduler.StageResult{}, aerr
 		}
-		completed++
-		chunksThisRun++
-		if r.Progress != nil {
-			r.Progress(completed, totalChunks)
-		}
+		assembledThisRun = true
 	}
 
 	e.accountScratch(ctx, book)
@@ -119,12 +183,14 @@ func (e *Executor) factPass(ctx context.Context, book store.Book, r scheduler.St
 	// Captured from each chunk's validated facts file this run. A mid-stage resume
 	// (already-complete chunks skipped) counts only the chunks (re)processed here.
 	m["needs_audio_review"] = needsReview
+	m["parallel_workers"] = workers
+	m["assembled"] = assembledThisRun
 	// Units are the chunks (re)processed this run - a resume that skipped already-complete
-	// chunks records only the ones it actually ran - and seconds are the accumulated
-	// productive agent time (rate-limit backoff already excluded per chunk).
+	// chunks records only the ones it actually ran. Seconds use the critical parallel
+	// worker lane plus serial assembly, with rate-limit backoff excluded.
 	result := scheduler.StageResult{
 		Metrics:    metrics(m),
-		RateSample: rateSample(chunksThisRun, usageTotal.Seconds),
+		RateSample: rateSample(chunksThisRun, productiveSeconds),
 	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.FactPass), result); err != nil {
 		return scheduler.StageResult{}, err
@@ -132,15 +198,11 @@ func (e *Executor) factPass(ctx context.Context, book store.Book, r scheduler.St
 	return result, nil
 }
 
-// factPassChunk stages and runs one chunk. The staged dir contains ONLY the chunk's
-// corrected chapters (no chapter outside [from,to]), the chunk's spelling sheet, and
-// the prior knowledge sheet (the previous chunk's cumulative sheet, or the series
-// predecessor's final sheet renamed knowledge-inherited.md for a later book's opening
-// chunk, or nothing for a series opener's first chunk).
+// factPassChunk stages and runs one independent chunk. The staged dir contains ONLY
+// that range's corrected chapters, its spelling sheet, and optionally the previous
+// BOOK's compact final knowledge. It never receives a prior current-book chunk.
 func (e *Executor) factPassChunk(ctx context.Context, book store.Book, r scheduler.StageReport, plan chunkPlan, idx int, hasCarryover bool, pred *store.Book) (agentUsage, int, error) {
 	chunk := plan.Chunks[idx]
-	isFirst := idx == 0
-	isLast := idx == len(plan.Chunks)-1
 
 	st, err := agent.New(book.WorkDir, fmt.Sprintf("%s-c%02d", state.FactPass, idx+1), e.stageAttempt(ctx, book, state.FactPass))
 	if err != nil {
@@ -157,11 +219,10 @@ func (e *Executor) factPassChunk(ctx context.Context, book store.Book, r schedul
 		return agentUsage{}, 0, fmt.Errorf("fact_pass: stage spelling sheet: %w", err)
 	}
 
-	// Prior knowledge sheet.
-	priorSheet := ""
+	// The predecessor is safe context for every independent chunk. Current-book
+	// knowledge is deliberately absent so no chunk depends on another.
 	hasInherited := false
-	switch {
-	case isFirst && hasCarryover && pred != nil:
+	if hasCarryover && pred != nil {
 		src := filepath.Join(pred.WorkDir, factsDir, knowledgeFinalName)
 		if !fsutil.IsFile(src) {
 			return agentUsage{}, 0, fmt.Errorf("fact_pass: predecessor knowledge-final.md missing (%s)", src)
@@ -169,18 +230,7 @@ func (e *Executor) factPassChunk(ctx context.Context, book store.Book, r schedul
 		if err := st.CopyFile(src, knowledgeInheritedName); err != nil {
 			return agentUsage{}, 0, fmt.Errorf("fact_pass: stage inherited knowledge sheet: %w", err)
 		}
-		priorSheet, hasInherited = knowledgeInheritedName, true
-	case !isFirst:
-		prevTo := plan.Chunks[idx-1].To
-		name := knowledgeThroughName(prevTo)
-		src := filepath.Join(book.WorkDir, factsDir, name)
-		if !fsutil.IsFile(src) {
-			return agentUsage{}, 0, fmt.Errorf("fact_pass: prior knowledge sheet %s missing (chunk %d must complete first)", filepath.Join(factsDir, name), idx)
-		}
-		if err := st.CopyFile(src, name); err != nil {
-			return agentUsage{}, 0, fmt.Errorf("fact_pass: stage prior knowledge sheet: %w", err)
-		}
-		priorSheet = name
+		hasInherited = true
 	}
 
 	// The chunk's corrected chapters ONLY - the load-bearing spoiler-scope invariant.
@@ -199,17 +249,14 @@ func (e *Executor) factPassChunk(ctx context.Context, book store.Book, r schedul
 		Title:         book.Title,
 		From:          chunk.From,
 		To:            chunk.To,
-		IsFirstChunk:  isFirst,
-		IsLastChunk:   isLast,
 		HasInherited:  hasInherited,
-		PriorSheet:    priorSheet,
 		SpellingSheet: sheet,
 	}
 	// Capture the NEEDS AUDIO REVIEW count from the successful attempt's facts file so
 	// no whole-dir re-read is needed for the metric.
 	needsReview := 0
 	validate := func(_ agent.Result, s *agent.Staging) error {
-		n, verr := validateFactPassChunk(s.OutDir(), chunk.From, chunk.To, isLast)
+		n, verr := validateFactPassChunk(s.OutDir(), chunk.From, chunk.To)
 		if verr != nil {
 			return verr
 		}
@@ -221,26 +268,16 @@ func (e *Executor) factPassChunk(ctx context.Context, book store.Book, r schedul
 		return usage, 0, err
 	}
 
-	specs := []agent.HarvestSpec{
-		{From: factsChunkName(chunk.From, chunk.To), To: filepath.Join(factsDir, factsChunkName(chunk.From, chunk.To))},
-		{From: knowledgeThroughName(chunk.To), To: filepath.Join(factsDir, knowledgeThroughName(chunk.To))},
-	}
-	if isLast {
-		specs = append(specs, agent.HarvestSpec{From: knowledgeFinalName, To: filepath.Join(factsDir, knowledgeFinalName)})
-	}
+	specs := []agent.HarvestSpec{{From: factsChunkName(chunk.From, chunk.To), To: filepath.Join(factsDir, factsChunkName(chunk.From, chunk.To))}}
 	if err := agent.Harvest(st, specs); err != nil {
 		return usage, 0, fmt.Errorf("fact_pass: harvest chunk %d: %w", idx+1, err)
 	}
 	return usage, needsReview, nil
 }
 
-// validateFactPassChunk checks a chunk's outputs: the facts file exists non-empty and
-// carries a "## Chapter k" heading for EVERY k in [from,to] and NONE outside it; the
-// cumulative knowledge sheet exists non-empty and names its ROSTER/REVEALS/THREADS
-// sections; and on the last chunk knowledge-final.md exists non-empty with an ENDING
-// section. It returns the NEEDS AUDIO REVIEW occurrence count in the facts file so the
-// stage tallies the metric without a separate re-read.
-func validateFactPassChunk(outDir string, from, to int, isLast bool) (int, error) {
+// validateFactPassChunk checks that the compact facts file exists and carries a
+// chapter heading for every chapter in range and none outside it.
+func validateFactPassChunk(outDir string, from, to int) (int, error) {
 	factsName := factsChunkName(from, to)
 	factsData, err := readNonEmptyFile(filepath.Join(outDir, factsName))
 	if err != nil {
@@ -259,24 +296,54 @@ func validateFactPassChunk(outDir string, from, to int, isLast bool) (int, error
 			return 0, fmt.Errorf("out/%s is missing the '## Chapter %d' heading (chapters %d through %d each need one)", factsName, k, from, to)
 		}
 	}
-	knowName := knowledgeThroughName(to)
-	knowData, err := readNonEmptyFile(filepath.Join(outDir, knowName))
-	if err != nil {
-		return 0, fmt.Errorf("out/%s: %v", knowName, err)
-	}
-	if err := requireSections(string(knowData), knowName, "ROSTER", "REVEALS", "THREADS"); err != nil {
-		return 0, err
-	}
-	if isLast {
-		finalData, err := readNonEmptyFile(filepath.Join(outDir, knowledgeFinalName))
-		if err != nil {
-			return 0, fmt.Errorf("out/%s: %v", knowledgeFinalName, err)
-		}
-		if err := requireSections(string(finalData), knowledgeFinalName, "ENDING"); err != nil {
-			return 0, err
-		}
-	}
 	return strings.Count(string(factsData), needsAudioReviewMarker), nil
+}
+
+// assembleFacts builds one compact book-level knowledge sheet after all independent
+// chunk facts have been harvested. This is the only current-book aggregation call.
+func (e *Executor) assembleFacts(ctx context.Context, book store.Book, r scheduler.StageReport, plan chunkPlan, hasCarryover bool, pred *store.Book) (agentUsage, error) {
+	st, err := agent.New(book.WorkDir, string(state.FactPass)+"-assemble", e.stageAttempt(ctx, book, state.FactPass))
+	if err != nil {
+		return agentUsage{}, err
+	}
+	for _, chunk := range plan.Chunks {
+		name := factsChunkName(chunk.From, chunk.To)
+		if err := st.CopyFile(filepath.Join(book.WorkDir, factsDir, name), filepath.Join(factsDir, name)); err != nil {
+			return agentUsage{}, fmt.Errorf("fact_pass: stage %s for assembly: %w", name, err)
+		}
+	}
+	finalSpellingSheet := spelling.SheetName(plan.Chunks[len(plan.Chunks)-1].To)
+	if err := st.CopyFile(filepath.Join(book.WorkDir, factsDir, finalSpellingSheet), finalSpellingSheet); err != nil {
+		return agentUsage{}, fmt.Errorf("fact_pass: stage final spelling sheet for assembly: %w", err)
+	}
+	hasInherited := hasCarryover && pred != nil
+	if hasInherited {
+		src := filepath.Join(pred.WorkDir, factsDir, knowledgeFinalName)
+		if !fsutil.IsFile(src) {
+			return agentUsage{}, fmt.Errorf("fact_pass: predecessor knowledge-final.md missing (%s)", src)
+		}
+		if err := st.CopyFile(src, knowledgeInheritedName); err != nil {
+			return agentUsage{}, fmt.Errorf("fact_pass: stage inherited knowledge for assembly: %w", err)
+		}
+	}
+	chapterCount := plan.Chunks[len(plan.Chunks)-1].To
+	validate := func(_ agent.Result, s *agent.Staging) error {
+		data, rerr := readNonEmptyFile(filepath.Join(s.OutDir(), knowledgeFinalName))
+		if rerr != nil {
+			return fmt.Errorf("out/%s: %v", knowledgeFinalName, rerr)
+		}
+		return requireSections(string(data), knowledgeFinalName, "ROSTER", "REVEALS", "THREADS", "ENDING")
+	}
+	usage, err := e.runAgent(ctx, book, state.FactPass, r, st, "factpass_assemble.md", factAssemblePromptData{
+		Title: book.Title, HasInherited: hasInherited, ChapterCount: chapterCount, SpellingSheet: finalSpellingSheet,
+	}, false, validate)
+	if err != nil {
+		return usage, err
+	}
+	if err := agent.Harvest(st, []agent.HarvestSpec{{From: knowledgeFinalName, To: filepath.Join(factsDir, knowledgeFinalName)}}); err != nil {
+		return usage, fmt.Errorf("fact_pass: harvest assembled knowledge: %w", err)
+	}
+	return usage, nil
 }
 
 // requireSections returns an error naming the first section marker absent from text.
@@ -301,28 +368,18 @@ func readNonEmptyFile(path string) ([]byte, error) {
 	return b, nil
 }
 
-// chunkComplete reports whether a chunk's harvested outputs all exist already (the
-// resume test): the facts file, the cumulative knowledge sheet, and - for the last
-// chunk - knowledge-final.md.
-func chunkComplete(workDir string, c chunkRange, isLast bool) bool {
-	if !fsutil.IsFile(filepath.Join(workDir, factsDir, factsChunkName(c.From, c.To))) {
-		return false
-	}
-	if !fsutil.IsFile(filepath.Join(workDir, factsDir, knowledgeThroughName(c.To))) {
-		return false
-	}
-	if isLast && !fsutil.IsFile(filepath.Join(workDir, factsDir, knowledgeFinalName)) {
-		return false
-	}
-	return true
+// chunkComplete is the resume test for independent extraction. Assembly has its own
+// knowledge-final.md resume artifact.
+func chunkComplete(workDir string, c chunkRange) bool {
+	return fsutil.IsFile(filepath.Join(workDir, factsDir, factsChunkName(c.From, c.To)))
 }
 
 // countCompleteChunks counts how many plan chunks are already complete (for the resume
 // progress baseline).
 func countCompleteChunks(workDir string, plan chunkPlan) int {
 	n := 0
-	for i, c := range plan.Chunks {
-		if chunkComplete(workDir, c, i == len(plan.Chunks)-1) {
+	for _, c := range plan.Chunks {
+		if chunkComplete(workDir, c) {
 			n++
 		}
 	}

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
@@ -81,16 +82,16 @@ func stagedChapterRange(t *testing.T, dir string) (int, int) {
 // from the staged corrected chapters and the prompt's last-chunk marker).
 func factPassAct(t *testing.T) func(*fakeRunner, agent.Request, int) (agent.Result, error) {
 	return func(_ *fakeRunner, req agent.Request, _ int) (agent.Result, error) {
+		if strings.Contains(req.Prompt, "assembling the compact final knowledge sheet") {
+			writeOutRaw(t, req, knowledgeFinalName, "ROSTER\n- a name\nREVEALS\n- a fact\nTHREADS\n- a question\nENDING\n- it ends\n")
+			return agent.Result{Usage: agent.Usage{Model: "sonnet", Input: 200, Output: 50, CostUSD: 0.05}}, nil
+		}
 		from, to := stagedChapterRange(t, req.Dir)
 		var facts strings.Builder
 		for k := from; k <= to; k++ {
 			fmt.Fprintf(&facts, "## Chapter %d\nEVENTS:\n- something happens [ch%d @ 00:00-00:10]\n\n", k, k)
 		}
 		writeOutRaw(t, req, factsChunkName(from, to), facts.String())
-		writeOutRaw(t, req, knowledgeThroughName(to), "ROSTER\n- a name\nREVEALS\n- a fact\nTHREADS\n- a question\n")
-		if strings.Contains(req.Prompt, knowledgeFinalName) {
-			writeOutRaw(t, req, knowledgeFinalName, "ROSTER\n- a name\nREVEALS\n- a fact\nENDING\n- it ends\n")
-		}
 		return agent.Result{Usage: agent.Usage{Model: "sonnet", Input: 300, Output: 150, CostUSD: 0.1}}, nil
 	}
 }
@@ -107,16 +108,16 @@ func TestFactPassTwoChunkHappyPath(t *testing.T) {
 		t.Fatalf("fact_pass: %v", err)
 	}
 	for _, name := range []string{
-		factsChunkName(1, 2), knowledgeThroughName(2),
-		factsChunkName(3, 4), knowledgeThroughName(4),
+		factsChunkName(1, 2),
+		factsChunkName(3, 4),
 		knowledgeFinalName,
 	} {
 		if _, err := os.Stat(filepath.Join(work, factsDir, name)); err != nil {
 			t.Errorf("facts/%s missing: %v", name, err)
 		}
 	}
-	if n := fake.count(string(state.FactPass)); n != 2 {
-		t.Errorf("agent invoked %d times, want 2 (one per chunk)", n)
+	if n := fake.count(string(state.FactPass)); n != 3 {
+		t.Errorf("agent invoked %d times, want 3 (two chunks plus one assembly)", n)
 	}
 	if !scheduler.SentinelExists(work, string(state.FactPass)) {
 		t.Error("fact_pass sentinel missing")
@@ -135,11 +136,8 @@ func TestFactPassTwoChunkHappyPath(t *testing.T) {
 func TestFactPassResumesSkippingCompleteChunks(t *testing.T) {
 	work := t.TempDir()
 	seedFactPassInputs(t, work, []chunkRange{{From: 1, To: 2}, {From: 3, To: 4}})
-	// Pre-complete chunk 1 (its facts file + cumulative sheet already exist).
+	// Pre-complete chunk 1 (its independent facts file already exists).
 	if err := fsutil.WriteFileAtomic(filepath.Join(work, factsDir, factsChunkName(1, 2)), []byte("## Chapter 1\n## Chapter 2\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := fsutil.WriteFileAtomic(filepath.Join(work, factsDir, knowledgeThroughName(2)), []byte("ROSTER\nREVEALS\nTHREADS\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -149,9 +147,9 @@ func TestFactPassResumesSkippingCompleteChunks(t *testing.T) {
 	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.FactPass, scheduler.StageReport{}); err != nil {
 		t.Fatalf("fact_pass: %v", err)
 	}
-	// Only chunk 2 ran.
-	if n := fake.count(string(state.FactPass)); n != 1 {
-		t.Errorf("agent invoked %d times, want 1 (chunk 1 was already complete)", n)
+	// Only chunk 2 plus the final assembly ran.
+	if n := fake.count(string(state.FactPass)); n != 2 {
+		t.Errorf("agent invoked %d times, want 2 (one remaining chunk plus assembly)", n)
 	}
 	if _, err := os.Stat(filepath.Join(work, factsDir, knowledgeFinalName)); err != nil {
 		t.Errorf("knowledge-final.md missing after resume: %v", err)
@@ -166,8 +164,6 @@ func TestFactPassHeadingValidationRetries(t *testing.T) {
 	fake.act = func(_ *fakeRunner, req agent.Request, _ int) (agent.Result, error) {
 		// A facts file missing the '## Chapter 2' heading fails validation every round.
 		writeOutRaw(t, req, factsChunkName(1, 2), "## Chapter 1\nEVENTS:\n- a thing\n")
-		writeOutRaw(t, req, knowledgeThroughName(2), "ROSTER\nREVEALS\nTHREADS\n")
-		writeOutRaw(t, req, knowledgeFinalName, "ROSTER\nREVEALS\nENDING\n")
 		return agent.Result{}, nil
 	}
 	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
@@ -233,15 +229,54 @@ func TestFactPassStagesInheritedSheetForPredecessor(t *testing.T) {
 	if _, err := exe.Execute(context.Background(), book, state.FactPass, scheduler.StageReport{}); err != nil {
 		t.Fatalf("fact_pass: %v", err)
 	}
-	// The predecessor's knowledge-final.md was staged as knowledge-inherited.md.
+	// The predecessor's knowledge-final.md was staged for the independent chunk.
 	staged := filepath.Join(work, "_runs", "fact_pass-c01-a01", knowledgeInheritedName)
 	if !fsutil.IsFile(staged) {
 		t.Errorf("inherited knowledge sheet not staged at %s", staged)
 	}
 	// And the prompt told the agent it inherited a previous book.
 	r, ok := fake.lastRequest(string(state.FactPass))
-	if !ok || !strings.Contains(r.Prompt, "PREVIOUS BOOK") {
+	if !ok || !strings.Contains(strings.ToLower(r.Prompt), "previous book") {
 		t.Errorf("fact_pass prompt did not flag the inherited sheet; prompt=%q", r.Prompt)
 	}
 	_ = pred
+}
+
+func TestFactPassRunsIndependentChunksConcurrently(t *testing.T) {
+	work := t.TempDir()
+	seedFactPassInputs(t, work, []chunkRange{{From: 1, To: 1}, {From: 2, To: 2}})
+
+	fake := newFakeRunner()
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	fake.act = func(_ *fakeRunner, req agent.Request, _ int) (agent.Result, error) {
+		if strings.Contains(req.Prompt, "assembling the compact final knowledge sheet") {
+			writeOutRaw(t, req, knowledgeFinalName, "ROSTER\nREVEALS\nTHREADS\nENDING\n")
+			return agent.Result{}, nil
+		}
+		started <- struct{}{}
+		<-release
+		from, to := stagedChapterRange(t, req.Dir)
+		writeOutRaw(t, req, factsChunkName(from, to), fmt.Sprintf("## Chapter %d\nEVENTS:\n- fact\n", from))
+		return agent.Result{}, nil
+	}
+	cfg := withAgentConfig(t.TempDir(), fake)
+	cfg.AgentConcurrency = 2
+	done := make(chan error, 1)
+	go func() {
+		_, err := NewExecutor(cfg).Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.FactPass, scheduler.StageReport{})
+		done <- err
+	}()
+
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("both independent chunks did not start concurrently")
+		}
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("fact_pass: %v", err)
+	}
 }

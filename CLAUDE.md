@@ -282,9 +282,13 @@ internal/
             contributions rows; export.go composes the download zip + core-proposal
             JSON injected into api) - EVERY stage is now real. The load-bearing
             invariants live in
-            the staging (synthesizing/auditing dirs hold NO transcripts, fact_pass chunk
-            dirs hold no chapter beyond the chunk's end, spelling reference_files are
-            restricted to the daemon-staged carryover). Constructed in server.go with the
+            the staging (synthesizing/auditing dirs hold NO transcripts, independent
+            fact_pass chunk dirs hold only their own chapter range and spoiler-bounded
+            spelling sheet, and a separate notes-only assembly writes the compact final
+            knowledge sheet). Fact chunks run concurrently behind the same executor-wide
+            agent semaphore as ordinary stages, so agent.concurrency is a true global cap
+            rather than a multiplier. Spelling reference_files are restricted to the
+            daemon-staged carryover. Constructed in server.go with the
             toolfetch-resolved paths, the asr.Select-chosen backend, and the
             agent.Select-chosen runner (nil when no CLI resolved). The sanitizing stage
             deliberately RE-DERIVES all chapters every run (cheap, idempotent, raw is the
@@ -339,8 +343,9 @@ internal/
             round's {blocker,fix,nit}; when a non-passing round is CONVERGING (blocker 0,
             validation clean, round >= 2, 0 < fix <= auditAcceptMaxFix(2), fix not
             growing, fix budget left) the stage writes audit_accepted.json (the residual
-            findings), routes to ONE final fixing round, and the re-entry passes
-            agentlessly when validation is clean - so no KNOWN defect ships unfixed and a
+            findings), routes to ONE final fixing round, and the re-entry runs a focused
+            semantic verifier over those exact accepted findings when validation is clean -
+            so a mechanically valid but unapplied FIX cannot ship and a
             90-chapter book (where a fresh adversarial pass finds ~1 new small defect
             forever - a sampling process that never reaches zero) finishes instead of
             parking fix_loop_exhausted with round-N's findings still live. Blockers or a
@@ -924,8 +929,9 @@ Milestones from the workspace plan; each is shippable.
   burning a paid re-verification of the same chapters every round; (3) **audit
   trajectory acceptance** - blockers always fail, but a converging non-growing
   fix count (<= 2) at round >= 2 writes `audit_accepted.json`, takes ONE final fix
-  round, and passes agentlessly (no known defect ever ships unfixed; residuals
-  recorded + surfaced on the contribution note); Retry on `fix_loop_exhausted`
+  round, and runs a bounded verifier over the accepted findings (no known defect
+  ever ships merely because mechanical validation is clean; residuals recorded +
+  surfaced on the contribution note); Retry on `fix_loop_exhausted`
   grants a genuinely fresh loop (fixing count + trajectory reset - previously it
   re-parked after one wasted audit); (4) **availability self-resume** -
   `books.retry_at` (migration 0008) + a scheduler auto-readmit pass for
@@ -934,10 +940,20 @@ Milestones from the workspace plan; each is shippable.
   no backend is configured; (5) **cost containment** - `agent.book_budget_usd`
   (default 75) parks `budget_exceeded` before more spend, and Retry SUPERSEDES
   stage_runs instead of deleting them so spend history (and the budget) survive.
-  Deferred, documented: fact_pass output-token cost (~$18 on 90ch; the facts are
-  dense content, not boilerplate), auditing stays on opus (it is the public-
-  contribution quality gate; acceptance bounds its rounds), and the audit model's
+  Auditing stays on opus (it is the public-contribution quality gate; acceptance
+  bounds its rounds), and the audit model's
   per-round history lives in work-dir JSON, not the DB.
+
+- **Post-M8 fact-pass cost round (done):** replaced the serial rolling knowledge
+  rewrite with bounded map-reduce. Each chunk now extracts only chapter-attributed
+  delta facts from its own corrected chapters and spoiler sheet; chunks run in
+  parallel up to `agent.concurrency`; one notes-only assembly produces a sub-2500-word
+  `knowledge-final.md`. A shared invocation semaphore caps parallel chunks plus all
+  other agent stages globally, and both backends run in stateless/ephemeral mode with
+  stage-sized tool/turn bounds. Chunk facts are individually resumable, so a crash
+  keeps every completed paid extraction. Synthesis uses reveal-safe roster snapshots
+  and an explicit coverage pass. The audit convergence re-entry now performs targeted
+  semantic verification instead of accepting on mechanical validation alone.
 
 Still **not built**: signed installers / a friendlier packaged client (a possible
 follow-up per the meta EXTRACTION roadmap); a separately-deployable UI-only image

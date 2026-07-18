@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
+	"github.com/kodestar/audiosilo-sidecars/internal/audio"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
@@ -18,6 +19,15 @@ type auditPromptData struct {
 	ChapterCount   int
 	IsSeriesOpener bool
 	VerifiedLedger string
+}
+
+// auditVerifyPromptData feeds audit_verify.md on the bounded convergence path.
+// Unlike a fresh adversarial audit, this pass checks only the exact FIX findings
+// accepted for one final correction round.
+type auditVerifyPromptData struct {
+	Title        string
+	ChapterCount int
+	Round        int
 }
 
 // audit runs the independent adversarial auditor over the (canonical) sidecars. It
@@ -48,11 +58,10 @@ func (e *Executor) audit(ctx context.Context, book store.Book, r scheduler.Stage
 			removeAuditTrajectory(book.WorkDir)
 		}
 		round = done + 1
-		// Acceptance re-entry: a prior round accepted-and-finished and the final fixing
-		// round has now re-validated. If validation is clean, PASS the stage WITHOUT
-		// invoking the (expensive) agent; if the final fix broke canonical form, drop the
-		// marker and fall through to a real audit round.
-		if res, handled, aerr := e.auditReentryAccept(book, r); handled || aerr != nil {
+		// Acceptance re-entry: a prior round converged and the final fixing round has
+		// re-validated. Run a focused verifier over those exact fixes; if mechanical
+		// validation is dirty, drop the marker and fall through to a fresh audit.
+		if res, handled, aerr := e.auditReentryAccept(ctx, book, r); handled || aerr != nil {
 			return res, aerr
 		}
 	}
@@ -159,13 +168,12 @@ func (e *Executor) audit(ctx context.Context, book store.Book, r scheduler.Stage
 	return result, nil
 }
 
-// auditReentryAccept handles the auditing entry that follows an accept-and-finish round:
-// the acceptance marker exists and the final fixing round has re-validated. It returns
-// (result, handled=true, nil) when it PASSES the stage without invoking the agent
-// (validation clean); (zero, false, nil) when there is no marker, or the marker existed
-// but the final fix left validation UNCLEAN (the marker is dropped so a real audit round
-// runs); and (zero, false, err) on an unreadable validation report.
-func (e *Executor) auditReentryAccept(book store.Book, r scheduler.StageReport) (scheduler.StageResult, bool, error) {
+// auditReentryAccept handles the entry after a converging audit's final fixing round.
+// Mechanical validation alone cannot prove that semantic FIX findings were applied,
+// so this path now invokes a focused verifier over the exact accepted findings. A
+// clean targeted report passes; an unresolved item removes the marker and re-enters
+// the ordinary fix/audit path rather than silently shipping a known defect.
+func (e *Executor) auditReentryAccept(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, bool, error) {
 	acc, ok := loadAuditAccepted(book.WorkDir)
 	if !ok {
 		return scheduler.StageResult{}, false, nil
@@ -179,22 +187,62 @@ func (e *Executor) auditReentryAccept(book store.Book, r scheduler.StageReport) 
 		_ = os.Remove(auditAcceptedPath(book.WorkDir))
 		return scheduler.StageResult{}, false, nil
 	}
+	manifest, err := audio.ReadManifest(book.WorkDir)
+	if err != nil {
+		return scheduler.StageResult{}, false, fmt.Errorf("auditing: verification read manifest: %w", err)
+	}
+	st, err := agent.New(book.WorkDir, string(state.Auditing)+"-verify", e.stageAttempt(ctx, book, state.Auditing))
+	if err != nil {
+		return scheduler.StageResult{}, false, err
+	}
+	if err := stageAuditInputs(st, book.WorkDir); err != nil {
+		return scheduler.StageResult{}, false, err
+	}
+	if err := st.CopyFile(auditAcceptedPath(book.WorkDir), scheduler.AuditAcceptedFile); err != nil {
+		return scheduler.StageResult{}, false, fmt.Errorf("auditing: stage accepted findings: %w", err)
+	}
+	var rep AuditReport
+	validate := func(_ agent.Result, s *agent.Staging) error {
+		parsed, verr := loadAuditReport(s.OutDir())
+		if verr != nil {
+			return verr
+		}
+		rep = parsed
+		return nil
+	}
+	usage, err := e.runAgent(ctx, book, state.Auditing, r, st, "audit_verify.md", auditVerifyPromptData{
+		Title: book.Title, ChapterCount: manifest.ChapterCount, Round: acc.Round,
+	}, false, validate)
+	if err != nil {
+		return scheduler.StageResult{}, true, err
+	}
+	if err := agent.Harvest(st, []agent.HarvestSpec{{From: auditReportName, To: auditReportName}}); err != nil {
+		return scheduler.StageResult{}, true, fmt.Errorf("auditing: harvest verification audit.json: %w", err)
+	}
+	blocker, fix, nit := rep.counts()
+	passed := rep.Pass && blocker == 0 && fix == 0
+	m := usage.metricsMap()
+	m["pass"] = passed
+	m["targeted_verification"] = true
+	m["accepted_after_rounds"] = acc.Round
+	m["residual_nits"] = acc.Nit
+	m["blocker"] = blocker
+	m["fix"] = fix
+	m["nit"] = nit
+	result := scheduler.StageResult{AuditPassed: passed, Metrics: metrics(m), RateSample: usage.rateSample()}
+	if !passed {
+		_ = os.Remove(auditAcceptedPath(book.WorkDir))
+		if r.Note != nil {
+			r.Note(fmt.Sprintf("audit verification found %d unresolved blocker(s) and %d fix(es); continuing the normal correction path", blocker, fix))
+		}
+	} else if r.Note != nil {
+		r.Note(fmt.Sprintf("audit accepted after targeted verification (converged round %d; %d residual nit(s) recorded)", acc.Round, acc.Nit))
+	}
 	if r.Progress != nil {
 		r.Progress(1, 1)
 	}
-	if r.Note != nil {
-		r.Note(fmt.Sprintf("audit accepted (converged round %d; final fixes applied; %d residual nits recorded)", acc.Round, acc.Nit))
-	}
-	result := scheduler.StageResult{
-		AuditPassed: true,
-		Metrics: metrics(map[string]any{
-			"pass":                  true,
-			"accepted_after_rounds": acc.Round,
-			"residual_nits":         acc.Nit,
-		}),
-	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.Auditing), result); err != nil {
-		return scheduler.StageResult{}, false, err
+		return scheduler.StageResult{}, true, err
 	}
 	return result, true, nil
 }

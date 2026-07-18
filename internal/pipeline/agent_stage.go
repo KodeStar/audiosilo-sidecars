@@ -187,6 +187,25 @@ func (u agentUsage) metricsMap() map[string]any {
 	}
 }
 
+// stageMaxTurns bounds the CLI's internal tool loop by workload. The old global 200
+// turn ceiling let malformed file-navigation plans run for tens of minutes. These
+// limits still allow several reads per staged file plus validation-retry patches, but
+// fail a runaway invocation before it can dominate a book's budget.
+func stageMaxTurns(stage state.State) int {
+	switch stage {
+	case state.MarkersNormalizing:
+		return 16
+	case state.QAAdjudicating:
+		return 64
+	case state.SpellingResearch:
+		return 80
+	case state.FactPass, state.Synthesizing, state.Auditing, state.Fixing:
+		return 32
+	default:
+		return 32
+	}
+}
+
 // validationError wraps a stage validator's failure so runAgent can distinguish an
 // exhausted-after-retries output-validation failure (park, naming the artifact) from
 // a backend/transport error (plain error) - RunWithRetry returns the validator's
@@ -253,12 +272,13 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 	}
 
 	req := agent.Request{
-		Stage:   string(stage),
-		Dir:     st.Dir(),
-		Prompt:  prompt,
-		Model:   model,
-		Web:     web,
-		Timeout: e.agentTimeout,
+		Stage:    string(stage),
+		Dir:      st.Dir(),
+		Prompt:   prompt,
+		Model:    model,
+		Web:      web,
+		Timeout:  e.agentTimeout,
+		MaxTurns: stageMaxTurns(stage),
 		// Liveness heartbeat: while the agent subprocess runs, emit a durable note so a
 		// long stage (a 6-minute qa_adjudicating) visibly proves the daemon is alive. It
 		// fires only while the child is running (never during rate-limit backoff).
@@ -272,6 +292,18 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 	if backoff == nil {
 		backoff = agent.DefaultBackoff()
 	}
+	// The scheduler caps concurrent agent stages, while fact_pass can additionally
+	// run independent chunk invocations in parallel. Share one executor-level
+	// semaphore across both shapes so the configured concurrency remains a real cap,
+	// not a multiplier. Cancellation while queued spends nothing.
+	select {
+	case e.agentSlots <- struct{}{}:
+		defer func() { <-e.agentSlots }()
+	case <-ctx.Done():
+		return total, ctx.Err()
+	}
+	// Queueing behind another invocation is capacity wait, not productive model
+	// time. Start the rate clock only after this invocation owns a slot.
 	start := time.Now()
 	_, slept, err := agent.RunWithBackoff(ctx, runner, req, func(res agent.Result) error {
 		if verr := validate(res, st); verr != nil {

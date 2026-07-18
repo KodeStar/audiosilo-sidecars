@@ -106,6 +106,11 @@ type Config struct {
 	AgentSelect  agent.SelectConfig
 	AgentModels  AgentModels
 	AgentTimeout time.Duration
+	// AgentConcurrency is the shared invocation cap inside the executor. The
+	// scheduler already limits agent STAGES; this second, invocation-level cap lets a
+	// fact-pass stage fan independent chunks out without exceeding the configured
+	// backend concurrency when another book is using the agent lane too.
+	AgentConcurrency int
 	// BookBudgetUSD caps the total agent spend for one book: an agent stage parks the
 	// book budget_exceeded (with everything already recorded) once its summed cost reaches
 	// this, before spending more. 0 disables the guard (config seeds a large default; set
@@ -156,6 +161,8 @@ type Executor struct {
 	agentSelect   agent.SelectConfig
 	agentModels   AgentModels
 	agentTimeout  time.Duration
+	agentWorkers  int
+	agentSlots    chan struct{}
 	bookBudgetUSD float64
 	secrets       secrets.Store
 	log           *slog.Logger
@@ -195,6 +202,10 @@ func NewExecutor(cfg Config) *Executor {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	agentWorkers := cfg.AgentConcurrency
+	if agentWorkers < 1 {
+		agentWorkers = 1
+	}
 	e := &Executor{
 		db:            cfg.DB,
 		ffmpeg:        cfg.FFmpeg,
@@ -209,6 +220,8 @@ func NewExecutor(cfg Config) *Executor {
 		agentSelect:   cfg.AgentSelect,
 		agentModels:   cfg.AgentModels,
 		agentTimeout:  cfg.AgentTimeout,
+		agentWorkers:  agentWorkers,
+		agentSlots:    make(chan struct{}, agentWorkers),
 		bookBudgetUSD: cfg.BookBudgetUSD,
 		secrets:       cfg.Secrets,
 		log:           log,

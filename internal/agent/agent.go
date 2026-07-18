@@ -37,8 +37,8 @@ const (
 const maxTurns = 200
 
 // baseAllowedTools is the file-only tool whitelist every stage gets. Web-enabled
-// stages additionally get webTools. In claude -p mode a tool not on this list is
-// denied, so the list IS the sandbox for tool access.
+// stages additionally get webTools. claudeRunner passes the list to both --tools
+// (availability boundary) and --allowedTools (permission pre-approval).
 const (
 	baseAllowedTools = "Read,Write,Edit,Glob,Grep"
 	webTools         = "WebSearch,WebFetch"
@@ -112,6 +112,10 @@ type Request struct {
 	Model   string        // "" = the backend CLI's default model
 	Web     bool          // allow the web search/fetch tools
 	Timeout time.Duration // per-invocation wall-clock cap; 0 = no timeout
+	// MaxTurns overrides the backend's runaway ceiling when positive. Stages set a
+	// bounded value appropriate to their file set; zero retains maxTurns for callers
+	// outside the pipeline.
+	MaxTurns int
 	// Heartbeat, when non-nil, is called periodically (every heartbeatInterval) WHILE
 	// the CLI subprocess is genuinely running - between cmd.Start and cmd.Wait
 	// returning - with the elapsed wall-time since the process started. It is a real

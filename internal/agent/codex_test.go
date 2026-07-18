@@ -33,6 +33,12 @@ func TestCodexRunSuccessAccumulatesUsage(t *testing.T) {
 	if got := readCapture(t, capDir, "stdin.txt"); got != "codex prompt" {
 		t.Errorf("prompt on stdin = %q", got)
 	}
+	argv := readCapture(t, capDir, "argv.txt")
+	for _, flag := range []string{"--ephemeral", "--ignore-user-config", "--ignore-rules"} {
+		if !strings.Contains(argv, flag) {
+			t.Errorf("optimized invocation missing %s: %q", flag, argv)
+		}
+	}
 }
 
 func TestCodexFallsBackToLastAgentMessage(t *testing.T) {

@@ -22,8 +22,8 @@ import (
 const auditAcceptMaxFix = 2
 
 // auditRound is one entry in audit_rounds.json: the per-round finding tally the
-// acceptance decision and the park trajectory message read. Appended once per real
-// audit round (the agent-invoking path), never on the no-agent acceptance re-entry.
+// acceptance decision and the park trajectory message read. Appended once per broad
+// adversarial audit round, never for the later targeted verification.
 type auditRound struct {
 	Round   int `json:"round"`
 	Blocker int `json:"blocker"`
@@ -34,8 +34,8 @@ type auditRound struct {
 // auditAccepted is the audit_accepted.json marker written when a round accepts-and-
 // finishes: the round it accepted on, the residual FIX/NIT counts, and this round's
 // FIX+NIT findings (so the record shows exactly what was accepted). Its presence on the
-// next auditing entry (after the final fix re-validates clean) passes the stage WITHOUT
-// invoking the agent; it is the durable "we converged" record the contribution note reads.
+// next auditing entry (after the final fix re-validates clean) drives a focused semantic
+// verification; it is also the durable "we converged" record the contribution note reads.
 type auditAccepted struct {
 	Round    int            `json:"round"`
 	Fix      int            `json:"fix"`

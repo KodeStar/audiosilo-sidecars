@@ -60,6 +60,11 @@ func TestClaudeWebFlagTogglesTools(t *testing.T) {
 	if strings.Contains(argv, "WebSearch") {
 		t.Errorf("no-web run should not enable WebSearch: %q", argv)
 	}
+	for _, flag := range []string{"--tools", "--allowedTools", "--bare", "--no-session-persistence", "--system-prompt"} {
+		if !strings.Contains(argv, flag) {
+			t.Errorf("optimized invocation missing %s: %q", flag, argv)
+		}
+	}
 
 	if _, err := r.Run(context.Background(), Request{Dir: t.TempDir(), Prompt: "p", Web: true}); err != nil {
 		t.Fatalf("Run web: %v", err)
@@ -67,6 +72,18 @@ func TestClaudeWebFlagTogglesTools(t *testing.T) {
 	argv = readCapture(t, capDir, "argv.txt")
 	if !strings.Contains(argv, "WebSearch,WebFetch") {
 		t.Errorf("web run should enable WebSearch,WebFetch: %q", argv)
+	}
+}
+
+func TestClaudeMaxTurnsOverride(t *testing.T) {
+	path, capDir := fakeCLI(t, fakeCLIOpts{versionLine: "v", response: claudeOK})
+	r := newClaudeRunner(path, secrets.NewMemStore())
+	if _, err := r.Run(context.Background(), Request{Dir: t.TempDir(), Prompt: "p", MaxTurns: 32}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	argv := readCapture(t, capDir, "argv.txt")
+	if !strings.Contains(argv, "--max-turns 32") {
+		t.Errorf("argv missing max-turns override: %q", argv)
 	}
 }
 

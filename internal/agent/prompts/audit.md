@@ -27,7 +27,10 @@ web access. Do NOT rewrite the sidecars - you only report.
 1. SPOILER LEAKS: every claim in every `description` traces to a chapter at or
    before the card's `reveal`; every claim in every recap to a chapter at or
    before its `through`. Roles and aliases must not leak a later twist. "Implies"
-   counts as a leak.
+   counts as a leak. A deliberate temporal identity pair is valid: an early-name
+   card with no future/cross-identity aliases, followed by a primary-name card at
+   the chapter where the connection becomes safe. Do not flag that safe pair as a
+   duplicate or demand that it be collapsed into a leaking early card.
 2. REVEAL / THROUGH CORRECTNESS, both directions: `reveal` is the FIRST meaningful
    introduction (too late is also a defect); `through` points sit at sensible act
    breaks; every position is in the range 0 to {{.ChapterCount}}.

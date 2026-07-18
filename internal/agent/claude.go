@@ -62,11 +62,24 @@ func (c *claudeRunner) buildArgs(req Request) []string {
 	if req.Web {
 		tools += "," + webTools
 	}
+	turns := req.MaxTurns
+	if turns < 1 {
+		turns = maxTurns
+	}
 	args := []string{
 		"-p",
 		"--output-format", "json",
-		"--max-turns", fmt.Sprintf("%d", maxTurns),
+		"--max-turns", fmt.Sprintf("%d", turns),
+		// --tools is the actual availability boundary; --allowedTools only
+		// pre-approves tools. Supplying both prevents permission prompts without
+		// leaving unrelated coding tools in the model's tool catalogue.
+		"--tools", tools,
 		"--allowedTools", tools,
+		// These invocations are disposable ETL jobs, not coding sessions. Avoid
+		// loading project/user customizations and do not persist a resumable session.
+		"--bare",
+		"--no-session-persistence",
+		"--system-prompt", "You are a deterministic document-processing worker. Follow the stdin task exactly, use only the provided tools and paths, write the requested artifacts, and stop.",
 	}
 	if req.Model != "" {
 		args = append(args, "--model", req.Model)

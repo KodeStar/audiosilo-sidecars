@@ -71,6 +71,12 @@ func (r *codexRunner) buildArgs(req Request, lastMsgFile string) []string {
 	args := []string{
 		"exec",
 		"--json",
+		// Pipeline invocations are disposable ETL jobs. Do not load a user's coding
+		// profiles/rules or persist session history - both add irrelevant context and
+		// filesystem churn, while auth remains available by CLI contract.
+		"--ephemeral",
+		"--ignore-user-config",
+		"--ignore-rules",
 		"--cd", req.Dir,
 		"--sandbox", "workspace-write",
 		"--skip-git-repo-check",

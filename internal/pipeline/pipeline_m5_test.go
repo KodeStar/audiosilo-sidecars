@@ -93,11 +93,11 @@ func TestPipelineSpellingToSynthesisFlow(t *testing.T) {
 			t.Errorf("expected artifact %s missing: %v", rel, err)
 		}
 	}
-	// Each agent stage ran exactly once.
+	// Spelling runs once. The one-chunk fact pass runs extraction plus assembly.
 	if n := fake.count(string(state.SpellingResearch)); n != 1 {
 		t.Errorf("spelling_research ran %d times, want 1", n)
 	}
-	if n := fake.count(string(state.FactPass)); n != 1 {
-		t.Errorf("fact_pass ran %d times, want 1", n)
+	if n := fake.count(string(state.FactPass)); n != 2 {
+		t.Errorf("fact_pass ran %d times, want 2 (chunk plus assembly)", n)
 	}
 }

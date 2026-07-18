@@ -77,9 +77,9 @@ func recordAuditSuccess(t *testing.T, db *store.DB, bookID int64, attempt int) {
 	}
 }
 
-// TestAuditReentryPassesWithoutAgent: an acceptance marker plus a clean validation report
-// on re-entry passes the stage WITHOUT invoking the agent, carrying the accepted metrics.
-func TestAuditReentryPassesWithoutAgent(t *testing.T) {
+// TestAuditReentryPassesAfterTargetedVerification: an acceptance marker plus clean
+// mechanical validation must still run a focused semantic verifier before passing.
+func TestAuditReentryPassesAfterTargetedVerification(t *testing.T) {
 	db := openContribDB(t)
 	b := auditBook(t, db, true) // clean validation
 	recordAuditSuccess(t, db, b.ID, 1)
@@ -91,9 +91,12 @@ func TestAuditReentryPassesWithoutAgent(t *testing.T) {
 	}
 
 	fake := newFakeRunner()
-	fake.act = func(_ *fakeRunner, _ agent.Request, _ int) (agent.Result, error) {
-		t.Error("agent invoked on an accepted re-entry; the pass must be agentless")
-		return agent.Result{}, nil
+	fake.act = func(_ *fakeRunner, req agent.Request, _ int) (agent.Result, error) {
+		if !strings.Contains(req.Prompt, "focused semantic verification") {
+			t.Errorf("verification prompt missing focused scope: %q", req.Prompt)
+		}
+		writeOut(t, req, auditReportName, AuditReport{Pass: true, Findings: []AuditFinding{}})
+		return agent.Result{Usage: agent.Usage{Model: "opus", Input: 20, Output: 5}}, nil
 	}
 	cfg := withSidecarAgent(t.TempDir(), fake)
 	cfg.DB = db
@@ -104,8 +107,8 @@ func TestAuditReentryPassesWithoutAgent(t *testing.T) {
 	if !res.AuditPassed {
 		t.Error("AuditPassed = false, want true (accepted re-entry)")
 	}
-	if n := fake.count(string(state.Auditing)); n != 0 {
-		t.Errorf("agent invoked %d times, want 0", n)
+	if n := fake.count(string(state.Auditing)); n != 1 {
+		t.Errorf("agent invoked %d times, want 1 targeted verification", n)
 	}
 	var m struct {
 		AcceptedAfterRounds int `json:"accepted_after_rounds"`
@@ -118,7 +121,39 @@ func TestAuditReentryPassesWithoutAgent(t *testing.T) {
 		t.Errorf("metrics accepted_after_rounds=%d residual_nits=%d, want 2/2", m.AcceptedAfterRounds, m.ResidualNits)
 	}
 	if !scheduler.SentinelExists(b.WorkDir, string(state.Auditing)) {
-		t.Error("auditing sentinel missing after the agentless pass")
+		t.Error("auditing sentinel missing after targeted verification")
+	}
+}
+
+func TestAuditReentryUnresolvedFixCannotShip(t *testing.T) {
+	db := openContribDB(t)
+	b := auditBook(t, db, true)
+	recordAuditSuccess(t, db, b.ID, 1)
+	if err := writeAuditAccepted(b.WorkDir, auditAccepted{
+		Round: 2, Fix: 1,
+		Findings: []AuditFinding{{Severity: SeverityFix, Locus: "characters[0].description", Text: "leak"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := newFakeRunner()
+	fake.act = func(_ *fakeRunner, req agent.Request, _ int) (agent.Result, error) {
+		writeOut(t, req, auditReportName, AuditReport{Pass: false, Findings: []AuditFinding{{
+			Severity: SeverityFix, Locus: "characters[0].description", Text: "leak remains", Evidence: "chapter 3", Suggestion: "remove it",
+		}}})
+		return agent.Result{}, nil
+	}
+	cfg := withSidecarAgent(t.TempDir(), fake)
+	cfg.DB = db
+	res, err := NewExecutor(cfg).Execute(context.Background(), b, state.Auditing, scheduler.StageReport{})
+	if err != nil {
+		t.Fatalf("auditing: %v", err)
+	}
+	if res.AuditPassed {
+		t.Fatal("unresolved accepted FIX was allowed to ship")
+	}
+	if _, err := os.Stat(auditAcceptedPath(b.WorkDir)); !os.IsNotExist(err) {
+		t.Errorf("acceptance marker still present after failed verification: %v", err)
 	}
 }
 
@@ -194,9 +229,8 @@ func TestAuditCleanPassWritesNoMarker(t *testing.T) {
 // --- scheduler-level end to end ---
 
 // TestAuditAcceptsConvergingTrajectory drives the full sidecar loop: a converging audit
-// (fix 3 -> fix 1) is ACCEPTED at round 2, the final fixing round applies its items, the
-// auditing re-entry passes WITHOUT an agent invocation, and the book reaches done with
-// the acceptance recorded on the marker and the contribution note.
+// (fix 3 -> fix 1) is accepted at round 2, the final fixing round applies its items,
+// targeted verification confirms them, and the book reaches done.
 func TestAuditAcceptsConvergingTrajectory(t *testing.T) {
 	fake := newFakeRunner()
 	fake.act = func(_ *fakeRunner, req agent.Request, attempt int) (agent.Result, error) {
@@ -204,6 +238,10 @@ func TestAuditAcceptsConvergingTrajectory(t *testing.T) {
 		case string(state.Synthesizing), string(state.Fixing):
 			writeOutSidecars(t, req, "book")
 		case string(state.Auditing):
+			if strings.Contains(req.Prompt, "focused semantic verification") {
+				writeOut(t, req, auditReportName, AuditReport{Pass: true, Findings: []AuditFinding{}})
+				break
+			}
 			switch attempt {
 			case 1:
 				writeOut(t, req, auditReportName, AuditReport{Pass: false, Findings: []AuditFinding{
@@ -216,7 +254,7 @@ func TestAuditAcceptsConvergingTrajectory(t *testing.T) {
 					{Severity: SeverityNit, Locus: "n1"}, {Severity: SeverityNit, Locus: "n2"},
 				}})
 			default:
-				t.Errorf("auditing agent invoked a 3rd time (attempt %d); the accepted re-entry must pass without the agent", attempt)
+				t.Errorf("unexpected fresh audit attempt %d", attempt)
 			}
 		}
 		return agent.Result{Usage: agent.Usage{Model: "opus"}}, nil
@@ -228,9 +266,9 @@ func TestAuditAcceptsConvergingTrajectory(t *testing.T) {
 	if final.State != "done" {
 		t.Fatalf("book state = %q (status %q err %q), want done", final.State, final.Status, final.Error)
 	}
-	// The agent ran audit rounds 1 and 2 only; the converged re-entry passed agentlessly.
-	if n := fake.count(string(state.Auditing)); n != 2 {
-		t.Errorf("audit agent invoked %d times, want 2 (round 3 must be agentless)", n)
+	// Two broad audit rounds plus one focused verification.
+	if n := fake.count(string(state.Auditing)); n != 3 {
+		t.Errorf("audit agent invoked %d times, want 3", n)
 	}
 	// One accept round + the re-entry pass = 3 auditing successes; 2 fixing rounds.
 	assertSuccesses(t, db, book.ID, string(state.Auditing), 3)

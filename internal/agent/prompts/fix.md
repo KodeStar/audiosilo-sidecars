@@ -34,6 +34,12 @@ web access.
   caps (description 1500, text 3000, in_short 1500, ending 2000), the reveal /
   through spoiler bounds, and `license` "CC-BY-SA-3.0" with `sources`
   `[{"type": "community"}]`.
+- Identity transitions need temporal cards when the connection is learned later:
+  keep the early-name card free of all future names and aliases, then use a separate
+  primary-name card at the chapter where the connection becomes safe. Do not collapse
+  them into one early card whose static `name` or `aliases` leaks the later identity.
+- Never mention facts, notes, supplied material, sources, the pipeline, or the audit
+  process in published prose. State only the chapter-safe story fact.
 {{if .VerifiedLedger}}
 Use exactly these canonical spellings for every published proper noun:
 
