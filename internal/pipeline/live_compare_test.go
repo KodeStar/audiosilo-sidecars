@@ -63,12 +63,7 @@ func TestLiveCompareExisting(t *testing.T) {
 	if runner == nil || !availability.Available {
 		t.Fatalf("backend unavailable: %+v", availability)
 	}
-	title := compareEnv("AUDIOSILO_COMPARE_TITLE", "Comparison Book")
-	book := store.Book{
-		ID: 1, SourcePath: source, WorkDir: out, Title: title,
-		Authors: []string{compareEnv("AUDIOSILO_COMPARE_AUTHOR", "Unknown")},
-		WorkID:  strings.TrimSpace(os.Getenv("AUDIOSILO_COMPARE_WORK_ID")),
-	}
+	book, db := compareBook(t, source, out)
 	models := AgentModels{
 		Claude: map[string]string{
 			string(state.FactPass): "sonnet", string(state.Synthesizing): "opus", string(state.Auditing): "opus", string(state.Fixing): "opus",
@@ -78,7 +73,7 @@ func TestLiveCompareExisting(t *testing.T) {
 		},
 	}
 	exe := NewExecutor(Config{
-		Agent: runner, AgentAvail: availability, AgentModels: models,
+		DB: db, Agent: runner, AgentAvail: availability, AgentModels: models,
 		AgentTimeout: 60 * time.Minute, AgentConcurrency: 2,
 	})
 
@@ -146,18 +141,13 @@ func TestLiveFixExisting(t *testing.T) {
 	if runner == nil || !availability.Available {
 		t.Fatalf("backend unavailable: %+v", availability)
 	}
-	book := store.Book{
-		ID: 1, SourcePath: compareEnv("AUDIOSILO_COMPARE_WORK", out), WorkDir: out,
-		Title:   compareEnv("AUDIOSILO_COMPARE_TITLE", "Comparison Book"),
-		Authors: []string{compareEnv("AUDIOSILO_COMPARE_AUTHOR", "Unknown")},
-		WorkID:  strings.TrimSpace(os.Getenv("AUDIOSILO_COMPARE_WORK_ID")),
-	}
+	book, db := compareBook(t, compareEnv("AUDIOSILO_COMPARE_WORK", out), out)
 	models := AgentModels{
 		Claude: map[string]string{string(state.Fixing): "opus", string(state.Auditing): "opus"},
 		OpenAI: map[string]string{string(state.Fixing): "gpt-5.6-sol", string(state.Auditing): "gpt-5.6-sol"},
 	}
 	exe := NewExecutor(Config{
-		Agent: runner, AgentAvail: availability, AgentModels: models,
+		DB: db, Agent: runner, AgentAvail: availability, AgentModels: models,
 		AgentTimeout: 60 * time.Minute, AgentConcurrency: 1,
 	})
 	type stageResult struct {
@@ -200,11 +190,155 @@ func TestLiveFixExisting(t *testing.T) {
 	}
 }
 
+// TestLiveAuditExisting revalidates and independently audits a preserved comparison
+// without first modifying its sidecars. It is the cheap final check after a bounded
+// correction loop, and avoids paying for another fact pass or synthesis merely to
+// reject an auditor's prior false positive.
+func TestLiveAuditExisting(t *testing.T) {
+	out := strings.TrimSpace(os.Getenv("AUDIOSILO_COMPARE_OUT"))
+	if out == "" {
+		t.Skip("set AUDIOSILO_COMPARE_OUT to an existing comparison directory")
+	}
+	if _, _, err := loadWorkSidecars(out); err != nil {
+		t.Fatalf("comparison has no sidecars: %v", err)
+	}
+	backend := compareEnv("AUDIOSILO_COMPARE_BACKEND", agent.IDCodex)
+	runner, availability, err := agent.Select(context.Background(), agent.SelectConfig{Backend: backend}, secrets.NewMemStore())
+	if err != nil {
+		t.Fatalf("select %s: %v", backend, err)
+	}
+	if runner == nil || !availability.Available {
+		t.Fatalf("backend unavailable: %+v", availability)
+	}
+	book, db := compareBook(t, compareEnv("AUDIOSILO_COMPARE_WORK", out), out)
+	models := AgentModels{
+		Claude: map[string]string{string(state.Auditing): "opus"},
+		OpenAI: map[string]string{string(state.Auditing): "gpt-5.6-sol"},
+	}
+	exe := NewExecutor(Config{
+		DB: db, Agent: runner, AgentAvail: availability, AgentModels: models,
+		AgentTimeout: 60 * time.Minute, AgentConcurrency: 1,
+	})
+
+	started := time.Now()
+	validation, err := exe.Execute(context.Background(), book, state.Validating, scheduler.StageReport{})
+	if err != nil {
+		t.Fatalf("validating: %v", err)
+	}
+	audit, err := exe.Execute(context.Background(), book, state.Auditing, scheduler.StageReport{
+		Note: func(note string) { t.Log(note) },
+	})
+	if err != nil {
+		t.Fatalf("auditing: %v", err)
+	}
+	data, err := json.MarshalIndent(map[string]any{
+		"backend": backend,
+		"passed":  audit.AuditPassed,
+		"elapsed": time.Since(started).Round(time.Second).String(),
+		"stages": map[string]json.RawMessage{
+			string(state.Validating): validation.Metrics,
+			string(state.Auditing):   audit.Metrics,
+		},
+	}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsutil.WriteFileAtomic(filepath.Join(out, "compare_audit_summary.json"), append(data, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !audit.AuditPassed {
+		t.Log("preserved comparison still has audit findings")
+	}
+}
+
 func compareEnv(name, fallback string) string {
 	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
 		return value
 	}
 	return fallback
+}
+
+// compareBook reproduces the production series lookup in the otherwise isolated
+// live harness. A later volume needs both its series identity and the preceding
+// work directory so fact extraction can inherit knowledge-final.md and sidecar
+// stages can enforce the chapter-0 series recap contract.
+func compareBook(t *testing.T, source, out string) (store.Book, *store.DB) {
+	t.Helper()
+	db, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatalf("open comparison store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	title := compareEnv("AUDIOSILO_COMPARE_TITLE", "Comparison Book")
+	author := compareEnv("AUDIOSILO_COMPARE_AUTHOR", "Unknown")
+	series := strings.TrimSpace(os.Getenv("AUDIOSILO_COMPARE_SERIES"))
+	seriesPos := strings.TrimSpace(os.Getenv("AUDIOSILO_COMPARE_SERIES_POS"))
+	if series != "" {
+		predecessor := strings.TrimSpace(os.Getenv("AUDIOSILO_COMPARE_PREDECESSOR_WORK"))
+		if predecessor == "" {
+			t.Fatal("AUDIOSILO_COMPARE_PREDECESSOR_WORK is required when AUDIOSILO_COMPARE_SERIES is set")
+		}
+		if !fsutil.IsFile(filepath.Join(predecessor, factsDir, knowledgeFinalName)) {
+			t.Fatalf("comparison predecessor has no %s: %s", filepath.Join(factsDir, knowledgeFinalName), predecessor)
+		}
+		_, err = db.CreateBook(context.Background(), store.NewBook{
+			SourcePath: predecessor,
+			WorkDir:    predecessor,
+			Title:      compareEnv("AUDIOSILO_COMPARE_PREDECESSOR_TITLE", "Series predecessor"),
+			Authors:    []string{author},
+			Series:     series,
+			SeriesPos:  compareEnv("AUDIOSILO_COMPARE_PREDECESSOR_SERIES_POS", "1"),
+		})
+		if err != nil {
+			t.Fatalf("seed comparison predecessor: %v", err)
+		}
+	}
+
+	book, err := db.CreateBook(context.Background(), store.NewBook{
+		SourcePath: source + "#isolated-comparison",
+		WorkDir:    out,
+		Title:      title,
+		Authors:    []string{author},
+		Series:     series,
+		SeriesPos:  seriesPos,
+		WorkID:     strings.TrimSpace(os.Getenv("AUDIOSILO_COMPARE_WORK_ID")),
+	})
+	if err != nil {
+		t.Fatalf("seed comparison target: %v", err)
+	}
+	return book, db
+}
+
+func TestCompareBookSeedsSeriesPredecessor(t *testing.T) {
+	predecessor := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(predecessor, factsDir), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(predecessor, factsDir, knowledgeFinalName), []byte("# Prior book\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AUDIOSILO_COMPARE_SERIES", "Example Series")
+	t.Setenv("AUDIOSILO_COMPARE_SERIES_POS", "2")
+	t.Setenv("AUDIOSILO_COMPARE_PREDECESSOR_WORK", predecessor)
+	t.Setenv("AUDIOSILO_COMPARE_PREDECESSOR_SERIES_POS", "1")
+
+	book, db := compareBook(t, t.TempDir(), t.TempDir())
+	pred, found, err := findSeriesPredecessor(context.Background(), db, book)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || pred == nil || pred.WorkDir != predecessor {
+		t.Fatalf("predecessor = %+v, found = %v; want %s", pred, found, predecessor)
+	}
+	exe := NewExecutor(Config{DB: db})
+	opener, err := exe.isSeriesOpener(context.Background(), book)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opener {
+		t.Fatal("series book with seeded predecessor reported as opener")
+	}
 }
 
 func copyCompareInputs(t *testing.T, source, out string) {

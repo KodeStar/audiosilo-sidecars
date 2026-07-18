@@ -36,7 +36,12 @@ web access. Do NOT rewrite the sidecars - you only report.
    breaks; every position is in the range 0 to {{.ChapterCount}}.
 3. ACCURACY: names, statuses, chapter-of-death, and the ending are consistent with
    the facts. Flag any claim not present in the fact notes at all.
-4. COVERAGE: look-up-worthy characters with no card; spans with no recap.
+4. COVERAGE: look-up-worthy characters with no card; spans with no recap. Apply
+   the authoring contract's walk-on rule in both directions: do NOT demand cards
+   for unnamed, single-scene officials, messengers, servants, guards, or advisers
+   who have no distinct action, fate, obligation, or continuing thread. Merely
+   attending a scene, delivering a report, or supporting another character's
+   action does not make an incidental figure look-up-worthy.
 5. CONTRACT: neutral voice; caps (description 1500, text 3000, in_short 1500,
    ending 2000); the final recap states the ending plainly, never a tease; no em
    dashes; {{if .IsSeriesOpener}}a series opener has NO `chapter: 0` series recap{{else}}book 2+ carries a `chapter: 0` series recap{{end}}; `license` is
