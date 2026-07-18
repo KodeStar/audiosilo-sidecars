@@ -9,7 +9,14 @@ const settings: Settings = {
   cors_origins: [],
   secrets: { anthropic_api_key: false, openai_api_key: false, github_pat: false },
   asr: { backend: '' },
-  agent: { backend: '', concurrency: 2, timeout_minutes: 60, claude_models: {}, openai_models: {} },
+  agent: {
+    backend: '',
+    concurrency: 2,
+    timeout_minutes: 60,
+    book_budget_usd: 75,
+    claude_models: {},
+    openai_models: {},
+  },
   contribution: {
     mode: 'issue',
     repo: 'KodeStar/audiosilo-meta',

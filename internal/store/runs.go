@@ -13,6 +13,15 @@ import (
 // Model/InputTokens/OutputTokens/CostUSD (M5) capture agent spend: an agent stage
 // accumulates them per invocation via AddOpenStageRunUsage. Mechanical/ASR stages
 // leave them zero. CostUSD is 0 when the backend does not report a USD cost (codex).
+//
+// Superseded (migration 0008) splits the two questions a stage_runs row answers.
+// SCHEDULING readers (round/fix-loop counters via CountStageSuccesses, the
+// crash-resume "stage done" set via SucceededStages*) treat a superseded run as if it
+// never happened: a Retry marks a stage's prior ok=1 runs superseded to reset those
+// counters and force a fresh execution. MONEY readers (SumStageRunCost / StageRunTotals
+// / the book-detail per-stage cost table via ListStageRuns) INCLUDE superseded rows -
+// spend is spend, and a Retry must not erase a book's recorded cost. This replaced the
+// old DeleteStageSuccess, which DELETED the rows and destroyed the cost history.
 type StageRun struct {
 	ID           int64           `json:"id"`
 	BookID       int64           `json:"book_id"`
@@ -26,6 +35,10 @@ type StageRun struct {
 	InputTokens  int64           `json:"input_tokens"`
 	OutputTokens int64           `json:"output_tokens"`
 	CostUSD      float64         `json:"cost_usd"`
+	// Superseded is true when a Retry reset this stage: the run's success no longer
+	// counts for scheduling (round/fix counters, crash-resume set) but its cost still
+	// counts. Failed runs are never superseded.
+	Superseded bool `json:"superseded"`
 }
 
 // StartStageRun opens a new run for (book, stage) with finished_at NULL and
@@ -96,7 +109,8 @@ func (db *DB) AddOpenStageRunUsage(ctx context.Context, bookID int64, stage, mod
 // StageRunTotals returns the summed agent cost_usd per book across all stage runs,
 // bucketed by book id, in ONE grouped query so the book-list endpoint attaches per-book
 // totals without an N+1. Books with no runs (or only zero-cost mechanical/ASR runs) are
-// absent from the map (callers read a missing key as 0).
+// absent from the map (callers read a missing key as 0). It is a MONEY reader, so it
+// deliberately INCLUDES superseded runs - a Retry must not erase recorded spend.
 func (db *DB) StageRunTotals(ctx context.Context) (map[int64]float64, error) {
 	rows, err := db.sql.QueryContext(ctx,
 		`SELECT book_id, COALESCE(SUM(cost_usd), 0) FROM stage_runs GROUP BY book_id`)
@@ -117,7 +131,9 @@ func (db *DB) StageRunTotals(ctx context.Context) (map[int64]float64, error) {
 }
 
 // SumStageRunCost returns the summed agent cost_usd across one book's stage runs - the
-// single-book form of StageRunTotals for the book-detail/create paths.
+// single-book form of StageRunTotals for the book-detail/create paths. Like
+// StageRunTotals it INCLUDES superseded runs (spend is spend); it is the number the
+// per-book budget guard checks, so a Retry that supersedes a stage never lowers it.
 func (db *DB) SumStageRunCost(ctx context.Context, bookID int64) (float64, error) {
 	var total float64
 	err := db.sql.QueryRowContext(ctx,
@@ -177,26 +193,31 @@ func (db *DB) CountStageRuns(ctx context.Context, bookID int64, stage string) (i
 	return n, err
 }
 
-// CountStageSuccesses returns how many runs of stage completed ok for a book.
+// CountStageSuccesses returns how many runs of stage completed ok AND are not
+// superseded for a book. It is a SCHEDULING reader (round counters, the fix-loop
+// count): a Retry marks a stage's successes superseded to reset the count, so a
+// superseded success is excluded here (its cost still counts elsewhere).
 func (db *DB) CountStageSuccesses(ctx context.Context, bookID int64, stage string) (int, error) {
 	var n int
 	err := db.sql.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM stage_runs WHERE book_id=? AND stage=? AND ok=1`, bookID, stage).Scan(&n)
+		`SELECT COUNT(*) FROM stage_runs WHERE book_id=? AND stage=? AND ok=1 AND superseded=0`, bookID, stage).Scan(&n)
 	return n, err
 }
 
 const runCols = `id, book_id, stage, attempt, started_at, finished_at, ok, metrics, ` +
-	`model, input_tokens, output_tokens, cost_usd`
+	`model, input_tokens, output_tokens, cost_usd, superseded`
 
 func scanRun(sc interface{ Scan(...any) error }) (StageRun, error) {
 	var r StageRun
 	var finished sql.NullString
 	var ok sql.NullInt64
 	var metrics string
+	var superseded int64
 	if err := sc.Scan(&r.ID, &r.BookID, &r.Stage, &r.Attempt, &r.StartedAt,
-		&finished, &ok, &metrics, &r.Model, &r.InputTokens, &r.OutputTokens, &r.CostUSD); err != nil {
+		&finished, &ok, &metrics, &r.Model, &r.InputTokens, &r.OutputTokens, &r.CostUSD, &superseded); err != nil {
 		return StageRun{}, err
 	}
+	r.Superseded = superseded == 1
 	if finished.Valid {
 		r.FinishedAt = finished.String
 	}
@@ -250,13 +271,15 @@ func (db *DB) OpenStageRuns(ctx context.Context) ([]StageRun, error) {
 }
 
 // SucceededStagesAll returns, for every book, the set of stages with at least
-// one ok=1 run, in one grouped query - the "DB says done" set the reconcile
-// cross-checks against on-disk sentinels. A single grouped query avoids a per-book
-// N+1 across the whole catalogue at startup; callers that want one book's set
-// index the result by book id.
+// one ok=1 non-superseded run, in one grouped query - the "DB says done" set the
+// reconcile cross-checks against on-disk sentinels. It is a SCHEDULING reader, so a
+// superseded success (a Retry-reset stage) is excluded, exactly as the old
+// DeleteStageSuccess removed the row. A single grouped query avoids a per-book N+1
+// across the whole catalogue at startup; callers that want one book's set index the
+// result by book id.
 func (db *DB) SucceededStagesAll(ctx context.Context) (map[int64]map[string]bool, error) {
 	rows, err := db.sql.QueryContext(ctx,
-		`SELECT DISTINCT book_id, stage FROM stage_runs WHERE ok=1`)
+		`SELECT DISTINCT book_id, stage FROM stage_runs WHERE ok=1 AND superseded=0`)
 	if err != nil {
 		return nil, err
 	}
@@ -278,11 +301,12 @@ func (db *DB) SucceededStagesAll(ctx context.Context) (map[int64]map[string]bool
 	return out, rows.Err()
 }
 
-// SucceededStages returns one book's set of stages with at least one ok=1 run - the
-// single-book form of SucceededStagesAll, used by a mid-run reconcile (a scratch
-// purge) that must recover just the purged book without a whole-catalogue scan.
+// SucceededStages returns one book's set of stages with at least one ok=1
+// non-superseded run - the single-book form of SucceededStagesAll (a SCHEDULING
+// reader), used by a mid-run reconcile (a scratch purge) that must recover just the
+// purged book without a whole-catalogue scan.
 func (db *DB) SucceededStages(ctx context.Context, bookID int64) (map[string]bool, error) {
-	rows, err := db.sql.QueryContext(ctx, `SELECT DISTINCT stage FROM stage_runs WHERE book_id=? AND ok=1`, bookID)
+	rows, err := db.sql.QueryContext(ctx, `SELECT DISTINCT stage FROM stage_runs WHERE book_id=? AND ok=1 AND superseded=0`, bookID)
 	if err != nil {
 		return nil, err
 	}
@@ -298,11 +322,16 @@ func (db *DB) SucceededStages(ctx context.Context, bookID int64) (map[string]boo
 	return out, rows.Err()
 }
 
-// DeleteStageSuccess removes ok=1 runs of a stage for a book, used by reconcile
-// when a completed stage's sentinel is missing and the stage must re-run.
-func (db *DB) DeleteStageSuccess(ctx context.Context, bookID int64, stage string) error {
+// SupersedeStageSuccesses marks a stage's ok=1 runs superseded for a book, resetting
+// the SCHEDULING counters (round/fix-loop counts, the crash-resume "done" set) so the
+// stage re-runs, WITHOUT deleting the rows - their recorded cost is real spend and must
+// survive. Used by Retry/auto-readmit and by reconcile when a completed stage's
+// sentinel is missing and the stage must re-run. It replaced DeleteStageSuccess (which
+// DELETED the rows and destroyed a book's cost history). Failed runs (ok=0) are left
+// untouched.
+func (db *DB) SupersedeStageSuccesses(ctx context.Context, bookID int64, stage string) error {
 	_, err := db.sql.ExecContext(ctx,
-		`DELETE FROM stage_runs WHERE book_id=? AND stage=? AND ok=1`, bookID, stage)
+		`UPDATE stage_runs SET superseded=1 WHERE book_id=? AND stage=? AND ok=1`, bookID, stage)
 	return err
 }
 

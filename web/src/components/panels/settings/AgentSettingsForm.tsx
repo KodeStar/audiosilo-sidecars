@@ -41,6 +41,9 @@ export function AgentSettingsForm({ client, initial, info }: AgentSettingsFormPr
   function setTimeout(timeoutMinutes: string) {
     setForm((f) => ({ ...f, timeoutMinutes }));
   }
+  function setBookBudget(bookBudgetUSD: string) {
+    setForm((f) => ({ ...f, bookBudgetUSD }));
+  }
   function setModel(stage: AgentStageKey, col: 'claude' | 'openai', value: string) {
     setForm((f) => ({
       ...f,
@@ -116,6 +119,18 @@ export function AgentSettingsForm({ client, initial, info }: AgentSettingsFormPr
             value={form.timeoutMinutes}
             onChange={(e) => setTimeout(e.target.value)}
             className="w-24 rounded-md border border-edge bg-raised px-3 py-2 text-body"
+          />
+        </Field>
+
+        <Field label="Book budget (USD)" htmlFor="agent-budget">
+          <input
+            id="agent-budget"
+            type="number"
+            min={0}
+            step="0.01"
+            value={form.bookBudgetUSD}
+            onChange={(e) => setBookBudget(e.target.value)}
+            className="w-28 rounded-md border border-edge bg-raised px-3 py-2 text-body"
           />
         </Field>
       </div>

@@ -217,7 +217,11 @@ type bookView struct {
 	Status          string            `json:"status"`
 	Error           string            `json:"error,omitempty"`
 	// ParkCode is the typed park reason beside Error (empty = none), from books.park_code.
-	ParkCode string          `json:"park_code,omitempty"`
+	ParkCode string `json:"park_code,omitempty"`
+	// RetryAt is the scheduled automatic re-admit instant (RFC3339 UTC) for a book parked
+	// on a transient agent condition; empty for a plain park or a book that predates the
+	// feature. The UI reads its presence to say the book will retry automatically.
+	RetryAt  string          `json:"retry_at,omitempty"`
 	Coverage json.RawMessage `json:"coverage,omitempty"`
 	// ETASeconds is the scheduler's latest estimated remaining seconds for this book
 	// (0/omitted when the book has no active ETA - terminal/paused/parked/failed, or
@@ -321,7 +325,7 @@ func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64
 		Series: b.Series, SeriesPos: b.SeriesPos, ASIN: b.ASIN, ISBN: b.ISBN,
 		IdentitySources: idsrc, WorkID: b.WorkID,
 		State: b.State, Lane: string(state.LaneOf(state.State(b.State))),
-		Status: b.Status, Error: b.Error, ParkCode: b.ParkCode, Coverage: b.Coverage,
+		Status: b.Status, Error: b.Error, ParkCode: b.ParkCode, RetryAt: b.RetryAt, Coverage: b.Coverage,
 		ETASeconds: etaSeconds, StartedAt: startedAt,
 		Progress: progress, ScratchBytes: b.ScratchBytes, DurationSec: b.DurationSec,
 		TotalCostUSD: totalCostUSD, Contribution: contribution,

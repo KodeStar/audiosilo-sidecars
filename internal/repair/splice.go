@@ -146,6 +146,21 @@ func buildMidRepairLine(chapter int, start, end float64, before, after int) stri
 	)
 }
 
+// buildDirectedRepairLine formats one repairs.log entry for a run-less (agent-directed) TAIL
+// repair - the clipAndSpliceDirected path taken when the mechanical locator found no loop but
+// the adjudicator supplied a clip_start_sec. Unlike buildRepairLine there is no located run to
+// report (no loop phrase, count, or claimed rate), so the line notes the agent-directed window
+// [start, chend] and the head/clip word delta only, printing round(_,1) values like the tail
+// lines. It records VerdictTailRepaired.
+func buildDirectedRepairLine(chapter int, start, chapterEnd float64, before, after int) string {
+	return fmt.Sprintf(
+		"- ch%03d [%s]: spliced agent-directed clip at %ss (+%ss); no located loop. words %d -> %d (%+d)",
+		chapter, VerdictTailRepaired,
+		pyFloatStr(pyRound(start, 1)), pyFloatStr(pyRound(chapterEnd-start, 1)),
+		before, after, after-before,
+	)
+}
+
 // AppendRepairLog appends one already-formatted line to workDir/repairs.log, creating
 // the file with a header on first write. Unlike the batch build_repairs.py (which
 // rewrote the whole file with a header and a footer summary), the M5 pipeline splices

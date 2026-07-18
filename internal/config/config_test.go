@@ -18,8 +18,50 @@ func TestLoadDefaultsOnFirstRun(t *testing.T) {
 	if cfg.Agent.Concurrency != DefaultConcurrency {
 		t.Errorf("concurrency = %d, want %d", cfg.Agent.Concurrency, DefaultConcurrency)
 	}
+	if cfg.Agent.BookBudgetUSD != DefaultBookBudgetUSD {
+		t.Errorf("book_budget_usd default = %v, want %v", cfg.Agent.BookBudgetUSD, DefaultBookBudgetUSD)
+	}
 	if cfg.CORSOrigins == nil {
 		t.Error("CORSOrigins should be non-nil empty slice")
+	}
+}
+
+func TestBookBudgetNormalizeAndOverride(t *testing.T) {
+	// A config with book_budget_usd unset (0) adopts the default on Load ...
+	dir := t.TempDir()
+	in := Default()
+	in.Agent.BookBudgetUSD = 0
+	if err := Save(dir, in); err != nil {
+		t.Fatal(err)
+	}
+	out, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Agent.BookBudgetUSD != DefaultBookBudgetUSD {
+		t.Errorf("zero budget normalized to %v, want default %v", out.Agent.BookBudgetUSD, DefaultBookBudgetUSD)
+	}
+	// ... and an explicit (large) value round-trips untouched, so a user can effectively
+	// disable the guard.
+	in.Agent.BookBudgetUSD = 100000
+	if err := Save(dir, in); err != nil {
+		t.Fatal(err)
+	}
+	out, err = Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Agent.BookBudgetUSD != 100000 {
+		t.Errorf("explicit budget = %v, want 100000", out.Agent.BookBudgetUSD)
+	}
+	// The env override applies too.
+	t.Setenv("AUDIOSILO_SIDECARS_AGENT_BOOK_BUDGET_USD", "42.5")
+	out, err = Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Agent.BookBudgetUSD != 42.5 {
+		t.Errorf("env override budget = %v, want 42.5", out.Agent.BookBudgetUSD)
 	}
 }
 
@@ -130,6 +172,7 @@ func TestValidateAgentFields(t *testing.T) {
 		"non-agent claude key": func(c *Config) { c.Agent.Claude = map[string]string{"splitting": "sonnet"} },
 		"non-agent openai key": func(c *Config) { c.Agent.OpenAI = map[string]string{"asr": "gpt-x"} },
 		"unknown claude key":   func(c *Config) { c.Agent.Claude = map[string]string{"not_a_stage": "sonnet"} },
+		"negative budget":      func(c *Config) { c.Agent.BookBudgetUSD = -1 },
 	}
 	for name, mutate := range bad {
 		t.Run(name, func(t *testing.T) {

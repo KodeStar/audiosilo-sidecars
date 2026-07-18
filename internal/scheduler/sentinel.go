@@ -22,7 +22,22 @@ type StageResult struct {
 	// update the learned rate". It persists in the sentinel (additive, omitempty) but
 	// is never re-folded on a crash-resume skip, only on a genuine execution.
 	RateSample *RateSample `json:"rate_sample,omitempty"`
+	// ParkMessage is an optional richer reason a stage attaches for a park the
+	// SCHEDULER decides (not the stage). The auditing stage fills it with the
+	// fix-count trajectory so advance()'s fix-loop-exhausted park can surface why the
+	// book did not converge, instead of the generic hardcoded message. Empty = use the
+	// scheduler's default. Additive/omitempty; persisted so a crash-resume park keeps it.
+	ParkMessage string `json:"park_message,omitempty"`
 }
+
+// Audit-loop trajectory artifacts, written by the pipeline's auditing stage in a
+// book's work dir. The scheduler owns their NAMES - like the _done sentinels - so
+// Retry can wipe them for a fresh fix loop without importing the pipeline package
+// (which would invert the dependency direction). The pipeline owns their JSON schema.
+const (
+	AuditRoundsFile   = "audit_rounds.json"
+	AuditAcceptedFile = "audit_accepted.json"
+)
 
 // Sentinel is the on-disk _done/<stage>.json marker: the CONTENT truth that a
 // stage produced its output. Runs counts real executions (so a test can prove a

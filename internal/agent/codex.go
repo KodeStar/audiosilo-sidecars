@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/secrets"
 )
@@ -130,12 +131,12 @@ func (r *codexRunner) Run(ctx context.Context, req Request) (Result, error) {
 
 	if failDetail != "" {
 		if isRateLimit(failDetail) {
-			return Result{}, &RateLimitError{Detail: truncate(failDetail)}
+			return Result{}, newRateLimitError(failDetail, time.Now())
 		}
 		return Result{}, fmt.Errorf("codex turn failed: %s", truncate(failDetail))
 	}
 	if isRateLimit(stderr) {
-		return Result{}, &RateLimitError{Detail: truncate(firstNonEmpty(stderr, stdout))}
+		return Result{}, newRateLimitError(firstNonEmpty(stderr, stdout), time.Now())
 	}
 	if runErr != nil {
 		return Result{}, fmt.Errorf("codex exited: %w: %s", runErr, truncate(firstNonEmpty(stderr, stdout)))

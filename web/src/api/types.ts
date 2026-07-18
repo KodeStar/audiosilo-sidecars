@@ -74,6 +74,7 @@ export interface AgentConfig {
   backend: string;
   concurrency: number;
   timeout_minutes: number;
+  book_budget_usd: number;
   claude_models: Record<string, string>;
   openai_models: Record<string, string>;
 }
@@ -116,6 +117,7 @@ export interface AgentUpdate {
   backend?: string;
   concurrency?: number;
   timeout_minutes?: number;
+  book_budget_usd?: number;
   claude_models?: Record<string, string>;
   openai_models?: Record<string, string>;
 }
@@ -368,6 +370,12 @@ export interface BookView {
   // internal/state ParkCode enum). Present (non-empty) only while parked
   // (status === 'needs_attention'); cleared on retry/resume/cancel. omitempty.
   park_code?: string;
+  // Scheduled automatic re-admit instant (RFC3339 UTC) for a book parked on a transient
+  // agent condition (agent_unavailable/agent_rate_limited); absent for a plain park or a
+  // book predating the feature. Its presence flips the park hint to "retries
+  // automatically". Carried on the initial GET /books fetch AND on the book.state SSE
+  // patch (applyBookState mirrors it, clearing it when a frame carries none).
+  retry_at?: string;
   coverage?: Coverage;
   identity_sources?: Record<string, string>;
   progress: BookProgress[];
@@ -486,6 +494,10 @@ export interface BookStateEvent {
   error: string;
   // The typed park reason (see the internal/state ParkCode enum); '' when none.
   park_code?: string;
+  // The scheduled auto-readmit instant (RFC3339 UTC) the daemon set for this write, or
+  // '' when it set none - so a park frame carries the retry_at that flips the hint to
+  // "retries automatically" and an advance/clear frame carries '' to reset it.
+  retry_at?: string;
 }
 
 export interface StageProgressEvent {

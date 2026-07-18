@@ -12,6 +12,7 @@ const baseConfig: AgentConfig = {
   backend: 'claude',
   concurrency: 2,
   timeout_minutes: 60,
+  book_budget_usd: 75,
   claude_models: { fact_pass: 'sonnet', synthesizing: 'opus' },
   openai_models: {},
 };
@@ -22,6 +23,7 @@ describe('agentConfigToForm', () => {
     expect(form.backend).toBe('claude');
     expect(form.concurrency).toBe('2');
     expect(form.timeoutMinutes).toBe('60');
+    expect(form.bookBudgetUSD).toBe('75');
     // Every agent stage has a row.
     expect(Object.keys(form.models).sort()).toEqual([...AGENT_STAGE_KEYS].sort());
     expect(form.models.fact_pass.claude).toBe('sonnet');
@@ -40,6 +42,7 @@ describe('agentFormToUpdate', () => {
     expect(update.backend).toBe('claude');
     expect(update.concurrency).toBe(2);
     expect(update.timeout_minutes).toBe(60);
+    expect(update.book_budget_usd).toBe(75);
     expect(update.claude_models).toEqual({ fact_pass: 'sonnet', synthesizing: 'opus' });
     expect(update.openai_models).toEqual({ fact_pass: 'gpt-5' });
   });
@@ -69,5 +72,13 @@ describe('validateAgentForm', () => {
   it('rejects a sub-1 timeout', () => {
     expect(validateAgentForm({ ...ok, timeoutMinutes: '0' })).toMatch(/timeout/i);
     expect(validateAgentForm({ ...ok, timeoutMinutes: '' })).toMatch(/timeout/i);
+  });
+
+  it('rejects a negative or non-numeric book budget but accepts 0 and large values', () => {
+    expect(validateAgentForm({ ...ok, bookBudgetUSD: '-1' })).toMatch(/budget/i);
+    expect(validateAgentForm({ ...ok, bookBudgetUSD: '' })).toMatch(/budget/i);
+    expect(validateAgentForm({ ...ok, bookBudgetUSD: 'x' })).toMatch(/budget/i);
+    expect(validateAgentForm({ ...ok, bookBudgetUSD: '0' })).toBeNull();
+    expect(validateAgentForm({ ...ok, bookBudgetUSD: '100000' })).toBeNull();
   });
 });

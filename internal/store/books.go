@@ -37,6 +37,17 @@ func enforceParkCode(status, parkCode string) string {
 	return parkCode
 }
 
+// enforceRetryAt drops a scheduled-retry instant that does not belong to the status
+// being written: retry_at is meaningful only alongside needs_attention (the auto-readmit
+// window), so any other status - including a clear via retry/resume - writes empty.
+// Shares the park_code invariant so a status-clearing write can never leave a stale time.
+func enforceRetryAt(status, retryAt string) string {
+	if status != statusNeedsAttention {
+		return ""
+	}
+	return retryAt
+}
+
 // DeriveWorkDir returns a unique per-book scratch directory under root. The
 // source_path hash guarantees uniqueness (two books may share a title), while the
 // title slug keeps the path human-readable. An empty/all-symbol title falls back
@@ -118,7 +129,13 @@ type Book struct {
 	DurationSec float64
 	// ParkCode is the typed park reason (empty = none): set when status becomes
 	// needs_attention, cleared whenever status clears. It rides beside Error.
-	ParkCode  string
+	ParkCode string
+	// RetryAt is an RFC3339 (UTC) instant at which the scheduler may auto-readmit a book
+	// parked on a transient agent condition (empty = no scheduled retry). Like ParkCode
+	// it is meaningful only alongside needs_attention and is cleared whenever status
+	// clears. A book that predates migration 0008 (or a plain park) has '' and never
+	// auto-readmits - only a human Retry re-admits it.
+	RetryAt   string
 	CreatedAt string
 	UpdatedAt string
 }
@@ -240,7 +257,7 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 
 const bookCols = `id, source_path, work_dir, title, authors, narrators, series, series_pos,
 	asin, isbn, identity_sources, work_id, state, status, error, coverage, scratch_bytes,
-	chapters, duration_sec, park_code, created_at, updated_at`
+	chapters, duration_sec, park_code, retry_at, created_at, updated_at`
 
 func scanBook(sc interface{ Scan(...any) error }) (Book, error) {
 	var b Book
@@ -248,7 +265,7 @@ func scanBook(sc interface{ Scan(...any) error }) (Book, error) {
 	if err := sc.Scan(&b.ID, &b.SourcePath, &b.WorkDir, &b.Title, &authors, &narrators,
 		&b.Series, &b.SeriesPos, &b.ASIN, &b.ISBN, &idsrc, &b.WorkID, &b.State, &b.Status,
 		&b.Error, &coverage, &b.ScratchBytes, &b.Chapters, &b.DurationSec, &b.ParkCode,
-		&b.CreatedAt, &b.UpdatedAt); err != nil {
+		&b.RetryAt, &b.CreatedAt, &b.UpdatedAt); err != nil {
 		return Book{}, err
 	}
 	if authors != "" {
@@ -300,15 +317,47 @@ func (db *DB) ListBooks(ctx context.Context) ([]Book, error) {
 	return out, rows.Err()
 }
 
+// ListBooksDueForRetry returns every needs_attention book whose scheduled auto-readmit
+// instant (retry_at) is set and at or before now (an RFC3339 UTC string, the same format
+// SetBookStatusRetry writes, so a lexical compare is chronological). The scheduler
+// filters these by park_code (only the transient agent codes auto-readmit); a book that
+// predates migration 0008 has retry_at=” and is excluded here, so it never auto-readmits.
+func (db *DB) ListBooksDueForRetry(ctx context.Context, now string) ([]Book, error) {
+	rows, err := db.sql.QueryContext(ctx,
+		`SELECT `+bookCols+` FROM books
+		 WHERE status=? AND retry_at != '' AND retry_at <= ? ORDER BY id`,
+		statusNeedsAttention, now)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []Book
+	for rows.Next() {
+		b, err := scanBook(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
 // SetBookState updates a book's state, status, error, and typed park code together
 // (the fields the scheduler mutates on every transition) and bumps updated_at. The
 // park_code invariant is enforced here: a code is written only alongside a
 // needs_attention status, so a status-clearing write always wipes any prior code
 // even if the caller passes one.
 func (db *DB) SetBookState(ctx context.Context, id int64, state, status, errMsg, parkCode string) error {
+	// retry_at is preserved across a needs_attention-preserving write (a crash-reconcile
+	// rewind of a timed park must keep its auto-readmit instant) and cleared otherwise (a
+	// waypoint advance to a running/clear status), mirroring the park_code invariant. A
+	// fresh timed park is stamped via SetBookStatusRetry, not here.
 	res, err := db.sql.ExecContext(ctx,
-		`UPDATE books SET state=?, status=?, error=?, park_code=?, updated_at=? WHERE id=?`,
-		state, status, errMsg, enforceParkCode(status, parkCode), timestamp(nowFn()), id)
+		`UPDATE books SET state=?, status=?, error=?, park_code=?,
+		 retry_at = CASE WHEN ?=? THEN retry_at ELSE '' END,
+		 updated_at=? WHERE id=?`,
+		state, status, errMsg, enforceParkCode(status, parkCode),
+		status, statusNeedsAttention, timestamp(nowFn()), id)
 	return checkAffected(res, err)
 }
 
@@ -349,14 +398,26 @@ func (db *DB) SetBookPipelineState(ctx context.Context, id int64, state string) 
 }
 
 // SetBookStatus updates only the orthogonal status flag (paused/needs_attention/
-// failed and back), preserving the pipeline state. The park_code invariant is
-// enforced here: a code is written only alongside a needs_attention status, so any
-// other status (including a clear) always wipes a prior code even if the caller
-// passes one.
+// failed and back), preserving the pipeline state, and CLEARS any scheduled retry
+// instant. The park_code invariant is enforced here: a code is written only alongside a
+// needs_attention status, so any other status (including a clear) always wipes a prior
+// code even if the caller passes one. It is the plain form of SetBookStatusRetry (no
+// timed retry), so every existing caller (pause/resume/cancel/plain park) clears
+// retry_at - a park that should auto-readmit uses SetBookStatusRetry instead.
 func (db *DB) SetBookStatus(ctx context.Context, id int64, status, errMsg, parkCode string) error {
+	return db.SetBookStatusRetry(ctx, id, status, errMsg, parkCode, "")
+}
+
+// SetBookStatusRetry is SetBookStatus plus the scheduled auto-readmit instant
+// (books.retry_at, RFC3339 UTC): the scheduler stamps it when parking a book on a
+// transient agent condition so a later dispatch pass can re-admit it once the window
+// elapses. retry_at obeys the same needs_attention invariant as park_code (enforced
+// here), so a status-clearing write wipes it even if a caller passes one.
+func (db *DB) SetBookStatusRetry(ctx context.Context, id int64, status, errMsg, parkCode, retryAt string) error {
 	res, err := db.sql.ExecContext(ctx,
-		`UPDATE books SET status=?, error=?, park_code=?, updated_at=? WHERE id=?`,
-		status, errMsg, enforceParkCode(status, parkCode), timestamp(nowFn()), id)
+		`UPDATE books SET status=?, error=?, park_code=?, retry_at=?, updated_at=? WHERE id=?`,
+		status, errMsg, enforceParkCode(status, parkCode), enforceRetryAt(status, retryAt),
+		timestamp(nowFn()), id)
 	return checkAffected(res, err)
 }
 

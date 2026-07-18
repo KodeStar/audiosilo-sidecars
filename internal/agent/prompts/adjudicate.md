@@ -37,9 +37,23 @@ web access.
   loop spam inflated the count; inspect and queue the appropriate repair.
 - An `accept` verdict must carry an ARGUED reason (why this really is authentic
   narration or a harmless closing echo), never a bare "looks fine".
+- Accepts are DURABLE: an accepted chapter is recorded and never re-adjudicated in a
+  later round, so accept DECISIVELY when the evidence supports it (a false positive, a
+  harmless echo, or a repair whose remaining flag is a residual of a splice that already
+  landed). You will not see it again.
+- For a chapter whose repair options are EXHAUSTED - a window already marked
+  `CLIP-REDEGENERATED` under the current decode params, or the same text reproduced by two
+  independent decode paths - an explicit `accept` with your reasoning is the correct
+  terminal disposition: repetition that survives two independent decodes is authentic
+  audio, not corruption. Do not keep re-queuing it.
 {{if gt .Round 1}}- On this re-entry round, ACCEPT residuals that a prior round already repaired
   rather than re-queuing them - repeated retranscription of a chapter that keeps
   collapsing at the same point does not improve it. Converge; do not loop.
+- If a `tail_clip` you queued last round produced NO `repairs.log` entry and NO
+  `tail_verdicts.json` verdict for the chapter, the mechanical locator could NOT find the
+  loop (it needs a long 6-gram run; a short repeat like a 3x phrase is below its reach).
+  Re-queue that chapter WITH an explicit `clip_start_sec` - the repair stage cuts exactly
+  there instead of no-oping - or use `mid_clip` with a bounded window.
 {{end}}
 
 ## Actions

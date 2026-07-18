@@ -38,6 +38,13 @@ const DefaultConcurrency = 2
 // it. Applied per invocation, not per stage or per book.
 const DefaultTimeoutMinutes = 60
 
+// DefaultBookBudgetUSD is the default per-book agent spend cap: an agent stage parks the
+// book budget_exceeded (everything recorded) once its summed cost reaches this, before
+// spending more - the backstop for a pathological book (one real 90-chapter book burned
+// $62 before parking). Set a very large value in config.yaml to effectively disable the
+// guard. Restart-to-apply, like the rest of agent.*.
+const DefaultBookBudgetUSD = 75.0
+
 // Agent backend selector values. An empty backend means "auto" (claude when
 // detectable, else codex, else unavailable); the two explicit values force one
 // runner.
@@ -121,13 +128,17 @@ type ASRConfig struct {
 // resolved once at startup, like asr.backend), unlike cors_origins which the API
 // re-reads live per request.
 type AgentConfig struct {
-	Backend        string            `yaml:"backend"`         // "" (auto) | "claude" | "codex"
-	Concurrency    int               `yaml:"concurrency"`     // parallel agent slots (Lane B)
-	ClaudePath     string            `yaml:"claude_path"`     // explicit claude CLI location; "" = $PATH
-	CodexPath      string            `yaml:"codex_path"`      // explicit codex CLI location; "" = $PATH
-	TimeoutMinutes int               `yaml:"timeout_minutes"` // per-invocation wall-clock cap
-	Claude         map[string]string `yaml:"claude"`          // agent-stage name -> model
-	OpenAI         map[string]string `yaml:"openai"`          // agent-stage name -> model (empty = codex default)
+	Backend        string `yaml:"backend"`         // "" (auto) | "claude" | "codex"
+	Concurrency    int    `yaml:"concurrency"`     // parallel agent slots (Lane B)
+	ClaudePath     string `yaml:"claude_path"`     // explicit claude CLI location; "" = $PATH
+	CodexPath      string `yaml:"codex_path"`      // explicit codex CLI location; "" = $PATH
+	TimeoutMinutes int    `yaml:"timeout_minutes"` // per-invocation wall-clock cap
+	// BookBudgetUSD caps total agent spend per book: a stage parks the book
+	// budget_exceeded once its summed cost reaches this (0 -> the default; set a very
+	// large value to effectively disable). Restart-to-apply, like the rest of agent.*.
+	BookBudgetUSD float64           `yaml:"book_budget_usd"`
+	Claude        map[string]string `yaml:"claude"` // agent-stage name -> model
+	OpenAI        map[string]string `yaml:"openai"` // agent-stage name -> model (empty = codex default)
 }
 
 // ContributionConfig controls the contributing stage + the intake poller (M7). Mode
@@ -217,6 +228,7 @@ func Default() Config {
 		Agent: AgentConfig{
 			Concurrency:    DefaultConcurrency,
 			TimeoutMinutes: DefaultTimeoutMinutes,
+			BookBudgetUSD:  DefaultBookBudgetUSD,
 			Claude:         defaultClaudeModels(),
 			OpenAI:         map[string]string{},
 		},
@@ -269,6 +281,11 @@ func Load(dataDir string) (Config, error) {
 	}
 	if cfg.Agent.TimeoutMinutes == 0 {
 		cfg.Agent.TimeoutMinutes = DefaultTimeoutMinutes
+	}
+	// 0 (absent / an older config) adopts the default budget; an explicit large value is
+	// how a user effectively disables the guard, so only the zero sentinel is normalized.
+	if cfg.Agent.BookBudgetUSD == 0 {
+		cfg.Agent.BookBudgetUSD = DefaultBookBudgetUSD
 	}
 	// Normalize ASR defaults so an older/partial config.yaml (or one predating M3a)
 	// resolves to a working backend without an explicit edit.
@@ -361,6 +378,11 @@ func applyEnv(cfg *Config) {
 			cfg.Agent.TimeoutMinutes = n
 		}
 	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_AGENT_BOOK_BUDGET_USD"); ok {
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+			cfg.Agent.BookBudgetUSD = f
+		}
+	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_MODE"); ok {
 		cfg.Contribution.Mode = strings.TrimSpace(v)
 	}
@@ -410,6 +432,9 @@ func (c Config) Validate() error {
 	}
 	if c.Agent.TimeoutMinutes < 1 {
 		return fmt.Errorf("agent.timeout_minutes must be >= 1, got %d", c.Agent.TimeoutMinutes)
+	}
+	if c.Agent.BookBudgetUSD < 0 {
+		return fmt.Errorf("agent.book_budget_usd must be >= 0, got %v", c.Agent.BookBudgetUSD)
 	}
 	// Model-map keys must name agent-lane stages; a typo would silently never route.
 	for key := range c.Agent.Claude {

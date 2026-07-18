@@ -149,6 +149,170 @@ func TestClipAndSplice_NotLocatedNoOp(t *testing.T) {
 	if res.Located || res.Spliced {
 		t.Errorf("expected no-op, got %+v", res)
 	}
+	if !res.Unlocatable() {
+		t.Errorf("expected Unlocatable() true for a no-loop/no-override no-op, got %+v", res)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("expected no artifacts written, got %d entries", len(entries))
+	}
+}
+
+// unlocatableTranscript builds a chapter with >= 50 DISTINCT tokens and no repeated 6-gram,
+// so LocateTailRun returns ok=false (nothing to locate) - the shape a SHORT tail repeat below
+// the 6-gram threshold produces, which the agent-directed clip_start_sec path must handle.
+func unlocatableTranscript(chapter int) transcript.Transcript {
+	return buildTranscript(chapter, 8, loopTokens(60, nil, 0, 0, 0))
+}
+
+// TestClipAndSplice_UnlocatableOverrideSplices is the item-1 core: when LocateTailRun finds no
+// loop BUT the agent supplies a clip_start_sec, ClipAndSplice runs the run-less directed repair
+// - it cuts at the override, health-checks the fresh clip, and (healthy) splices to the chapter
+// end, writing the repaired file, a TAIL-REPAIRED repairs.log line, and a TAIL-REPAIRED verdict
+// (a TAIL window: ClipEnd 0). res.Located stays false; the outcome is a splice, not a no-op.
+func TestClipAndSplice_UnlocatableOverrideSplices(t *testing.T) {
+	dir := t.TempDir()
+	rc := &recordingCut{}
+	const override = 5.0
+	res, err := ClipAndSplice(context.Background(), ClipSpliceRequest{
+		WorkDir:          dir,
+		Chapter:          9,
+		Transcript:       unlocatableTranscript(9),
+		ChapterEnd:       30.0,
+		Cut:              rc.cut,
+		Transcribe:       fakeTranscribe("he walked to the door and left the room quietly"),
+		StartOverrideSec: override,
+		DecodeTag:        "nocontext-v1",
+	})
+	if err != nil {
+		t.Fatalf("ClipAndSplice: %v", err)
+	}
+	if res.Located {
+		t.Error("expected Located=false (no located run on the directed path)")
+	}
+	if res.Unlocatable() {
+		t.Error("a directed splice is not the unlocatable no-op")
+	}
+	if !res.Spliced || res.Verdict != VerdictTailRepaired {
+		t.Fatalf("res = %+v, want a TAIL-REPAIRED splice", res)
+	}
+	if len(rc.starts) != 1 || rc.starts[0] != override {
+		t.Fatalf("cut window starts = %v, want a single cut at %.1f (the override)", rc.starts, override)
+	}
+	if res.ClipStart != override {
+		t.Errorf("res.ClipStart = %.1f, want %.1f", res.ClipStart, override)
+	}
+	// The repaired text has the fresh clip ending and dropped nothing before the override.
+	body := readFile(t, filepath.Join(dir, transcript.RepairedDir, transcript.TextName(9)))
+	if !strings.Contains(body, "walked to the door") {
+		t.Errorf("repaired text missing the fresh clip ending: %q", body)
+	}
+	// repairs.log carries the run-less line.
+	log := readFile(t, filepath.Join(dir, RepairsLogName))
+	if !strings.Contains(log, "- ch009 [TAIL-REPAIRED]: spliced agent-directed clip") {
+		t.Errorf("repairs.log missing the directed entry:\n%s", log)
+	}
+	// The verdict is a TAIL window (ClipEnd 0), so the residual auto-accept treats it as
+	// [clip_start, +Inf] and the known-failed skip keys on clip_start alone.
+	vs, err := LoadTailVerdicts(dir)
+	if err != nil || len(vs) != 1 {
+		t.Fatalf("verdicts = %+v (%v)", vs, err)
+	}
+	if vs[0].Chapter != 9 || vs[0].Verdict != VerdictTailRepaired || vs[0].ClipEnd != 0 || vs[0].IsMidWindow() {
+		t.Errorf("verdict = %+v, want a TAIL-REPAIRED tail window for ch9", vs[0])
+	}
+}
+
+// TestClipAndSplice_UnlocatableOverrideUnhealthyRedegenThenSkipped: a directed clip that
+// re-degenerates records a CLIP-REDEGENERATED TAIL verdict (with the decode tag) and keeps the
+// original; a SECOND directed attempt at the same window under the same tag then fires the
+// known-failed skip (no cut, no ASR) - the same convergence guarantee the located path has.
+func TestClipAndSplice_UnlocatableOverrideUnhealthyRedegenThenSkipped(t *testing.T) {
+	dir := t.TempDir()
+	const override = 5.0
+	const tag = "nocontext-v1"
+	// Round 1: the fresh clip loops (unhealthy) -> CLIP-REDEGENERATED, no splice, verdict only.
+	res, err := ClipAndSplice(context.Background(), ClipSpliceRequest{
+		WorkDir:          dir,
+		Chapter:          9,
+		Transcript:       unlocatableTranscript(9),
+		ChapterEnd:       30.0,
+		Cut:              fakeCut,
+		Transcribe:       fakeTranscribe(strings.Repeat("and then he ran away fast ", 5)),
+		StartOverrideSec: override,
+		DecodeTag:        tag,
+	})
+	if err != nil {
+		t.Fatalf("ClipAndSplice round 1: %v", err)
+	}
+	if res.ClipHealthy {
+		t.Error("expected the looping directed clip to be unhealthy")
+	}
+	if res.Spliced || res.Verdict != VerdictClipRedegenerated {
+		t.Errorf("res = %+v, want no splice + CLIP-REDEGENERATED", res)
+	}
+	if _, serr := os.Stat(filepath.Join(dir, transcript.RepairedDir, transcript.TextName(9))); !os.IsNotExist(serr) {
+		t.Error("expected no repaired file on a re-degenerated directed clip")
+	}
+	if _, serr := os.Stat(filepath.Join(dir, RepairsLogName)); !os.IsNotExist(serr) {
+		t.Error("expected no repairs.log entry on a re-degenerated directed clip")
+	}
+	vs, _ := LoadTailVerdicts(dir)
+	if len(vs) != 1 || vs[0].Verdict != VerdictClipRedegenerated || vs[0].ClipEnd != 0 {
+		t.Errorf("verdict = %+v, want a TAIL CLIP-REDEGENERATED with ClipEnd 0", vs)
+	}
+
+	// Round 2: the SAME window under the SAME tag is skipped known-failed - no cut, no ASR.
+	rt := &recordingTranscribe{}
+	rc := &recordingCut{}
+	res2, err := ClipAndSplice(context.Background(), ClipSpliceRequest{
+		WorkDir:          dir,
+		Chapter:          9,
+		Transcript:       unlocatableTranscript(9),
+		ChapterEnd:       30.0,
+		Cut:              rc.cut,
+		Transcribe:       rt.fn,
+		StartOverrideSec: override,
+		DecodeTag:        tag,
+	})
+	if err != nil {
+		t.Fatalf("ClipAndSplice round 2: %v", err)
+	}
+	if !res2.SkippedKnownFailed {
+		t.Error("expected SkippedKnownFailed on the re-queued directed window")
+	}
+	if rt.calls != 0 || len(rc.starts) != 0 {
+		t.Errorf("known-failed directed skip re-ran ASR/cut (transcribe %d, cut %d), want 0/0", rt.calls, len(rc.starts))
+	}
+}
+
+// TestClipAndSplice_DirectedDegenerateWindowNoOp: a bogus agent clip_start_sec at (or past)
+// the chapter end leaves no room for a ~1s window, so the directed path returns the
+// unlocatable no-op instead of cutting a zero/negative-length clip that would hard-fail the
+// book. Nothing is cut/transcribed and no artifacts are written; the stage re-queues the
+// chapter for a sane window.
+func TestClipAndSplice_DirectedDegenerateWindowNoOp(t *testing.T) {
+	dir := t.TempDir()
+	rc := &recordingCut{}
+	rt := &recordingTranscribe{}
+	res, err := ClipAndSplice(context.Background(), ClipSpliceRequest{
+		WorkDir:          dir,
+		Chapter:          9,
+		Transcript:       unlocatableTranscript(9), // LocateTailRun fails -> directed path
+		ChapterEnd:       30.0,
+		Cut:              rc.cut,
+		Transcribe:       rt.fn,
+		StartOverrideSec: 30.0, // == chend: > chend-1, so degenerate
+		DecodeTag:        "nocontext-v1",
+	})
+	if err != nil {
+		t.Fatalf("ClipAndSplice: %v", err)
+	}
+	if !res.Unlocatable() {
+		t.Errorf("expected Unlocatable() true for a degenerate directed window, got %+v", res)
+	}
+	if len(rc.starts) != 0 || rt.calls != 0 {
+		t.Errorf("degenerate window cut/transcribed (cut %d, transcribe %d), want 0/0", len(rc.starts), rt.calls)
+	}
 	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
 		t.Errorf("expected no artifacts written, got %d entries", len(entries))
 	}

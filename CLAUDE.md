@@ -111,7 +111,11 @@ internal/
             contribution.{mode [issue|pr|local], repo, auto_purge, poll_minutes,
             api_base_url} (restart-to-apply; api_base_url exists for tests/GHE;
             Validate rejects an unknown mode, a non-owner/name repo, poll_minutes < 1,
-            a non-http(s) api_base_url).
+            a non-http(s) api_base_url). The reliability round added
+            agent.book_budget_usd (default 75; 0 in yaml normalizes to the default, so
+            set a very large value to effectively disable; Validate rejects negative;
+            env AUDIOSILO_SIDECARS_AGENT_BOOK_BUDGET_USD; restart-to-apply like the
+            rest of agent.*) - the per-book agent-spend cap runAgent enforces.
   toolfetch/ fetches the three external artifact families, all gated by
             tools.auto_download and confined to <data>/tools: ffmpeg/ffprobe static
             builds (explicit path -> next to the binary -> $PATH -> HTTPS download,
@@ -207,7 +211,12 @@ internal/
             _runs/, 0444 copied inputs + out/, Harvest with traversal + size-cap guards),
             and go:embed prompts/ (one template per stage + a vendored authoring.md from
             audiosilo-meta). The child env injects an API key from secrets that NEVER
-            appears in argv/logs/errors (tested).
+            appears in argv/logs/errors (tested). Reliability round: RunWithBackoff also
+            retries a transient NotAvailableError (15s, 60s - the claude CLI auto-update
+            briefly breaks exec.LookPath, which stranded a real book mid-fact_pass);
+            RateLimitError carries a best-effort ResetAt via ParseResetTime (the
+            |<epoch> suffix within (now, now+48h], or "resets at H[:MM] am/pm" as the
+            next host-local occurrence).
   repair/   M5: the mechanical tail-clip + adoption machinery (ports the historical
             tail_clip_check/adjudicate_tails/build_repairs): ClipAndSplice (locate the
             tail loop, cut+re-transcribe the window prompt-free, health-check, rotation-
@@ -247,7 +256,16 @@ internal/
             bound mid windows GENEROUSLY (a mid_clip cannot be refined) and to use
             retranscribe for a multi-loop chapter; the endSec is clamped to the chapter
             duration. A proper fix (per-window verdicts + splice composition) is a
-            follow-up.
+            follow-up. The reliability round added the DIRECTED (run-less) tail path:
+            when LocateTailRun finds no loop (a SHORT tail repeat - a 3x phrase is below
+            the 6-gram locator's reach) but the plan supplied clip_start_sec,
+            clipAndSpliceDirected cuts [override, chend+2] anyway, health-check-gated
+            like the MID path (no rotation-adjudication), writing a TAIL-REPAIRED
+            verdict (ClipEnd 0, so auto-accept/known-failed behave like a located tail);
+            a degenerate override past chend-1 is the Unlocatable no-op, never an error.
+            ClipResult.Unlocatable() distinguishes the true no-op (no loop AND no
+            override), which the stage buckets as clips_unlocatable + a note naming the
+            chapters so the adjudicator knows to supply clip_start_sec next round.
   pipeline/ composite scheduler.Executor: routes inspecting -> audio.Inspect,
             splitting -> audio.Split, asr -> the per-chapter internal/asr loop
             (resumable: skip complete raws, delete+retry malformed, freeze each raw
@@ -303,7 +321,29 @@ internal/
             The repair re-transcription is decode-tagged
             (retranscribe/decode_params marker): a stale pre-NoContext fresh raw is discarded
             so the chapter is re-transcribed under the current params rather than reused, and
-            a free known-failed skip is excluded from the stage's rate sample.
+            a free known-failed skip is excluded from the stage's rate sample. The
+            reliability round added (4) a DURABLE accepted-chapters ledger
+            (qa_accepted.json): every accept (agent's and auto-accept's) persists and is
+            mechanically re-accepted in later rounds without re-invoking the agent - most
+            detectors read the stale unrepaired layer, so repaired chapters re-flag
+            forever and were being re-verified at full agent cost every round. The ledger
+            is deliberately NOT cleared by the done==0 reset or Retry (repairs only touch
+            planned non-accept chapters, so accepted decisions stay valid). The AUDIT
+            loop likewise now terminates by ACCEPTING: audit_rounds.json records each
+            round's {blocker,fix,nit}; when a non-passing round is CONVERGING (blocker 0,
+            validation clean, round >= 2, 0 < fix <= auditAcceptMaxFix(2), fix not
+            growing, fix budget left) the stage writes audit_accepted.json (the residual
+            findings), routes to ONE final fixing round, and the re-entry passes
+            agentlessly when validation is clean - so no KNOWN defect ships unfixed and a
+            90-chapter book (where a fresh adversarial pass finds ~1 new small defect
+            forever - a sampling process that never reaches zero) finishes instead of
+            parking fix_loop_exhausted with round-N's findings still live. Blockers or a
+            growing fix count still park, with the fix-count trajectory in the park
+            message (StageResult.ParkMessage). contrib appends an acceptance note to the
+            contribution rows (process metadata only - the public issue/PR payload is
+            unchanged). runAgent also enforces agent.book_budget_usd (default 75) as a
+            preflight: summed stage_runs cost (superseded rows included, so Retry can't
+            duck it) >= budget parks ParkBudgetExceeded before spending more.
   contrib/  M7: everything GitHub-facing for contribution. TokenSource (secrets
             GitHubPAT first, else `gh auth token` - the token NEVER enters argv/logs/
             errors, leak-canary tested), a stdlib REST client (issues/gists/fork/
@@ -346,11 +386,18 @@ internal/
             array like authors, feeds the core add-work proposal);
             ContributionSummary folds rows into the one aggregate chip status.
             Plain tested CRUD; AuthStore adapts it to auth.Store.
-            Holds the SCHEDULING truth.
+            Holds the SCHEDULING truth. The reliability round's 0008 added
+            books.retry_at (RFC3339, '' = none; cleared with status, enforced like
+            park_code) + stage_runs.superseded - Retry/readmit now SUPERSEDES success
+            rows instead of deleting them, splitting the readers: SCHEDULING readers
+            (CountStageSuccesses, SucceededStages*) filter superseded=0, MONEY readers
+            (SumStageRunCost, StageRunTotals, ListStageRuns) include everything, so
+            round counters reset on Retry but spend history survives.
   state/    per-book pipeline state machine: table-driven states/lanes/transitions,
             CanStart/NextState guards, the audit fix-loop cap. Pure, no I/O. M6 added
             ParkCode (typed park reasons - M7 added contrib_unavailable, core_needed,
-            core_pending, so 13 now), MainlineNext (the optimistic mainline
+            core_pending; the reliability round added budget_exceeded, so 14 now),
+            MainlineNext (the optimistic mainline
             successor the ETA engine walks - the table's Next ordering is load-bearing:
             conditional/loop target first, mainline continuation LAST),
             ParseSeriesPos (moved here from scheduler so eta/scheduler share one
@@ -383,6 +430,22 @@ internal/
             WaitGroup-tracked startup GC purges done-with-scratch books after
             Reconcile (per-book reservation so a concurrent Delete sees busy); both
             gated by the autoPurge constructor param (from contribution.auto_purge).
+            Reliability round: Retry's core was extracted into readmit(), shared by
+            manual Retry, the contrib poller, and the new autoReadmitDue pass (each
+            dispatch tick re-admits books parked agent_unavailable/agent_rate_limited
+            whose retry_at is due, publishing a durable stage.note). readmit supersedes
+            the CURRENT stage's successes ONLY for the round-cap park codes
+            (qa_no_converge, fix_loop_exhausted - the latter also superseding fixing +
+            wiping the audit trajectory files) so an availability park never destroys a
+            loop's round history; parks with a plain code just clear status. Timed parks
+            come from ParkError.RetryAfter (ParkWithCodeAfter): the rate-limit park uses
+            the parsed reset + 2min (agent.ParseResetTime - epoch accepted only within
+            (now, now+48h]; clock form host-local by documented assumption) floored at
+            now+5min, else a 30min fallback; the mid-run transient NotAvailable park
+            uses now+10min; the PREFLIGHT no-backend park carries NO retry_at (human
+            only, so an unconfigured daemon parks once instead of churning). retry_at
+            rides bookView and the book.state SSE frame (the web patch clears it when
+            absent); pre-migration parks (retry_at '') never auto-readmit.
   metaops/  meta.audiosilo.app client (coverage/lookup, capped 1h TTL caches,
             graceful degrade) + async folder-scan job manager over audiosilo-meta
             pkg/scan + the library_roots PathAllowed check. Coverage resolves
@@ -836,6 +899,39 @@ Milestones from the workspace plan; each is shippable.
   (`spelling.DeadRules` against the original layer, naming each dead pattern in
   the retry feedback) - previously a dead rule whose RHS was attested elsewhere
   passed all four gates as silent under-correction.
+
+- **Post-M8 reliability round (done):** made large books complete WITHOUT a human
+  babysitter - after the first end-to-end success (31 chapters), 6 of 6 real books
+  failed: 5 parked `qa_no_converge`, one 90-chapter book parked
+  `fix_loop_exhausted` after $62.45 (audit rounds fix:4 -> 1 -> 1 -> 1, blocker 0,
+  every round's fixes correctly applied, each fresh audit finding ~1 genuinely new
+  small defect - an unreachable fix==0 bar on a large book), and one stranded
+  `agent_unavailable` mid-run by a transient `exec.LookPath` blip. The hand-run
+  process had a HUMAN as the terminating condition at exactly the two loops; this
+  round taught them to ACCEPT. Five changes (details in the package table): (1)
+  the **directed tail repair** - the dominant qa_no_converge cause was
+  `LocateTailRun` silently no-opping on short tail repeats BEFORE consulting the
+  agent's `clip_start_sec`, so the adjudicator's recourse was dead code; now the
+  override drives a run-less, health-gated cut (TAIL-REPAIRED verdict), and true
+  no-ops surface as `clips_unlocatable` + a note; (2) the **durable
+  qa_accepted.json ledger** - accepts survive rounds, so stale-layer re-flags stop
+  burning a paid re-verification of the same chapters every round; (3) **audit
+  trajectory acceptance** - blockers always fail, but a converging non-growing
+  fix count (<= 2) at round >= 2 writes `audit_accepted.json`, takes ONE final fix
+  round, and passes agentlessly (no known defect ever ships unfixed; residuals
+  recorded + surfaced on the contribution note); Retry on `fix_loop_exhausted`
+  grants a genuinely fresh loop (fixing count + trajectory reset - previously it
+  re-parked after one wasted audit); (4) **availability self-resume** -
+  `books.retry_at` (migration 0008) + a scheduler auto-readmit pass for
+  `agent_unavailable`/`agent_rate_limited`, reset-time parsing with a 5min floor,
+  transient-NotAvailable in-process retries, and a human-only preflight park when
+  no backend is configured; (5) **cost containment** - `agent.book_budget_usd`
+  (default 75) parks `budget_exceeded` before more spend, and Retry SUPERSEDES
+  stage_runs instead of deleting them so spend history (and the budget) survive.
+  Deferred, documented: fact_pass output-token cost (~$18 on 90ch; the facts are
+  dense content, not boilerplate), auditing stays on opus (it is the public-
+  contribution quality gate; acceptance bounds its rounds), and the audit model's
+  per-round history lives in work-dir JSON, not the DB.
 
 Still **not built**: signed installers / a friendlier packaged client (a possible
 follow-up per the meta EXTRACTION roadmap); a separately-deployable UI-only image

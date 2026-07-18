@@ -70,9 +70,15 @@ type Executor interface {
 // Code is the machine-readable park reason persisted to books.park_code and
 // published on book.state (empty when the park has no typed code); Reason is the
 // human-facing message.
+//
+// RetryAfter, when non-zero, schedules an AUTOMATIC re-admit: the scheduler persists it
+// to books.retry_at and a later dispatch pass re-admits the book once the instant
+// passes (used for the transient agent-unavailable/rate-limited parks so an overnight
+// batch heals itself). A zero RetryAfter is a human-only park (Retry re-admits it).
 type ParkError struct {
-	Reason string
-	Code   state.ParkCode
+	Reason     string
+	Code       state.ParkCode
+	RetryAfter time.Time
 }
 
 func (e *ParkError) Error() string { return e.Reason }
@@ -85,6 +91,14 @@ func Park(reason string) error { return &ParkError{Reason: reason} }
 // emits it on the book.state event so the UI can render a per-class affordance.
 func ParkWithCode(code state.ParkCode, reason string) error {
 	return &ParkError{Reason: reason, Code: code}
+}
+
+// ParkWithCodeAfter is ParkWithCode plus a RetryAfter instant: the scheduler stamps
+// books.retry_at and auto-readmits the book once it passes. Used for the transient
+// agent parks (unavailable/rate-limited) so a book self-resumes when the CLI returns or
+// the rate-limit window elapses, without waiting for a human Retry.
+func ParkWithCodeAfter(code state.ParkCode, reason string, retryAfter time.Time) error {
+	return &ParkError{Reason: reason, Code: code, RetryAfter: retryAfter}
 }
 
 // StubExecutor is the M1 placeholder executor: it sleeps a short, bounded time

@@ -83,7 +83,9 @@ export const BookRow = memo(function BookRow({
   const stageProgress = activeProgress(book);
   const elapsed = elapsedSeconds(book, now, done);
   const hint =
-    book.status === 'needs_attention' && book.park_code ? parkHint(book.park_code) : null;
+    book.status === 'needs_attention' && book.park_code
+      ? parkHint(book.park_code, !!book.retry_at)
+      : null;
 
   // The cost-ledger detail (shared with the Done row): opened lazily, re-fetched on
   // each open. The live log below is a BookRow-specific addition.

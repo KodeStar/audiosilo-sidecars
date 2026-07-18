@@ -248,6 +248,38 @@ func TestMarkersNormalizeAgentUnavailableParks(t *testing.T) {
 	if pe.Reason != AgentUnavailableMsg {
 		t.Errorf("park reason = %q, want AgentUnavailableMsg", pe.Reason)
 	}
+	// A PREFLIGHT unavailable park (no CLI configured at all) carries NO auto-readmit time:
+	// a daemon with no backend must park once for a human, not churn a re-admit every 10min.
+	if !pe.RetryAfter.IsZero() {
+		t.Errorf("preflight unavailable park must carry no auto-readmit time, got %v", pe.RetryAfter)
+	}
+}
+
+// TestRateLimitRetryAtFloor: a parsed reset instant that (after the buffer) lands in the past
+// or barely ahead is floored to now+rateLimitMinDelay, so the auto-readmit never schedules a
+// past/immediate re-admit that would tight-loop a re-park. A comfortably-future reset keeps
+// reset+buffer; no parsed reset falls back to the fixed 30min.
+func TestRateLimitRetryAtFloor(t *testing.T) {
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	floor := now.Add(rateLimitMinDelay)
+
+	// A past reset instant -> floored.
+	if got := rateLimitRetryAt(&agent.RateLimitError{ResetAt: now.Add(-time.Hour)}, now); !got.Equal(floor) {
+		t.Errorf("past reset: got %v, want the floor %v", got, floor)
+	}
+	// A reset barely ahead: reset+buffer (now+2min) is still below the floor -> floored.
+	if got := rateLimitRetryAt(&agent.RateLimitError{ResetAt: now}, now); !got.Equal(floor) {
+		t.Errorf("barely-ahead reset: got %v, want the floor %v", got, floor)
+	}
+	// A comfortably-future reset keeps reset + buffer (well above the floor).
+	fut := now.Add(time.Hour)
+	if got := rateLimitRetryAt(&agent.RateLimitError{ResetAt: fut}, now); !got.Equal(fut.Add(rateLimitReadmitBuffer)) {
+		t.Errorf("future reset: got %v, want reset+buffer %v", got, fut.Add(rateLimitReadmitBuffer))
+	}
+	// No parsed reset -> the fixed fallback (already above the floor).
+	if got := rateLimitRetryAt(&agent.RateLimitError{}, now); !got.Equal(now.Add(rateLimitFallbackDelay)) {
+		t.Errorf("no reset: got %v, want the 30min fallback", got)
+	}
 }
 
 // --- qa_adjudicating ---
@@ -428,6 +460,65 @@ func TestQAAdjudicateAutoAcceptsRepairedTails(t *testing.T) {
 
 // f64ptr returns a pointer to v, for the optional *float64 report fields.
 func f64ptr(v float64) *float64 { return &v }
+
+// TestRunAgentParksOnBudgetExceeded: once a book's summed agent cost has reached the
+// per-book budget, the next runAgent call parks ParkBudgetExceeded BEFORE invoking the
+// agent (no further spend), and the recorded spend the guard reads includes superseded
+// rows (so a Retry cannot lower it below the budget).
+func TestRunAgentParksOnBudgetExceeded(t *testing.T) {
+	ctx := context.Background()
+	work := t.TempDir()
+	fake := newFakeRunner()
+	db, exe, book := dbBackedQAExecutor(t, work, fake)
+	exe.bookBudgetUSD = 10.0
+
+	// Record $12 of spend on a finished stage run, over the $10 budget.
+	runID, err := db.StartStageRun(ctx, book.ID, string(state.FactPass), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddOpenStageRunUsage(ctx, book.ID, string(state.FactPass), "opus", 0, 0, 12.0); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishStageRun(ctx, runID, true, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := agent.New(work, string(state.FactPass), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = exe.runAgent(ctx, book, state.FactPass, scheduler.StageReport{}, st, "fact_pass.md", nil, false,
+		func(agent.Result, *agent.Staging) error { return nil })
+
+	var pe *scheduler.ParkError
+	if !errors.As(err, &pe) {
+		t.Fatalf("error = %v, want a ParkError (budget)", err)
+	}
+	if pe.Code != state.ParkBudgetExceeded {
+		t.Errorf("park code = %q, want %q", pe.Code, state.ParkBudgetExceeded)
+	}
+	if !pe.RetryAfter.IsZero() {
+		t.Errorf("budget park must carry no auto-readmit time, got %v", pe.RetryAfter)
+	}
+	if !strings.Contains(pe.Reason, "12.00") || !strings.Contains(pe.Reason, "10.00") {
+		t.Errorf("park reason = %q, want it to name the spend and budget", pe.Reason)
+	}
+	if n := fake.count(string(state.FactPass)); n != 0 {
+		t.Errorf("agent invoked %d times over budget, want 0", n)
+	}
+
+	// Superseding the stage's success (what a Retry does) must NOT lower the spend the
+	// guard sees - the book still parks over budget.
+	if err := db.SupersedeStageSuccesses(ctx, book.ID, string(state.FactPass)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = exe.runAgent(ctx, book, state.FactPass, scheduler.StageReport{}, st, "fact_pass.md", nil, false,
+		func(agent.Result, *agent.Staging) error { return nil })
+	if !errors.As(err, &pe) || pe.Code != state.ParkBudgetExceeded {
+		t.Errorf("after supersede: err = %v, want still ParkBudgetExceeded (superseded cost still counts)", err)
+	}
+}
 
 // dbBackedQAExecutor opens a real store, creates a book at work dir `work`, and returns a
 // db-backed executor with the fake agent - the setup the stall-marker/round-cap tests need

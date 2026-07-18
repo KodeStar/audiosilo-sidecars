@@ -222,17 +222,68 @@ func TestStageRunsAndReconcileHelpers(t *testing.T) {
 	if !allSucc[b.ID]["asr"] {
 		t.Fatalf("SucceededStagesAll = %+v", allSucc)
 	}
-	if err := db.DeleteStageSuccess(ctx, b.ID, "asr"); err != nil {
+	if err := db.SupersedeStageSuccesses(ctx, b.ID, "asr"); err != nil {
 		t.Fatal(err)
 	}
+	// Superseding resets the SCHEDULING readers (the stage no longer counts as a
+	// success / a done stage) ...
 	allSucc, _ = db.SucceededStagesAll(ctx)
 	if allSucc[b.ID]["asr"] {
-		t.Fatalf("DeleteStageSuccess did not remove: %+v", allSucc[b.ID])
+		t.Fatalf("SupersedeStageSuccesses did not clear the succeeded set: %+v", allSucc[b.ID])
+	}
+	if ok, _ := db.CountStageSuccesses(ctx, b.ID, "asr"); ok != 0 {
+		t.Fatalf("CountStageSuccesses after supersede = %d, want 0", ok)
+	}
+	// ... but the row (and its cost) is PRESERVED - a MONEY reader still sees it, marked
+	// superseded - so a Retry never erases recorded spend.
+	runs, _ := db.ListStageRuns(ctx, b.ID)
+	if len(runs) != 1 {
+		t.Fatalf("ListStageRuns after supersede = %d, want 1 (row preserved)", len(runs))
+	}
+	if !runs[0].Superseded {
+		t.Fatalf("superseded run not marked: %+v", runs[0])
+	}
+}
+
+// TestSupersedePreservesCost proves the Part C split: superseding a stage's successes
+// resets the scheduling counter (CountStageSuccesses) but leaves the recorded cost
+// intact for the MONEY readers (SumStageRunCost / StageRunTotals), so a Retry never
+// erases a book's spend.
+func TestSupersedePreservesCost(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	b, _ := db.CreateBook(ctx, NewBook{SourcePath: "/x", WorkDir: "/w", Title: "X"})
+
+	runID, err := db.StartStageRun(ctx, b.ID, "auditing", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddOpenStageRunUsage(ctx, b.ID, "auditing", "opus", 1000, 500, 4.50); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishStageRun(ctx, runID, true, nil); err != nil {
+		t.Fatal(err)
 	}
 
-	runs, _ := db.ListStageRuns(ctx, b.ID)
-	if len(runs) != 0 {
-		t.Fatalf("ListStageRuns after delete = %d", len(runs))
+	if n, _ := db.CountStageSuccesses(ctx, b.ID, "auditing"); n != 1 {
+		t.Fatalf("CountStageSuccesses before supersede = %d, want 1", n)
+	}
+	beforeCost, _ := db.SumStageRunCost(ctx, b.ID)
+
+	if err := db.SupersedeStageSuccesses(ctx, b.ID, "auditing"); err != nil {
+		t.Fatal(err)
+	}
+
+	if n, _ := db.CountStageSuccesses(ctx, b.ID, "auditing"); n != 0 {
+		t.Errorf("CountStageSuccesses after supersede = %d, want 0", n)
+	}
+	afterCost, _ := db.SumStageRunCost(ctx, b.ID)
+	if afterCost != beforeCost || afterCost < 4.49 {
+		t.Errorf("SumStageRunCost after supersede = %v, want unchanged (~%v)", afterCost, beforeCost)
+	}
+	totals, _ := db.StageRunTotals(ctx)
+	if totals[b.ID] < 4.49 {
+		t.Errorf("StageRunTotals[book] = %v, want the superseded cost still counted", totals[b.ID])
 	}
 }
 

@@ -210,14 +210,15 @@ func Run(ctx context.Context, opts Options) error {
 			DataDir:        opts.DataDir,
 			Log:            toolLog,
 		},
-		Agent:        agentRunner,
-		AgentAvail:   agentAvail,
-		AgentSelect:  agentSelect,
-		AgentModels:  pipeline.AgentModels{Claude: cfg.Agent.Claude, OpenAI: cfg.Agent.OpenAI},
-		AgentTimeout: time.Duration(cfg.Agent.TimeoutMinutes) * time.Minute,
-		Secrets:      sec,
-		Log:          toolLog,
-		Fallback:     scheduler.NewStubExecutor(0, 0),
+		Agent:         agentRunner,
+		AgentAvail:    agentAvail,
+		AgentSelect:   agentSelect,
+		AgentModels:   pipeline.AgentModels{Claude: cfg.Agent.Claude, OpenAI: cfg.Agent.OpenAI},
+		AgentTimeout:  time.Duration(cfg.Agent.TimeoutMinutes) * time.Minute,
+		BookBudgetUSD: cfg.Agent.BookBudgetUSD,
+		Secrets:       sec,
+		Log:           toolLog,
+		Fallback:      scheduler.NewStubExecutor(0, 0),
 		// Contribution (M7): the contributing stage resolves the work slug against the
 		// metadata client, resolves a GitHub credential (PAT in secrets, else `gh auth
 		// token`), and publishes per the configured mode. ContribBaseURL is the GitHub

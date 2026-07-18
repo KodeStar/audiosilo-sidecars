@@ -37,6 +37,12 @@ const (
 	// ParkCorePending: a core proposal has been submitted; the book waits for the intake
 	// PR to merge, after which the poller resolves the real work slug and re-admits it.
 	ParkCorePending ParkCode = "core_pending"
+
+	// ParkBudgetExceeded: the book's summed agent cost reached the configured per-book
+	// budget (agent.book_budget_usd), so an agent stage parked before spending more. A
+	// human decision: raise the budget in config.yaml (restart to apply), then Retry -
+	// so, unlike the transient agent parks, it carries no auto-readmit time.
+	ParkBudgetExceeded ParkCode = "budget_exceeded"
 )
 
 // IsParkedWith reports whether a book carrying the given status/park code is parked

@@ -157,6 +157,7 @@ type agentView struct {
 	Backend        string            `json:"backend"`
 	Concurrency    int               `json:"concurrency"`
 	TimeoutMinutes int               `json:"timeout_minutes"`
+	BookBudgetUSD  float64           `json:"book_budget_usd"`
 	ClaudeModels   map[string]string `json:"claude_models"`
 	OpenAIModels   map[string]string `json:"openai_models"`
 }
@@ -202,6 +203,7 @@ func (a *API) settingsView() (settingsResponse, error) {
 			Backend:        cfg.Agent.Backend,
 			Concurrency:    cfg.Agent.Concurrency,
 			TimeoutMinutes: cfg.Agent.TimeoutMinutes,
+			BookBudgetUSD:  cfg.Agent.BookBudgetUSD,
 			ClaudeModels:   copyStringMap(cfg.Agent.Claude),
 			OpenAIModels:   copyStringMap(cfg.Agent.OpenAI),
 		},
@@ -253,6 +255,7 @@ type agentUpdate struct {
 	Backend        *string           `json:"backend"`
 	Concurrency    *int              `json:"concurrency"`
 	TimeoutMinutes *int              `json:"timeout_minutes"`
+	BookBudgetUSD  *float64          `json:"book_budget_usd"`
 	Claude         map[string]string `json:"claude_models"`
 	OpenAI         map[string]string `json:"openai_models"`
 }
@@ -294,6 +297,9 @@ func applyAgentUpdate(cfg *config.AgentConfig, u *agentUpdate) {
 	}
 	if u.TimeoutMinutes != nil {
 		cfg.TimeoutMinutes = *u.TimeoutMinutes
+	}
+	if u.BookBudgetUSD != nil {
+		cfg.BookBudgetUSD = *u.BookBudgetUSD
 	}
 	if u.Claude != nil {
 		cfg.Claude = u.Claude

@@ -106,7 +106,12 @@ type Config struct {
 	AgentSelect  agent.SelectConfig
 	AgentModels  AgentModels
 	AgentTimeout time.Duration
-	Secrets      secrets.Store
+	// BookBudgetUSD caps the total agent spend for one book: an agent stage parks the
+	// book budget_exceeded (with everything already recorded) once its summed cost reaches
+	// this, before spending more. 0 disables the guard (config seeds a large default; set
+	// a very large value to effectively disable). From config.agent.book_budget_usd.
+	BookBudgetUSD float64
+	Secrets       secrets.Store
 
 	// Contribution (M7) drives the contributing stage. Meta resolves a book's work
 	// slug and reads sidecar coverage (nil = metadata disabled); TokenSource resolves a
@@ -144,16 +149,17 @@ type Executor struct {
 	agentRun   agent.Runner
 	agentAvail agent.Availability
 
-	ffmpegCfg    string
-	ffprobeCfg   string
-	dataDir      string
-	asrSelect    asr.SelectConfig
-	agentSelect  agent.SelectConfig
-	agentModels  AgentModels
-	agentTimeout time.Duration
-	secrets      secrets.Store
-	log          *slog.Logger
-	fallback     scheduler.Executor
+	ffmpegCfg     string
+	ffprobeCfg    string
+	dataDir       string
+	asrSelect     asr.SelectConfig
+	agentSelect   agent.SelectConfig
+	agentModels   AgentModels
+	agentTimeout  time.Duration
+	bookBudgetUSD float64
+	secrets       secrets.Store
+	log           *slog.Logger
+	fallback      scheduler.Executor
 
 	// Contribution-stage deps (M7); see Config.
 	meta           MetaCoverage
@@ -190,22 +196,23 @@ func NewExecutor(cfg Config) *Executor {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	e := &Executor{
-		db:           cfg.DB,
-		ffmpeg:       cfg.FFmpeg,
-		ffprobe:      cfg.FFprobe,
-		asr:          cfg.ASR,
-		agentRun:     cfg.Agent,
-		agentAvail:   cfg.AgentAvail,
-		ffmpegCfg:    cfg.Tools.FFmpegPath,
-		ffprobeCfg:   cfg.Tools.FFprobePath,
-		dataDir:      cfg.DataDir,
-		asrSelect:    cfg.ASRSelect,
-		agentSelect:  cfg.AgentSelect,
-		agentModels:  cfg.AgentModels,
-		agentTimeout: cfg.AgentTimeout,
-		secrets:      cfg.Secrets,
-		log:          log,
-		fallback:     cfg.Fallback,
+		db:            cfg.DB,
+		ffmpeg:        cfg.FFmpeg,
+		ffprobe:       cfg.FFprobe,
+		asr:           cfg.ASR,
+		agentRun:      cfg.Agent,
+		agentAvail:    cfg.AgentAvail,
+		ffmpegCfg:     cfg.Tools.FFmpegPath,
+		ffprobeCfg:    cfg.Tools.FFprobePath,
+		dataDir:       cfg.DataDir,
+		asrSelect:     cfg.ASRSelect,
+		agentSelect:   cfg.AgentSelect,
+		agentModels:   cfg.AgentModels,
+		agentTimeout:  cfg.AgentTimeout,
+		bookBudgetUSD: cfg.BookBudgetUSD,
+		secrets:       cfg.Secrets,
+		log:           log,
+		fallback:      cfg.Fallback,
 
 		meta:           cfg.Meta,
 		tokenSource:    cfg.TokenSource,

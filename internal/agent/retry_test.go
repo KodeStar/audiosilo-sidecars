@@ -183,3 +183,65 @@ func TestRunWithRetryUsesDefaultBackoffLength(t *testing.T) {
 		t.Errorf("DefaultBackoff length = %d, want 3", got)
 	}
 }
+
+// withTinyNotAvailableBackoff shrinks the NotAvailable retry schedule so the tests do
+// not sleep for real seconds, restoring it on cleanup. Agent tests run sequentially, so
+// mutating the package var is race-free.
+func withTinyNotAvailableBackoff(t *testing.T) {
+	t.Helper()
+	prev := notAvailableBackoff
+	notAvailableBackoff = []time.Duration{time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { notAvailableBackoff = prev })
+}
+
+func TestRunWithRetryNotAvailableTransientThenSuccess(t *testing.T) {
+	withTinyNotAvailableBackoff(t)
+	// A NotAvailable blip (the CLI symlink auto-updating), then a normal success: the
+	// retry re-runs the backend (re-resolving the binary) and recovers.
+	r := &scriptRunner{steps: []step{
+		{err: &NotAvailableError{Backend: "claude", Detail: "exec: claude not found"}},
+		{res: Result{Text: "ok"}},
+	}}
+	res, slept, err := RunWithBackoff(context.Background(), r, Request{Prompt: "base"}, alwaysValid, func(Usage) {}, tinyBackoff(3))
+	if err != nil || res.Text != "ok" {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	if r.calls != 2 {
+		t.Errorf("calls=%d, want 2 (1 blip + 1 recovery)", r.calls)
+	}
+	if slept <= 0 {
+		t.Errorf("slept=%v, want > 0 (the NotAvailable wait counts into slept)", slept)
+	}
+}
+
+func TestRunWithRetryNotAvailableExhausted(t *testing.T) {
+	withTinyNotAvailableBackoff(t)
+	// A genuinely missing CLI: every attempt is NotAvailable, so after the retry budget
+	// the error is returned (the stage then parks).
+	r := &scriptRunner{steps: []step{
+		{err: &NotAvailableError{Backend: "claude", Detail: "missing"}},
+		{err: &NotAvailableError{Backend: "claude", Detail: "missing"}},
+		{err: &NotAvailableError{Backend: "claude", Detail: "missing"}},
+	}}
+	_, _, err := RunWithBackoff(context.Background(), r, Request{Prompt: "base"}, alwaysValid, func(Usage) {}, tinyBackoff(3))
+	var na *NotAvailableError
+	if !errors.As(err, &na) {
+		t.Fatalf("want *NotAvailableError, got %v", err)
+	}
+	if r.calls != 3 { // 1 initial + 2 retries
+		t.Errorf("calls=%d, want 3", r.calls)
+	}
+}
+
+func TestRunWithRetryNotAvailableContextCancel(t *testing.T) {
+	r := &scriptRunner{steps: []step{{err: &NotAvailableError{Backend: "claude", Detail: "blip"}}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled: the NotAvailable wait returns immediately
+	prev := notAvailableBackoff
+	notAvailableBackoff = []time.Duration{time.Hour}
+	t.Cleanup(func() { notAvailableBackoff = prev })
+	_, _, err := RunWithBackoff(ctx, r, Request{Prompt: "base"}, alwaysValid, func(Usage) {}, tinyBackoff(3))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("want context.Canceled, got %v", err)
+	}
+}

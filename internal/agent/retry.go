@@ -21,6 +21,16 @@ func DefaultBackoff() []time.Duration {
 	return []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute}
 }
 
+// notAvailableBackoff is the retry schedule for a TRANSIENT *NotAvailableError: a real
+// book once parked agent_unavailable because exec.LookPath("claude") failed for a single
+// instant while the Claude CLI auto-updated its own symlink - resolve() runs per
+// invocation, so a blip at exactly the wrong moment surfaced as "no backend" and parked
+// the book (a NotAvailableError bypasses the rate-limit backoff entirely). Retrying it a
+// couple of times (each retry re-runs resolve()) rides out that blip; a genuinely-missing
+// CLI still fails in ~75s and parks as before. It is a package var so a test can shrink
+// it (agent tests run sequentially, so no data race); production keeps 15s then 60s.
+var notAvailableBackoff = []time.Duration{15 * time.Second, 60 * time.Second}
+
 // RunWithRetry runs req through r with the default backoff schedule. See
 // RunWithBackoff for the policy. The returned duration is the total time spent
 // sleeping in rate-limit backoff, so a caller measuring wall-clock cost can subtract
@@ -51,12 +61,18 @@ func RunWithRetry(ctx context.Context, r Runner, req Request, validate func(Resu
 //   - A *RateLimitError sleeps for the next backoff delay (context-cancellable) and
 //     retries, NOT counting against the output-retry budget; after len(backoff)
 //     rate-limit rounds the RateLimitError is returned.
-//   - Any other error (including a *NotAvailableError or a timeout) fails immediately.
+//   - A *NotAvailableError retries a small fixed number of times over notAvailableBackoff
+//     (each retry re-runs the backend's per-invocation resolve(), so a transient
+//     LookPath blip - a CLI auto-updating its symlink - is ridden out); when that budget
+//     is spent the NotAvailableError is returned so the stage parks. Its sleep counts
+//     into the slept total (rate-sample exclusion), like the rate-limit backoff.
+//   - Any other error (a timeout, a render/transport failure) fails immediately.
 func RunWithBackoff(ctx context.Context, r Runner, req Request, validate func(Result) error, onUsage func(Usage), backoff []time.Duration) (Result, time.Duration, error) {
 	basePrompt := req.Prompt
 	prompt := basePrompt
 	outputRetries := 0
 	rateLimitRounds := 0
+	notAvailRetries := 0
 	var slept time.Duration
 
 	for {
@@ -76,6 +92,19 @@ func RunWithBackoff(ctx context.Context, r Runner, req Request, validate func(Re
 				}
 				delay := backoff[rateLimitRounds]
 				rateLimitRounds++
+				if werr := sleepCtx(ctx, delay); werr != nil {
+					return Result{}, slept, werr
+				}
+				slept += delay
+				continue
+			}
+			var na *NotAvailableError
+			if errors.As(err, &na) {
+				if notAvailRetries >= len(notAvailableBackoff) {
+					return Result{}, slept, err
+				}
+				delay := notAvailableBackoff[notAvailRetries]
+				notAvailRetries++
 				if werr := sleepCtx(ctx, delay); werr != nil {
 					return Result{}, slept, werr
 				}

@@ -22,6 +22,14 @@ const (
 	// adjudicate) - the ClipHealthy check is the guard, and this records that a healthy
 	// interior window replaced an interior degeneration loop.
 	VerdictMidRepaired Verdict = "MID-REPAIRED"
+	// VerdictTailRepaired: an agent-directed TAIL window was cut, re-transcribed prompt-free,
+	// health-checked, and spliced to the chapter end. It is the run-less counterpart of the
+	// FABRICATED/BENIGN tail splice - the mechanical locator found NO loop (a short repeat like
+	// a 3x phrase is below the 6-gram threshold's reach), so the adjudicator supplied a
+	// clip_start_sec and there is no located run to rotation-adjudicate. Like MID-REPAIRED it
+	// is not an authenticity judgment: the ClipHealthy check is the sole guard, and this
+	// records that a healthy fresh window replaced an unlocatable tail degeneration.
+	VerdictTailRepaired Verdict = "TAIL-REPAIRED"
 )
 
 // adjRedegenMax is adjudicate_tails.py's boundary: in_clip <= 2 is a real echoed

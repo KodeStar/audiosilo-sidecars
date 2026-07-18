@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"path/filepath"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/scratch"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
@@ -46,7 +47,7 @@ func (s *Scheduler) Pause(ctx context.Context, id int64) error {
 		if err := s.db.SetBookStatus(ctx, id, string(state.StatusPaused), b.Error, b.ParkCode); err != nil {
 			return err
 		}
-		s.publishState(id, b.State, string(state.StatusPaused), b.Error, b.ParkCode)
+		s.publishState(id, b.State, string(state.StatusPaused), b.Error, b.ParkCode, "")
 		return nil
 	default:
 		return ErrInvalidOp
@@ -66,7 +67,7 @@ func (s *Scheduler) Resume(ctx context.Context, id int64) error {
 	if err := s.db.SetBookStatus(ctx, id, string(state.StatusNone), "", ""); err != nil {
 		return err
 	}
-	s.publishState(id, b.State, "", "", "")
+	s.publishState(id, b.State, "", "", "", "")
 	s.notify()
 	return nil
 }
@@ -82,21 +83,59 @@ func (s *Scheduler) Retry(ctx context.Context, id int64) error {
 	}
 	switch state.Status(b.Status) {
 	case state.StatusFailed, state.StatusNeedsAttention:
-		stage := b.State
-		_ = os.Remove(SentinelPath(b.WorkDir, stage)) // best-effort; force a clean re-run
-		if err := s.db.DeleteStageSuccess(ctx, id, stage); err != nil {
-			return err
-		}
-		// Clearing the status clears the error and the typed park_code together.
-		if err := s.db.SetBookStatus(ctx, id, string(state.StatusNone), "", ""); err != nil {
-			return err
-		}
-		s.publishState(id, b.State, "", "", "")
-		s.notify()
-		return nil
+		return s.readmit(ctx, b)
 	default:
 		return ErrInvalidOp
 	}
+}
+
+// readmit is the shared re-admission body: it forces the book's current stage to
+// re-run (drop its sentinel), clears the status/error/park_code (and the scheduled
+// retry_at, via SetBookStatus), and wakes the dispatch loop. Retry (the manual control)
+// gates on status first; the scheduler's timed auto-readmit calls it directly for a due
+// transient-agent park. It takes b so a caller that already read the book does not
+// re-query.
+//
+// Whether it SUPERSEDES the current stage's recorded successes is keyed on the PARK CODE,
+// not merely the stage: superseding resets that stage's round/fix counter (CountStageSuccesses),
+// which is the "grant one fresh round" reset the ROUND-CAP parks want (qa_no_converge resets
+// the QA round counter; fix_loop_exhausted resets the audit round count). For every OTHER park
+// code the current stage's successes are LEFT intact - an availability park (agent_rate_limited/
+// agent_unavailable) or a budget park readmitted mid-stage (e.g. at auditing) must not wipe the
+// convergence trajectory it had already built. A plain failed-book Retry has no success rows at
+// the current stage anyway, so leaving them alone is a harmless no-op there.
+func (s *Scheduler) readmit(ctx context.Context, b store.Book) error {
+	id := b.ID
+	stage := b.State
+	_ = os.Remove(SentinelPath(b.WorkDir, stage)) // best-effort; force a clean re-run
+	// Reset the current stage's round/fix counter ONLY for the round-cap parks (grant one
+	// fresh round). Availability/budget parks keep their successes so their trajectory survives.
+	if b.ParkCode == string(state.ParkQANoConverge) || b.ParkCode == string(state.ParkFixLoopExhausted) {
+		if err := s.db.SupersedeStageSuccesses(ctx, id, stage); err != nil {
+			return err
+		}
+	}
+	// A book parked at auditing SPECIFICALLY because it exhausted its fix-loop budget
+	// (park_code fix_loop_exhausted; FixAttempts counts the fixing successes) needs a
+	// genuinely fresh loop: superseding only the auditing success would burn one audit
+	// (~$4.50) and instantly re-park at the cap. Grant it by superseding the fixing
+	// successes too and wiping the audit-loop trajectory artifacts so the re-run starts
+	// from a clean round-1 history (audit_rounds.json / audit_accepted.json).
+	if b.ParkCode == string(state.ParkFixLoopExhausted) {
+		if err := s.db.SupersedeStageSuccesses(ctx, id, string(state.Fixing)); err != nil {
+			return err
+		}
+		_ = os.Remove(filepath.Join(b.WorkDir, AuditRoundsFile))
+		_ = os.Remove(filepath.Join(b.WorkDir, AuditAcceptedFile))
+	}
+	// Clearing the status clears the error, the typed park_code, and any scheduled
+	// retry_at together.
+	if err := s.db.SetBookStatus(ctx, id, string(state.StatusNone), "", ""); err != nil {
+		return err
+	}
+	s.publishState(id, b.State, "", "", "", "")
+	s.notify()
+	return nil
 }
 
 // Cancel stops a book: it interrupts any running stage and marks the book failed
@@ -115,7 +154,7 @@ func (s *Scheduler) Cancel(ctx context.Context, id int64) error {
 		return err
 	}
 	s.cancelInflight(id)
-	s.publishState(id, b.State, string(state.StatusFailed), "cancelled by user", "")
+	s.publishState(id, b.State, string(state.StatusFailed), "cancelled by user", "", "")
 	return nil
 }
 

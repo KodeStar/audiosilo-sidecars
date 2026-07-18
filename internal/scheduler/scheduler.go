@@ -274,11 +274,12 @@ func (s *Scheduler) reconcileBook(ctx context.Context, b store.Book, succeeded m
 	if !haveRewind {
 		return nil
 	}
-	// Drop the DB success of the rewind stage and every later completed stage
-	// so their counts stay honest when the book re-advances.
+	// Supersede the DB success of the rewind stage and every later completed stage so
+	// their counts stay honest when the book re-advances (the rows - and their cost -
+	// are preserved, only their scheduling success is retired).
 	for stage := range succeeded {
 		if state.Order(state.State(stage)) >= state.Order(state.State(rewind)) {
-			if err := s.db.DeleteStageSuccess(ctx, b.ID, stage); err != nil {
+			if err := s.db.SupersedeStageSuccesses(ctx, b.ID, stage); err != nil {
 				return err
 			}
 		}
@@ -298,6 +299,9 @@ func (s *Scheduler) dispatch() {
 	if ctx == nil || ctx.Err() != nil {
 		return
 	}
+	// Timed self-resume: re-admit any book whose transient-agent park window has
+	// elapsed BEFORE advancing waypoints, so a healed book is dispatched this same pass.
+	s.autoReadmitDue(ctx)
 	// advanceWaypoints promotes queued/ready books until none remain and returns
 	// the resulting fresh list, so dispatch never re-queries.
 	books, err := s.advanceWaypoints(ctx)
@@ -450,9 +454,11 @@ func (s *Scheduler) runStage(ctx context.Context, b store.Book) {
 		// stage), so park the book needs_attention rather than flag a hard failure.
 		var pe *ParkError
 		if errors.As(err, &pe) {
-			s.setStatus(b.ID, state.StatusNeedsAttention, pe.Error(), pe.Code)
+			// A ParkError may carry a RetryAfter (a transient agent condition), which the
+			// dispatch loop's auto-readmit acts on once due; a plain park passes the zero time.
+			s.setStatus(b.ID, state.StatusNeedsAttention, pe.Error(), pe.Code, pe.RetryAfter)
 		} else {
-			s.setStatus(b.ID, state.StatusFailed, err.Error(), "")
+			s.setStatus(b.ID, state.StatusFailed, err.Error(), "", time.Time{})
 		}
 		return
 	}
@@ -464,7 +470,7 @@ func (s *Scheduler) runStage(ctx context.Context, b store.Book) {
 	if !SentinelExists(b.WorkDir, stageName) {
 		serr := fmt.Errorf("stage %q returned success without writing its sentinel - bug in the stage implementation", stageName)
 		_ = s.db.FinishStageRun(ctx, runID, false, metricsErr(serr))
-		s.setStatus(b.ID, state.StatusFailed, serr.Error(), "")
+		s.setStatus(b.ID, state.StatusFailed, serr.Error(), "", time.Time{})
 		return
 	}
 	if ferr := s.db.FinishStageRun(ctx, runID, true, result.Metrics); ferr != nil {
@@ -539,13 +545,20 @@ func (s *Scheduler) advance(ctx context.Context, b store.Book, stage state.State
 
 	next, status, err := state.NextState(stage, out)
 	if err != nil {
-		s.setStatus(b.ID, state.StatusFailed, err.Error(), "")
+		s.setStatus(b.ID, state.StatusFailed, err.Error(), "", time.Time{})
 		return
 	}
 	if status == state.StatusNeedsAttention {
 		// Park: keep the state, flag needs_attention (audit unresolved after the fix
-		// loop is exhausted), carrying the typed fix-loop-exhausted park code.
-		s.setStatus(b.ID, state.StatusNeedsAttention, "audit failed after maximum fix attempts", state.ParkFixLoopExhausted)
+		// loop is exhausted), carrying the typed fix-loop-exhausted park code. The
+		// auditing stage attaches a fix-count trajectory (ParkMessage) so the reason
+		// explains WHY it did not converge; fall back to the generic message when absent
+		// (a legacy/pre-change sentinel or a stage that set none).
+		msg := "audit failed after maximum fix attempts"
+		if result.ParkMessage != "" {
+			msg = result.ParkMessage
+		}
+		s.setStatus(b.ID, state.StatusNeedsAttention, msg, state.ParkFixLoopExhausted, time.Time{})
 		return
 	}
 
@@ -564,7 +577,7 @@ func (s *Scheduler) advance(ctx context.Context, b store.Book, stage state.State
 	if err := s.db.SetBookPipelineState(ctx, b.ID, string(next)); err != nil {
 		return
 	}
-	s.publishState(b.ID, string(next), "", "", "")
+	s.publishState(b.ID, string(next), "", "", "", "")
 
 	// Auto-purge: a book that just reached done no longer needs its scratch. The worker
 	// already holds this book's in-flight slot, so reclaim WITHOUT reserving (that would
@@ -617,12 +630,54 @@ func (s *Scheduler) advanceWaypoints(ctx context.Context) ([]store.Book, error) 
 				continue
 			}
 			books[i].State = string(next) // mirror the persisted advance in memory
-			s.publishState(b.ID, string(next), "", "", "")
+			s.publishState(b.ID, string(next), "", "", "", "")
 			advanced = true
 		}
 		if !advanced {
 			return books, nil
 		}
+	}
+}
+
+// autoReadmitCodes are the park reasons the timed self-resume acts on: the transient
+// agent conditions a wait heals (the CLI symlink blip recovers, or the rate-limit
+// window elapses). Every other park (a not-confident marker verdict, a spelling gate
+// failure, a budget stop, ...) needs a human and is never auto-readmitted.
+var autoReadmitCodes = []state.ParkCode{state.ParkAgentUnavailable, state.ParkAgentRateLimited}
+
+// autoReadmitDue re-admits every book whose scheduled retry_at has elapsed and whose
+// park code is one the timed self-resume owns (autoReadmitCodes). It re-admits through
+// the SAME readmit path a manual Retry uses (clearing status/error/park_code/retry_at
+// and forcing the current stage to re-run) and drops a durable stage.note so the log
+// shows the automatic re-admit. A book parked before migration 0008 has retry_at=” and
+// is never returned by the query, so it only ever re-admits via a human Retry. Errors
+// are logged and skipped - one stuck book must not stall the whole dispatch pass.
+func (s *Scheduler) autoReadmitDue(ctx context.Context) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	due, err := s.db.ListBooksDueForRetry(ctx, now)
+	if err != nil {
+		slog.Warn("auto-readmit: query due books failed", "err", err)
+		return
+	}
+	for _, b := range due {
+		if !state.IsParkedWith(b.Status, b.ParkCode, autoReadmitCodes...) {
+			continue
+		}
+		// Reserve so a concurrent PurgeScratch/Delete/manual-Retry does not race the
+		// re-admit; a book already in-flight (it should not be, while parked) is skipped.
+		if !s.reserve(b.ID) {
+			continue
+		}
+		err := s.readmit(ctx, b)
+		s.unreserve(b.ID)
+		if err != nil {
+			slog.Warn("auto-readmit: readmit failed", "book_id", b.ID, "err", err)
+			continue
+		}
+		_ = s.hub.PublishBook("stage.note", b.ID, map[string]any{
+			"book_id": b.ID, "stage": b.State,
+			"msg": "auto-retry: agent availability window elapsed",
+		})
 	}
 }
 
@@ -676,7 +731,11 @@ func seriesLess(a, b store.Book) bool {
 
 // --- events ---
 
-func (s *Scheduler) publishState(bookID int64, st, status, errMsg, parkCode string) {
+// publishState emits a book.state SSE frame. retryAt is the scheduled auto-readmit
+// instant (RFC3339 UTC) when the write set one, else "" - it rides the patch so a client
+// can flip a parked book's hint to "retries automatically" (and clear it on re-admit)
+// without a separate GET. Every caller but setStatus passes "" (no scheduled retry).
+func (s *Scheduler) publishState(bookID int64, st, status, errMsg, parkCode, retryAt string) {
 	_ = s.hub.PublishBook("book.state", bookID, map[string]any{
 		"book_id":   bookID,
 		"state":     st,
@@ -684,6 +743,7 @@ func (s *Scheduler) publishState(bookID int64, st, status, errMsg, parkCode stri
 		"status":    status,
 		"error":     errMsg,
 		"park_code": parkCode,
+		"retry_at":  retryAt,
 	})
 }
 
@@ -722,17 +782,24 @@ func (s *Scheduler) publishQueueStats(books []store.Book, counts map[state.Lane]
 // typed park code) and publishes book.state, so a client can surface both the
 // reason string and the machine-readable park class. parkCode is the typed reason
 // for a needs_attention park; callers pass "" for a plain failure or a clear, so
-// the code stays in sync with the status (set on a park, empty otherwise).
-func (s *Scheduler) setStatus(bookID int64, status state.Status, errMsg string, parkCode state.ParkCode) {
+// the code stays in sync with the status (set on a park, empty otherwise). retryAt,
+// when non-zero, schedules an automatic re-admit (persisted to books.retry_at in UTC
+// RFC3339): the transient-agent parks pass a due time so the dispatch loop heals the
+// book without a human; every other caller passes the zero time (no scheduled retry).
+func (s *Scheduler) setStatus(bookID int64, status state.Status, errMsg string, parkCode state.ParkCode, retryAt time.Time) {
 	ctx := context.Background()
 	b, err := s.db.GetBook(ctx, bookID)
 	if err != nil {
 		return
 	}
-	if err := s.db.SetBookStatus(ctx, bookID, string(status), errMsg, string(parkCode)); err != nil {
+	retryStr := ""
+	if !retryAt.IsZero() {
+		retryStr = retryAt.UTC().Format(time.RFC3339)
+	}
+	if err := s.db.SetBookStatusRetry(ctx, bookID, string(status), errMsg, string(parkCode), retryStr); err != nil {
 		return
 	}
-	s.publishState(bookID, b.State, string(status), errMsg, string(parkCode))
+	s.publishState(bookID, b.State, string(status), errMsg, string(parkCode), retryStr)
 }
 
 func metricsErr(err error) json.RawMessage {

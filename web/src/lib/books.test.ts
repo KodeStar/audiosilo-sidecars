@@ -93,6 +93,31 @@ describe('applyBookState', () => {
     });
     expect(out).toBe(books);
   });
+
+  it('mirrors retry_at from the event: sets it on a timed park, clears a stale one on a park without it', () => {
+    const books = [bk({ id: 1, state: 'fact_pass', status: '' })];
+    // A transient-agent park carrying a scheduled auto-readmit instant.
+    const parked = applyBookState(books, {
+      book_id: 1,
+      state: 'fact_pass',
+      lane: 'agent',
+      status: 'needs_attention',
+      error: 'rate limited',
+      park_code: 'agent_rate_limited',
+      retry_at: '2026-07-18T12:34:56Z',
+    });
+    expect(parked[0].retry_at).toBe('2026-07-18T12:34:56Z');
+    // A later human-only park (no retry_at on the frame) must drop the stale instant to ''.
+    const reparked = applyBookState(parked, {
+      book_id: 1,
+      state: 'fact_pass',
+      lane: 'agent',
+      status: 'needs_attention',
+      error: 'backend unavailable',
+      park_code: 'agent_unavailable',
+    });
+    expect(reparked[0].retry_at).toBe('');
+  });
 });
 
 describe('applyEtaUpdate', () => {

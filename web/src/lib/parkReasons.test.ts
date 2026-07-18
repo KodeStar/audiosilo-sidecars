@@ -17,12 +17,31 @@ describe('parkHint', () => {
       'contrib_unavailable',
       'core_needed',
       'core_pending',
+      'budget_exceeded',
     ];
     for (const code of codes) {
       const hint = parkHint(code);
       expect(hint, code).toBeTruthy();
       expect(hint).toMatch(/\S/);
     }
+  });
+
+  it('flips to the auto-retry hint purely on retry_at (the server owns that decision)', () => {
+    for (const code of ['agent_unavailable', 'agent_rate_limited']) {
+      expect(parkHint(code, true)).toMatch(/automatically/i);
+      // Without a scheduled retry, the manual-Retry hint is used.
+      expect(parkHint(code, false)).not.toMatch(/automatically/i);
+    }
+    // No frontend code-list gates this: retry_at drives it for any known code, so the
+    // wire field can never drift from a hardcoded set. (The server only sets retry_at on
+    // the transient agent parks, but the frontend trusts the field rather than re-deciding.)
+    expect(parkHint('budget_exceeded', true)).toMatch(/automatically/i);
+    // An unknown/empty code still has no hint, even with retry_at.
+    expect(parkHint('bogus_code', true)).toBeNull();
+  });
+
+  it('budget_exceeded points at the config lever', () => {
+    expect(parkHint('budget_exceeded')).toMatch(/book_budget_usd/);
   });
 
   it('returns a specific hint for a representative code', () => {

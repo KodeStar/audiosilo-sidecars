@@ -606,8 +606,10 @@ func TestSidecarLoopFixCapParks(t *testing.T) {
 	if final.State != string(state.Auditing) {
 		t.Errorf("parked at %q, want auditing", final.State)
 	}
-	if !strings.Contains(final.Error, "audit failed after maximum fix attempts") {
-		t.Errorf("park reason = %q, want the fix-cap message", final.Error)
+	// The park now carries the fix-count trajectory (never accepted: every round is a
+	// BLOCKER, so acceptTrajectory refuses and the loop runs to the cap).
+	if !strings.Contains(final.Error, "did not converge after 3 fix round(s)") || !strings.Contains(final.Error, "blockers 1") {
+		t.Errorf("park reason = %q, want the fix-trajectory message with blockers", final.Error)
 	}
 	assertSuccesses(t, db, book.ID, string(state.Fixing), state.MaxFixAttempts)
 }

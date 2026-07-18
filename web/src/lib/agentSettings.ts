@@ -5,7 +5,7 @@
 // immediate feedback; a rejected save still surfaces the server's 400 message.
 
 import type { AgentConfig, AgentUpdate } from '@/api/types';
-import { parseIntOrNaN } from '@/lib/formNumbers';
+import { parseFloatOrNaN, parseIntOrNaN } from '@/lib/formNumbers';
 
 // The agent-lane stage names, in pipeline order. Mirrors the Go config's
 // defaultClaudeModels keys / state.IsAgent set - a model-map key outside this set
@@ -30,6 +30,7 @@ export interface AgentFormState {
   backend: string; // '' (auto) | 'claude' | 'codex'
   concurrency: string;
   timeoutMinutes: string;
+  bookBudgetUSD: string; // per-book agent spend cap, USD (a large value effectively disables)
   models: Record<AgentStageKey, { claude: string; openai: string }>;
 }
 
@@ -47,6 +48,7 @@ export function agentConfigToForm(agent: AgentConfig): AgentFormState {
     backend: agent.backend,
     concurrency: String(agent.concurrency),
     timeoutMinutes: String(agent.timeout_minutes),
+    bookBudgetUSD: String(agent.book_budget_usd),
     models,
   };
 }
@@ -71,6 +73,7 @@ export function agentFormToUpdate(form: AgentFormState): AgentUpdate {
     backend: form.backend,
     concurrency: parseIntOrNaN(form.concurrency),
     timeout_minutes: parseIntOrNaN(form.timeoutMinutes),
+    book_budget_usd: parseFloatOrNaN(form.bookBudgetUSD),
     claude_models: nonEmptyModels(form, 'claude'),
     openai_models: nonEmptyModels(form, 'openai'),
   };
@@ -87,6 +90,10 @@ export function validateAgentForm(form: AgentFormState): string | null {
   const t = parseIntOrNaN(form.timeoutMinutes);
   if (!Number.isInteger(t) || t < 1) {
     return 'Timeout must be a whole number of at least 1 minute.';
+  }
+  const budget = parseFloatOrNaN(form.bookBudgetUSD);
+  if (!Number.isFinite(budget) || budget < 0) {
+    return 'Book budget must be a non-negative dollar amount (set a large value to effectively disable it).';
   }
   return null;
 }

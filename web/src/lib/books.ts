@@ -6,10 +6,12 @@ import type { BookStateEvent, BookView, EtaUpdateEvent, StageProgressEvent } fro
 import { MAINLINE, OFF_MAINLINE_AFTER } from '@/lib/timeline';
 
 // applyBookState patches the matching book's state + lane + status + error +
-// park_code. An event for a book not in the list is ignored (a newly created
+// park_code + retry_at. An event for a book not in the list is ignored (a newly created
 // book arrives via a list refetch, which carries its full identity/coverage; SSE
-// only patches what we already hold). park_code rides along the patch (empty/
-// absent on an advance, so a retry/resume clears a prior park reason).
+// only patches what we already hold). park_code and retry_at ride along the patch
+// (empty/absent on an advance, so a retry/resume clears a prior park reason and any
+// stale scheduled re-admit); retry_at falls back to '' when the frame carries none, so
+// an advance/clear frame drops a book's previous "retries automatically" instant.
 export function applyBookState(books: BookView[], ev: BookStateEvent): BookView[] {
   let changed = false;
   const next = books.map((b) => {
@@ -22,6 +24,7 @@ export function applyBookState(books: BookView[], ev: BookStateEvent): BookView[
       status: ev.status,
       error: ev.error,
       park_code: ev.park_code,
+      retry_at: ev.retry_at ?? '',
     };
   });
   return changed ? next : books;

@@ -548,6 +548,29 @@ func TestContributeLocalMode(t *testing.T) {
 	}
 }
 
+// TestContributeCarriesAuditAcceptanceNote: a book whose sidecars were accepted on a
+// converging audit trajectory (audit_accepted.json present) carries the residual-nits
+// note on its contribution rows, so the acceptance surfaces in the UI.
+func TestContributeCarriesAuditAcceptanceNote(t *testing.T) {
+	db := openContribDB(t)
+	export := t.TempDir()
+
+	b := contribBook(t, db, store.NewBook{WorkID: "reacher-01"}, baseChars("x"), baseRecaps("x"))
+	if err := writeAuditAccepted(b.WorkDir, auditAccepted{Round: 2, Fix: 1, Nit: 3}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := contribConfig(t, db, contribModeLocal, "", "", export, nil)
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
+		t.Fatalf("contribute: %v", err)
+	}
+	rows := rowsByKind(t, db, b.ID)
+	for kind, row := range rows {
+		if !strings.Contains(row.Note, "converged after 2 rounds") || !strings.Contains(row.Note, "3 residual nit") {
+			t.Errorf("%s row note = %q, want the acceptance line", kind, row.Note)
+		}
+	}
+}
+
 func TestContributeLocalModeUnresolvedSlugUsesPlaceholder(t *testing.T) {
 	db := openContribDB(t)
 	export := t.TempDir()

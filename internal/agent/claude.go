@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/secrets"
 )
@@ -113,7 +114,7 @@ func (c *claudeRunner) Run(ctx context.Context, req Request) (Result, error) {
 	// rate-limit result, or as a nonzero exit with the message on stderr.
 	detail := firstNonEmpty(res.Result, stderr, stdout)
 	if isRateLimit(res.Result) || isRateLimit(stderr) {
-		return Result{}, &RateLimitError{Detail: truncate(detail)}
+		return Result{}, newRateLimitError(detail, time.Now())
 	}
 
 	if runErr != nil {

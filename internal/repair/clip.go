@@ -69,10 +69,19 @@ type ClipSpliceRequest struct {
 }
 
 // ClipResult reports what ClipAndSplice did for one chapter.
+//
+// Outcomes are told apart by their fields: a splice sets Spliced; a re-degeneration sets
+// Verdict=CLIP-REDEGENERATED with !Spliced; a known-failed skip sets SkippedKnownFailed;
+// and the UNLOCATABLE NO-OP (LocateTailRun found no loop AND the caller supplied no
+// StartOverrideSec) leaves every one of those zero - !Located, !Spliced, !SkippedKnownFailed,
+// empty Verdict - which Unlocatable reports so the stage can bucket it as clips_unlocatable
+// and re-queue the chapter asking for a clip_start_sec. Located is true only on the mechanical
+// tail path (a run was found); the agent-directed (run-less) path leaves it false even when it
+// splices.
 type ClipResult struct {
 	Chapter     int
-	Located     bool    // a tail run was found (LocateTailRun ok AND phrase located in the word stream)
-	Verdict     Verdict // the adjudication verdict (empty when no run was located)
+	Located     bool    // a tail run was found (LocateTailRun ok AND phrase located in the word stream); false on the agent-directed run-less path even when spliced
+	Verdict     Verdict // the adjudication verdict (empty ONLY on the unlocatable no-op)
 	Spliced     bool    // transcripts-repaired/chNNN.txt was written
 	ClipHealthy bool    // the fresh clip passed the max-6-gram-x1 health check
 	// SkippedKnownFailed is set when the effective window matched a prior
@@ -88,6 +97,16 @@ type ClipResult struct {
 	WordsAfter         int
 }
 
+// Unlocatable reports the tail no-op outcome: ClipAndSplice found no locatable tail run AND
+// the caller supplied no StartOverrideSec, so nothing was cut, transcribed, spliced, or
+// recorded (the ClipResult is zero). It is distinct from a re-degeneration (Verdict set), a
+// known-failed skip (SkippedKnownFailed), and any splice (Spliced). The retranscribing stage
+// buckets it as clips_unlocatable and asks the adjudicator to supply a clip_start_sec so the
+// window can be relocated. It is never true for a MID clip (ClipAndSpliceWindow always cuts).
+func (r ClipResult) Unlocatable() bool {
+	return !r.Located && !r.Spliced && !r.SkippedKnownFailed && r.Verdict == ""
+}
+
 // ClipAndSplice runs the full mechanical tail repair for one chapter: locate the tail
 // run, cut the audio window, transcribe it prompt-free, health-check the clip,
 // adjudicate the loop against the fresh clip, and (unless the clip re-degenerated)
@@ -95,17 +114,24 @@ type ClipResult struct {
 // appending repairs.log and merging tail_verdicts.json.
 //
 // A chapter with no locatable tail run (LocateTailRun returned ok=false, or the phrase
-// never appeared in the word-timestamp stream) is a no-op: ClipResult.Located is
-// false, no splice, no artifacts. A CLIP-REDEGENERATED verdict (or an unhealthy clip)
-// keeps the original and records only the verdict. ctx cancellation propagates from
-// the cut/transcribe calls.
+// never appeared in the word-timestamp stream) BUT an agent-supplied req.StartOverrideSec
+// falls through to the run-less directed repair (clipAndSpliceDirected): the mechanical
+// locator missed a SHORT tail repeat (a 3x phrase is below the 6-gram threshold), so the
+// adjudicator's documented recourse - clip_start_sec - drives the cut instead of a no-op.
+// With no override it is a true no-op: ClipResult is zero (Unlocatable), no splice, no
+// artifacts. A CLIP-REDEGENERATED verdict (or an unhealthy clip) keeps the original and
+// records only the verdict. ctx cancellation propagates from the cut/transcribe calls.
 func ClipAndSplice(ctx context.Context, req ClipSpliceRequest) (ClipResult, error) {
 	res := ClipResult{Chapter: req.Chapter}
 
 	run, ok := LocateTailRun(req.Transcript, req.ChapterEnd)
 	if !ok || !run.Located {
-		// No 6-gram tail to adjudicate, or the phrase was not in the timed word
-		// stream: nothing to clip. The caller records the chapter as unrepaired.
+		// No 6-gram tail to adjudicate, or the phrase was not in the timed word stream. If the
+		// agent relocated the window (clip_start_sec), honor it via the run-less directed path;
+		// otherwise a true no-op (Unlocatable), and the caller records the chapter as unrepaired.
+		if req.StartOverrideSec > 0 {
+			return clipAndSpliceDirected(ctx, req)
+		}
 		return res, nil
 	}
 	res.Located = true
@@ -178,6 +204,79 @@ func ClipAndSplice(ctx context.Context, req ClipSpliceRequest) (ClipResult, erro
 		tailVerdict(run, adj, clipStart, req.ChapterEnd, adj.Verdict, req.DecodeTag)); err != nil {
 		return res, err
 	}
+	res.Spliced = true
+	return res, nil
+}
+
+// clipAndSpliceDirected runs the run-less TAIL repair from an agent-supplied window start,
+// taken by ClipAndSplice when the mechanical locator found no loop (LocateTailRun failed) but
+// req.StartOverrideSec > 0. It is the recourse for a SHORT tail repeat the 6-gram locator
+// cannot reach (a 3x "Kill!" is below TailGramThreshold's cluster reach): cut [override,
+// chend - override + 2], transcribe prompt-free, and - because there is NO located run to
+// rotation-adjudicate - gate the splice on the ClipHealthy check ALONE, exactly like the MID
+// path (ClipAndSpliceWindow). A healthy clip splices to the chapter end and writes the usual
+// durable evidence (repaired file + repairs.log line + a TAIL-REPAIRED verdict), so
+// tailClipAlreadyDone, resume-idempotency and the residual auto-accept all work; an unhealthy
+// clip records a CLIP-REDEGENERATED verdict (with the DecodeTag, so the known-failed skip
+// fires next round) and keeps the original. res.Located stays false (there was no located
+// run); the outcome is told apart from a true no-op by Spliced / Verdict / SkippedKnownFailed.
+// The known-failed skip and the clip filename scheme match the located path exactly, so a
+// re-queued identical directed window is skipped free rather than re-cut.
+func clipAndSpliceDirected(ctx context.Context, req ClipSpliceRequest) (ClipResult, error) {
+	res := ClipResult{Chapter: req.Chapter}
+
+	// Degenerate-window guard: a bogus agent clip_start_sec at (or past) the chapter end
+	// would cut a zero/negative-length window - `chend - override + 2` collapses to <= 2s
+	// of nothing, so ffmpeg would produce an empty/failed clip and hard-FAIL the book.
+	// Treat "no room for at least a ~1s window" (override > chend - 1) as an unlocatable
+	// no-op instead: nothing is cut, and the stage's clips_unlocatable bucket + note + the
+	// next adjudication round handle re-supplying a sane window. This keeps a single bad
+	// number from failing a book the pipeline can still recover.
+	if req.StartOverrideSec > req.ChapterEnd-1 {
+		return res, nil
+	}
+	clipStart := pyRound(req.StartOverrideSec, 1)
+	res.ClipStart = clipStart
+
+	// Known-failed skip: identical to the located path (knownFailedWindow reads a TAIL verdict
+	// only), so a prior CLIP-REDEGENERATED at this window under the same decode params skips the
+	// ASR - re-cutting the identical audio would re-degenerate identically.
+	if knownFailedWindow(req.WorkDir, req.Chapter, clipStart, req.DecodeTag) {
+		res.SkippedKnownFailed = true
+		res.Verdict = VerdictClipRedegenerated
+		return res, nil
+	}
+
+	// Same tail clip filename scheme as the located path (t-prefix, integer deciseconds start;
+	// the stem must stay dot-free - see the located path's note).
+	clipFlac := filepath.Join(req.WorkDir, ClipsDir, fmt.Sprintf("t%03d-%d.flac", req.Chapter, int(math.Round(clipStart*10))))
+	// Cut [override, chend - override + 2] (the same +2s tail pad as the located path),
+	// transcribe prompt-free, and health-check.
+	clipText, healthy, err := cutTranscribeHealth(ctx, req, "clip", clipFlac, req.StartOverrideSec, req.ChapterEnd-req.StartOverrideSec+2)
+	if err != nil {
+		return res, err
+	}
+	res.ClipHealthy = healthy
+
+	// No located run -> no rotation-adjudication possible; the health check is the only guard
+	// (as in ClipAndSpliceWindow). An unhealthy fresh clip re-degenerated: record a TAIL
+	// CLIP-REDEGENERATED verdict (ClipEnd stays 0) and keep the original.
+	if !healthy {
+		res.Verdict = VerdictClipRedegenerated
+		if err := MergeTailVerdict(req.WorkDir, runlessTailVerdict(req.Chapter, clipStart, req.ChapterEnd, VerdictClipRedegenerated, req.DecodeTag)); err != nil {
+			return res, err
+		}
+		return res, nil
+	}
+
+	newText, before, after := Splice(req.Transcript, clipStart, clipText)
+	res.WordsBefore, res.WordsAfter = before, after
+	line := buildDirectedRepairLine(req.Chapter, req.StartOverrideSec, req.ChapterEnd, before, after)
+	if err := writeSplice(req.WorkDir, req.Chapter, newText, line,
+		runlessTailVerdict(req.Chapter, clipStart, req.ChapterEnd, VerdictTailRepaired, req.DecodeTag)); err != nil {
+		return res, err
+	}
+	res.Verdict = VerdictTailRepaired
 	res.Spliced = true
 	return res, nil
 }
@@ -326,6 +425,23 @@ func midVerdict(chapter int, clipStart, clipEnd float64, verdict Verdict, decode
 		ClipStart: clipStart,
 		ClipEnd:   clipEnd,
 		ClipSecs:  pyRound(clipEnd-clipStart, 1),
+		Verdict:   verdict,
+		DecodeTag: decodeTag,
+	}
+}
+
+// runlessTailVerdict assembles the persisted verdict for a run-less (agent-directed) TAIL
+// repair - the clipAndSpliceDirected path with no located run, so the tail-specific
+// loop/adjudication fields (Count/Phrase/LoopStartT/LoopWords/Unit/Period/InClip) stay zero.
+// ClipEnd stays 0, so IsMidWindow() is false: the residual auto-accept treats it as an
+// unbounded tail window [clip_start, +Inf] and the known-failed skip keys on clip_start alone,
+// identical to a located tail verdict. verdict is TAIL-REPAIRED (a healthy splice) or
+// CLIP-REDEGENERATED (an unhealthy clip).
+func runlessTailVerdict(chapter int, clipStart, chapterEnd float64, verdict Verdict, decodeTag string) TailVerdict {
+	return TailVerdict{
+		Chapter:   chapter,
+		ClipStart: clipStart,
+		ClipSecs:  pyRound(chapterEnd-clipStart, 1),
 		Verdict:   verdict,
 		DecodeTag: decodeTag,
 	}

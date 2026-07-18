@@ -372,6 +372,11 @@ func TestPipelineParksUnnormalizableMarkers(t *testing.T) {
 			if final.Error != AgentUnavailableMsg {
 				t.Errorf("park reason = %q, want %q", final.Error, AgentUnavailableMsg)
 			}
+			// A preflight no-backend park schedules no auto-readmit (retry_at stays empty), so
+			// the daemon never churns a re-admit loop for a machine that has no CLI configured.
+			if final.RetryAt != "" {
+				t.Errorf("no-backend park retry_at = %q, want '' (no auto-readmit)", final.RetryAt)
+			}
 		})
 	}
 }

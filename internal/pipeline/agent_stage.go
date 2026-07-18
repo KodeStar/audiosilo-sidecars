@@ -59,6 +59,49 @@ const (
 	SpellingGateFailurePrefix = "spelling corrections failed the gates - fix spelling_research and retry"
 )
 
+// budgetExceededMsg is the park reason when a book's summed agent cost has reached the
+// configured per-book budget. It names the spend and the budget and the exact fix, so a
+// user knows the one lever (raise agent.book_budget_usd, restart, Retry).
+func budgetExceededMsg(spent, budget float64) string {
+	return fmt.Sprintf("book agent cost $%.2f reached the budget $%.2f - raise agent.book_budget_usd in config.yaml (restart to apply), then Retry", spent, budget)
+}
+
+// Timed-park delays runAgent stamps on a transient agent park (see scheduler
+// auto-readmit): the scheduler re-admits the book once the instant passes.
+const (
+	// rateLimitReadmitBuffer is added to a PARSED reset instant so the auto-readmit lands
+	// safely after the limit window has fully cleared, not exactly on the boundary.
+	rateLimitReadmitBuffer = 2 * time.Minute
+	// rateLimitFallbackDelay is the auto-readmit delay when the backend gave no parseable
+	// reset time - a conservative wait that lets most short windows clear.
+	rateLimitFallbackDelay = 30 * time.Minute
+	// rateLimitMinDelay is the FLOOR under a parsed-reset readmit: never schedule earlier
+	// than now+5min. A reset instant that parses in the past or barely ahead (stale message,
+	// timezone skew on the clock form) would otherwise readmit the book into an immediate
+	// re-park, a tight loop; the floor bounds that harm to an extra short wait.
+	rateLimitMinDelay = 5 * time.Minute
+	// notAvailableReadmitDelay is the auto-readmit delay for an agent-unavailable park
+	// (reached only after the agent package's in-process NotAvailable retries): long
+	// enough that a CLI mid-reinstall is likely back, short enough to self-heal an
+	// overnight batch.
+	notAvailableReadmitDelay = 10 * time.Minute
+)
+
+// rateLimitRetryAt computes the auto-readmit instant for a rate-limit park: the backend's
+// parsed reset time plus a buffer when known (floored at now+rateLimitMinDelay so a stale or
+// tz-skewed reset can never schedule a past/immediate readmit into a re-park loop), else a
+// fixed fallback from now (already well above the floor).
+func rateLimitRetryAt(rl *agent.RateLimitError, now time.Time) time.Time {
+	if !rl.ResetAt.IsZero() {
+		at := rl.ResetAt.Add(rateLimitReadmitBuffer)
+		if floor := now.Add(rateLimitMinDelay); at.Before(floor) {
+			return floor
+		}
+		return at
+	}
+	return now.Add(rateLimitFallbackDelay)
+}
+
 // QANoConvergeMsg is the park reason when QA adjudication hits the hard round cap
 // (maxQARounds) without converging - the backstop for a book that makes real progress
 // every round (the cheaper stall park, QAStalledPrefix, handles a genuinely-stuck book
@@ -165,8 +208,28 @@ func (e *validationError) Error() string { return e.msg }
 // (actionable, Retry-able); an exhausted output validator PARKS naming why; any other
 // error (render, transport, timeout) is returned as a plain error (StatusFailed).
 func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.State, r scheduler.StageReport, st *agent.Staging, promptName string, promptData any, web bool, validate func(agent.Result, *agent.Staging) error) (agentUsage, error) {
+	// Per-book budget preflight: park (with everything already recorded) BEFORE spending
+	// another invocation once the book's summed agent cost has reached the budget. It runs
+	// per runAgent call, so fact_pass (one runAgent per chunk) naturally checks between
+	// chunks; a single invocation is never aborted mid-flight. SumStageRunCost includes
+	// superseded rows, so a Retry that reset counters never lowers the spend the guard sees.
+	if e.db != nil && e.bookBudgetUSD > 0 {
+		spent, serr := e.db.SumStageRunCost(ctx, book.ID)
+		if serr != nil {
+			return agentUsage{}, fmt.Errorf("%s: read book cost: %w", stage, serr)
+		}
+		if spent >= e.bookBudgetUSD {
+			return agentUsage{}, scheduler.ParkWithCode(state.ParkBudgetExceeded, budgetExceededMsg(spent, e.bookBudgetUSD))
+		}
+	}
 	runner, av := e.ensureAgent(ctx)
 	if runner == nil || !av.Available {
+		// PREFLIGHT unavailability: no CLI is configured/resolvable at all (not a transient
+		// mid-run vanish). Park for a HUMAN with NO auto-readmit - a daemon that will never
+		// have a backend until someone configures one must not churn a re-admit every 10min
+		// forever. The operator installs/configures a CLI and clicks Retry. (The transient
+		// case - a CLI that existed and vanished mid-run - is the POST-invocation
+		// NotAvailableError branch below, which does schedule a short auto-readmit.)
 		return agentUsage{}, scheduler.ParkWithCode(state.ParkAgentUnavailable, AgentUnavailableMsg)
 	}
 	model := agent.ModelFor(e.agentModels.Claude, e.agentModels.OpenAI, runner.ID(), string(stage))
@@ -225,11 +288,18 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 	if err != nil {
 		var rl *agent.RateLimitError
 		if errors.As(err, &rl) {
-			return total, scheduler.ParkWithCode(state.ParkAgentRateLimited, AgentRateLimitedPrefix+" ("+rl.Detail+") - retry later")
+			// Schedule an automatic re-admit shortly after the limit window clears (the
+			// backend's parsed reset time + a buffer, else a fixed fallback) so an overnight
+			// batch heals itself instead of stranding until a human clicks Retry.
+			return total, scheduler.ParkWithCodeAfter(state.ParkAgentRateLimited,
+				AgentRateLimitedPrefix+" ("+rl.Detail+") - retry later", rateLimitRetryAt(rl, time.Now()))
 		}
 		var na *agent.NotAvailableError
 		if errors.As(err, &na) {
-			return total, scheduler.ParkWithCode(state.ParkAgentUnavailable, AgentUnavailableMsg)
+			// Reached only after the agent package rode out the transient LookPath blip, so a
+			// short auto-readmit window lets a CLI that finished (re)installing self-resume.
+			return total, scheduler.ParkWithCodeAfter(state.ParkAgentUnavailable, AgentUnavailableMsg,
+				time.Now().Add(notAvailableReadmitDelay))
 		}
 		var ve *validationError
 		if errors.As(err, &ve) {
@@ -460,6 +530,49 @@ type adjudicatePromptData struct {
 // tail_clip or mid_clip splice already landed; the residual reads the untouched raw layer).
 const autoAcceptTailReason = "already repaired via clip splice - splice present in transcripts-repaired"
 
+// acceptedLedgerName is the work-dir file recording every chapter qa_adjudicating accepted
+// (agent or auto) across rounds, so an accepted chapter is never re-adjudicated in a later
+// round. Without it most detectors re-flag an already-accepted chapter each qa_sweep round
+// (they read the stale unrepaired layer), so the agent re-opens and re-accepts the SAME
+// chapters every round at full cost - the round-cap burner one real book exhausted its budget
+// on. The decisions stay valid because repairs only ever touch PLANNED non-accept chapters, so
+// an accepted chapter's transcript never changes afterwards; the ledger is therefore
+// deliberately NOT cleared by the done==0 reset or a Retry (unlike the stall marker). A
+// deleted + re-enqueued book gets a fresh work dir, so it never inherits a stale ledger.
+const acceptedLedgerName = "qa_accepted.json"
+
+// acceptedEntry records one accepted chapter's disposition: the round it was first accepted,
+// the argued reason, and whether the acceptance was the agent's or a mechanical auto-accept.
+type acceptedEntry struct {
+	Round  int    `json:"round"`
+	Reason string `json:"reason"`
+	Source string `json:"source"` // "agent" | "auto"
+}
+
+// loadAcceptedLedger reads qa_accepted.json (chapter -> entry), tolerating an absent,
+// unreadable, or malformed file as an empty ledger so a first round (or a corrupt artifact)
+// simply starts fresh rather than failing the stage.
+func loadAcceptedLedger(workDir string) map[int]acceptedEntry {
+	raw, err := os.ReadFile(filepath.Join(workDir, acceptedLedgerName)) //nolint:gosec // path derives from the book's own work dir
+	if err != nil {
+		return map[int]acceptedEntry{}
+	}
+	var m map[int]acceptedEntry
+	if err := json.Unmarshal(raw, &m); err != nil || m == nil {
+		return map[int]acceptedEntry{}
+	}
+	return m
+}
+
+// writeAcceptedLedger persists the ledger (pretty JSON, trailing newline) atomically.
+func writeAcceptedLedger(workDir string, ledger map[int]acceptedEntry) error {
+	out, err := json.MarshalIndent(ledger, "", " ")
+	if err != nil {
+		return err
+	}
+	return fsutil.WriteFileAtomic(filepath.Join(workDir, acceptedLedgerName), append(out, '\n'), 0o644)
+}
+
 // retranscribeStalledMarker is the work-dir file the retranscribing stage writes when a
 // repair round made no progress (it neither spliced nor adopted any chapter) and removes
 // when a round DID make progress. It is the pipeline's QA-loop convergence signal:
@@ -583,6 +696,29 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, r schedule
 	for _, en := range autoEntries {
 		autoSet[en.Chapter] = true
 	}
+	// Fold the durable accepted-chapters ledger into the mechanical-accept set: any flagged
+	// chapter accepted in a PRIOR round (agent or auto) is accepted mechanically again this
+	// round and excluded from the set the agent must adjudicate. This is what stops the agent
+	// re-verifying the SAME already-accepted chapters every round at full cost (the round-cap
+	// burner). Folded into autoEntries/autoSet so the merged plan, the prompt's do-not-
+	// disposition list, and the remaining-count all treat a ledger accept exactly like an
+	// auto-accept.
+	ledger := loadAcceptedLedger(book.WorkDir)
+	for _, ch := range qa.FlaggedChapters(rep) {
+		if autoSet[ch] {
+			continue
+		}
+		le, ok := ledger[ch]
+		if !ok {
+			continue
+		}
+		autoEntries = append(autoEntries, qa.PlanEntry{
+			Chapter: ch,
+			Action:  qa.ActionAccept,
+			Reason:  fmt.Sprintf("%s (accepted round %d)", le.Reason, le.Round),
+		})
+		autoSet[ch] = true
+	}
 	remaining := 0
 	for _, ch := range qa.FlaggedChapters(rep) {
 		if !autoSet[ch] {
@@ -602,6 +738,27 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, r schedule
 			return scheduler.StageResult{}, aerr
 		}
 		plan, usage = p, u
+	}
+
+	// Persist every accept in the final (merged, validated) plan into the durable ledger -
+	// agent's AND auto's - so a later round accepts them mechanically instead of re-adjudicating
+	// them. An existing entry is never overwritten, so the FIRST acceptance round/reason is kept
+	// and the "(accepted round N)" suffix never nests across rounds.
+	for _, en := range plan.Entries {
+		if en.Action != qa.ActionAccept {
+			continue
+		}
+		if _, exists := ledger[en.Chapter]; exists {
+			continue
+		}
+		src := "agent"
+		if autoSet[en.Chapter] {
+			src = "auto"
+		}
+		ledger[en.Chapter] = acceptedEntry{Round: round, Reason: en.Reason, Source: src}
+	}
+	if err := writeAcceptedLedger(book.WorkDir, ledger); err != nil {
+		return scheduler.StageResult{}, fmt.Errorf("qa_adjudicating: write accepted ledger: %w", err)
 	}
 
 	if err := qa.WritePlan(book.WorkDir, plan); err != nil {
@@ -846,14 +1003,22 @@ func mergePlans(auto []qa.PlanEntry, autoSet map[int]bool, agentPlan *qa.Plan) *
 }
 
 // chaptersCSV renders the chapter numbers of a plan-entry slice as a "1, 3, 7" string
-// (empty for no entries), for the adjudicate prompt's auto-accepted block.
+// (empty for no entries), for the adjudicate prompt's auto-accepted block. It projects
+// the entries to their chapter numbers and delegates to intsCSV (one shared join).
 func chaptersCSV(entries []qa.PlanEntry) string {
-	if len(entries) == 0 {
-		return ""
-	}
-	parts := make([]string, len(entries))
+	ns := make([]int, len(entries))
 	for i, en := range entries {
-		parts[i] = strconv.Itoa(en.Chapter)
+		ns[i] = en.Chapter
+	}
+	return intsCSV(ns)
+}
+
+// intsCSV renders a slice of chapter numbers as a "12, 81" string (empty for none), for the
+// unlocatable-chapters stage note.
+func intsCSV(ns []int) string {
+	parts := make([]string, len(ns))
+	for i, n := range ns {
+		parts[i] = strconv.Itoa(n)
 	}
 	return strings.Join(parts, ", ")
 }
@@ -957,26 +1122,37 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 	// clip-cutter resolution are excluded) and count only entries processed THIS run
 	// (done - completed), so a resume is not charged for prior work.
 	loopStart := time.Now()
-	var retranscribed, adopted, kept, spliced, redegen, skippedKnownFailed, accepted int
-	// skippedNew counts known-failed skips processed THIS run (skipped && !wasDone). They
-	// tick progress (display is right to advance) but did NO productive ASR work, so they
-	// are excluded from the rate sample below - counting a free skip as a processed unit
-	// would inflate the learned per-unit rate.
-	skippedNew := 0
-	// recordClipOutcome buckets a clip repair's (spliced, skippedKnownFailed) result into
-	// the shared counters. Both the tail and mid clip actions feed it, so a mid splice reuses
-	// the SAME buckets as a tail splice - an interior repair counts as progress for the stall
-	// signal below. wasDone excludes a resumed known-failed skip from skippedNew (the
-	// rate-sample tally).
-	recordClipOutcome := func(spl, skipped, wasDone bool) {
+	var retranscribed, adopted, kept, spliced, redegen, skippedKnownFailed, unlocatable, accepted int
+	// skippedNew / unlocatableNew count free (no-ASR) outcomes processed THIS run (!wasDone):
+	// a known-failed skip and a tail unlocatable no-op each tick progress (display is right to
+	// advance) but did NO productive ASR work, so both are excluded from the rate sample below
+	// - counting a free outcome as a processed unit would inflate the learned per-unit rate.
+	skippedNew, unlocatableNew := 0, 0
+	// unlocatableChapters names the chapters whose tail_clip could not be located (a short
+	// repeat below the 6-gram reach) AND that carried no clip_start_sec, so the round did no
+	// work on them - the stage Note asks the adjudicator to supply clip_start_sec.
+	var unlocatableChapters []int
+	// recordClipOutcome buckets a clip repair's ClipResult into the shared counters. Both the
+	// tail and mid clip actions feed it, so a mid splice reuses the SAME buckets as a tail
+	// splice - an interior repair counts as progress for the stall signal below. An unlocatable
+	// no-op (only the tail path can produce it) is bucketed separately from a re-degeneration:
+	// it did no ASR at all (misleadingly counting it as clips_redegenerated hid why the round
+	// stalled). wasDone excludes a resumed free outcome from the rate-sample tallies.
+	recordClipOutcome := func(res repair.ClipResult, wasDone bool) {
 		switch {
-		case spl:
+		case res.Spliced:
 			spliced++
-		case skipped:
+		case res.SkippedKnownFailed:
 			skippedKnownFailed++
 			if !wasDone {
 				skippedNew++
 			}
+		case res.Unlocatable():
+			unlocatable++
+			if !wasDone {
+				unlocatableNew++
+			}
+			unlocatableChapters = append(unlocatableChapters, res.Chapter)
 		default:
 			redegen++
 		}
@@ -1006,17 +1182,17 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 				kept++
 			}
 		case qa.ActionTailClip:
-			spl, skipped, rerr := e.tailClipChapter(ctx, setup, cut, book, durations[entry.Chapter], entry.Chapter, entry.ClipStartSec, verdicts)
+			res, rerr := e.tailClipChapter(ctx, setup, cut, book, durations[entry.Chapter], entry.Chapter, entry.ClipStartSec, verdicts)
 			if rerr != nil {
 				return scheduler.StageResult{}, rerr
 			}
-			recordClipOutcome(spl, skipped, wasDone)
+			recordClipOutcome(res, wasDone)
 		case qa.ActionMidClip:
-			spl, skipped, rerr := e.midClipChapter(ctx, setup, cut, book, durations[entry.Chapter], entry.Chapter, entry.ClipStartSec, entry.ClipEndSec, verdicts)
+			res, rerr := e.midClipChapter(ctx, setup, cut, book, durations[entry.Chapter], entry.Chapter, entry.ClipStartSec, entry.ClipEndSec, verdicts)
 			if rerr != nil {
 				return scheduler.StageResult{}, rerr
 			}
-			recordClipOutcome(spl, skipped, wasDone)
+			recordClipOutcome(res, wasDone)
 		default:
 			return scheduler.StageResult{}, fmt.Errorf("retranscribing: chapter %d has unknown action %q", entry.Chapter, entry.Action)
 		}
@@ -1030,6 +1206,18 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 
 	loopSeconds := time.Since(loopStart).Seconds()
 	e.accountScratch(ctx, book)
+
+	// Visibility: name the chapters whose tail_clip could not be located and carried no
+	// clip_start_sec, so the book log shows why the round did no work on them - the mechanical
+	// 6-gram locator cannot reach a short repeat, and the adjudicator's recourse is to re-queue
+	// with an explicit clip_start_sec (or a mid_clip window).
+	if len(unlocatableChapters) > 0 && r.Note != nil {
+		noun := "chapters"
+		if len(unlocatableChapters) == 1 {
+			noun = "chapter"
+		}
+		r.Note(fmt.Sprintf("tail-clip could not locate a loop in %s %s - the adjudicator must supply clip_start_sec", noun, intsCSV(unlocatableChapters)))
+	}
 
 	// Convergence signal for qaAdjudicate: a repair round that neither spliced nor adopted
 	// anything achieved nothing - the qa_sweep re-run will re-flag the same chapters and the
@@ -1052,11 +1240,14 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 			"clips_spliced":              spliced,
 			"clips_redegenerated":        redegen,
 			"clips_skipped_known_failed": skippedKnownFailed,
+			"clips_unlocatable":          unlocatable,
 			"accepted":                   accepted,
 		}),
-		// Exclude free known-failed skips (skippedNew) from the productive unit count so a
-		// skip-only run records no rate (rateSample returns nil for zero units).
-		RateSample: rateSample(done-completed-skippedNew, loopSeconds),
+		// Exclude free (no-ASR) outcomes - known-failed skips (skippedNew) AND tail unlocatable
+		// no-ops (unlocatableNew) - from the productive unit count, so a round that did no real
+		// ASR records no rate (rateSample returns nil for zero units) rather than inflating the
+		// learned per-unit rate with ~ms no-ops.
+		RateSample: rateSample(done-completed-skippedNew-unlocatableNew, loopSeconds),
 	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.Retranscribing), result); err != nil {
 		return scheduler.StageResult{}, err
@@ -1236,18 +1427,19 @@ func (e *Executor) retranscribeChapter(ctx context.Context, setup ASRSetup, book
 // context-conditioned collapse, so re-transcribing without context is what lets it resolve
 // differently instead of replaying), calls splice, and drops the chapter's stale corrected
 // file on a splice (correcting re-runs fully). label ("tail-clip" / "mid-clip") shapes the
-// wrapped error text. It returns whether a splice was written and whether the exact window
-// was skipped as known-failed (no ASR ran).
-func (e *Executor) clipChapter(ctx context.Context, setup ASRSetup, cut repair.ClipCutter, book store.Book, chapter int, verdicts map[int]repair.TailVerdict, label string, req repair.ClipSpliceRequest, splice func(context.Context, repair.ClipSpliceRequest) (repair.ClipResult, error)) (spliced, skippedKnownFailed bool, err error) {
+// wrapped error text. It returns the full repair.ClipResult so the caller can distinguish a
+// splice, a re-degeneration, a known-failed skip, and the tail unlocatable no-op (which it
+// buckets as clips_unlocatable and re-queues asking for a clip_start_sec).
+func (e *Executor) clipChapter(ctx context.Context, setup ASRSetup, cut repair.ClipCutter, book store.Book, chapter int, verdicts map[int]repair.TailVerdict, label string, req repair.ClipSpliceRequest, splice func(context.Context, repair.ClipSpliceRequest) (repair.ClipResult, error)) (repair.ClipResult, error) {
 	if tailClipAlreadyDone(book.WorkDir, chapter, verdicts) {
-		return true, false, nil // a prior run already spliced this chapter
+		return repair.ClipResult{Chapter: chapter, Spliced: true}, nil // a prior run already spliced this chapter
 	}
 	origT, err := transcript.ReadNormalized(filepath.Join(book.WorkDir, transcript.JSONDir), chapter)
 	if err != nil {
-		return false, false, fmt.Errorf("retranscribing: read chapter %d transcript: %w", chapter, err)
+		return repair.ClipResult{Chapter: chapter}, fmt.Errorf("retranscribing: read chapter %d transcript: %w", chapter, err)
 	}
 	if cut == nil {
-		return false, false, scheduler.ParkWithCode(state.ParkMediaToolsUnavailable, MediaToolsUnavailableMsg)
+		return repair.ClipResult{Chapter: chapter}, scheduler.ParkWithCode(state.ParkMediaToolsUnavailable, MediaToolsUnavailableMsg)
 	}
 	transcribe := func(ctx context.Context, clipPath string) ([]byte, error) {
 		outDir := filepath.Join(book.WorkDir, repair.ClipsDir)
@@ -1267,12 +1459,12 @@ func (e *Executor) clipChapter(ctx context.Context, setup ASRSetup, cut repair.C
 	req.DecodeTag = retranscribeDecodeTag
 	res, err := splice(ctx, req)
 	if err != nil {
-		return false, false, fmt.Errorf("retranscribing: %s chapter %d: %w", label, chapter, err)
+		return repair.ClipResult{Chapter: chapter}, fmt.Errorf("retranscribing: %s chapter %d: %w", label, chapter, err)
 	}
 	if res.Spliced {
 		_ = os.Remove(filepath.Join(book.WorkDir, spelling.CorrectedDir, transcript.TextName(chapter)))
 	}
-	return res.Spliced, res.SkippedKnownFailed, nil
+	return res, nil
 }
 
 // tailClipChapter is the thin tail-repair wrapper over clipChapter: locate the tail loop,
@@ -1280,7 +1472,7 @@ func (e *Executor) clipChapter(ctx context.Context, setup ASRSetup, cut repair.C
 // degenerated. startOverrideSec, when > 0, is the agent-supplied window start (from the
 // plan entry's clip_start_sec) that relocates a window whose derived cut kept re-
 // degenerating; 0 derives as usual.
-func (e *Executor) tailClipChapter(ctx context.Context, setup ASRSetup, cut repair.ClipCutter, book store.Book, chapterEnd float64, chapter int, startOverrideSec float64, verdicts map[int]repair.TailVerdict) (spliced, skippedKnownFailed bool, err error) {
+func (e *Executor) tailClipChapter(ctx context.Context, setup ASRSetup, cut repair.ClipCutter, book store.Book, chapterEnd float64, chapter int, startOverrideSec float64, verdicts map[int]repair.TailVerdict) (repair.ClipResult, error) {
 	return e.clipChapter(ctx, setup, cut, book, chapter, verdicts, "tail-clip",
 		repair.ClipSpliceRequest{ChapterEnd: chapterEnd, StartOverrideSec: startOverrideSec},
 		repair.ClipAndSplice)
@@ -1291,7 +1483,7 @@ func (e *Executor) tailClipChapter(ctx context.Context, setup ASRSetup, cut repa
 // health-check, splice between the intact head and tail unless the clip re-degenerated. The
 // window comes from the plan entry's clip_start_sec/clip_end_sec (Validate guarantees
 // start>0 and end>start). chapterEnd rides on the request for parity with the tail path.
-func (e *Executor) midClipChapter(ctx context.Context, setup ASRSetup, cut repair.ClipCutter, book store.Book, chapterEnd float64, chapter int, startSec, endSec float64, verdicts map[int]repair.TailVerdict) (spliced, skippedKnownFailed bool, err error) {
+func (e *Executor) midClipChapter(ctx context.Context, setup ASRSetup, cut repair.ClipCutter, book store.Book, chapterEnd float64, chapter int, startSec, endSec float64, verdicts map[int]repair.TailVerdict) (repair.ClipResult, error) {
 	// Clamp an over-long agent window to the chapter end: an endSec past EOF would leave an
 	// empty tail (no segment starts after it) and silently turn the interior splice into a
 	// tail-to-EOF one, discarding real narration the agent meant to keep. ChapterEnd > 0

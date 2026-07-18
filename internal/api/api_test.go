@@ -325,7 +325,7 @@ func TestSettingsAgentPUT(t *testing.T) {
 	env := newTestEnv(t)
 	token := env.login(t)
 
-	body := `{"agent":{"backend":"codex","concurrency":3,"timeout_minutes":30,` +
+	body := `{"agent":{"backend":"codex","concurrency":3,"timeout_minutes":30,"book_budget_usd":120.5,` +
 		`"claude_models":{"fact_pass":"haiku"},"openai_models":{"auditing":"gpt-x"}}}`
 	resp := env.do(t, http.MethodPut, "/api/v1/settings", token, body)
 	if resp.StatusCode != http.StatusOK {
@@ -338,7 +338,7 @@ func TestSettingsAgentPUT(t *testing.T) {
 		t.Fatal("config not persisted")
 	}
 	if env.saved.Agent.Backend != "codex" || env.saved.Agent.Concurrency != 3 ||
-		env.saved.Agent.TimeoutMinutes != 30 {
+		env.saved.Agent.TimeoutMinutes != 30 || env.saved.Agent.BookBudgetUSD != 120.5 {
 		t.Errorf("saved agent scalars = %+v", env.saved.Agent)
 	}
 	if env.saved.Agent.Claude["fact_pass"] != "haiku" || len(env.saved.Agent.Claude) != 1 {

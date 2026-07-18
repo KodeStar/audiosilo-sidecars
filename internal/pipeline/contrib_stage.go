@@ -158,8 +158,12 @@ func (e *Executor) contribute(ctx context.Context, book store.Book, r scheduler.
 		}
 	}
 
-	// 5. Submit per mode (idempotent on resume).
-	if err := e.submitContributions(ctx, book, slug, artifacts, placeholderNote); err != nil {
+	// 5. Submit per mode (idempotent on resume). A book whose sidecars were accepted on a
+	// converging audit trajectory (rather than a clean zero-finding pass) carries a note
+	// so the residual-nits fact rides to the UI; the note is process metadata only and
+	// NEVER enters the public issue/PR payload (metaissue parses the body).
+	auditNote := auditAcceptanceNote(book.WorkDir)
+	if err := e.submitContributions(ctx, book, slug, artifacts, placeholderNote, auditNote); err != nil {
 		return scheduler.StageResult{}, err
 	}
 
@@ -362,16 +366,31 @@ func (e *Executor) coveredDimensions(ctx context.Context, slug string) (hasChars
 	return cov.HasCharacters, cov.HasRecaps
 }
 
-// submitContributions dispatches to the configured mode's submit path.
-func (e *Executor) submitContributions(ctx context.Context, book store.Book, slug string, artifacts []contribArtifact, placeholderNote string) error {
+// submitContributions dispatches to the configured mode's submit path. auditNote (a
+// non-empty "audit converged..." line when the sidecars were accepted on a converging
+// trajectory) is appended to each submitted row's note.
+func (e *Executor) submitContributions(ctx context.Context, book store.Book, slug string, artifacts []contribArtifact, placeholderNote, auditNote string) error {
 	switch e.contribModeOrDefault() {
 	case contribModeLocal:
-		return e.submitLocal(ctx, book, slug, artifacts, placeholderNote)
+		return e.submitLocal(ctx, book, slug, artifacts, placeholderNote, auditNote)
 	case contribModePR:
-		return e.submitPR(ctx, book, slug, artifacts)
+		return e.submitPR(ctx, book, slug, artifacts, auditNote)
 	default:
-		return e.submitIssue(ctx, book, slug, artifacts)
+		return e.submitIssue(ctx, book, slug, artifacts, auditNote)
 	}
+}
+
+// joinNotes concatenates the non-empty note parts with "; " (a row note is free text
+// that rides to the UI). It drops empty parts so a row with no per-row note carries just
+// the audit note, and vice versa.
+func joinNotes(parts ...string) string {
+	kept := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if strings.TrimSpace(p) != "" {
+			kept = append(kept, p)
+		}
+	}
+	return strings.Join(kept, "; ")
 }
 
 // submitIssue opens one intake issue per uncovered dimension. It verifies the routing
@@ -379,7 +398,7 @@ func (e *Executor) submitContributions(ctx context.Context, book store.Book, slu
 // did not, and switches an oversize body to a secret gist link. A RateLimitError
 // propagates as a transient stage error (not a park); a resume with an already-recorded
 // row skips that dimension.
-func (e *Executor) submitIssue(ctx context.Context, book store.Book, slug string, artifacts []contribArtifact) error {
+func (e *Executor) submitIssue(ctx context.Context, book store.Book, slug string, artifacts []contribArtifact, auditNote string) error {
 	cli, err := e.contribClient(ctx)
 	if err != nil {
 		return err
@@ -421,7 +440,7 @@ func (e *Executor) submitIssue(ctx context.Context, book store.Book, slug string
 				note = fmt.Sprintf("labels missing - a maintainer must apply %s for intake to run", routingLabel(a.kind))
 			}
 		}
-		if err := e.upsertRow(ctx, book.ID, a.kind, store.ContribModeIssue, issue.Number, issue.URL, store.ContribStatusSubmitted, note); err != nil {
+		if err := e.upsertRow(ctx, book.ID, a.kind, store.ContribModeIssue, issue.Number, issue.URL, store.ContribStatusSubmitted, joinNotes(note, auditNote)); err != nil {
 			return err
 		}
 	}
@@ -433,7 +452,7 @@ func (e *Executor) submitIssue(ctx context.Context, book store.Book, slug string
 // pull request that both dimension rows share. Covered dimensions are recorded
 // already_covered; a resume where every uncovered dimension already has a URL is a
 // no-op.
-func (e *Executor) submitPR(ctx context.Context, book store.Book, slug string, artifacts []contribArtifact) error {
+func (e *Executor) submitPR(ctx context.Context, book store.Book, slug string, artifacts []contribArtifact, auditNote string) error {
 	cli, err := e.contribClient(ctx)
 	if err != nil {
 		return err
@@ -506,7 +525,7 @@ func (e *Executor) submitPR(ctx context.Context, book store.Book, slug string, a
 		}
 	}
 	for _, a := range toSubmit {
-		if err := e.upsertRow(ctx, book.ID, a.kind, store.ContribModePR, pr.Number, pr.URL, store.ContribStatusSubmitted, ""); err != nil {
+		if err := e.upsertRow(ctx, book.ID, a.kind, store.ContribModePR, pr.Number, pr.URL, store.ContribStatusSubmitted, auditNote); err != nil {
 			return err
 		}
 	}
@@ -516,7 +535,7 @@ func (e *Executor) submitPR(ctx context.Context, book store.Book, slug string, a
 // submitLocal exports each uncovered sidecar into <exportRoot>/works/<shard>/<slug>/
 // in repo layout, recording a local row (with placeholderNote when the slug is a
 // title-derived placeholder). No network, no credential.
-func (e *Executor) submitLocal(ctx context.Context, book store.Book, slug string, artifacts []contribArtifact, placeholderNote string) error {
+func (e *Executor) submitLocal(ctx context.Context, book store.Book, slug string, artifacts []contribArtifact, placeholderNote, auditNote string) error {
 	shard := model.Shard(slug)
 	// WriteFileAtomic MkdirAlls the destination parent, so no explicit MkdirAll here.
 	destDir := filepath.Join(e.exportRoot, "works", shard, slug)
@@ -540,7 +559,7 @@ func (e *Executor) submitLocal(ctx context.Context, book store.Book, slug string
 		if err := fsutil.WriteFileAtomic(filepath.Join(destDir, fileNameFor(a.kind)), content, 0o644); err != nil {
 			return err
 		}
-		if err := e.upsertRow(ctx, book.ID, a.kind, store.ContribModeLocal, 0, "", store.ContribStatusLocal, placeholderNote); err != nil {
+		if err := e.upsertRow(ctx, book.ID, a.kind, store.ContribModeLocal, 0, "", store.ContribStatusLocal, joinNotes(placeholderNote, auditNote)); err != nil {
 			return err
 		}
 	}

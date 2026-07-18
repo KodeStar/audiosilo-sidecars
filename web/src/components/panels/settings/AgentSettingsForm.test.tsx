@@ -10,6 +10,7 @@ const initial: AgentConfig = {
   backend: '',
   concurrency: 2,
   timeout_minutes: 60,
+  book_budget_usd: 75,
   claude_models: { fact_pass: 'sonnet' },
   openai_models: {},
 };
@@ -53,6 +54,7 @@ describe('AgentSettingsForm', () => {
         backend: '',
         concurrency: 2,
         timeout_minutes: 60,
+        book_budget_usd: 75,
         claude_models: { fact_pass: 'sonnet' },
         openai_models: {},
       },
