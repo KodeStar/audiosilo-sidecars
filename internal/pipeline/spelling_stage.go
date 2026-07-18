@@ -41,13 +41,19 @@ const spellingCorpusFloor = 5000
 // spellingLedgerStatuses is the closed set of ledger statuses the validator accepts.
 var spellingLedgerStatuses = map[string]bool{"verified": true, "probable": true, "unresolved": true}
 
+// priorSpellingsFile is the staged name of the predecessor's spelling ledger under
+// spelling-refs/. The carryover-integrity validator reads it (via
+// spelling.PriorCanonicals) to confirm each carryover:true row names a canonical the
+// predecessor actually ledgered.
+const priorSpellingsFile = "prior-spellings.json"
+
 // priorRefNames maps each series-predecessor carryover file (src, named in the prior
 // book's work dir) to its prior-* staged name (dst). populateSpellingRefs writes them
 // by src into spelling-refs/; the spelling_research staging loop reads them back by
 // dst. A missing file is skipped silently by design (best-effort carryover).
 var priorRefNames = []struct{ src, dst string }{
 	{markerTitlesFile, "prior-marker_titles.txt"},
-	{spelling.SpellingsFile, "prior-spellings.json"},
+	{spelling.SpellingsFile, priorSpellingsFile},
 	{spelling.CorrectionsFile, "prior-corrections.json"},
 }
 
@@ -322,19 +328,45 @@ func validateSpellingOutputs(outDir, dryRunDir, title string, plan chunkPlan) (r
 	// canonical to OCCUR in the corrected layer - a ledger whose canonical is an external
 	// spelling the uncorrected text does not contain (the agent left the name alone but
 	// ledgered the verified form) fails it. Without this dry run that bad ledger passes
-	// validation and kills the mechanical correcting stage instead.
-	if err := dryRunSheets(dryRunDir, sp); err != nil {
+	// validation and kills the mechanical correcting stage instead. The audit is
+	// EXHAUSTIVE (every gate + spoiler violation at once) so one patch retry can fix them
+	// all, and adds two spoiler checks GenerateSheets does not perform (carryover
+	// integrity + preamble safety); the prior-book ledger for the carryover check is the
+	// one staged under spelling-refs/.
+	priorSet, hasPrior, err := spelling.PriorCanonicals(filepath.Join(dryRunDir, spellingRefsDir, priorSpellingsFile))
+	if err != nil {
+		return 0, 0, fmt.Errorf("read staged prior-book ledger: %w", err)
+	}
+	if err := dryRunSheets(dryRunDir, sp, priorSet, hasPrior); err != nil {
 		return 0, 0, err
 	}
 	return len(corr.Rules), len(sp.Ledger), nil
 }
 
-// dryRunSheets removes a prior attempt's facts/ output and re-runs spelling.GenerateSheets
-// inside the pre-built corpus (whose transcripts-corrected/ the dry-run Apply just wrote),
-// surfacing any sheet-gate failure verbatim so it rides into the agent's retry prompt.
-// facts/ under the throwaway corpus is disposable, so removing it keeps attempts
-// independent exactly like dryRunCorrections does for transcripts-corrected/.
-func dryRunSheets(dryRunDir string, sp *spelling.Spellings) error {
+// dryRunSheets runs the EXHAUSTIVE validator-side sheet audit inside the pre-built
+// corpus (whose transcripts-corrected/ the dry-run Apply just wrote), aggregating
+// EVERY gate-1/gate-2 violation plus the carryover-integrity and preamble-safety
+// checks into a single error so one patch retry can fix them all - the engine's
+// GenerateSheets fails fast (one message per attempt), which drained the retry budget.
+// After the audit is clean it still runs GenerateSheets as the authoritative confirm
+// (the mechanical correcting stage runs it for real), so any drift between the
+// exhaustive validator and the frozen engine surfaces here rather than parking
+// correcting. facts/ under the throwaway corpus is disposable, so removing it keeps
+// attempts independent exactly like dryRunCorrections does for transcripts-corrected/.
+func dryRunSheets(dryRunDir string, sp *spelling.Spellings, priorSet map[string]bool, hasPrior bool) error {
+	violations, err := spelling.AuditSheets(dryRunDir, sp, priorSet, hasPrior)
+	if err != nil {
+		return fmt.Errorf("dry-run spelling-sheet validation failed: %v", err)
+	}
+	if len(violations) > 0 {
+		var b strings.Builder
+		b.WriteString("the spelling sheets have spoiler/gate problems - fix ALL of them in one patch pass:")
+		for _, v := range violations {
+			b.WriteString("\n- ")
+			b.WriteString(v)
+		}
+		return errors.New(b.String())
+	}
 	if err := os.RemoveAll(filepath.Join(dryRunDir, spelling.FactsDir)); err != nil {
 		return err
 	}

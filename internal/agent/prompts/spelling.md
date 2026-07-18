@@ -119,6 +119,28 @@ If validation fails: fix or DELETE exactly the offending rules (deleting a rule 
 marking its name `unresolved` is always acceptable); never resubmit an unchanged
 failing rule.
 
+## Spoiler safety (the sheets)
+
+The ledger becomes per-chunk spoiler sheets: each sheet lists only terms heard by its
+chapter. Two surfaces render EARLY, so a name that shows up on them leaks:
+
+- A ledger row's `note` rides its own sheet, and a `carryover:true` row rides EVERY
+  sheet from the first. NEVER name a form, person, or event first heard later than the
+  row's own first appearance. Defer the detail without naming it ("takes a house name
+  later in the book"), or record the cross-reference as a `non_merges`/`clusters` entry
+  (each renders only once every name it mentions has already been heard, so it cannot
+  leak early).
+- The `preamble` renders on EVERY sheet. Do not name any term in it whose first
+  appearance is after the first chunk end.
+- `carryover:true` STRICTLY means the canonical appears in the staged prior-book ledger
+  (`spelling-refs/prior-spellings.json`). Anything else - a name you judge "feels like a
+  series carryover", or any name with no prior-book ledger staged this run - is
+  `carryover:false`. first_use gating then shows the row from the correct sheet
+  automatically, so nothing is lost.
+
+The validator reports EVERY sheet-gate and spoiler violation at once - fix them all in
+one patch pass.
+
 ## Output (only under out/)
 
 1. `out/corrections.json`:
