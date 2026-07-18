@@ -162,12 +162,16 @@ type asrView struct {
 }
 
 type agentView struct {
-	Backend        string            `json:"backend"`
-	Concurrency    int               `json:"concurrency"`
-	TimeoutMinutes int               `json:"timeout_minutes"`
-	BookBudgetUSD  float64           `json:"book_budget_usd"`
-	ClaudeModels   map[string]string `json:"claude_models"`
-	OpenAIModels   map[string]string `json:"openai_models"`
+	Backend                        string            `json:"backend"`
+	Concurrency                    int               `json:"concurrency"` // compatible effective/legacy cap
+	QueueConcurrency               int               `json:"queue_concurrency"`
+	MaxAgentsPerBook               int               `json:"max_agents_per_book"`
+	EffectiveGlobalInvocationLimit int               `json:"effective_global_invocation_limit"`
+	LegacyConcurrency              bool              `json:"legacy_concurrency"`
+	TimeoutMinutes                 int               `json:"timeout_minutes"`
+	BookBudgetUSD                  float64           `json:"book_budget_usd"`
+	ClaudeModels                   map[string]string `json:"claude_models"`
+	OpenAIModels                   map[string]string `json:"openai_models"`
 }
 
 type contributionView struct {
@@ -199,6 +203,7 @@ type settingsResponse struct {
 // values never leave the daemon.
 func (a *API) settingsView() (settingsResponse, error) {
 	cfg := a.snapshot()
+	capacity := cfg.Agent.Capacity()
 	pres := make(map[string]bool, len(secrets.Names()))
 	for _, name := range secrets.Names() {
 		p, err := a.secrets.Present(name)
@@ -217,12 +222,16 @@ func (a *API) settingsView() (settingsResponse, error) {
 		Secrets:     pres,
 		ASR:         asrView{Backend: cfg.ASR.Backend},
 		Agent: agentView{
-			Backend:        cfg.Agent.Backend,
-			Concurrency:    cfg.Agent.Concurrency,
-			TimeoutMinutes: cfg.Agent.TimeoutMinutes,
-			BookBudgetUSD:  cfg.Agent.BookBudgetUSD,
-			ClaudeModels:   copyStringMap(cfg.Agent.Claude),
-			OpenAIModels:   copyStringMap(cfg.Agent.OpenAI),
+			Backend:                        cfg.Agent.Backend,
+			Concurrency:                    capacity.QueueConcurrency,
+			QueueConcurrency:               capacity.QueueConcurrency,
+			MaxAgentsPerBook:               capacity.MaxAgentsPerBook,
+			EffectiveGlobalInvocationLimit: capacity.GlobalInvocations,
+			LegacyConcurrency:              capacity.Legacy,
+			TimeoutMinutes:                 cfg.Agent.TimeoutMinutes,
+			BookBudgetUSD:                  cfg.Agent.BookBudgetUSD,
+			ClaudeModels:                   copyStringMap(cfg.Agent.Claude),
+			OpenAIModels:                   copyStringMap(cfg.Agent.OpenAI),
 		},
 		Contribution: contributionView{
 			Mode:        cfg.Contribution.Mode,
@@ -299,12 +308,14 @@ func applySupervisorUpdate(cfg *config.SupervisorConfig, u *supervisorUpdate) {
 // map wholesale when present (a nil map = leave unchanged). config.Validate rejects
 // a bad backend, a sub-1 timeout, or a non-agent-stage model key.
 type agentUpdate struct {
-	Backend        *string           `json:"backend"`
-	Concurrency    *int              `json:"concurrency"`
-	TimeoutMinutes *int              `json:"timeout_minutes"`
-	BookBudgetUSD  *float64          `json:"book_budget_usd"`
-	Claude         map[string]string `json:"claude_models"`
-	OpenAI         map[string]string `json:"openai_models"`
+	Backend          *string           `json:"backend"`
+	Concurrency      *int              `json:"concurrency"`
+	QueueConcurrency *int              `json:"queue_concurrency"`
+	MaxAgentsPerBook *int              `json:"max_agents_per_book"`
+	TimeoutMinutes   *int              `json:"timeout_minutes"`
+	BookBudgetUSD    *float64          `json:"book_budget_usd"`
+	Claude           map[string]string `json:"claude_models"`
+	OpenAI           map[string]string `json:"openai_models"`
 }
 
 // contributionUpdate carries the optional contribution-config mutations. Each field
@@ -341,6 +352,23 @@ func applyAgentUpdate(cfg *config.AgentConfig, u *agentUpdate) {
 	}
 	if u.Concurrency != nil {
 		cfg.Concurrency = *u.Concurrency
+		cfg.QueueConcurrency, cfg.MaxAgentsPerBook = 0, 0
+	}
+	if u.QueueConcurrency != nil || u.MaxAgentsPerBook != nil {
+		previous := cfg.Capacity()
+		cfg.Concurrency = 0
+		if cfg.QueueConcurrency == 0 {
+			cfg.QueueConcurrency = previous.QueueConcurrency
+		}
+		if cfg.MaxAgentsPerBook == 0 {
+			cfg.MaxAgentsPerBook = previous.MaxAgentsPerBook
+		}
+		if u.QueueConcurrency != nil {
+			cfg.QueueConcurrency = *u.QueueConcurrency
+		}
+		if u.MaxAgentsPerBook != nil {
+			cfg.MaxAgentsPerBook = *u.MaxAgentsPerBook
+		}
 	}
 	if u.TimeoutMinutes != nil {
 		cfg.TimeoutMinutes = *u.TimeoutMinutes

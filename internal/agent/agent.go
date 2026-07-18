@@ -128,6 +128,11 @@ type Request struct {
 	// in RunWithBackoff, outside the subprocess) or before/after the process runs. The
 	// pipeline uses it to emit an "agent still running" note on long agent stages.
 	Heartbeat func(elapsed time.Duration)
+	// AttemptComplete observes the final outcome of this concrete invocation after
+	// output validation. It is called exactly once by RunWithBackoff for every
+	// Runner.Run call, including backend errors and validation failures. Backends do
+	// not call it; the pipeline uses it for durable per-invocation accounting.
+	AttemptComplete func(Result, error)
 }
 
 // Usage is the token/cost accounting for one invocation. CostUSD is 0 when the

@@ -9,6 +9,8 @@ import type { AgentConfig, AgentInfo, Settings } from '@/api/types';
 const initial: AgentConfig = {
   backend: '',
   concurrency: 2,
+  queue_concurrency: 2,
+  max_agents_per_book: 3,
   timeout_minutes: 60,
   book_budget_usd: 75,
   claude_models: { fact_pass: 'sonnet' },
@@ -59,7 +61,8 @@ describe('AgentSettingsForm', () => {
     expect(updateSettings).toHaveBeenCalledWith({
       agent: {
         backend: '',
-        concurrency: 2,
+        queue_concurrency: 2,
+        max_agents_per_book: 3,
         timeout_minutes: 60,
         book_budget_usd: 75,
         claude_models: { fact_pass: 'sonnet' },
@@ -80,17 +83,17 @@ describe('AgentSettingsForm', () => {
     expect(await screen.findByText(/agent.backend "x" must be/i)).toBeInTheDocument();
   });
 
-  it('blocks a sub-1 concurrency client-side without calling the API', async () => {
+  it('blocks a sub-1 concurrent-book count client-side without calling the API', async () => {
     const updateSettings = vi.fn();
     const client = { updateSettings } as unknown as ApiClient;
     render(<AgentSettingsForm client={client} initial={initial} info={info} />);
 
-    const concurrency = screen.getByLabelText('Concurrency');
+    const concurrency = screen.getByLabelText('Concurrent books');
     await userEvent.clear(concurrency);
     await userEvent.type(concurrency, '0');
     await userEvent.click(screen.getByRole('button', { name: /save agent settings/i }));
 
-    expect(await screen.findByText(/concurrency must be a whole number/i)).toBeInTheDocument();
+    expect(await screen.findByText(/concurrent books must be a whole number/i)).toBeInTheDocument();
     expect(updateSettings).not.toHaveBeenCalled();
   });
 });

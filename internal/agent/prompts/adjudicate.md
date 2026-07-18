@@ -19,12 +19,15 @@ You work in the current directory. It contains:
   allowed. VERIFY a short end-fade or tail finding against the actual text and
   `accept` it when the repeat is a harmless closing echo, instead of queueing a
   conservative clip you cannot confirm.
-{{if gt .Round 1}}- `qa_plan.json`, `tail_verdicts.json`, `repairs.log` - artifacts from earlier
-  rounds. Chapters already repaired last round appear again only if a residual
+{{if gt .Round 1}}- `qa_plan.json` may contain the prior plan entries for the chapters assigned
+  to you. Chapters already repaired last round appear again only if a residual
   survived; do not re-queue a chapter whose repair already landed cleanly.
-- `repair_outcomes.json` - what each prior repair attempt ACTUALLY did, per chapter
+- `tail_verdicts.json`, when present, contains prior clip verdicts and windows for
+  only the chapters assigned to you.
+- `repair_outcomes.json`, when present, contains what prior repair attempts ACTUALLY
+  did for only the chapters assigned to you
   (the latest attempt's `action` and `outcome`). It surfaces outcomes the other
-  artifacts hide: a `kept` retranscribe (the fresh no-context re-transcription was
+  other context can hide: a `kept` retranscribe (the fresh no-context re-transcription was
   NOT adoptable, so the original text stands - it leaves no repairs.log line or
   verdict), a `skipped_known_failed` clip window (the same window already
   re-degenerated under these decode params, so it was not re-cut), and an
@@ -69,9 +72,8 @@ web access.
 {{if gt .Round 1}}- On this re-entry round, ACCEPT residuals that a prior round already repaired
   rather than re-queuing them - repeated retranscription of a chapter that keeps
   collapsing at the same point does not improve it. Converge; do not loop.
-- If a `tail_clip` you queued last round produced NO `repairs.log` entry and NO
-  `tail_verdicts.json` verdict for the chapter, the mechanical locator could NOT find the
-  loop (it needs a long 6-gram run; a short repeat like a 3x phrase is below its reach).
+- If `repair_outcomes.json` says a `tail_clip` was `unlocatable`, the mechanical locator
+  could NOT find the loop (it needs a long 6-gram run; a short repeat like a 3x phrase is below its reach).
   Re-queue that chapter WITH an explicit `clip_start_sec` - the repair stage cuts exactly
   there instead of no-oping - or use `mid_clip` with a bounded window.
 {{end}}

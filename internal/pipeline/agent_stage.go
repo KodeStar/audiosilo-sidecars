@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -261,6 +262,90 @@ type validationError struct{ msg string }
 
 func (e *validationError) Error() string { return e.msg }
 
+// trackedAgentRunner turns each concrete backend attempt (including validation,
+// rate-limit, and availability retries) into its own durable invocation row.
+type trackedAgentRunner struct {
+	agent.Runner
+	exec     *Executor
+	ctx      context.Context
+	book     store.Book
+	stage    state.State
+	workUnit string
+	current  int64
+	model    string
+}
+
+func (t *trackedAgentRunner) Run(ctx context.Context, req agent.Request) (agent.Result, error) {
+	var invocationID int64
+	if t.exec.db != nil {
+		id, err := t.exec.db.StartAgentInvocation(context.WithoutCancel(t.ctx), t.book.ID, string(t.stage), t.workUnit, t.ID(), req.Model)
+		if err != nil {
+			t.exec.log.Warn("agent: start invocation", "book", t.book.ID, "stage", string(t.stage), "err", err)
+		} else {
+			invocationID = id
+		}
+	}
+	t.current = invocationID
+	t.model = req.Model
+	t.exec.invocationMu.Lock()
+	t.exec.activeInvocations[t.book.ID]++
+	t.exec.invocationMu.Unlock()
+	originalHeartbeat, originalProcess := req.Heartbeat, req.Process
+	req.Heartbeat = func(elapsed time.Duration) {
+		if invocationID != 0 {
+			_ = t.exec.db.TouchAgentInvocation(context.WithoutCancel(t.ctx), invocationID, false)
+		}
+		if originalHeartbeat != nil {
+			originalHeartbeat(elapsed)
+		}
+	}
+	req.Process = func(pid int, active bool) {
+		if invocationID != 0 {
+			_ = t.exec.db.SetAgentInvocationProcess(context.WithoutCancel(t.ctx), invocationID, pid, active)
+		}
+		if originalProcess != nil {
+			originalProcess(pid, active)
+		}
+	}
+	return t.Runner.Run(ctx, req)
+}
+
+func (t *trackedAgentRunner) finish(res agent.Result, err error) {
+	t.exec.invocationMu.Lock()
+	t.exec.activeInvocations[t.book.ID]--
+	if t.exec.activeInvocations[t.book.ID] == 0 {
+		delete(t.exec.activeInvocations, t.book.ID)
+	}
+	t.exec.invocationMu.Unlock()
+	invocationID := t.current
+	model := res.Usage.Model
+	if model == "" {
+		model = t.model
+	}
+	t.current = 0
+	t.model = ""
+	if invocationID != 0 {
+		estimated, known := t.exec.pricing.Estimate(t.ID(), model, res.Usage.Input, res.Usage.Output, res.Usage.CacheRead)
+		status, msg := "success", ""
+		if err != nil {
+			status, msg = "failure", err.Error()
+			if errors.Is(err, context.Canceled) || errors.Is(t.ctx.Err(), context.Canceled) {
+				status = "cancelled"
+			} else {
+				var validation *validationError
+				if errors.As(err, &validation) {
+					status = "validation_failed"
+				}
+			}
+		}
+		reported := res.Usage.CostReported || res.Usage.CostUSD > 0
+		if ferr := t.exec.db.FinishAgentInvocation(context.WithoutCancel(t.ctx), invocationID, status, model,
+			res.Usage.Input, res.Usage.Output, res.Usage.CacheRead, res.Usage.CostUSD, reported, estimated, known, msg); ferr != nil {
+			t.exec.log.Warn("agent: finish invocation", "id", invocationID, "err", ferr)
+		}
+	}
+}
+
 // runAgent is the shared driver every agent stage uses: ensure a runner, resolve the
 // stage model, render the prompt, run it (with the agent package's invalid-output +
 // rate-limit retry policy), and translate the outcome into the pipeline's park/fail
@@ -315,16 +400,6 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 	onUsage := func(u agent.Usage) {
 		total.add(u)
 		total.Invocations++
-		if e.db != nil {
-			// context.WithoutCancel: the invocation already happened, so record its spend
-			// even if ctx is being cancelled - crash/cancel must not lose the accounting.
-			estimated, estimatedKnown := e.pricing.Estimate(runner.ID(), u.Model, u.Input, u.Output, u.CacheRead)
-			providerReported := u.CostReported || u.CostUSD > 0
-			if uerr := e.db.AddOpenStageRunUsageDetailed(context.WithoutCancel(ctx), book.ID, string(stage),
-				u.Model, u.Input, u.Output, u.CacheRead, u.CostUSD, providerReported, estimated, estimatedKnown); uerr != nil {
-				e.log.Warn("agent: record usage", "book", book.ID, "stage", string(stage), "err", uerr)
-			}
-		}
 	}
 
 	req := agent.Request{
@@ -348,13 +423,6 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 				r.Note(fmt.Sprintf("%s: still running (%s elapsed)", stage, humanDuration(elapsed)))
 			}
 		},
-		Process: func(pid int, active bool) {
-			if e.db != nil {
-				if err := e.db.SetOpenStageRunProcess(context.WithoutCancel(ctx), book.ID, string(stage), pid, active); err != nil {
-					e.log.Warn("agent: persist process liveness", "book", book.ID, "stage", string(stage), "pid", pid, "active", active, "err", err)
-				}
-			}
-		},
 	}
 	backoff := e.backoff
 	if backoff == nil {
@@ -362,7 +430,7 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 	}
 	// The scheduler caps concurrent agent stages, while fact_pass can additionally
 	// run independent chunk invocations in parallel. Share one executor-level
-	// semaphore across both shapes so the configured concurrency remains a real cap,
+	// semaphore across both shapes so the configured global limit remains a real cap,
 	// not a multiplier. Cancellation while queued spends nothing.
 	select {
 	case e.agentSlots <- struct{}{}:
@@ -373,7 +441,9 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 	// Queueing behind another invocation is capacity wait, not productive model
 	// time. Start the rate clock only after this invocation owns a slot.
 	start := time.Now()
-	_, slept, err := agent.RunWithBackoff(ctx, runner, req, func(res agent.Result) error {
+	tracked := &trackedAgentRunner{Runner: runner, exec: e, ctx: ctx, book: book, stage: stage, workUnit: filepath.Base(st.Dir())}
+	req.AttemptComplete = tracked.finish
+	_, slept, err := agent.RunWithBackoff(ctx, tracked, req, func(res agent.Result) error {
 		if verr := validate(res, st); verr != nil {
 			return &validationError{msg: verr.Error()}
 		}
@@ -896,7 +966,7 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, r schedule
 	// disposition list, and the remaining-count all treat a ledger accept exactly like an
 	// auto-accept.
 	ledger := loadAcceptedLedger(book.WorkDir)
-	for _, ch := range qa.FlaggedChapters(rep) {
+	for _, ch := range qa.AllowedChapters(rep) {
 		if autoSet[ch] {
 			continue
 		}
@@ -912,10 +982,13 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, r schedule
 		autoSet[ch] = true
 	}
 	remaining := 0
-	for _, ch := range qa.FlaggedChapters(rep) {
+	for _, ch := range qa.AllowedChapters(rep) {
 		if !autoSet[ch] {
 			remaining++
 		}
+	}
+	if r.Progress != nil && remaining > 0 {
+		r.Progress(0, remaining)
 	}
 
 	var plan *qa.Plan
@@ -957,7 +1030,7 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, r schedule
 		return scheduler.StageResult{}, fmt.Errorf("qa_adjudicating: write plan: %w", err)
 	}
 	if r.Progress != nil {
-		r.Progress(1, 1)
+		r.Progress(max(1, remaining), max(1, remaining))
 	}
 	m := usage.metricsMap()
 	m["auto_accepted"] = len(autoEntries)
@@ -966,7 +1039,7 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, r schedule
 		Metrics:            metrics(m),
 		// nil when every flagged chapter was auto-accepted (no agent invocation ran), so
 		// a zero-work adjudication records no rate.
-		RateSample: usage.rateSample(),
+		RateSample: rateSample(remaining, usage.Seconds),
 	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.QAAdjudicating), result); err != nil {
 		return scheduler.StageResult{}, err
@@ -980,22 +1053,158 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, r schedule
 // what lets the plan validator require the agent to cover only the non-auto chapters
 // while the persisted plan still covers every flagged chapter.
 func (e *Executor) runQAAdjudicateAgent(ctx context.Context, book store.Book, r scheduler.StageReport, rep *qa.Report, round int, autoEntries []qa.PlanEntry, autoSet map[int]bool) (*qa.Plan, agentUsage, error) {
-	st, err := agent.New(book.WorkDir, string(state.QAAdjudicating), e.stageAttempt(ctx, book, state.QAAdjudicating))
+	chapters := make([]int, 0)
+	for _, ch := range qa.AllowedChapters(rep) {
+		if !autoSet[ch] {
+			chapters = append(chapters, ch)
+		}
+	}
+	workers := min(e.agentWorkers, len(chapters))
+	parts := make([][]int, workers)
+	for i, ch := range chapters {
+		parts[i%workers] = append(parts[i%workers], ch)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type result struct {
+		worker int
+		plan   *qa.Plan
+		usage  agentUsage
+		err    error
+	}
+	results := make(chan result, workers)
+	for i, part := range parts {
+		go func() {
+			p, u, err := e.runQAAdjudicatePartition(ctx, book, r, rep, round, i, part)
+			results <- result{i, p, u, err}
+		}()
+	}
+	merged := &qa.Plan{Entries: append([]qa.PlanEntry{}, autoEntries...)}
+	fragments := make([]*qa.Plan, workers)
+	var total agentUsage
+	var firstErr error
+	for range workers {
+		got := <-results
+		if got.err != nil {
+			if firstErr == nil {
+				firstErr = got.err
+				cancel()
+			}
+		} else {
+			fragments[got.worker] = got.plan
+		}
+		total.add(got.usage.Usage)
+		total.Invocations += got.usage.Invocations
+		total.Seconds += got.usage.Seconds
+	}
+	if firstErr != nil {
+		return nil, total, firstErr
+	}
+	var notes []string
+	for _, fragment := range fragments {
+		merged.Entries = append(merged.Entries, fragment.Entries...)
+		if note := strings.TrimSpace(fragment.Notes); note != "" {
+			notes = append(notes, note)
+		}
+	}
+	merged.Notes = strings.Join(notes, "\n")
+	sort.Slice(merged.Entries, func(i, j int) bool { return merged.Entries[i].Chapter < merged.Entries[j].Chapter })
+	if err := merged.Validate(rep); err != nil {
+		return nil, total, fmt.Errorf("qa_adjudicating: validate merged plan: %w", err)
+	}
+	return merged, total, nil
+}
+
+// runQAAdjudicatePartition gives one worker only its assigned chapter findings,
+// transcripts, and bounded prior outcomes. Its isolated staging directory prevents
+// workers from overwriting one another; the caller performs whole-plan validation.
+func (e *Executor) runQAAdjudicatePartition(ctx context.Context, book store.Book, r scheduler.StageReport, rep *qa.Report, round, worker int, chapters []int) (*qa.Plan, agentUsage, error) {
+	st, err := agent.New(book.WorkDir, fmt.Sprintf("%s-p%02d", state.QAAdjudicating, worker+1), e.stageAttempt(ctx, book, state.QAAdjudicating))
 	if err != nil {
 		return nil, agentUsage{}, err
 	}
-	// Required inputs.
-	for _, name := range []string{qa.ReportJSONName, qa.ReportMDName, audio.ManifestName} {
-		if err := st.CopyFile(filepath.Join(book.WorkDir, name), name); err != nil {
-			return nil, agentUsage{}, fmt.Errorf("qa_adjudicating: stage %s: %w", name, err)
+	filtered := qa.FilterReport(rep, chapters)
+	if err := qa.WriteReport(st.Dir(), filtered); err != nil {
+		return nil, agentUsage{}, err
+	}
+	for _, name := range []string{qa.ReportJSONName, qa.ReportMDName} {
+		if err := os.Chmod(filepath.Join(st.Dir(), name), 0o400); err != nil {
+			return nil, agentUsage{}, err
 		}
 	}
-	// Optional re-entry artifacts (present only on rounds > 1). repair_outcomes.json is the
-	// one that surfaces the OTHERWISE-INVISIBLE terminal facts (a kept retranscribe, a
-	// known-failed skip, an unlocatable tail_clip) the adjudicator's exhaustion rules need.
-	for _, name := range []string{qa.PlanFile, repair.TailVerdictsName, repair.RepairsLogName, repairOutcomesName} {
-		if err := e.stageIfPresent(st, book.WorkDir, name, name); err != nil {
-			return nil, agentUsage{}, fmt.Errorf("qa_adjudicating: stage %s: %w", name, err)
+	manifestRaw, err := os.ReadFile(filepath.Join(book.WorkDir, audio.ManifestName)) //nolint:gosec // book-owned work dir
+	if err != nil {
+		return nil, agentUsage{}, fmt.Errorf("qa_adjudicating: load manifest: %w", err)
+	}
+	var manifest audio.Manifest
+	if err := json.Unmarshal(manifestRaw, &manifest); err != nil {
+		return nil, agentUsage{}, fmt.Errorf("qa_adjudicating: parse manifest: %w", err)
+	}
+	chapterSet := make(map[int]bool, len(chapters))
+	for _, ch := range chapters {
+		chapterSet[ch] = true
+	}
+	boundedChapters := manifest.Chapters[:0]
+	for _, ch := range manifest.Chapters {
+		if chapterSet[ch.Chapter] {
+			boundedChapters = append(boundedChapters, ch)
+		}
+	}
+	manifest.Chapters = boundedChapters
+	manifest.ChapterCount = len(boundedChapters)
+	manifestData, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return nil, agentUsage{}, err
+	}
+	if err := st.WriteFile(audio.ManifestName, append(manifestData, '\n')); err != nil {
+		return nil, agentUsage{}, fmt.Errorf("qa_adjudicating: stage bounded manifest: %w", err)
+	}
+	verdicts, verr := repair.LoadTailVerdicts(book.WorkDir)
+	if verr != nil {
+		return nil, agentUsage{}, fmt.Errorf("qa_adjudicating: load prior tail verdicts: %w", verr)
+	}
+	if len(verdicts) > 0 {
+		bounded := make([]repair.TailVerdict, 0, len(verdicts))
+		for _, verdict := range verdicts {
+			if chapterSet[verdict.Chapter] {
+				bounded = append(bounded, verdict)
+			}
+		}
+		if len(bounded) > 0 {
+			data, _ := json.MarshalIndent(bounded, "", "  ")
+			if err := st.WriteFile(repair.TailVerdictsName, append(data, '\n')); err != nil {
+				return nil, agentUsage{}, err
+			}
+		}
+	}
+	if prior, perr := qa.LoadPlan(book.WorkDir); perr == nil {
+		keep := map[int]bool{}
+		for _, ch := range chapters {
+			keep[ch] = true
+		}
+		bounded := qa.Plan{}
+		for _, entry := range prior.Entries {
+			if keep[entry.Chapter] {
+				bounded.Entries = append(bounded.Entries, entry)
+			}
+		}
+		data, _ := json.MarshalIndent(bounded, "", "  ")
+		if err := st.WriteFile(qa.PlanFile, append(data, '\n')); err != nil {
+			return nil, agentUsage{}, err
+		}
+	}
+	if outcomes := loadRepairOutcomes(book.WorkDir); len(outcomes) > 0 {
+		bounded := map[int]repairOutcome{}
+		for _, ch := range chapters {
+			if v, ok := outcomes[ch]; ok {
+				bounded[ch] = v
+			}
+		}
+		if len(bounded) > 0 {
+			data, _ := json.MarshalIndent(bounded, "", "  ")
+			if err := st.WriteFile(repairOutcomesName, append(data, '\n')); err != nil {
+				return nil, agentUsage{}, err
+			}
 		}
 	}
 	// The ALLOWED chapters' transcript text (and any repaired copy) - the disposition
@@ -1004,7 +1213,7 @@ func (e *Executor) runQAAdjudicateAgent(ctx context.Context, book store.Book, r 
 	// chapter (a short end-fade repeat, a cross-segment residual) against its real text
 	// rather than blind-queueing a conservative tail_clip; these are still the ONLY
 	// transcripts the stage stages, so a chapter the sweep did not flag at all never leaks.
-	for _, ch := range qa.AllowedChapters(rep) {
+	for _, ch := range qa.AllowedChapters(filtered) {
 		rel := filepath.Join(transcript.TextDir, transcript.TextName(ch))
 		if err := e.stageIfPresent(st, book.WorkDir, rel, rel); err != nil {
 			return nil, agentUsage{}, fmt.Errorf("qa_adjudicating: stage %s: %w", rel, err)
@@ -1015,26 +1224,24 @@ func (e *Executor) runQAAdjudicateAgent(ctx context.Context, book store.Book, r 
 		}
 	}
 
-	// Capture the validated MERGED plan from the successful attempt.
-	var merged *qa.Plan
+	var fragment *qa.Plan
 	validate := func(_ agent.Result, s *agent.Staging) error {
 		p, perr := qa.LoadPlan(s.OutDir())
 		if perr != nil {
 			return perr
 		}
-		mp := mergePlans(autoEntries, autoSet, p)
-		if verr := mp.Validate(rep); verr != nil {
+		if verr := p.Validate(filtered); verr != nil {
 			return verr
 		}
-		merged = mp
+		fragment = p
 		return nil
 	}
-	data := adjudicatePromptData{Title: book.Title, Round: round, AutoAccepted: chaptersCSV(autoEntries)}
+	data := adjudicatePromptData{Title: book.Title, Round: round}
 	usage, err := e.runAgent(ctx, book, state.QAAdjudicating, r, st, "adjudicate.md", data, false, validate)
 	if err != nil {
 		return nil, usage, err
 	}
-	return merged, usage, nil
+	return fragment, usage, nil
 }
 
 // autoAcceptRepairedTails returns an accept entry for every flagged chapter whose only
@@ -1183,21 +1390,6 @@ func multiLoopTailCovered(f qa.MultiLoopFinding, v repair.TailVerdict) bool {
 		return false
 	}
 	return spanCovered(f.AtSec, nil, f.Pos, v)
-}
-
-// mergePlans combines the daemon's auto-accept entries with the agent's plan, dropping
-// any agent entry for a chapter the daemon already auto-accepted (the auto disposition
-// wins). The agent's free-text notes are preserved.
-func mergePlans(auto []qa.PlanEntry, autoSet map[int]bool, agentPlan *qa.Plan) *qa.Plan {
-	merged := &qa.Plan{Notes: agentPlan.Notes}
-	merged.Entries = append(merged.Entries, auto...)
-	for _, en := range agentPlan.Entries {
-		if autoSet[en.Chapter] {
-			continue
-		}
-		merged.Entries = append(merged.Entries, en)
-	}
-	return merged
 }
 
 // chaptersCSV renders the chapter numbers of a plan-entry slice as a "1, 3, 7" string

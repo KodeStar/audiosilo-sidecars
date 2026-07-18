@@ -83,6 +83,13 @@ func RunWithBackoff(ctx context.Context, r Runner, req Request, validate func(Re
 		if onUsage != nil {
 			onUsage(res.Usage)
 		}
+		attemptErr := err
+		if attemptErr == nil {
+			attemptErr = validate(res)
+		}
+		if attempt.AttemptComplete != nil {
+			attempt.AttemptComplete(res, attemptErr)
+		}
 
 		if err != nil {
 			var rl *RateLimitError
@@ -114,7 +121,7 @@ func RunWithBackoff(ctx context.Context, r Runner, req Request, validate func(Re
 			return Result{}, slept, err
 		}
 
-		if verr := validate(res); verr != nil {
+		if verr := attemptErr; verr != nil {
 			if outputRetries >= maxOutputRetries {
 				return res, slept, verr
 			}

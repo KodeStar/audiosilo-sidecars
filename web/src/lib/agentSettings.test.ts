@@ -11,6 +11,8 @@ import type { AgentConfig } from '@/api/types';
 const baseConfig: AgentConfig = {
   backend: 'claude',
   concurrency: 2,
+  queue_concurrency: 2,
+  max_agents_per_book: 3,
   timeout_minutes: 60,
   book_budget_usd: 75,
   claude_models: { fact_pass: 'sonnet', synthesizing: 'opus' },
@@ -21,7 +23,8 @@ describe('agentConfigToForm', () => {
   it('fills every stage row, defaulting missing cells to empty', () => {
     const form = agentConfigToForm(baseConfig);
     expect(form.backend).toBe('claude');
-    expect(form.concurrency).toBe('2');
+    expect(form.queueConcurrency).toBe('2');
+    expect(form.maxAgentsPerBook).toBe('3');
     expect(form.timeoutMinutes).toBe('60');
     expect(form.bookBudgetUSD).toBe('75');
     // Every agent stage has a row.
@@ -40,7 +43,8 @@ describe('agentFormToUpdate', () => {
     form.models.fact_pass.openai = '  gpt-5  '; // trims
     const update = agentFormToUpdate(form);
     expect(update.backend).toBe('claude');
-    expect(update.concurrency).toBe(2);
+    expect(update.queue_concurrency).toBe(2);
+    expect(update.max_agents_per_book).toBe(3);
     expect(update.timeout_minutes).toBe(60);
     expect(update.book_budget_usd).toBe(75);
     expect(update.claude_models).toEqual({ fact_pass: 'sonnet', synthesizing: 'opus' });
@@ -62,11 +66,13 @@ describe('validateAgentForm', () => {
     expect(validateAgentForm(ok)).toBeNull();
   });
 
-  it('rejects a sub-1 or non-integer concurrency', () => {
-    expect(validateAgentForm({ ...ok, concurrency: '0' })).toMatch(/concurrency/i);
-    expect(validateAgentForm({ ...ok, concurrency: '' })).toMatch(/concurrency/i);
-    expect(validateAgentForm({ ...ok, concurrency: '1.5' })).toMatch(/concurrency/i);
-    expect(validateAgentForm({ ...ok, concurrency: 'x' })).toMatch(/concurrency/i);
+  it('rejects invalid capacity dimensions and products', () => {
+    expect(validateAgentForm({ ...ok, queueConcurrency: '0' })).toMatch(/concurrent books/i);
+    expect(validateAgentForm({ ...ok, queueConcurrency: '' })).toMatch(/concurrent books/i);
+    expect(validateAgentForm({ ...ok, maxAgentsPerBook: '0' })).toMatch(/max agents/i);
+    expect(validateAgentForm({ ...ok, queueConcurrency: '9', maxAgentsPerBook: '8' })).toMatch(
+      /64/,
+    );
   });
 
   it('rejects a sub-1 timeout', () => {

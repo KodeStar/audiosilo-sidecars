@@ -308,6 +308,9 @@ func TestSettingsAgentGET(t *testing.T) {
 	if view.Agent.Concurrency != config.DefaultConcurrency {
 		t.Errorf("concurrency = %d, want %d", view.Agent.Concurrency, config.DefaultConcurrency)
 	}
+	if view.Agent.QueueConcurrency != config.DefaultAgentQueueConcurrency || view.Agent.MaxAgentsPerBook != config.DefaultMaxAgentsPerBook || view.Agent.EffectiveGlobalInvocationLimit != 6 || view.Agent.LegacyConcurrency {
+		t.Errorf("capacity view = %+v", view.Agent)
+	}
 	if view.Agent.TimeoutMinutes != config.DefaultTimeoutMinutes {
 		t.Errorf("timeout_minutes = %d, want %d", view.Agent.TimeoutMinutes, config.DefaultTimeoutMinutes)
 	}
@@ -316,6 +319,33 @@ func TestSettingsAgentGET(t *testing.T) {
 	}
 	if view.Agent.OpenAIModels == nil {
 		t.Error("openai_models should be non-nil (empty map)")
+	}
+}
+
+func TestSettingsAgentPUTModernCapacityAndPartialLegacyMigration(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.login(t)
+	resp := env.do(t, http.MethodPut, "/api/v1/settings", token, `{"agent":{"queue_concurrency":3,"max_agents_per_book":2}}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("put modern capacity = %d: %s", resp.StatusCode, readAll(t, resp))
+	}
+	resp.Body.Close()
+	if env.saved.Agent.Concurrency != 0 || env.saved.Agent.QueueConcurrency != 3 || env.saved.Agent.MaxAgentsPerBook != 2 {
+		t.Fatalf("saved modern capacity=%+v", env.saved.Agent)
+	}
+
+	// Old clients/configs can migrate one dimension at a time without producing a
+	// transient zero dimension: the legacy effective value seeds the omitted field.
+	env.api.mu.Lock()
+	env.api.cfg.Agent.Concurrency, env.api.cfg.Agent.QueueConcurrency, env.api.cfg.Agent.MaxAgentsPerBook = 4, 0, 0
+	env.api.mu.Unlock()
+	resp = env.do(t, http.MethodPut, "/api/v1/settings", token, `{"agent":{"queue_concurrency":2}}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("partial migration = %d: %s", resp.StatusCode, readAll(t, resp))
+	}
+	resp.Body.Close()
+	if env.saved.Agent.Concurrency != 0 || env.saved.Agent.QueueConcurrency != 2 || env.saved.Agent.MaxAgentsPerBook != 4 {
+		t.Fatalf("partial migrated capacity=%+v", env.saved.Agent)
 	}
 }
 

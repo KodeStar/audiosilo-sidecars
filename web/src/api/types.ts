@@ -50,6 +50,10 @@ export interface SupervisorRuntime {
   agent_capacity: number;
   eligible_agent_books: number;
   eligible_agent_book_ids?: number[];
+  agent_invocations?: number;
+  invocation_capacity?: number;
+  invocations_by_book?: Record<string, number>;
+  max_agents_per_book?: number;
 }
 
 export interface SupervisorStatus {
@@ -94,6 +98,10 @@ export interface AsrConfig {
 export interface AgentConfig {
   backend: string;
   concurrency: number;
+  queue_concurrency?: number;
+  max_agents_per_book?: number;
+  effective_global_invocation_limit?: number;
+  legacy_concurrency?: boolean;
   timeout_minutes: number;
   book_budget_usd: number;
   claude_models: Record<string, string>;
@@ -146,6 +154,8 @@ export interface ContributionUpdate {
 export interface AgentUpdate {
   backend?: string;
   concurrency?: number;
+  queue_concurrency?: number;
+  max_agents_per_book?: number;
   timeout_minutes?: number;
   book_budget_usd?: number;
   claude_models?: Record<string, string>;
@@ -419,6 +429,13 @@ export interface BookView {
   // When the first stage run for the book began (RFC3339); MIN(stage_runs.started_at).
   // Absent until the book has started running. omitempty.
   started_at?: string;
+  timing?: BookTiming;
+  active_agent_invocations?: number;
+  max_agents_per_book?: number;
+  fanout_supported?: boolean;
+  current_work_units?: number;
+  completed_work_units?: number;
+  remaining_work_units?: number;
   // Current on-disk size of the book's work dir in bytes (chapters + durables);
   // 0 when not yet created or already purged.
   scratch_bytes: number;
@@ -434,6 +451,42 @@ export interface BookView {
   contribution?: ContributionSummary;
   created_at: string;
   updated_at: string;
+}
+
+export interface BookTiming {
+  batch_started_at?: string;
+  primary_asr_completed_at?: string;
+  batch_elapsed_seconds?: number;
+  pre_asr_wall_seconds?: number;
+  asr_active_seconds?: number;
+  post_asr_elapsed_seconds?: number;
+  active_processing_seconds?: number;
+  queue_wait_seconds?: number;
+}
+
+export interface AgentInvocation {
+  id: number;
+  stage_run_id: number;
+  book_id: number;
+  stage: string;
+  work_unit: string;
+  backend: string;
+  model: string;
+  process_id?: number;
+  active: boolean;
+  heartbeat_at: string;
+  progress_at: string;
+  started_at: string;
+  completed_at?: string;
+  status: 'running' | 'success' | 'validation_failed' | 'failure' | 'cancelled';
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number;
+  cost_reported: boolean;
+  estimated_api_cost_usd?: number;
+  estimate_complete: boolean;
+  error?: string;
 }
 
 // StageRun is one execution (or attempt) of a stage for a book, from the book
@@ -468,6 +521,7 @@ export interface StageRun {
 export interface BookDetail extends BookView {
   stage_runs: StageRun[];
   contributions?: ContributionRow[];
+  agent_invocations?: AgentInvocation[];
 }
 
 // --- M7: core work proposal (add-work) ---
@@ -614,6 +668,11 @@ export interface StageNoteEvent {
 export interface QueueStatsEvent {
   asr_active: number;
   agent_active: number;
+  agent_books_active?: number;
+  agent_book_capacity?: number;
+  agent_invocations_active?: number;
+  agent_invocation_capacity?: number;
+  agent_invocations_by_book?: Record<string, number>;
   mechanical_active: number;
   queued: number;
 }

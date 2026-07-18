@@ -71,10 +71,26 @@ func (db *DB) FinishStageRun(ctx context.Context, runID int64, ok bool, metrics 
 	if m == "" {
 		m = "{}"
 	}
-	res, err := db.sql.ExecContext(ctx,
-		`UPDATE stage_runs SET finished_at=?, ok=?, metrics=?, process_active=0 WHERE id=?`,
-		timestamp(nowFn()), boolToInt(ok), m, runID)
-	return checkAffected(res, err)
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	finished := timestamp(nowFn())
+	res, err := tx.ExecContext(ctx,
+		`UPDATE stage_runs SET finished_at=?, ok=?, metrics=?, process_active=0, process_id=0 WHERE id=?`,
+		finished, boolToInt(ok), m, runID)
+	if err = checkAffected(res, err); err != nil {
+		return err
+	}
+	status := "failure"
+	if ok {
+		status = "success"
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE agent_invocations SET completed_at=COALESCE(completed_at,?),active=0,status=CASE WHEN status='running' THEN ? ELSE status END WHERE stage_run_id=?`, finished, status, runID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func boolToInt(b bool) int {

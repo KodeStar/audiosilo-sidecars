@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -318,6 +319,82 @@ func TestQAAdjudicateAcceptAll(t *testing.T) {
 	}
 	if !scheduler.SentinelExists(work, string(state.QAAdjudicating)) {
 		t.Error("qa_adjudicating sentinel missing")
+	}
+}
+
+func TestQAAdjudicateFansOutBoundedPartitionsAndMergesDeterministically(t *testing.T) {
+	work := t.TempDir()
+	chapters := []int{1, 2, 3, 4, 5, 6}
+	rep := &qa.Report{Chapters: len(chapters), RetranscribeQueue: chapters}
+	if err := qa.WriteReport(work, rep); err != nil {
+		t.Fatal(err)
+	}
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x/book.m4b", Style: audio.StyleMarkers, Duration: 12, ChapterCount: len(chapters), Chapters: markerChapters(chapters...)})
+	for _, chapter := range chapters {
+		seedText(t, work, chapter)
+		if err := repair.MergeTailVerdict(work, repair.TailVerdict{Chapter: chapter, Verdict: repair.VerdictBenign}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake := newFakeRunner()
+	fake.act = func(_ *fakeRunner, req agent.Request, _ int) (agent.Result, error) {
+		partition, err := qa.LoadReport(req.Dir)
+		if err != nil {
+			return agent.Result{}, err
+		}
+		assigned := qa.FlaggedChapters(partition)
+		manifest, err := audio.ReadManifest(req.Dir)
+		if err != nil {
+			return agent.Result{}, err
+		}
+		if len(assigned) != 2 || len(manifest.Chapters) != len(assigned) {
+			return agent.Result{}, errors.New("partition was not bounded to two assigned chapters")
+		}
+		verdicts, err := repair.LoadTailVerdicts(req.Dir)
+		if err != nil || len(verdicts) != len(assigned) {
+			return agent.Result{}, errors.New("prior verdicts were not bounded to assigned chapters")
+		}
+		for _, verdict := range verdicts {
+			if verdict.Chapter != assigned[0] && verdict.Chapter != assigned[1] {
+				return agent.Result{}, errors.New("partition leaked another chapter's prior verdict")
+			}
+		}
+		entries := make([]qa.PlanEntry, 0, len(assigned))
+		for _, chapter := range assigned {
+			entries = append(entries, qa.PlanEntry{Chapter: chapter, Action: qa.ActionAccept, Reason: "verified partition"})
+		}
+		data, err := json.Marshal(qa.Plan{Entries: entries, Notes: fmt.Sprintf("starts %d", assigned[0])})
+		if err != nil {
+			return agent.Result{}, err
+		}
+		if err := os.WriteFile(filepath.Join(agent.OutPath(req.Dir), qa.PlanFile), data, 0o644); err != nil { //nolint:gosec // isolated test staging
+			return agent.Result{}, err
+		}
+		return agent.Result{Usage: agent.Usage{Model: "sonnet", Input: 10, Output: 5}}, nil
+	}
+	cfg := withAgentConfig(t.TempDir(), fake)
+	cfg.AgentConcurrency, cfg.MaxAgentsPerBook = 3, 3
+	exe := NewExecutor(cfg)
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.QAAdjudicating, scheduler.StageReport{}); err != nil {
+		t.Fatalf("qa_adjudicating: %v", err)
+	}
+	if got := fake.count(string(state.QAAdjudicating)); got != 3 {
+		t.Fatalf("invocations=%d, want 3", got)
+	}
+	plan, err := qa.LoadPlan(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Entries) != len(chapters) {
+		t.Fatalf("merged entries=%v", plan.Entries)
+	}
+	for i, entry := range plan.Entries {
+		if entry.Chapter != i+1 {
+			t.Fatalf("merged order=%v", plan.Entries)
+		}
+	}
+	if plan.Notes != "starts 1\nstarts 2\nstarts 3" {
+		t.Fatalf("merged notes=%q", plan.Notes)
 	}
 }
 
@@ -929,6 +1006,52 @@ func TestQAAdjudicateRecordsUsage(t *testing.T) {
 	}
 	if !found {
 		t.Error("no qa_adjudicating stage run recorded")
+	}
+}
+
+func TestValidationRetryPersistsEachInvocationOutcome(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(context.Background(), filepath.Join(dir, "sidecars.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	work := filepath.Join(dir, "work")
+	if err := os.MkdirAll(work, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	seedQAReport(t, work, []int{2})
+	book, err := db.CreateBook(context.Background(), store.NewBook{SourcePath: filepath.Join(dir, "b.m4b"), WorkDir: work, Title: "Book"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.StartStageRun(context.Background(), book.ID, string(state.QAAdjudicating), 1); err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeRunner()
+	fake.act = func(_ *fakeRunner, req agent.Request, attempt int) (agent.Result, error) {
+		plan := qa.Plan{}
+		if attempt == 2 {
+			plan.Entries = []qa.PlanEntry{{Chapter: 2, Action: qa.ActionAccept, Reason: "verified"}}
+		}
+		writeOut(t, req, qa.PlanFile, plan)
+		return agent.Result{Usage: agent.Usage{Model: "sonnet", Input: 10, Output: 5}}, nil
+	}
+	cfg := withAgentConfig(t.TempDir(), fake)
+	cfg.DB = db
+	if _, err := NewExecutor(cfg).Execute(context.Background(), book, state.QAAdjudicating, scheduler.StageReport{}); err != nil {
+		t.Fatal(err)
+	}
+	invocations, err := db.ListAgentInvocations(context.Background(), book.ID)
+	if err != nil || len(invocations) != 2 {
+		t.Fatalf("invocations=%+v err=%v", invocations, err)
+	}
+	if invocations[0].Status != "validation_failed" || invocations[1].Status != "success" {
+		t.Fatalf("statuses=%q,%q", invocations[0].Status, invocations[1].Status)
+	}
+	runs, err := db.ListStageRuns(context.Background(), book.ID)
+	if err != nil || runs[0].InputTokens != 20 || runs[0].OutputTokens != 10 {
+		t.Fatalf("retry accounting=%+v err=%v", runs, err)
 	}
 }
 

@@ -25,6 +25,10 @@ type Runtime struct {
 	AgentCapacity      int            `json:"agent_capacity"`
 	EligibleAgentBooks int            `json:"eligible_agent_books"`
 	EligibleAgentIDs   []int64        `json:"eligible_agent_book_ids,omitempty"`
+	AgentInvocations   int            `json:"agent_invocations"`
+	InvocationCapacity int            `json:"invocation_capacity"`
+	InvocationsByBook  map[int64]int  `json:"invocations_by_book,omitempty"`
+	MaxAgentsPerBook   int            `json:"max_agents_per_book"`
 }
 
 type Hooks struct {
@@ -112,6 +116,20 @@ func (s *Service) check(ctx context.Context, trigger string) {
 		s.setCheck(err)
 		return
 	}
+	activeInvocations, err := s.db.ActiveAgentInvocations(ctx)
+	if err != nil {
+		s.setCheck(err)
+		return
+	}
+	invocationsByRun := make(map[int64][]store.AgentInvocation)
+	for _, invocation := range activeInvocations {
+		invocationsByRun[invocation.StageRunID] = append(invocationsByRun[invocation.StageRunID], invocation)
+	}
+	progressByBook, err := s.db.ListAllProgress(ctx)
+	if err != nil {
+		s.setCheck(err)
+		return
+	}
 	runtime := Runtime{ActiveBooks: map[int64]bool{}}
 	if s.hooks.Runtime != nil {
 		runtime = s.hooks.Runtime(books)
@@ -128,10 +146,55 @@ func (s *Service) check(ctx context.Context, trigger string) {
 		if len(runtime.EligibleAgentIDs) > 0 && book.ID == runtime.EligibleAgentIDs[0] {
 			eligibleCount = runtime.EligibleAgentBooks
 		}
+		remaining := 0
+		for _, progress := range progressByBook[book.ID] {
+			if progress.Stage == book.State {
+				remaining = max(0, progress.Total-progress.Done)
+				break
+			}
+		}
 		snap := Snapshot{Now: time.Now().UTC(), Book: book, Runs: runs, RuntimeActive: runtime.ActiveBooks[book.ID],
-			Artifacts: s.artifactStatuses(book, runs), AgentActive: runtime.AgentActive, AgentCapacity: runtime.AgentCapacity, EligibleAgentBooks: eligibleCount}
+			Artifacts: s.artifactStatuses(book, runs), AgentActive: runtime.AgentActive, AgentCapacity: runtime.AgentCapacity, EligibleAgentBooks: eligibleCount,
+			AgentInvocations: runtime.AgentInvocations, InvocationCapacity: runtime.InvocationCapacity, BookInvocations: runtime.InvocationsByBook[book.ID],
+			MaxAgentsPerBook: runtime.MaxAgentsPerBook, RemainingWorkUnits: remaining}
 		for i := range runs {
-			if runs[i].FinishedAt == "" && runs[i].ProcessActive && runs[i].ProcessID > 0 {
+			if runs[i].FinishedAt != "" {
+				continue
+			}
+			children := invocationsByRun[runs[i].ID]
+			if len(children) > 0 {
+				oldestHeartbeat := children[0].HeartbeatAt
+				for _, child := range children[1:] {
+					if child.HeartbeatAt < oldestHeartbeat {
+						oldestHeartbeat = child.HeartbeatAt
+					}
+				}
+				// A fresh sibling must not hide a stale child behind the compatible
+				// parent roll-up. Classification therefore uses the oldest active
+				// invocation heartbeat for this fanned-out run.
+				runs[i].HeartbeatAt = oldestHeartbeat
+				alive := true
+				checked := false
+				for _, child := range children {
+					// PID zero is the short interval after durable admission and before
+					// cmd.Start. Staleness catches a child that never starts; it is not
+					// evidence that a process disappeared.
+					if child.ProcessID <= 0 {
+						continue
+					}
+					checked = true
+					if !processAlive(child.ProcessID) {
+						alive = false
+						break
+					}
+				}
+				if checked {
+					snap.ProcessAlive = &alive
+				}
+				break
+			}
+			// Legacy/pre-migration active process fallback.
+			if runs[i].ProcessActive && runs[i].ProcessID > 0 {
 				alive := processAlive(runs[i].ProcessID)
 				snap.ProcessAlive = &alive
 				break
@@ -460,7 +523,8 @@ func (s *Service) modelContext(ctx context.Context, i Incident, runs []store.Sta
 		}
 		c.Attempts = append(c.Attempts, attempt)
 	}
-	c.Scheduler = SchedulerContext{AgentActive: runtime.AgentActive, AgentCapacity: runtime.AgentCapacity, EligibleAgentBooks: runtime.EligibleAgentBooks}
+	c.Scheduler = SchedulerContext{AgentActive: runtime.AgentActive, AgentCapacity: runtime.AgentCapacity, EligibleAgentBooks: runtime.EligibleAgentBooks,
+		AgentInvocations: runtime.AgentInvocations, InvocationCapacity: runtime.InvocationCapacity, BookInvocations: runtime.InvocationsByBook[b.ID], MaxAgentsPerBook: runtime.MaxAgentsPerBook}
 	events, err := s.db.ListEvents(ctx, b.ID, 0, 8)
 	if err != nil {
 		return ModelContext{}, err

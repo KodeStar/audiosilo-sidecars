@@ -28,7 +28,8 @@ export type AgentStageKey = (typeof AGENT_STAGE_KEYS)[number];
 // two editable model cells (empty = the backend default).
 export interface AgentFormState {
   backend: string; // '' (auto) | 'claude' | 'codex'
-  concurrency: string;
+  queueConcurrency: string;
+  maxAgentsPerBook: string;
   timeoutMinutes: string;
   bookBudgetUSD: string; // per-book agent spend cap, USD (a large value effectively disables)
   models: Record<AgentStageKey, { claude: string; openai: string }>;
@@ -46,7 +47,8 @@ export function agentConfigToForm(agent: AgentConfig): AgentFormState {
   }
   return {
     backend: agent.backend,
-    concurrency: String(agent.concurrency),
+    queueConcurrency: String(agent.queue_concurrency ?? agent.concurrency),
+    maxAgentsPerBook: String(agent.max_agents_per_book ?? agent.concurrency),
     timeoutMinutes: String(agent.timeout_minutes),
     bookBudgetUSD: String(agent.book_budget_usd),
     models,
@@ -71,7 +73,8 @@ function nonEmptyModels(form: AgentFormState, col: 'claude' | 'openai'): Record<
 export function agentFormToUpdate(form: AgentFormState): AgentUpdate {
   return {
     backend: form.backend,
-    concurrency: parseIntOrNaN(form.concurrency),
+    queue_concurrency: parseIntOrNaN(form.queueConcurrency),
+    max_agents_per_book: parseIntOrNaN(form.maxAgentsPerBook),
     timeout_minutes: parseIntOrNaN(form.timeoutMinutes),
     book_budget_usd: parseFloatOrNaN(form.bookBudgetUSD),
     claude_models: nonEmptyModels(form, 'claude'),
@@ -83,10 +86,16 @@ export function agentFormToUpdate(form: AgentFormState): AgentUpdate {
 // problem, or null when the form looks savable. The server re-validates and its
 // 400 message wins on any disagreement.
 export function validateAgentForm(form: AgentFormState): string | null {
-  const c = parseIntOrNaN(form.concurrency);
+  const c = parseIntOrNaN(form.queueConcurrency);
   if (!Number.isInteger(c) || c < 1) {
-    return 'Concurrency must be a whole number of at least 1.';
+    return 'Concurrent books must be a whole number of at least 1.';
   }
+  if (c > 32) return 'Concurrent books cannot exceed 32.';
+  const perBook = parseIntOrNaN(form.maxAgentsPerBook);
+  if (!Number.isInteger(perBook) || perBook < 1)
+    return 'Max agents per book must be a whole number of at least 1.';
+  if (perBook > 32) return 'Max agents per book cannot exceed 32.';
+  if (c * perBook > 64) return 'The maximum possible simultaneous invocations cannot exceed 64.';
   const t = parseIntOrNaN(form.timeoutMinutes);
   if (!Number.isInteger(t) || t < 1) {
     return 'Timeout must be a whole number of at least 1 minute.';

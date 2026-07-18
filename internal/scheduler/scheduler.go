@@ -3,7 +3,7 @@
 // (book, stage) pairs, and dispatches them to lane workers:
 //
 //   - Lane A (ASR), capacity 1: asr + retranscribing (retranscribe jumps queue).
-//   - Lane B (agent), capacity config.agent.concurrency: gated by a SERIES LOCK -
+//   - Lane B (agent books), capacity config.agent.queue_concurrency: gated by a SERIES LOCK -
 //     only the lowest-position unfinished book of a series may hold an agent slot,
 //     so different series parallelize but a series is authored in order.
 //   - Lane C (mechanical), capacity 2: inspect/split/sanitize/qa/correct/validate/
@@ -93,7 +93,16 @@ type Scheduler struct {
 // queueStats is the published queue.stats snapshot, compared to suppress
 // no-change republishes on idle ticks.
 type queueStats struct {
-	asr, agent, mech, queued int
+	asr, agent, invocations, invocationCap, mech, queued int
+	invocationsByBook                                    string
+}
+
+type agentInvocationRuntime interface {
+	AgentInvocationRuntime() (total int, byBook map[int64]int, capacity int)
+}
+
+type agentFanoutRuntime interface {
+	AgentMaxPerBook() int
 }
 
 type inflightBook struct {
@@ -761,21 +770,35 @@ func (s *Scheduler) publishQueueStats(books []store.Book, counts map[state.Lane]
 			queued++
 		}
 	}
+	invocations, invocationCap := 0, s.agentCap
+	perBook := map[int64]int{}
+	if runtime, ok := s.exec.(agentInvocationRuntime); ok {
+		invocations, perBook, invocationCap = runtime.AgentInvocationRuntime()
+	}
+	perBookJSON, _ := json.Marshal(perBook) // int-key map is emitted in stable key order
 	next := queueStats{
-		asr:    counts[state.LaneASR],
-		agent:  counts[state.LaneAgent],
-		mech:   counts[state.LaneMechanical],
-		queued: queued,
+		asr:               counts[state.LaneASR],
+		agent:             counts[state.LaneAgent],
+		invocations:       invocations,
+		invocationCap:     invocationCap,
+		invocationsByBook: string(perBookJSON),
+		mech:              counts[state.LaneMechanical],
+		queued:            queued,
 	}
 	if s.haveStats && next == s.lastStats {
 		return
 	}
 	s.lastStats, s.haveStats = next, true
 	_ = s.hub.Publish("queue.stats", map[string]any{
-		"asr_active":        next.asr,
-		"agent_active":      next.agent,
-		"mechanical_active": next.mech,
-		"queued":            next.queued,
+		"asr_active":                next.asr,
+		"agent_active":              next.agent,
+		"agent_books_active":        next.agent,
+		"agent_book_capacity":       s.agentCap,
+		"agent_invocations_active":  next.invocations,
+		"agent_invocation_capacity": next.invocationCap,
+		"agent_invocations_by_book": perBook,
+		"mechanical_active":         next.mech,
+		"queued":                    next.queued,
 	})
 }
 

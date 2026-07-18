@@ -17,8 +17,9 @@ func TestLoadDefaultsOnFirstRun(t *testing.T) {
 	if cfg.Listen != DefaultListen {
 		t.Errorf("listen = %q, want %q", cfg.Listen, DefaultListen)
 	}
-	if cfg.Agent.Concurrency != DefaultConcurrency {
-		t.Errorf("concurrency = %d, want %d", cfg.Agent.Concurrency, DefaultConcurrency)
+	cap := cfg.Agent.Capacity()
+	if cap.QueueConcurrency != DefaultAgentQueueConcurrency || cap.MaxAgentsPerBook != DefaultMaxAgentsPerBook || cap.GlobalInvocations != 6 || cap.Legacy {
+		t.Errorf("capacity = %+v", cap)
 	}
 	if cfg.Agent.BookBudgetUSD != DefaultBookBudgetUSD {
 		t.Errorf("book_budget_usd default = %v, want %v", cfg.Agent.BookBudgetUSD, DefaultBookBudgetUSD)
@@ -75,6 +76,8 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	in.ASR.Backend = "whisper-cpp"
 	in.Agent.Backend = "claude"
 	in.Agent.Concurrency = 4
+	in.Agent.QueueConcurrency = 0
+	in.Agent.MaxAgentsPerBook = 0
 	in.Agent.Claude = map[string]string{"fact_pass": "sonnet", "synthesizing": "opus"}
 	in.Agent.OpenAI = map[string]string{"auditing": "gpt-x"}
 	in.Agent.TimeoutMinutes = 90
@@ -110,6 +113,58 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 	if out.Agent.ClaudePath != "/opt/claude" || out.Agent.CodexPath != "/opt/codex" {
 		t.Errorf("agent paths = %q,%q", out.Agent.ClaudePath, out.Agent.CodexPath)
+	}
+}
+
+func TestLegacyConcurrencyNormalizationPreservesGlobalCap(t *testing.T) {
+	dir := t.TempDir()
+	raw := []byte("listen: 127.0.0.1:8090\nagent:\n  concurrency: 4\n  timeout_minutes: 60\npricing:\n  version: test\nsupervisor: {}\ncontribution: {}\n")
+	path := filepath.Join(dir, FileName)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := cfg.Agent.Capacity()
+	if !cap.Legacy || cap.QueueConcurrency != 4 || cap.MaxAgentsPerBook != 4 || cap.GlobalInvocations != 4 {
+		t.Fatalf("legacy capacity=%+v", cap)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || string(after) != string(raw) {
+		t.Fatalf("Load rewrote legacy config: err=%v\n%s", err, after)
+	}
+}
+
+func TestLegacyZeroConcurrencyKeepsHistoricalDefaulting(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, FileName), []byte("listen: 127.0.0.1:8090\nagent:\n  concurrency: 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Agent.Capacity(); !got.Legacy || got.GlobalInvocations != DefaultConcurrency {
+		t.Fatalf("legacy zero capacity=%+v", got)
+	}
+}
+
+func TestModernAgentCapacityValidation(t *testing.T) {
+	cfg := Default()
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Agent.QueueConcurrency = 3
+	cfg.Agent.MaxAgentsPerBook = 3
+	if got := cfg.Agent.Capacity().GlobalInvocations; got != 9 {
+		t.Fatalf("global=%d", got)
+	}
+	cfg.Agent.QueueConcurrency = 9
+	cfg.Agent.MaxAgentsPerBook = 8
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected unreasonable product rejection")
 	}
 }
 
@@ -273,6 +328,8 @@ func TestAgentEnvOverrides(t *testing.T) {
 	t.Setenv("AUDIOSILO_SIDECARS_AGENT_CLAUDE_PATH", "/usr/local/bin/claude")
 	t.Setenv("AUDIOSILO_SIDECARS_AGENT_CODEX_PATH", "/usr/local/bin/codex")
 	t.Setenv("AUDIOSILO_SIDECARS_AGENT_TIMEOUT_MINUTES", "45")
+	t.Setenv("AUDIOSILO_SIDECARS_AGENT_QUEUE_CONCURRENCY", "3")
+	t.Setenv("AUDIOSILO_SIDECARS_AGENT_MAX_AGENTS_PER_BOOK", "2")
 	cfg, err := Load(dir)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -285,6 +342,9 @@ func TestAgentEnvOverrides(t *testing.T) {
 	}
 	if cfg.Agent.TimeoutMinutes != 45 {
 		t.Errorf("timeout_minutes = %d, want 45", cfg.Agent.TimeoutMinutes)
+	}
+	if got := cfg.Agent.Capacity(); got.QueueConcurrency != 3 || got.MaxAgentsPerBook != 2 || got.GlobalInvocations != 6 || got.Legacy {
+		t.Errorf("env capacity=%+v", got)
 	}
 }
 

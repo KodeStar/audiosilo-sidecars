@@ -91,6 +91,48 @@ func TestSimulatedMultiBookRecoveryAndEscalation(t *testing.T) {
 	}
 }
 
+func TestLivenessFailsWhenAnyOfSeveralChildProcessesDisappears(t *testing.T) {
+	ctx := context.Background()
+	db := supervisorDB(t)
+	if err := db.EnsureBatch(ctx, "children", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	b, err := db.CreateBook(ctx, store.NewBook{BatchID: "children", SourcePath: "/children", WorkDir: t.TempDir(), Title: "Children", State: "fact_pass"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.StartStageRun(ctx, b.ID, "fact_pass", 1); err != nil {
+		t.Fatal(err)
+	}
+	alive, err := db.StartAgentInvocation(ctx, b.ID, "fact_pass", "chunk-1", "claude", "sonnet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	missing, err := db.StartAgentInvocation(ctx, b.ID, "fact_pass", "chunk-2", "claude", "sonnet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetAgentInvocationProcess(ctx, alive, os.Getpid(), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetAgentInvocationProcess(ctx, missing, 1<<30, true); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default().Supervisor
+	cfg.StaleMinutes, cfg.NoProgressMinutes, cfg.MaxStageMinutes = 999, 999, 999
+	s := New(db, cfg, pricing.Table{Version: "test"}, nil, Hooks{Runtime: func([]store.Book) Runtime {
+		return Runtime{ActiveBooks: map[int64]bool{b.ID: true}, AgentActive: 1, AgentCapacity: 1, AgentInvocations: 2, InvocationCapacity: 2, InvocationsByBook: map[int64]int{b.ID: 2}, MaxAgentsPerBook: 2}
+	}})
+	s.check(ctx, "children")
+	runs, err := db.RecentSupervisorRuns(ctx, "children", 10)
+	if err != nil || len(runs) == 0 {
+		t.Fatalf("supervisor runs=%+v err=%v", runs, err)
+	}
+	if runs[0].Diagnosis != "recorded invocation process has disappeared" {
+		t.Fatalf("diagnosis=%q", runs[0].Diagnosis)
+	}
+}
+
 func TestModelBudgetsPerBookAndBatch(t *testing.T) {
 	ctx := context.Background()
 	db := supervisorDB(t)

@@ -190,6 +190,7 @@ func Run(ctx context.Context, opts Options) error {
 	// core-submit/poller service - both resolve the same PAT-then-`gh auth token`
 	// credential, so there is no reason to build two.
 	tokenSource := contrib.NewTokenSource(sec)
+	agentCapacity := cfg.Agent.Capacity()
 	exec := pipeline.NewExecutor(pipeline.Config{
 		DB:      db,
 		FFmpeg:  tools.FFmpeg,
@@ -216,7 +217,8 @@ func Run(ctx context.Context, opts Options) error {
 		AgentSelect:      agentSelect,
 		AgentModels:      pipeline.AgentModels{Claude: cfg.Agent.Claude, OpenAI: cfg.Agent.OpenAI},
 		AgentTimeout:     time.Duration(cfg.Agent.TimeoutMinutes) * time.Minute,
-		AgentConcurrency: cfg.Agent.Concurrency,
+		AgentConcurrency: agentCapacity.GlobalInvocations,
+		MaxAgentsPerBook: agentCapacity.MaxAgentsPerBook,
 		BookBudgetUSD:    cfg.Agent.BookBudgetUSD,
 		Pricing:          cfg.Pricing,
 		Secrets:          sec,
@@ -234,7 +236,7 @@ func Run(ctx context.Context, opts Options) error {
 		ContribBaseURL: cfg.Contribution.APIBaseURL,
 		ExportRoot:     filepath.Join(opts.DataDir, "export"),
 	})
-	sched := scheduler.New(db, hub, exec, cfg.Agent.Concurrency, workRoot, cfg.Contribution.AutoPurge)
+	sched := scheduler.New(db, hub, exec, agentCapacity.QueueConcurrency, workRoot, cfg.Contribution.AutoPurge)
 	schedCtx, cancelSched := context.WithCancel(ctx)
 	defer cancelSched()
 	schedDone := make(chan struct{})
@@ -273,7 +275,8 @@ func Run(ctx context.Context, opts Options) error {
 	supervisorSvc := supervisor.New(db, cfg.Supervisor, cfg.Pricing, supervisorModel, supervisor.Hooks{
 		Runtime: func(books []store.Book) supervisor.Runtime {
 			r := sched.SupervisorRuntime(books)
-			return supervisor.Runtime{ActiveBooks: r.ActiveBooks, AgentActive: r.AgentActive, AgentCapacity: r.AgentCapacity, EligibleAgentBooks: r.EligibleAgentBooks, EligibleAgentIDs: r.EligibleAgentIDs}
+			return supervisor.Runtime{ActiveBooks: r.ActiveBooks, AgentActive: r.AgentActive, AgentCapacity: r.AgentCapacity, EligibleAgentBooks: r.EligibleAgentBooks, EligibleAgentIDs: r.EligibleAgentIDs,
+				AgentInvocations: r.AgentInvocations, InvocationCapacity: r.InvocationCapacity, InvocationsByBook: r.InvocationsByBook, MaxAgentsPerBook: r.MaxAgentsPerBook}
 		},
 		Apply: func(ctx context.Context, action supervisor.Action, incident supervisor.Incident) (string, error) {
 			if action == supervisor.ActionFallbackBackend {

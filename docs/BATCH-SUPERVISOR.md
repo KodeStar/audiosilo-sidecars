@@ -46,8 +46,8 @@ machine merely by recording a decision.
 
 The deterministic classifier covers:
 
-- open stage runs missing a scheduler worker, or a recorded child PID which no longer
-  exists;
+- open stage runs missing a scheduler worker, or any recorded per-invocation child
+  PID which no longer exists (with parent-PID fallback for pre-migration runs);
 - stale invocation heartbeats and lack of meaningful stage progress;
 - configured duration, token, and reported-cost ceilings;
 - duration, tokens, or cost growing beyond the configured factor versus the last
@@ -56,7 +56,8 @@ The deterministic classifier covers:
 - three identical QA metric fingerprints and flat/diverging audit fix counts;
 - authentication, rate-limit/overload, and backend-unavailable signatures;
 - absent, empty, or invalid completion sentinels and required artifacts;
-- idle configured agent capacity while eligible books are waiting.
+- idle agent-book capacity while eligible books are waiting, and idle per-book or
+  global invocation capacity while a supported fanned-out stage has queued units.
 
 Available playbooks are `observe`, `retry`, `readmit`, `requeue`,
 `terminate_requeue`, `supersede_rerun`, `stop_budget`, `reallocate`,

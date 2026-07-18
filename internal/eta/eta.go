@@ -141,6 +141,9 @@ type Book struct {
 	Chapters int
 	// Progress is the per-stage done/total keyed by stage name (may be nil).
 	Progress map[string]Progress
+	// MaxAgentsPerBook is the fan-out width for supported stages. Zero preserves
+	// the historical serial assumption for direct callers.
+	MaxAgentsPerBook int
 }
 
 // UnitIsBook reports whether a stage is measured in whole books (one unit per run)
@@ -259,10 +262,22 @@ func remainingSegments(b Book, rates map[string]float64) []segment {
 		}
 		isCurrent := cur == b.State
 		units := stageRemainingUnits(b, cur, isCurrent)
+		seconds := float64(units) * rateFor(cur, rates)
+		if state.SupportsAgentFanout(cur) && units > 0 {
+			fanout := b.MaxAgentsPerBook
+			if fanout < 1 {
+				fanout = 1
+			}
+			waves := (units + fanout - 1) / fanout
+			seconds = float64(waves) * rateFor(cur, rates)
+			if cur == state.FactPass && b.MaxAgentsPerBook > 0 {
+				seconds += 300
+			} // bounded serial notes assembly
+		}
 		segs = append(segs, segment{
 			stage:   cur,
 			lane:    state.LaneOf(cur),
-			seconds: float64(units) * rateFor(cur, rates),
+			seconds: seconds,
 		})
 	}
 	return segs

@@ -53,6 +53,10 @@ type SchedulerContext struct {
 	AgentActive        int `json:"agent_active"`
 	AgentCapacity      int `json:"agent_capacity"`
 	EligibleAgentBooks int `json:"eligible_agent_books"`
+	AgentInvocations   int `json:"agent_invocations"`
+	InvocationCapacity int `json:"invocation_capacity"`
+	BookInvocations    int `json:"book_invocations"`
+	MaxAgentsPerBook   int `json:"max_agents_per_book"`
 }
 
 type LogContext struct {

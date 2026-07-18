@@ -95,7 +95,9 @@ cmd/audiosilo-sidecars/   entrypoint: `serve` (default) + `version`; flags --dat
 internal/
   config/   config.yaml in <data>/ + AUDIOSILO_SIDECARS_* env overrides; Load/Save/Validate.
             M1 added library_roots (scan allow-list), metadata.base_url;
-            agent.concurrency is now live (scheduler agent lane). M2 added tools.
+            agent.queue_concurrency controls agent-lane books and
+            agent.max_agents_per_book controls safe within-book fan-out; legacy
+            agent.concurrency retains its historical global cap. M2 added tools.
             {ffmpeg_path,ffprobe_path,auto_download} - the SINGLE source of truth for
             tool paths (the ffprobe knob lives under tools.*; the folder scan uses
             the resolved path). M3a made asr.* live: backend
@@ -104,7 +106,7 @@ internal/
             the DETECTED device). Changing asr.backend or the tool paths takes effect
             only on a daemon RESTART (the backend is resolved once at startup, unlike
             cors_origins, which the API re-reads live per request). M5 made agent.*
-            LIVE: backend (""|claude|codex), concurrency, claude_path/codex_path,
+            LIVE: backend (""|claude|codex), capacity, claude_path/codex_path,
             timeout_minutes, and the per-stage claude/openai model maps (keys are agent
             stage names). Validate rejects an unknown backend, an unknown model-map key,
             or timeout_minutes < 1; Default() seeds the claude map. M7 added
@@ -283,11 +285,12 @@ internal/
             JSON injected into api) - EVERY stage is now real. The load-bearing
             invariants live in
             the staging (synthesizing/auditing dirs hold NO transcripts, independent
-            fact_pass chunk dirs hold only their own chapter range and spoiler-bounded
+            fact_pass chunk and QA partition dirs hold only their own chapter range and spoiler-bounded
             spelling sheet, and a separate notes-only assembly writes the compact final
-            knowledge sheet). Fact chunks run concurrently behind the same executor-wide
-            agent semaphore as ordinary stages, so agent.concurrency is a true global cap
-            rather than a multiplier. Spelling reference_files are restricted to the
+            knowledge sheet). Fact chunks and QA chapter partitions run concurrently
+            behind the same executor-wide invocation semaphore. New capacity uses
+            queue_concurrency * max_agents_per_book; legacy concurrency remains a
+            non-multiplied global cap. Spelling reference_files are restricted to the
             daemon-staged carryover. Constructed in server.go with the
             toolfetch-resolved paths, the asr.Select-chosen backend, and the
             agent.Select-chosen runner (nil when no CLI resolved). The sanitizing stage
@@ -947,7 +950,7 @@ Milestones from the workspace plan; each is shippable.
 - **Post-M8 fact-pass cost round (done):** replaced the serial rolling knowledge
   rewrite with bounded map-reduce. Each chunk now extracts only chapter-attributed
   delta facts from its own corrected chapters and spoiler sheet; chunks run in
-  parallel up to `agent.concurrency`; one notes-only assembly produces a sub-2500-word
+  parallel up to `agent.max_agents_per_book`; one notes-only assembly produces a sub-2500-word
   `knowledge-final.md`. A shared invocation semaphore caps parallel chunks plus all
   other agent stages globally, and both backends run in stateless/ephemeral mode with
   stage-sized tool/turn bounds. Chunk facts are individually resumable, so a crash

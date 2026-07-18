@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -279,4 +280,193 @@ func TestFactPassRunsIndependentChunksConcurrently(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("fact_pass: %v", err)
 	}
+}
+
+func TestFactPassGlobalCapacityIsProductAcrossBooks(t *testing.T) {
+	for _, bookCount := range []int{2, 3} {
+		t.Run(fmt.Sprintf("books_%d", bookCount), func(t *testing.T) {
+			works := make([]string, bookCount)
+			for i := range works {
+				works[i] = t.TempDir()
+				seedFactPassInputs(t, works[i], []chunkRange{{From: 1, To: 1}, {From: 2, To: 2}, {From: 3, To: 3}, {From: 4, To: 4}})
+			}
+			fake := newFakeRunner()
+			capacity := int32(bookCount * 3)
+			started := make(chan struct{}, bookCount*4)
+			release := make(chan struct{})
+			var active, peak atomic.Int32
+			fake.act = func(_ *fakeRunner, req agent.Request, _ int) (agent.Result, error) {
+				if strings.Contains(req.Prompt, "assembling the compact final knowledge sheet") {
+					err := os.WriteFile(filepath.Join(agent.OutPath(req.Dir), knowledgeFinalName), []byte("ROSTER\nREVEALS\nTHREADS\nENDING\n"), 0o644) //nolint:gosec // test staging
+					return agent.Result{}, err
+				}
+				now := active.Add(1)
+				defer active.Add(-1)
+				for old := peak.Load(); now > old && !peak.CompareAndSwap(old, now); old = peak.Load() {
+				}
+				started <- struct{}{}
+				<-release
+				entries, err := os.ReadDir(filepath.Join(req.Dir, spelling.CorrectedDir))
+				if err != nil {
+					return agent.Result{}, err
+				}
+				chapter, ok := transcript.ParseChapter(entries[0].Name())
+				if !ok {
+					return agent.Result{}, errors.New("could not infer staged chapter")
+				}
+				body := fmt.Sprintf("## Chapter %d\nEVENTS:\n- fact\n", chapter)
+				err = os.WriteFile(filepath.Join(agent.OutPath(req.Dir), factsChunkName(chapter, chapter)), []byte(body), 0o644) //nolint:gosec // test staging
+				return agent.Result{}, err
+			}
+			cfg := withAgentConfig(t.TempDir(), fake)
+			cfg.AgentConcurrency, cfg.MaxAgentsPerBook = int(capacity), 3
+			exe := NewExecutor(cfg)
+			errs := make(chan error, bookCount)
+			for i, work := range works {
+				go func() {
+					_, err := exe.Execute(context.Background(), store.Book{ID: int64(i + 1), Title: "Book", WorkDir: work}, state.FactPass, scheduler.StageReport{})
+					errs <- err
+				}()
+			}
+			for range capacity {
+				select {
+				case <-started:
+				case <-time.After(2 * time.Second):
+					t.Fatal("configured product capacity was not filled")
+				}
+			}
+			select {
+			case <-started:
+				t.Fatal("an invocation exceeded the configured global product")
+			case <-time.After(100 * time.Millisecond):
+			}
+			close(release)
+			for range bookCount {
+				if err := <-errs; err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := peak.Load(); got != capacity {
+				t.Fatalf("peak=%d, want %d", got, capacity)
+			}
+		})
+	}
+}
+
+func TestFactPassGlobalSlotsAreFairToAnotherIncompleteBook(t *testing.T) {
+	work1, work2 := t.TempDir(), t.TempDir()
+	seedFactPassInputs(t, work1, []chunkRange{{From: 1, To: 1}, {From: 2, To: 2}, {From: 3, To: 3}, {From: 4, To: 4}})
+	seedFactPassInputs(t, work2, []chunkRange{{From: 1, To: 1}, {From: 2, To: 2}})
+	fake := newFakeRunner()
+	started := make(chan int, 8)
+	release := make(chan struct{})
+	fake.act = func(_ *fakeRunner, req agent.Request, _ int) (agent.Result, error) {
+		if strings.Contains(req.Prompt, "assembling the compact final knowledge sheet") {
+			err := os.WriteFile(filepath.Join(agent.OutPath(req.Dir), knowledgeFinalName), []byte("ROSTER\nREVEALS\nTHREADS\nENDING\n"), 0o644) //nolint:gosec // test staging
+			return agent.Result{}, err
+		}
+		book := 1
+		if strings.HasPrefix(req.Dir, work2) {
+			book = 2
+		}
+		started <- book
+		<-release
+		entries, err := os.ReadDir(filepath.Join(req.Dir, spelling.CorrectedDir))
+		if err != nil {
+			return agent.Result{}, err
+		}
+		chapter, ok := transcript.ParseChapter(entries[0].Name())
+		if !ok {
+			return agent.Result{}, errors.New("could not infer staged chapter")
+		}
+		body := fmt.Sprintf("## Chapter %d\nEVENTS:\n- fact\n", chapter)
+		err = os.WriteFile(filepath.Join(agent.OutPath(req.Dir), factsChunkName(chapter, chapter)), []byte(body), 0o644) //nolint:gosec // test staging
+		return agent.Result{}, err
+	}
+	cfg := withAgentConfig(t.TempDir(), fake)
+	cfg.AgentConcurrency, cfg.MaxAgentsPerBook = 3, 3
+	exe := NewExecutor(cfg)
+	errs := make(chan error, 2)
+	go func() {
+		_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "One", WorkDir: work1}, state.FactPass, scheduler.StageReport{})
+		errs <- err
+	}()
+	for range 3 {
+		if got := <-started; got != 1 {
+			t.Fatalf("initial occupant=%d, want book 1", got)
+		}
+	}
+	go func() {
+		_, err := exe.Execute(context.Background(), store.Book{ID: 2, Title: "Two", WorkDir: work2}, state.FactPass, scheduler.StageReport{})
+		errs <- err
+	}()
+	select {
+	case got := <-started:
+		t.Fatalf("book %d exceeded a full global pool", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	release <- struct{}{}
+	select {
+	case got := <-started:
+		if got != 2 {
+			t.Fatalf("next slot went to book %d, want already-waiting book 2", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiting book did not receive the released global slot")
+	}
+	close(release)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestFactPassFanoutCancellationDrainsWorkersAndReleasesSlots(t *testing.T) {
+	work := t.TempDir()
+	seedFactPassInputs(t, work, []chunkRange{{From: 1, To: 1}, {From: 2, To: 2}, {From: 3, To: 3}})
+	fake := newFakeRunner()
+	started := make(chan struct{}, 3)
+	blocking := &blockingAgentRunner{fakeRunner: fake, started: started}
+	cfg := withAgentConfig(t.TempDir(), fake)
+	cfg.Agent, cfg.AgentConcurrency, cfg.MaxAgentsPerBook = blocking, 3, 3
+	cfg.AgentAvail = agent.Availability{Backend: agent.IDClaude, Available: true, Version: "fake"}
+	exe := NewExecutor(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := exe.Execute(ctx, store.Book{ID: 1, Title: "One", WorkDir: work}, state.FactPass, scheduler.StageReport{})
+		done <- err
+	}()
+	for range 3 {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("fan-out workers did not start")
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancel error=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled workers did not drain")
+	}
+	active, byBook, capacity := exe.AgentInvocationRuntime()
+	if active != 0 || len(byBook) != 0 || capacity != 3 {
+		t.Fatalf("runtime after cancellation=%d,%v cap=%d", active, byBook, capacity)
+	}
+}
+
+type blockingAgentRunner struct {
+	*fakeRunner
+	started chan<- struct{}
+}
+
+func (r *blockingAgentRunner) Run(ctx context.Context, _ agent.Request) (agent.Result, error) {
+	r.started <- struct{}{}
+	<-ctx.Done()
+	return agent.Result{}, ctx.Err()
 }

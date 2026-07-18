@@ -18,10 +18,20 @@ type SupervisorRuntimeSnapshot struct {
 	AgentCapacity      int
 	EligibleAgentBooks int
 	EligibleAgentIDs   []int64
+	AgentInvocations   int
+	InvocationCapacity int
+	InvocationsByBook  map[int64]int
+	MaxAgentsPerBook   int
 }
 
 func (s *Scheduler) SupervisorRuntime(books []store.Book) SupervisorRuntimeSnapshot {
-	out := SupervisorRuntimeSnapshot{ActiveBooks: map[int64]bool{}, AgentCapacity: s.agentCap}
+	out := SupervisorRuntimeSnapshot{ActiveBooks: map[int64]bool{}, AgentCapacity: s.agentCap, InvocationsByBook: map[int64]int{}}
+	if runtime, ok := s.exec.(agentInvocationRuntime); ok {
+		out.AgentInvocations, out.InvocationsByBook, out.InvocationCapacity = runtime.AgentInvocationRuntime()
+	}
+	if runtime, ok := s.exec.(agentFanoutRuntime); ok {
+		out.MaxAgentsPerBook = runtime.AgentMaxPerBook()
+	}
 	s.mu.Lock()
 	for id, ib := range s.inflight {
 		out.ActiveBooks[id] = true

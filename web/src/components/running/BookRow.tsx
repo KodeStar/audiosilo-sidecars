@@ -86,6 +86,7 @@ export const BookRow = memo(function BookRow({
     book.series && book.series_pos ? `${book.series} #${book.series_pos}` : book.series;
   const stageProgress = activeProgress(book);
   const elapsed = elapsedSeconds(book, now, done);
+  const postAsr = postASRSeconds(book, now, done);
   const hint =
     book.status === 'needs_attention' && book.park_code
       ? parkHint(book.park_code, !!book.retry_at)
@@ -163,9 +164,35 @@ export const BookRow = memo(function BookRow({
                 {stageProgress.done}/{stageProgress.total}
               </span>
             )}
+            {postAsr !== null && (
+              <span
+                className="text-[11px] text-body"
+                title="Elapsed since successful primary ASR completion"
+              >
+                {formatDuration(postAsr)} post-ASR
+              </span>
+            )}
             {elapsed !== null && running && (
-              <span className="text-[11px] text-dim" title="Elapsed since the first stage started">
-                {formatDuration(elapsed)} elapsed
+              <span
+                className="text-[11px] text-dim"
+                title="End-to-end elapsed since the first batch stage started"
+              >
+                {formatDuration(elapsed)} batch elapsed
+              </span>
+            )}
+            {(book.active_agent_invocations ?? 0) > 0 && (
+              <span className="text-[11px] text-dim">
+                {book.active_agent_invocations}
+                {book.max_agents_per_book ? `/${book.max_agents_per_book}` : ''} active agent
+                invocation{book.active_agent_invocations === 1 ? '' : 's'}
+              </span>
+            )}
+            {book.fanout_supported && (book.current_work_units ?? 0) > 0 && (
+              <span
+                className="text-[11px] text-dim"
+                title="This stage supports isolated per-book fan-out"
+              >
+                fan-out {book.completed_work_units ?? 0}/{book.current_work_units} units
               </span>
             )}
             {book.eta_seconds !== undefined && !done && running && (
@@ -257,12 +284,38 @@ export const BookRow = memo(function BookRow({
             <p className="text-xs text-pink-500">Could not load stage details.</p>
           )}
           {detailState === 'idle' && detail && <StageCostList runs={detail.stage_runs} />}
+          {detailState === 'idle' && detail?.timing && <TimingBreakdown book={detail} />}
           <BookLog events={logEvents} bookId={book.id} title={book.title} getEvents={getEvents} />
         </div>
       )}
     </div>
   );
 });
+
+function TimingBreakdown({ book }: { book: BookView }) {
+  const t = book.timing;
+  if (!t) return null;
+  const rows = [
+    ['Batch elapsed', t.batch_elapsed_seconds],
+    ['Pre-ASR wall', t.pre_asr_wall_seconds],
+    ['ASR active', t.asr_active_seconds],
+    ['Post-ASR elapsed', t.post_asr_elapsed_seconds],
+    ['Active processing', t.active_processing_seconds],
+    ['Queue/wait', t.queue_wait_seconds],
+  ] as const;
+  return (
+    <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-xs">
+      {rows.map(([label, value]) => (
+        <div key={label} className="contents">
+          <dt className="text-dim">{label}</dt>
+          <dd className="text-body">
+            {value === undefined ? 'Not available' : formatDuration(value)}
+          </dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
 
 // StageTimeline renders the compact stage-chip row for an active book. The active
 // chip (the current stage) reuses the lane-colored state-chip styling; done and
@@ -366,4 +419,13 @@ function elapsedSeconds(book: BookView, now: number, done: boolean): number | nu
   if (start === null) return null;
   const secs = (now - start) / 1000;
   return secs >= 0 ? secs : null;
+}
+
+function postASRSeconds(book: BookView, now: number, done: boolean): number | null {
+  const baseline = book.timing?.primary_asr_completed_at;
+  if (!baseline) return null;
+  if (done) return book.timing?.post_asr_elapsed_seconds ?? null;
+  const start = parseTimestamp(baseline);
+  if (start === null) return null;
+  return Math.max(0, (now - start) / 1000);
 }

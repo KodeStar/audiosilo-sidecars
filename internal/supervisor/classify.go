@@ -179,10 +179,15 @@ func Classify(s Snapshot, p Policy) []Incident {
 		incidents = append(incidents, Incident{Kind: IncidentArtifactInvalid, BookID: s.Book.ID, BatchID: s.Book.BatchID, Stage: a.Stage, StageRunID: a.StageRunID,
 			Diagnosis: "required artifact or completion sentinel is missing or invalid", Evidence: []string{a.Path, a.Reason}, Protected: protected})
 	}
-	if s.AgentCapacity > 0 && s.AgentActive < s.AgentCapacity && s.EligibleAgentBooks > 0 {
-		occupancy := fmt.Sprintf("%d/%d active; %d eligible", s.AgentActive, s.AgentCapacity, s.EligibleAgentBooks)
+	bookSlotIdle := s.AgentCapacity > 0 && s.AgentActive < s.AgentCapacity && s.EligibleAgentBooks > 0
+	invocationSlotIdle := state.SupportsAgentFanout(state.State(s.Book.State)) && s.RuntimeActive && s.BookInvocations > 0 &&
+		s.BookInvocations < s.MaxAgentsPerBook && s.AgentInvocations < s.InvocationCapacity && s.RemainingWorkUnits > s.BookInvocations
+	if bookSlotIdle || invocationSlotIdle {
+		occupancy := fmt.Sprintf("books %d/%d active; %d eligible; invocations %d/%d global, %d/%d for book; %d work units remaining",
+			s.AgentActive, s.AgentCapacity, s.EligibleAgentBooks, s.AgentInvocations, s.InvocationCapacity,
+			s.BookInvocations, s.MaxAgentsPerBook, s.RemainingWorkUnits)
 		incidents = append(incidents, Incident{Kind: IncidentSlotInefficiency, BookID: s.Book.ID, BatchID: s.Book.BatchID,
-			Diagnosis: "agent capacity is idle while eligible books are queued", Fingerprint: ErrorFingerprint(occupancy), Evidence: []string{occupancy}})
+			Diagnosis: "agent capacity is idle while eligible book or invocation work is queued", Fingerprint: ErrorFingerprint(occupancy), Evidence: []string{occupancy}})
 	}
 	if s.Book.Status == string(state.StatusPaused) {
 		for idx := range incidents {

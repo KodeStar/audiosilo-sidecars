@@ -30,9 +30,18 @@ const FileName = "config.yaml"
 // exposed to the network unless the operator opts in.
 const DefaultListen = "127.0.0.1:8090"
 
-// DefaultConcurrency is the default number of parallel agent slots (Lane B),
-// honoured by the scheduler's agent lane (M1).
+// DefaultConcurrency is the deprecated legacy agent.concurrency default. Legacy
+// configurations keep using it as both the book-lane capacity and the global
+// invocation ceiling.
 const DefaultConcurrency = 2
+
+const (
+	DefaultAgentQueueConcurrency = 2
+	DefaultMaxAgentsPerBook      = 3
+	MaxAgentQueueConcurrency     = 32
+	MaxAgentsPerBook             = 32
+	MaxGlobalAgentInvocations    = 64
+)
 
 // DefaultTimeoutMinutes is the default per-invocation agent timeout (M5): the wall
 // clock any single agent CLI run (claude/codex) is allowed before the runner kills
@@ -145,17 +154,41 @@ type ASRConfig struct {
 // resolved once at startup, like asr.backend), unlike cors_origins which the API
 // re-reads live per request.
 type AgentConfig struct {
-	Backend        string `yaml:"backend"`         // "" (auto) | "claude" | "codex"
-	Concurrency    int    `yaml:"concurrency"`     // parallel agent slots (Lane B)
-	ClaudePath     string `yaml:"claude_path"`     // explicit claude CLI location; "" = $PATH
-	CodexPath      string `yaml:"codex_path"`      // explicit codex CLI location; "" = $PATH
-	TimeoutMinutes int    `yaml:"timeout_minutes"` // per-invocation wall-clock cap
+	Backend string `yaml:"backend"` // "" (auto) | "claude" | "codex"
+	// Concurrency is deprecated. It remains readable/writable for compatibility and
+	// is used only by the explicit legacy normalization path. New configurations
+	// should set QueueConcurrency and MaxAgentsPerBook instead.
+	Concurrency      int    `yaml:"concurrency,omitempty"`
+	QueueConcurrency int    `yaml:"queue_concurrency,omitempty"`   // books occupying agent stages
+	MaxAgentsPerBook int    `yaml:"max_agents_per_book,omitempty"` // fan-out within one supported stage
+	ClaudePath       string `yaml:"claude_path"`                   // explicit claude CLI location; "" = $PATH
+	CodexPath        string `yaml:"codex_path"`                    // explicit codex CLI location; "" = $PATH
+	TimeoutMinutes   int    `yaml:"timeout_minutes"`               // per-invocation wall-clock cap
 	// BookBudgetUSD caps total agent spend per book: a stage parks the book
 	// budget_exceeded once its summed cost reaches this (0 -> the default; set a very
 	// large value to effectively disable). Restart-to-apply, like the rest of agent.*.
 	BookBudgetUSD float64           `yaml:"book_budget_usd"`
 	Claude        map[string]string `yaml:"claude"` // agent-stage name -> model
 	OpenAI        map[string]string `yaml:"openai"` // agent-stage name -> model (empty = codex default)
+}
+
+// AgentCapacity is the normalized runtime capacity model. Legacy is true only
+// when a legacy config supplied agent.concurrency (or predated all capacity
+// fields); in that mode GlobalInvocations deliberately remains Concurrency rather
+// than multiplying the two derived dimensions.
+type AgentCapacity struct {
+	QueueConcurrency  int
+	MaxAgentsPerBook  int
+	GlobalInvocations int
+	Legacy            bool
+}
+
+func (c AgentConfig) Capacity() AgentCapacity {
+	if c.Concurrency > 0 && c.QueueConcurrency == 0 && c.MaxAgentsPerBook == 0 {
+		return AgentCapacity{QueueConcurrency: c.Concurrency, MaxAgentsPerBook: c.Concurrency, GlobalInvocations: c.Concurrency, Legacy: true}
+	}
+	return AgentCapacity{QueueConcurrency: c.QueueConcurrency, MaxAgentsPerBook: c.MaxAgentsPerBook,
+		GlobalInvocations: c.QueueConcurrency * c.MaxAgentsPerBook}
 }
 
 // SupervisorConfig controls the bounded orchestration monitor. Enabled defaults on,
@@ -257,8 +290,7 @@ type Config struct {
 	// It is the single source of truth for tool paths; the folder scan uses the
 	// resolved ffprobe.
 	Tools ToolsConfig `yaml:"tools"`
-	// ASR and Agent are typed stubs consumed by later milestones (Agent.Concurrency
-	// is live in M1).
+	// ASR and Agent are the live speech and agent runtime settings.
 	ASR   ASRConfig   `yaml:"asr"`
 	Agent AgentConfig `yaml:"agent"`
 	// Pricing is versioned and operator supplied. Empty rates mean an unavailable
@@ -280,11 +312,12 @@ func Default() Config {
 		Tools:        ToolsConfig{AutoDownload: DefaultAutoDownload},
 		ASR:          ASRConfig{Backend: DefaultASRBackend, Language: DefaultASRLanguage},
 		Agent: AgentConfig{
-			Concurrency:    DefaultConcurrency,
-			TimeoutMinutes: DefaultTimeoutMinutes,
-			BookBudgetUSD:  DefaultBookBudgetUSD,
-			Claude:         defaultClaudeModels(),
-			OpenAI:         map[string]string{},
+			QueueConcurrency: DefaultAgentQueueConcurrency,
+			MaxAgentsPerBook: DefaultMaxAgentsPerBook,
+			TimeoutMinutes:   DefaultTimeoutMinutes,
+			BookBudgetUSD:    DefaultBookBudgetUSD,
+			Claude:           defaultClaudeModels(),
+			OpenAI:           map[string]string{},
 		},
 		Pricing: pricing.Table{Version: "unconfigured-v1", Rates: map[string]pricing.Rate{}},
 		Supervisor: SupervisorConfig{
@@ -336,8 +369,19 @@ func Load(dataDir string) (Config, error) {
 	cfg := Default()
 	path := filepath.Join(dataDir, FileName)
 	raw, err := os.ReadFile(path) //nolint:gosec // path is operator-controlled data dir
+	fileExists := err == nil
+	var capacityKeys struct {
+		Agent struct {
+			Concurrency      *int `yaml:"concurrency"`
+			QueueConcurrency *int `yaml:"queue_concurrency"`
+			MaxAgentsPerBook *int `yaml:"max_agents_per_book"`
+		} `yaml:"agent"`
+	}
 	switch {
 	case err == nil:
+		if uerr := yaml.Unmarshal(raw, &capacityKeys); uerr != nil {
+			return Config{}, fmt.Errorf("parse %s: %w", path, uerr)
+		}
 		if uerr := yaml.Unmarshal(raw, &cfg); uerr != nil {
 			return Config{}, fmt.Errorf("parse %s: %w", path, uerr)
 		}
@@ -346,10 +390,27 @@ func Load(dataDir string) (Config, error) {
 	default:
 		return Config{}, fmt.Errorf("read %s: %w", path, err)
 	}
-	applyEnv(&cfg)
-	if cfg.Agent.Concurrency == 0 {
-		cfg.Agent.Concurrency = DefaultConcurrency
+	// Capacity normalization is intentionally presence-aware. yaml.Unmarshal merges
+	// into Default(), so without this explicit path an old `concurrency: N` file
+	// would accidentally inherit the new defaults and multiply its historical cap.
+	if fileExists {
+		legacy := capacityKeys.Agent.Concurrency != nil
+		modern := capacityKeys.Agent.QueueConcurrency != nil || capacityKeys.Agent.MaxAgentsPerBook != nil
+		switch {
+		case legacy && !modern:
+			cfg.Agent.QueueConcurrency, cfg.Agent.MaxAgentsPerBook = 0, 0
+			if cfg.Agent.Concurrency == 0 {
+				cfg.Agent.Concurrency = DefaultConcurrency
+			}
+		case !legacy && !modern:
+			// A pre-capacity config behaves like the historical default.
+			cfg.Agent.Concurrency = DefaultConcurrency
+			cfg.Agent.QueueConcurrency, cfg.Agent.MaxAgentsPerBook = 0, 0
+		case modern && !legacy:
+			cfg.Agent.Concurrency = 0
+		}
 	}
+	applyEnv(&cfg)
 	if cfg.Agent.TimeoutMinutes == 0 {
 		cfg.Agent.TimeoutMinutes = DefaultTimeoutMinutes
 	}
@@ -439,7 +500,32 @@ func applyEnv(cfg *Config) {
 	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_AGENT_CONCURRENCY"); ok {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			if n == 0 {
+				n = DefaultConcurrency
+			}
 			cfg.Agent.Concurrency = n
+			cfg.Agent.QueueConcurrency, cfg.Agent.MaxAgentsPerBook = 0, 0
+		}
+	}
+	queueRaw, queueSet := os.LookupEnv("AUDIOSILO_SIDECARS_AGENT_QUEUE_CONCURRENCY")
+	perBookRaw, perBookSet := os.LookupEnv("AUDIOSILO_SIDECARS_AGENT_MAX_AGENTS_PER_BOOK")
+	queueValue, queueErr := strconv.Atoi(strings.TrimSpace(queueRaw))
+	perBookValue, perBookErr := strconv.Atoi(strings.TrimSpace(perBookRaw))
+	validQueue, validPerBook := queueSet && queueErr == nil, perBookSet && perBookErr == nil
+	if validQueue || validPerBook {
+		previous := cfg.Agent.Capacity()
+		cfg.Agent.Concurrency = 0
+		if cfg.Agent.QueueConcurrency == 0 {
+			cfg.Agent.QueueConcurrency = previous.QueueConcurrency
+		}
+		if cfg.Agent.MaxAgentsPerBook == 0 {
+			cfg.Agent.MaxAgentsPerBook = previous.MaxAgentsPerBook
+		}
+		if validQueue {
+			cfg.Agent.QueueConcurrency = queueValue
+		}
+		if validPerBook {
+			cfg.Agent.MaxAgentsPerBook = perBookValue
 		}
 	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_AGENT_CLAUDE_PATH"); ok {
@@ -598,8 +684,18 @@ func (c Config) Validate() error {
 	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
 		return fmt.Errorf("invalid listen address %q: %w", c.Listen, err)
 	}
-	if c.Agent.Concurrency < 1 {
-		return fmt.Errorf("agent.concurrency must be >= 1, got %d", c.Agent.Concurrency)
+	cap := c.Agent.Capacity()
+	if c.Agent.Concurrency > 0 && (c.Agent.QueueConcurrency > 0 || c.Agent.MaxAgentsPerBook > 0) {
+		return errors.New("agent.concurrency is deprecated and cannot be combined with agent.queue_concurrency or agent.max_agents_per_book")
+	}
+	if cap.QueueConcurrency < 1 || cap.QueueConcurrency > MaxAgentQueueConcurrency {
+		return fmt.Errorf("agent.queue_concurrency must be between 1 and %d, got %d", MaxAgentQueueConcurrency, cap.QueueConcurrency)
+	}
+	if cap.MaxAgentsPerBook < 1 || cap.MaxAgentsPerBook > MaxAgentsPerBook {
+		return fmt.Errorf("agent.max_agents_per_book must be between 1 and %d, got %d", MaxAgentsPerBook, cap.MaxAgentsPerBook)
+	}
+	if cap.GlobalInvocations < 1 || cap.GlobalInvocations > MaxGlobalAgentInvocations {
+		return fmt.Errorf("effective agent invocation limit must be between 1 and %d, got %d", MaxGlobalAgentInvocations, cap.GlobalInvocations)
 	}
 	switch c.Agent.Backend {
 	case "", AgentBackendClaude, AgentBackendCodex:

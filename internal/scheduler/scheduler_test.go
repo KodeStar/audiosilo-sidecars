@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +18,34 @@ type harness struct {
 	dbPath   string
 	workRoot string
 	hub      *events.Hub
+}
+
+type occupancyExecutor struct {
+	inner *StubExecutor
+	mu    sync.Mutex
+	now   int
+	peak  int
+}
+
+func (e *occupancyExecutor) Execute(ctx context.Context, book store.Book, stage state.State, report StageReport) (StageResult, error) {
+	if state.LaneOf(stage) == state.LaneAgent {
+		e.mu.Lock()
+		e.now++
+		e.peak = max(e.peak, e.now)
+		e.mu.Unlock()
+		defer func() {
+			e.mu.Lock()
+			e.now--
+			e.mu.Unlock()
+		}()
+	}
+	return e.inner.Execute(ctx, book, stage, report)
+}
+
+func (e *occupancyExecutor) peakAgentBooks() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.peak
 }
 
 func newHarness(t *testing.T) *harness {
@@ -127,6 +156,22 @@ func TestPipelineRunsToDone(t *testing.T) {
 		if SentinelExists(b.WorkDir, string(state.MarkersNormalizing)) {
 			t.Errorf("%s: markers_normalizing should have been skipped", b.Title)
 		}
+	}
+}
+
+func TestAgentQueueConcurrencyBoundsBooks(t *testing.T) {
+	h := newHarness(t)
+	db := h.openDB(t)
+	for i := range 6 {
+		h.addBook(t, db, string(rune('a'+i))+"-book", "", "")
+	}
+	exec := &occupancyExecutor{inner: NewStubExecutor(time.Millisecond, 15*time.Millisecond)}
+	books := runUntil(t, db, h.hub, exec, 2, allDone, 15*time.Second)
+	if !allDone(books) {
+		t.Fatal("books did not finish")
+	}
+	if got := exec.peakAgentBooks(); got != 2 {
+		t.Fatalf("peak agent books=%d, want configured queue_concurrency 2", got)
 	}
 }
 

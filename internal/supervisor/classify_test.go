@@ -40,6 +40,25 @@ func TestClassifyRecordedProcessDisappeared(t *testing.T) {
 	}
 }
 
+func TestClassifyInvocationSlotInefficiencyOnlyWithQueuedFanoutWork(t *testing.T) {
+	now := time.Now().UTC()
+	open := store.StageRun{ID: 1, Stage: "fact_pass", StartedAt: now.Format(time.RFC3339Nano), HeartbeatAt: now.Format(time.RFC3339Nano), ProgressAt: now.Format(time.RFC3339Nano)}
+	base := Snapshot{Now: now, Book: store.Book{ID: 2, BatchID: "b", State: "fact_pass"}, Runs: []store.StageRun{open}, RuntimeActive: true,
+		AgentInvocations: 3, InvocationCapacity: 6, BookInvocations: 1, MaxAgentsPerBook: 3, RemainingWorkUnits: 4}
+	if got := kinds(Classify(base, Policy{MaxErrorRepeats: 2})); !got[IncidentSlotInefficiency] {
+		t.Fatalf("missing invocation inefficiency: %#v", got)
+	}
+	base.RemainingWorkUnits = 1
+	if got := kinds(Classify(base, Policy{MaxErrorRepeats: 2})); got[IncidentSlotInefficiency] {
+		t.Fatalf("tail work falsely classified inefficient: %#v", got)
+	}
+	base.RemainingWorkUnits = 4
+	base.Book.State = "synthesizing"
+	if got := kinds(Classify(base, Policy{MaxErrorRepeats: 2})); got[IncidentSlotInefficiency] {
+		t.Fatalf("serial stage falsely classified inefficient: %#v", got)
+	}
+}
+
 func TestClassifyRunawayComparedWithPreviousSuccessfulAttempt(t *testing.T) {
 	now := time.Date(2026, 7, 18, 20, 0, 0, 0, time.UTC)
 	ok := true

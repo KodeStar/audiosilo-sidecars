@@ -166,6 +166,41 @@ func TestFactPassChunkDefaultAndProgress(t *testing.T) {
 	}
 }
 
+func TestFanoutChangesSupportedStageETAByWaves(t *testing.T) {
+	rates := map[string]float64{string(state.FactPass): 100, string(state.QAAdjudicating): 60}
+	serial := Book{State: state.FactPass, MaxAgentsPerBook: 1, Progress: map[string]Progress{string(state.FactPass): {Done: 0, Total: 8}}}
+	parallel := serial
+	parallel.MaxAgentsPerBook = 3
+	s1, _ := BookETA(serial, rates)
+	s3, _ := BookETA(parallel, rates)
+	// The rest of the optimistic path is identical; only fact-pass waves differ:
+	// 8*100+300 assembly versus ceil(8/3)*100+300.
+	if s1-s3 != 500 {
+		t.Fatalf("serial=%v parallel=%v delta=%v", s1, s3, s1-s3)
+	}
+	qaBook := Book{State: state.QAAdjudicating, MaxAgentsPerBook: 3, Progress: map[string]Progress{string(state.QAAdjudicating): {Done: 0, Total: 6}}}
+	got := remainingSegments(qaBook, rates)[0].seconds
+	one := qaBook
+	one.MaxAgentsPerBook = 1
+	want := remainingSegments(one, rates)[0].seconds
+	if want-got != 240 {
+		t.Fatalf("QA serial=%v parallel=%v delta=%v", want, got, want-got)
+	}
+}
+
+func TestQueueETALegacyGlobalInvocationCapIsNotMultiplied(t *testing.T) {
+	books := []Book{
+		{ID: 1, State: state.FactPass, MaxAgentsPerBook: 2, Progress: map[string]Progress{"fact_pass": {Total: 2}}},
+		{ID: 2, State: state.FactPass, MaxAgentsPerBook: 2, Progress: map[string]Progress{"fact_pass": {Total: 2}}},
+	}
+	rates := map[string]float64{"fact_pass": 100}
+	legacy := QueueETA(books, rates, LaneCaps{ASR: 1, Mechanical: 2, Agent: 2, AgentInvocations: 2})
+	modern := QueueETA(books, rates, LaneCaps{ASR: 1, Mechanical: 2, Agent: 2, AgentInvocations: 4})
+	if legacy-modern != 100 {
+		t.Fatalf("legacy=%v modern=%v delta=%v, want one extra extraction wave", legacy, modern, legacy-modern)
+	}
+}
+
 func TestCurrentStageRemainingFromProgress(t *testing.T) {
 	// A resumed ASR: 7 of 10 chapters left drives the current-stage estimate; later
 	// chapter stages still use the full chapter count.

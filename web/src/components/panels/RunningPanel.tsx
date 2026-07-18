@@ -149,7 +149,20 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
         const ev = data as ContributionUpdateEvent;
         setBookEventCounts((prev) => bumpBookEventCount(prev, ev.book_id));
       } else if (type === 'queue.stats') {
-        setStats(data as QueueStatsEvent);
+        const ev = data as QueueStatsEvent;
+        setStats(ev);
+        // Invocation occupancy changes more often than book state. Fold the
+        // daemon-wide map into each row so the per-book fan-out indicator stays
+        // live without polling or one request per book.
+        if (ev.agent_invocations_by_book) {
+          setBooks(
+            (prev) =>
+              prev?.map((book) => ({
+                ...book,
+                active_agent_invocations: ev.agent_invocations_by_book?.[String(book.id)] ?? 0,
+              })) ?? prev,
+          );
+        }
       } else if (type === 'eta.update') {
         const ev = data as EtaUpdateEvent;
         // Patch each listed book's ETA and clear it on the rest (they lost their
@@ -427,7 +440,18 @@ function QueueStrip({
         <>
           <span className="hidden text-edge sm:inline">|</span>
           <Stat label="ASR" value={stats.asr_active} muted />
-          <Stat label="Agent" value={stats.agent_active} muted />
+          <Stat
+            label="Agent books"
+            value={`${stats.agent_books_active ?? stats.agent_active}/${stats.agent_book_capacity ?? '?'}`}
+            muted
+          />
+          {stats.agent_invocations_active !== undefined && (
+            <Stat
+              label="Invocations"
+              value={`${stats.agent_invocations_active}/${stats.agent_invocation_capacity ?? '?'}`}
+              muted
+            />
+          )}
           <Stat label="Mechanical" value={stats.mechanical_active} muted />
           <Stat label="Queued" value={stats.queued} muted />
         </>
@@ -454,7 +478,7 @@ function QueueStrip({
   );
 }
 
-function Stat({ label, value, muted }: { label: string; value: number; muted?: boolean }) {
+function Stat({ label, value, muted }: { label: string; value: number | string; muted?: boolean }) {
   return (
     <span className="flex items-baseline gap-1.5">
       <span className={muted ? 'text-dim' : 'font-semibold text-hi'}>{value}</span>

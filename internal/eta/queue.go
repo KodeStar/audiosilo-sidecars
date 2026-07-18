@@ -9,12 +9,13 @@ import (
 
 // LaneCaps is the per-lane worker capacity the queue simulation runs under. The
 // scheduler owns the real values (its own asr/mechanical constants and the
-// configured agent concurrency) and passes them in, so eta keeps no private copy
+// configured agent-book concurrency) and passes them in, so eta keeps no private copy
 // that could drift from the scheduler's. Each field is clamped to >= 1 by QueueETA.
 type LaneCaps struct {
-	ASR        int
-	Mechanical int
-	Agent      int
+	ASR              int
+	Mechanical       int
+	Agent            int
+	AgentInvocations int
 }
 
 // atLeastOne clamps a lane capacity to a minimum of 1, so a zero/negative cap never
@@ -70,6 +71,15 @@ func (sb *simBook) holdsSeriesLock() bool {
 func QueueETA(books []Book, rates map[string]float64, caps LaneCaps) float64 {
 	sim := make([]*simBook, 0, len(books))
 	for _, b := range books {
+		// BookETA describes an isolated book and may use its full fan-out. QueueETA
+		// must also respect the daemon-wide invocation pool. Dividing that pool over
+		// the simultaneously admitted agent books is exact for the modern default
+		// (queue * per-book == global) and deliberately conservative for a legacy
+		// single concurrency value, where global == queue rather than queue squared.
+		if caps.AgentInvocations > 0 && b.MaxAgentsPerBook > 0 {
+			shared := atLeastOne(caps.AgentInvocations / atLeastOne(caps.Agent))
+			b.MaxAgentsPerBook = min(b.MaxAgentsPerBook, shared)
+		}
 		segs := remainingSegments(b, rates)
 		if len(segs) == 0 {
 			continue

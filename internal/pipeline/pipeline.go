@@ -107,11 +107,12 @@ type Config struct {
 	AgentSelect  agent.SelectConfig
 	AgentModels  AgentModels
 	AgentTimeout time.Duration
-	// AgentConcurrency is the shared invocation cap inside the executor. The
-	// scheduler already limits agent STAGES; this second, invocation-level cap lets a
-	// fact-pass stage fan independent chunks out without exceeding the configured
-	// backend concurrency when another book is using the agent lane too.
+	// AgentConcurrency is the effective global invocation cap inside the executor.
+	// MaxAgentsPerBook independently bounds safe fan-out within one book. Keeping
+	// AgentConcurrency's field name here avoids breaking test/embedding callers; the
+	// user-facing config calls it the effective global invocation limit.
 	AgentConcurrency int
+	MaxAgentsPerBook int
 	// BookBudgetUSD caps the total agent spend for one book: an agent stage parks the
 	// book budget_exceeded (with everything already recorded) once its summed cost reaches
 	// this, before spending more. 0 disables the guard (config seeds a large default; set
@@ -156,20 +157,23 @@ type Executor struct {
 	agentRun   agent.Runner
 	agentAvail agent.Availability
 
-	ffmpegCfg     string
-	ffprobeCfg    string
-	dataDir       string
-	asrSelect     asr.SelectConfig
-	agentSelect   agent.SelectConfig
-	agentModels   AgentModels
-	agentTimeout  time.Duration
-	agentWorkers  int
-	agentSlots    chan struct{}
-	bookBudgetUSD float64
-	pricing       pricing.Table
-	secrets       secrets.Store
-	log           *slog.Logger
-	fallback      scheduler.Executor
+	ffmpegCfg             string
+	ffprobeCfg            string
+	dataDir               string
+	asrSelect             asr.SelectConfig
+	agentSelect           agent.SelectConfig
+	agentModels           AgentModels
+	agentTimeout          time.Duration
+	agentWorkers          int // per-book fan-out ceiling
+	agentSlots            chan struct{}
+	invocationMu          sync.Mutex
+	activeInvocations     map[int64]int
+	globalInvocationLimit int
+	bookBudgetUSD         float64
+	pricing               pricing.Table
+	secrets               secrets.Store
+	log                   *slog.Logger
+	fallback              scheduler.Executor
 
 	// Contribution-stage deps (M7); see Config.
 	meta           MetaCoverage
@@ -205,31 +209,36 @@ func NewExecutor(cfg Config) *Executor {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	agentWorkers := cfg.AgentConcurrency
+	globalWorkers := max(cfg.AgentConcurrency, 1)
+	agentWorkers := cfg.MaxAgentsPerBook
 	if agentWorkers < 1 {
-		agentWorkers = 1
+		// Compatibility for existing constructors/tests: the old single value was
+		// both the global semaphore and fact-pass worker count.
+		agentWorkers = globalWorkers
 	}
 	e := &Executor{
-		db:            cfg.DB,
-		ffmpeg:        cfg.FFmpeg,
-		ffprobe:       cfg.FFprobe,
-		asr:           cfg.ASR,
-		agentRun:      cfg.Agent,
-		agentAvail:    cfg.AgentAvail,
-		ffmpegCfg:     cfg.Tools.FFmpegPath,
-		ffprobeCfg:    cfg.Tools.FFprobePath,
-		dataDir:       cfg.DataDir,
-		asrSelect:     cfg.ASRSelect,
-		agentSelect:   cfg.AgentSelect,
-		agentModels:   cfg.AgentModels,
-		agentTimeout:  cfg.AgentTimeout,
-		agentWorkers:  agentWorkers,
-		agentSlots:    make(chan struct{}, agentWorkers),
-		bookBudgetUSD: cfg.BookBudgetUSD,
-		pricing:       cfg.Pricing,
-		secrets:       cfg.Secrets,
-		log:           log,
-		fallback:      cfg.Fallback,
+		db:                    cfg.DB,
+		ffmpeg:                cfg.FFmpeg,
+		ffprobe:               cfg.FFprobe,
+		asr:                   cfg.ASR,
+		agentRun:              cfg.Agent,
+		agentAvail:            cfg.AgentAvail,
+		ffmpegCfg:             cfg.Tools.FFmpegPath,
+		ffprobeCfg:            cfg.Tools.FFprobePath,
+		dataDir:               cfg.DataDir,
+		asrSelect:             cfg.ASRSelect,
+		agentSelect:           cfg.AgentSelect,
+		agentModels:           cfg.AgentModels,
+		agentTimeout:          cfg.AgentTimeout,
+		agentWorkers:          agentWorkers,
+		agentSlots:            make(chan struct{}, globalWorkers),
+		activeInvocations:     make(map[int64]int),
+		globalInvocationLimit: globalWorkers,
+		bookBudgetUSD:         cfg.BookBudgetUSD,
+		pricing:               cfg.Pricing,
+		secrets:               cfg.Secrets,
+		log:                   log,
+		fallback:              cfg.Fallback,
 
 		meta:           cfg.Meta,
 		tokenSource:    cfg.TokenSource,
@@ -242,6 +251,20 @@ func NewExecutor(cfg Config) *Executor {
 	e.redetectAgent = e.defaultRedetectAgent
 	return e
 }
+
+// AgentInvocationRuntime exposes live executor occupancy without coupling the
+// scheduler to pipeline implementation details.
+func (e *Executor) AgentInvocationRuntime() (total int, byBook map[int64]int, capacity int) {
+	e.invocationMu.Lock()
+	defer e.invocationMu.Unlock()
+	byBook = make(map[int64]int, len(e.activeInvocations))
+	for id, n := range e.activeInvocations {
+		byBook[id], total = n, total+n
+	}
+	return total, byBook, e.globalInvocationLimit
+}
+
+func (e *Executor) AgentMaxPerBook() int { return e.agentWorkers }
 
 // ASRCapability returns the executor's current ASR capability (which a stage may
 // have re-detected after a retry). Safe for concurrent use.

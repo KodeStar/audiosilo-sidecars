@@ -158,6 +158,9 @@ func TestMigrationAddsSupervisorDefaultsToLegacyDatabase(t *testing.T) {
 	if !runs[0].CostReported || runs[0].EstimatedAPICostUSD != nil || runs[0].EstimateComplete || runs[0].HeartbeatAt != created || runs[0].ProgressAt != created {
 		t.Fatalf("migrated cost/liveness defaults=%+v", runs[0])
 	}
+	if invocations, err := db.ListAgentInvocations(ctx, bookID); err != nil || len(invocations) != 0 {
+		t.Fatalf("0010 migration compatibility: invocations=%+v err=%v", invocations, err)
+	}
 	if err := db.EnsureBatch(ctx, "simulated", time.Now()); err != nil {
 		t.Fatal(err)
 	}

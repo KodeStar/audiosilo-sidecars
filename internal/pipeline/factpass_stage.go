@@ -149,12 +149,11 @@ sendJobs:
 	if err := ctx.Err(); err != nil {
 		return scheduler.StageResult{}, err
 	}
-	// Parallel extraction throughput is governed by the busiest worker lane, not
-	// the sum of all concurrent invocation durations. Assembly is serial and is
-	// added below.
-	productiveSeconds := 0.0
+	// Sum productive invocation time so the learned seconds-per-chunk rate is
+	// independent of how those invocations happened to be distributed over workers.
+	extractionInvocationSeconds := 0.0
 	for _, seconds := range workerSeconds {
-		productiveSeconds = max(productiveSeconds, seconds)
+		extractionInvocationSeconds += seconds
 	}
 
 	// The assembly is intentionally separate from extraction. It reads only the
@@ -165,7 +164,6 @@ sendJobs:
 		usageTotal.add(usage.Usage)
 		usageTotal.Invocations += usage.Invocations
 		usageTotal.Seconds += usage.Seconds
-		productiveSeconds += usage.Seconds
 		if aerr != nil {
 			return scheduler.StageResult{}, aerr
 		}
@@ -186,11 +184,12 @@ sendJobs:
 	m["parallel_workers"] = workers
 	m["assembled"] = assembledThisRun
 	// Units are the chunks (re)processed this run - a resume that skipped already-complete
-	// chunks records only the ones it actually ran. Seconds use the critical parallel
-	// worker lane plus serial assembly, with rate-limit backoff excluded.
+	// chunks records only the ones it actually ran.
 	result := scheduler.StageResult{
-		Metrics:    metrics(m),
-		RateSample: rateSample(chunksThisRun, productiveSeconds),
+		Metrics: metrics(m),
+		// Learn seconds per chunk invocation, independent of the configured fan-out.
+		// Serial assembly is deliberately excluded from this topology-neutral rate.
+		RateSample: rateSample(chunksThisRun, extractionInvocationSeconds),
 	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.FactPass), result); err != nil {
 		return scheduler.StageResult{}, err

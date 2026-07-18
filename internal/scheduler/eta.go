@@ -34,8 +34,12 @@ func (s *Scheduler) publishETAs(ctx context.Context, books []store.Book) {
 	rates := s.rateSnapshot()
 
 	inputs := make([]eta.Book, 0, len(books))
+	fanout := 1
+	if v, ok := s.exec.(interface{ AgentMaxPerBook() int }); ok {
+		fanout = max(1, v.AgentMaxPerBook())
+	}
 	for _, b := range books {
-		inputs = append(inputs, toETABook(b, progressByBook[b.ID]))
+		inputs = append(inputs, toETABook(b, progressByBook[b.ID], fanout))
 	}
 
 	// inputs are already in book-id order (dispatch's book list is ordered by id), so
@@ -53,6 +57,7 @@ func (s *Scheduler) publishETAs(ctx context.Context, books []store.Book) {
 	}
 	queue := round10(eta.QueueETA(inputs, rates, eta.LaneCaps{
 		ASR: asrCapacity, Mechanical: mechCapacity, Agent: s.agentCap,
+		AgentInvocations: agentInvocationCapacity(s.exec, s.agentCap),
 	}))
 
 	s.etaMu.Lock()
@@ -70,6 +75,16 @@ func (s *Scheduler) publishETAs(ctx context.Context, books []store.Book) {
 		"queue_seconds": queue,
 		"books":         payload,
 	})
+}
+
+func agentInvocationCapacity(exec Executor, fallback int) int {
+	if runtime, ok := exec.(agentInvocationRuntime); ok {
+		_, _, capacity := runtime.AgentInvocationRuntime()
+		if capacity > 0 {
+			return capacity
+		}
+	}
+	return max(1, fallback)
 }
 
 // anyActiveBook reports whether any book is still schedulable (status none and
@@ -145,7 +160,7 @@ func (s *Scheduler) rateSnapshot() map[string]float64 {
 }
 
 // toETABook adapts a store.Book + its progress rows into the pure eta.Book input.
-func toETABook(b store.Book, progress []store.Progress) eta.Book {
+func toETABook(b store.Book, progress []store.Progress, fanout int) eta.Book {
 	pm := make(map[string]eta.Progress, len(progress))
 	for _, p := range progress {
 		pm[p.Stage] = eta.Progress{Done: p.Done, Total: p.Total}
@@ -158,13 +173,14 @@ func toETABook(b store.Book, progress []store.Progress) eta.Book {
 		chapters = eta.ChaptersFromProgress(pm)
 	}
 	return eta.Book{
-		ID:        b.ID,
-		State:     state.State(b.State),
-		Status:    state.Status(b.Status),
-		Series:    b.Series,
-		SeriesPos: b.SeriesPos,
-		Chapters:  chapters,
-		Progress:  pm,
+		ID:               b.ID,
+		State:            state.State(b.State),
+		Status:           state.Status(b.Status),
+		Series:           b.Series,
+		SeriesPos:        b.SeriesPos,
+		Chapters:         chapters,
+		Progress:         pm,
+		MaxAgentsPerBook: max(1, fanout),
 	}
 }
 

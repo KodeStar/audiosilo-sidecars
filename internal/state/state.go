@@ -142,6 +142,10 @@ func IsStage(s State) bool { return table[s].Lane != LaneNone }
 // IsAgent reports whether s runs in the agent lane.
 func IsAgent(s State) bool { return table[s].Agent }
 
+// SupportsAgentFanout reports the stages with a proven isolated fragment/merge
+// contract. Other agent stages remain serial for whole-book consistency.
+func SupportsAgentFanout(s State) bool { return s == FactPass || s == QAAdjudicating }
+
 // IsTerminal reports whether s has no outgoing transitions (Done).
 func IsTerminal(s State) bool { return table[s].Terminal }
 

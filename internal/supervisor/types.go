@@ -86,6 +86,11 @@ type Snapshot struct {
 	AgentActive        int
 	AgentCapacity      int
 	EligibleAgentBooks int
+	AgentInvocations   int
+	InvocationCapacity int
+	BookInvocations    int
+	MaxAgentsPerBook   int
+	RemainingWorkUnits int
 }
 
 type Incident struct {

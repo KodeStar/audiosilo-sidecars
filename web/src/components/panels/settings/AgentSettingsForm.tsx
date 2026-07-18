@@ -35,8 +35,11 @@ export function AgentSettingsForm({ client, initial, info }: AgentSettingsFormPr
   function setBackend(backend: string) {
     setForm((f) => ({ ...f, backend }));
   }
-  function setConcurrency(concurrency: string) {
-    setForm((f) => ({ ...f, concurrency }));
+  function setQueueConcurrency(queueConcurrency: string) {
+    setForm((f) => ({ ...f, queueConcurrency }));
+  }
+  function setMaxAgentsPerBook(maxAgentsPerBook: string) {
+    setForm((f) => ({ ...f, maxAgentsPerBook }));
   }
   function setTimeout(timeoutMinutes: string) {
     setForm((f) => ({ ...f, timeoutMinutes }));
@@ -78,8 +81,9 @@ export function AgentSettingsForm({ client, initial, info }: AgentSettingsFormPr
   return (
     <div className="flex flex-col gap-5">
       <p className="max-w-prose text-sm text-dim">
-        Which backend runs the pipeline's agent stages, how many run in parallel, and the model each
-        stage uses. Changes are saved to config but only take effect after a daemon restart.
+        Concurrent books controls breadth across the queue. Max agents per book controls fan-out
+        within supported stages. ASR remains serial and series ordering still applies. Changes only
+        take effect after a daemon restart.
       </p>
 
       <AvailabilityLine info={info} />
@@ -100,13 +104,24 @@ export function AgentSettingsForm({ client, initial, info }: AgentSettingsFormPr
           </select>
         </Field>
 
-        <Field label="Concurrency" htmlFor="agent-concurrency">
+        <Field label="Concurrent books" htmlFor="agent-queue-concurrency">
           <input
-            id="agent-concurrency"
+            id="agent-queue-concurrency"
             type="number"
             min={1}
-            value={form.concurrency}
-            onChange={(e) => setConcurrency(e.target.value)}
+            value={form.queueConcurrency}
+            onChange={(e) => setQueueConcurrency(e.target.value)}
+            className="w-24 rounded-md border border-edge bg-raised px-3 py-2 text-body"
+          />
+        </Field>
+
+        <Field label="Max agents per book" htmlFor="agent-max-per-book">
+          <input
+            id="agent-max-per-book"
+            type="number"
+            min={1}
+            value={form.maxAgentsPerBook}
+            onChange={(e) => setMaxAgentsPerBook(e.target.value)}
             className="w-24 rounded-md border border-edge bg-raised px-3 py-2 text-body"
           />
         </Field>
@@ -134,6 +149,12 @@ export function AgentSettingsForm({ client, initial, info }: AgentSettingsFormPr
           />
         </Field>
       </div>
+
+      <p className="text-xs text-dim">
+        Maximum possible simultaneous invocations:{' '}
+        {Number(form.queueConcurrency) * Number(form.maxAgentsPerBook) || 0}. Fan-out is currently
+        supported for fact extraction and chapter-partitioned QA adjudication.
+      </p>
 
       <div className="flex flex-col gap-2">
         <span className="text-sm font-medium text-hi">Per-stage models</span>

@@ -68,6 +68,10 @@ explicit opt-ins. See [Bounded batch supervisor](docs/BATCH-SUPERVISOR.md) for i
 safety boundary, configuration, cost accounting, API/UI controls, and copied-data
 testing procedure.
 
+Agent capacity has separate controls for concurrent books and safe per-book
+invocation fan-out. See [Agent capacity and per-book fan-out](docs/AGENT-CAPACITY.md)
+for compatibility, supported stages, timing, liveness, cost, and safe testing.
+
 ### Frontend dev loop
 
 ```sh
