@@ -702,3 +702,102 @@ func assertRetranscribeMetrics(t *testing.T, raw json.RawMessage, want map[strin
 		}
 	}
 }
+
+// TestRetranscribeRecordsRepairOutcomes is the durable-outcomes regression: a retranscribing
+// round writes repair_outcomes.json with the LATEST mechanical outcome for EVERY processed
+// non-accept entry - crucially the ones the staged verdicts/log leave invisible to the next
+// adjudicator: a `kept` full retranscribe (no verdict, no repairs.log line) and an
+// `unlocatable` tail_clip (no ASR at all), alongside a normal `spliced` tail_clip. Accept
+// entries are not recorded (they are not work).
+func TestRetranscribeRecordsRepairOutcomes(t *testing.T) {
+	work := t.TempDir()
+	// ch2 retranscribe -> KEPT (3-word fresh is implausibly slow over 60s). ch3 tail_clip with
+	// no clip_start_sec over a loopless transcript -> UNLOCATABLE. ch4 tail_clip over a real
+	// tail loop -> SPLICED. ch5 accept -> not recorded.
+	distinct, dur3 := distinctChapterTranscript(3)
+	loop, dur4 := tailLoopTranscript(4)
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: 60 + dur3 + dur4, ChapterCount: 4, Chapters: []audio.Chapter{
+		{Chapter: 2, Start: 0, End: 60, Duration: 60},
+		{Chapter: 3, Start: 60, End: 60 + dur3, Duration: dur3},
+		{Chapter: 4, Start: 60 + dur3, End: 60 + dur3 + dur4, Duration: dur4},
+		{Chapter: 5, Start: 60 + dur3 + dur4, End: 61 + dur3 + dur4, Duration: 1},
+	}})
+	seedNormalized(t, work, transcript.Transcript{Schema: transcript.Schema, Chapter: 2, Segments: []transcript.Segment{{ID: 0, Start: 0, End: 60, Text: " ORIGINAL KEEP ME"}}})
+	seedNormalized(t, work, distinct)
+	seedNormalized(t, work, loop)
+	seedFLACs(t, work, 5)
+	seedPlan(t, work,
+		qa.PlanEntry{Chapter: 2, Action: qa.ActionRetranscribe, Reason: "collapse"},
+		qa.PlanEntry{Chapter: 3, Action: qa.ActionTailClip, Reason: "short tail repeat"},
+		qa.PlanEntry{Chapter: 4, Action: qa.ActionTailClip, Reason: "tail loop"},
+		qa.PlanEntry{Chapter: 5, Action: qa.ActionAccept, Reason: "false positive"},
+	)
+
+	fake := newFakeBackend()
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	exe.clipCutter = func(_ context.Context, _, dstFlac string, _, _ float64) error {
+		return os.WriteFile(dstFlac, []byte("clip"), 0o644) //nolint:gosec // test artifact
+	}
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{})
+	if err != nil {
+		t.Fatalf("retranscribing: %v", err)
+	}
+	assertRetranscribeMetrics(t, res.Metrics, map[string]int{"kept": 1, "clips_unlocatable": 1, "clips_spliced": 1, "accepted": 1})
+
+	got := loadRepairOutcomes(work)
+	want := map[int]repairOutcome{
+		2: {Chapter: 2, Action: "retranscribe", Outcome: "kept", Round: 1},
+		3: {Chapter: 3, Action: "tail_clip", Outcome: "unlocatable", Round: 1},
+		4: {Chapter: 4, Action: "tail_clip", Outcome: "spliced", Round: 1},
+	}
+	for ch, w := range want {
+		if got[ch] != w {
+			t.Errorf("repair_outcomes[%d] = %+v, want %+v", ch, got[ch], w)
+		}
+	}
+	if _, ok := got[5]; ok {
+		t.Errorf("accept entry chapter 5 was recorded (%+v), want it omitted (not work)", got[5])
+	}
+}
+
+// TestRetranscribeRepairOutcomesUpsertAcrossRounds: a chapter's outcome is UPSERTED by chapter
+// across rounds - a second retranscribing pass overwrites the prior round's outcome for the
+// same chapter rather than appending. Here ch2 is unlocatable (no clip_start_sec) in round 1,
+// then a directed tail_clip (clip_start_sec supplied) splices it in round 2, so the record
+// flips unlocatable -> spliced and gains the window start.
+func TestRetranscribeRepairOutcomesUpsertAcrossRounds(t *testing.T) {
+	work := t.TempDir()
+	distinct, dur := distinctChapterTranscript(2)
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: dur, ChapterCount: 1, Chapters: []audio.Chapter{{Chapter: 2, Start: 0, End: dur, Duration: dur}}})
+	seedNormalized(t, work, distinct)
+	seedFLACs(t, work, 2)
+
+	fake := newFakeBackend()
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	exe.clipCutter = func(_ context.Context, _, dstFlac string, _, _ float64) error {
+		return os.WriteFile(dstFlac, []byte("clip"), 0o644) //nolint:gosec // test artifact
+	}
+
+	// Round 1: no clip_start_sec, no locatable loop -> unlocatable.
+	seedPlan(t, work, qa.PlanEntry{Chapter: 2, Action: qa.ActionTailClip, Reason: "short tail repeat"})
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{}); err != nil {
+		t.Fatalf("round 1: %v", err)
+	}
+	if got := loadRepairOutcomes(work); got[2].Outcome != "unlocatable" {
+		t.Fatalf("round 1 repair_outcomes[2] = %+v, want outcome=unlocatable", got[2])
+	}
+
+	// Round 2: a directed tail_clip with clip_start_sec cuts run-less and splices.
+	const window = 5.0
+	seedPlan(t, work, qa.PlanEntry{Chapter: 2, Action: qa.ActionTailClip, Reason: "directed", ClipStartSec: window})
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{}); err != nil {
+		t.Fatalf("round 2: %v", err)
+	}
+	got := loadRepairOutcomes(work)
+	if len(got) != 1 {
+		t.Errorf("repair_outcomes has %d entries, want 1 (upsert by chapter, not append): %+v", len(got), got)
+	}
+	if got[2].Outcome != "spliced" || got[2].ClipStartSec != window {
+		t.Errorf("round 2 repair_outcomes[2] = %+v, want the round-1 unlocatable UPSERTED to a spliced record with clip_start_sec=%.1f", got[2], window)
+	}
+}

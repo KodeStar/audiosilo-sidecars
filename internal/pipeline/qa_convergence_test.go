@@ -124,6 +124,37 @@ func TestQAAdjudicateStagesAllowedNotFlaggedChapters(t *testing.T) {
 	}
 }
 
+// TestQAAdjudicateStagesRepairOutcomes: when a prior round left a repair_outcomes.json in the
+// work dir, the qa_adjudicating stage stages it into the agent's context dir so the adjudicator
+// can see each chapter's terminal mechanical outcome (a kept retranscribe, a known-failed skip,
+// an unlocatable tail_clip) that the staged verdicts/log do not carry.
+func TestQAAdjudicateStagesRepairOutcomes(t *testing.T) {
+	work := t.TempDir()
+	seedQAReport(t, work, []int{2})
+	seedText(t, work, 2)
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x/book.m4b", Style: audio.StyleMarkers, Duration: 30, ChapterCount: 3, Chapters: markerChapters(1, 2, 3)})
+	// A prior round recorded a kept retranscribe for chapter 2 - the invisible-to-the-agent case.
+	if err := writeRepairOutcomes(work, map[int]repairOutcome{2: {Chapter: 2, Action: "retranscribe", Outcome: "kept", Round: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeRunner()
+	fake.act = func(f *fakeRunner, req agent.Request, attempt int) (agent.Result, error) {
+		writeOut(t, req, qa.PlanFile, qa.Plan{Entries: []qa.PlanEntry{{Chapter: 2, Action: qa.ActionAccept, Reason: "kept fresh no-context decode reproduced the same text - authentic audio"}}})
+		return agent.Result{}, nil
+	}
+	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.QAAdjudicating, scheduler.StageReport{}); err != nil {
+		t.Fatalf("qa_adjudicating: %v", err)
+	}
+	req, ok := fake.lastRequest(string(state.QAAdjudicating))
+	if !ok {
+		t.Fatal("agent was not invoked")
+	}
+	if !fileExistsT(filepath.Join(req.Dir, repairOutcomesName)) {
+		t.Errorf("%s was not staged into the adjudication context dir", repairOutcomesName)
+	}
+}
+
 // TestQAAdjudicateLedgerSkipsAgentWhenAllCovered is the item-3 core: a chapter the agent
 // accepted in round 1 is recorded in the durable qa_accepted.json ledger, so round 2 (whose
 // re-sweep re-flags the same chapter off the stale layer) accepts it mechanically and does NOT

@@ -573,6 +573,76 @@ func writeAcceptedLedger(workDir string, ledger map[int]acceptedEntry) error {
 	return fsutil.WriteFileAtomic(filepath.Join(workDir, acceptedLedgerName), append(out, '\n'), 0o644)
 }
 
+// repairOutcomesName is the work-dir file recording the LATEST repair attempt outcome per
+// chapter across QA rounds. It exists because tail_verdicts.json + repairs.log leave several
+// terminal mechanical facts INVISIBLE to the next adjudicator: a full `retranscribe` that ran
+// and was KEPT (the fresh no-context output was not adoptable, so the original stands) writes
+// no repairs.log line and no verdict, and the fresh raw in retranscribe/ is not staged; a
+// `skipped_known_failed` window and an `unlocatable` tail_clip are likewise not obvious from
+// the staged artifacts. So the adjudicator was being asked to apply the prompt's exhaustion
+// rules (a kept retranscribe -> accept; an unlocatable tail_clip -> supply clip_start_sec)
+// against evidence it could not see. This file surfaces exactly that evidence.
+//
+// Like qa_accepted.json it records DURABLE mechanical facts and is deliberately NOT cleared on
+// the done==0 reset or a Retry: a re-run under the SAME decode params reproduces the same
+// outcomes, and the decode-params reconcile (ensureRetranscribeDecodeParams) already
+// invalidates stale fresh raws when the params change. It is ADVISORY context for the agent,
+// never a mechanical gate (nothing in the pipeline branches on it).
+const repairOutcomesName = "repair_outcomes.json"
+
+// repairOutcome records one chapter's LATEST repair attempt: the action the plan queued, the
+// mechanical result it produced, the QA round it ran in, and the clip window bounds when the
+// action carried them (a directed tail_clip or a mid_clip). Outcome is one of adopted | kept
+// (retranscribe), spliced | redegenerated | skipped_known_failed | unlocatable (clip).
+type repairOutcome struct {
+	Chapter      int     `json:"chapter"`
+	Action       string  `json:"action"`
+	Outcome      string  `json:"outcome"`
+	Round        int     `json:"round"`
+	ClipStartSec float64 `json:"clip_start_sec,omitempty"`
+	ClipEndSec   float64 `json:"clip_end_sec,omitempty"`
+}
+
+// loadRepairOutcomes reads repair_outcomes.json (chapter -> outcome), tolerating an absent,
+// unreadable, or malformed file as an empty map so a first round (or a corrupt artifact)
+// starts fresh rather than failing the stage.
+func loadRepairOutcomes(workDir string) map[int]repairOutcome {
+	raw, err := os.ReadFile(filepath.Join(workDir, repairOutcomesName)) //nolint:gosec // path derives from the book's own work dir
+	if err != nil {
+		return map[int]repairOutcome{}
+	}
+	var m map[int]repairOutcome
+	if err := json.Unmarshal(raw, &m); err != nil || m == nil {
+		return map[int]repairOutcome{}
+	}
+	return m
+}
+
+// writeRepairOutcomes persists the outcomes map (pretty JSON, trailing newline) atomically.
+func writeRepairOutcomes(workDir string, outcomes map[int]repairOutcome) error {
+	out, err := json.MarshalIndent(outcomes, "", " ")
+	if err != nil {
+		return err
+	}
+	return fsutil.WriteFileAtomic(filepath.Join(workDir, repairOutcomesName), append(out, '\n'), 0o644)
+}
+
+// clipOutcomeString maps a clip repair's ClipResult to its repair_outcomes.json outcome
+// string. It mirrors recordClipOutcome's bucketing (spliced / skipped_known_failed /
+// unlocatable / else redegenerated) so the durable record and the metrics counters agree.
+func clipOutcomeString(res repair.ClipResult) string {
+	switch {
+	case res.Spliced:
+		return "spliced"
+	case res.SkippedKnownFailed:
+		return "skipped_known_failed"
+	case res.Unlocatable():
+		return "unlocatable"
+	default:
+		return "redegenerated"
+	}
+}
+
 // retranscribeStalledMarker is the work-dir file the retranscribing stage writes (and
 // INCREMENTS) each time a repair round made no progress (it neither spliced nor adopted
 // any chapter) and removes when a round DID make progress. Its integer value is the count
@@ -820,8 +890,10 @@ func (e *Executor) runQAAdjudicateAgent(ctx context.Context, book store.Book, r 
 			return nil, agentUsage{}, fmt.Errorf("qa_adjudicating: stage %s: %w", name, err)
 		}
 	}
-	// Optional re-entry artifacts (present only on rounds > 1).
-	for _, name := range []string{qa.PlanFile, repair.TailVerdictsName, repair.RepairsLogName} {
+	// Optional re-entry artifacts (present only on rounds > 1). repair_outcomes.json is the
+	// one that surfaces the OTHERWISE-INVISIBLE terminal facts (a kept retranscribe, a
+	// known-failed skip, an unlocatable tail_clip) the adjudicator's exhaustion rules need.
+	for _, name := range []string{qa.PlanFile, repair.TailVerdictsName, repair.RepairsLogName, repairOutcomesName} {
 		if err := e.stageIfPresent(st, book.WorkDir, name, name); err != nil {
 			return nil, agentUsage{}, fmt.Errorf("qa_adjudicating: stage %s: %w", name, err)
 		}
@@ -1125,6 +1197,18 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 		return scheduler.StageResult{}, fmt.Errorf("retranscribing: load verdict ledger: %w", err)
 	}
 
+	// The durable per-chapter repair-outcome record (advisory context for the next
+	// adjudicator, see repairOutcomesName): load the accumulated map and this run's round.
+	// CountStageSuccesses is COMPLETED retranscribing runs (the current run is still open),
+	// so +1 is the round this pass runs in; it degrades to round 1 with no db or on error.
+	outcomes := loadRepairOutcomes(book.WorkDir)
+	round := 1
+	if e.db != nil {
+		if n, cerr := e.db.CountStageSuccesses(ctx, book.ID, string(state.Retranscribing)); cerr == nil {
+			round = n + 1
+		}
+	}
+
 	// total = the work entries (every non-accept entry). completed = the work entries a
 	// prior (interrupted) run already finished, so the FIRST report reflects prior work
 	// and an already-repaired entry never ticks the counter on resume - the scheduler's
@@ -1195,6 +1279,11 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 		// makes the predicate true), so a resumed entry re-runs idempotently but does not
 		// re-tick progress past the baseline.
 		wasDone := retranscribeEntryDone(book.WorkDir, entry, verdicts)
+		// oc records this entry's LATEST mechanical outcome for the durable repair_outcomes
+		// map (upsert by chapter, written after the loop). Every processed non-accept entry
+		// sets it - including a resumed (wasDone) entry, whose executor re-runs idempotently
+		// and re-derives the same outcome - so the map always reflects the current attempt.
+		oc := repairOutcome{Chapter: entry.Chapter, Action: string(entry.Action), Round: round}
 		switch entry.Action {
 		case qa.ActionRetranscribe:
 			ok, rerr := e.retranscribeChapter(ctx, setup, book, durations[entry.Chapter], entry.Chapter)
@@ -1204,8 +1293,10 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 			retranscribed++
 			if ok {
 				adopted++
+				oc.Outcome = "adopted"
 			} else {
 				kept++
+				oc.Outcome = "kept"
 			}
 		case qa.ActionTailClip:
 			res, rerr := e.tailClipChapter(ctx, setup, cut, book, durations[entry.Chapter], entry.Chapter, entry.ClipStartSec, verdicts)
@@ -1213,15 +1304,18 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 				return scheduler.StageResult{}, rerr
 			}
 			recordClipOutcome(res, wasDone)
+			oc.Outcome, oc.ClipStartSec = clipOutcomeString(res), entry.ClipStartSec
 		case qa.ActionMidClip:
 			res, rerr := e.midClipChapter(ctx, setup, cut, book, durations[entry.Chapter], entry.Chapter, entry.ClipStartSec, entry.ClipEndSec, verdicts)
 			if rerr != nil {
 				return scheduler.StageResult{}, rerr
 			}
 			recordClipOutcome(res, wasDone)
+			oc.Outcome, oc.ClipStartSec, oc.ClipEndSec = clipOutcomeString(res), entry.ClipStartSec, entry.ClipEndSec
 		default:
 			return scheduler.StageResult{}, fmt.Errorf("retranscribing: chapter %d has unknown action %q", entry.Chapter, entry.Action)
 		}
+		outcomes[entry.Chapter] = oc
 		if !wasDone {
 			done++
 			if r.Progress != nil {
@@ -1232,6 +1326,16 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 
 	loopSeconds := time.Since(loopStart).Seconds()
 	e.accountScratch(ctx, book)
+
+	// Persist the durable per-chapter repair-outcome record so the next adjudicator can see
+	// the terminal facts (a kept retranscribe, a known-failed skip, an unlocatable tail_clip)
+	// the staged verdicts/log do not carry. total > 0 whenever the plan queued work (an
+	// all-accept plan never routes here), so this always reflects this round's attempts.
+	if total > 0 {
+		if err := writeRepairOutcomes(book.WorkDir, outcomes); err != nil {
+			return scheduler.StageResult{}, fmt.Errorf("retranscribing: write repair outcomes: %w", err)
+		}
+	}
 
 	// Visibility: name the chapters whose tail_clip could not be located and carried no
 	// clip_start_sec, so the book log shows why the round did no work on them - the mechanical

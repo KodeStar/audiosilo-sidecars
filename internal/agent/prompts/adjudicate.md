@@ -22,6 +22,19 @@ You work in the current directory. It contains:
 {{if gt .Round 1}}- `qa_plan.json`, `tail_verdicts.json`, `repairs.log` - artifacts from earlier
   rounds. Chapters already repaired last round appear again only if a residual
   survived; do not re-queue a chapter whose repair already landed cleanly.
+- `repair_outcomes.json` - what each prior repair attempt ACTUALLY did, per chapter
+  (the latest attempt's `action` and `outcome`). It surfaces outcomes the other
+  artifacts hide: a `kept` retranscribe (the fresh no-context re-transcription was
+  NOT adoptable, so the original text stands - it leaves no repairs.log line or
+  verdict), a `skipped_known_failed` clip window (the same window already
+  re-degenerated under these decode params, so it was not re-cut), and an
+  `unlocatable` tail_clip (the mechanical locator found no loop and you gave no
+  `clip_start_sec`, so nothing ran). Read it before re-queuing: a `kept` retranscribe
+  or a `skipped_known_failed` window means the mechanical options are EXHAUSTED for
+  that chapter - `accept` it with your reasoning (repetition that survives an
+  independent no-context decode is authentic audio). An `unlocatable` tail_clip is
+  NOT exhausted - re-queue it WITH an explicit `clip_start_sec` (or a bounded
+  `mid_clip`) so the repair stage cuts where the garbage really begins.
 {{end}}- `out/` - the ONLY place you write output.
 
 Do not use any tool other than reading and writing files in this directory. No
@@ -51,7 +64,8 @@ web access.
   or the same text reproduced by two independent decode paths - an explicit `accept` with
   your reasoning is the correct terminal disposition: repetition that survives two
   independent decodes is authentic audio, not corruption. The mechanical options are spent;
-  do not keep re-queuing it.
+  do not keep re-queuing it. On a re-entry round `repair_outcomes.json` names these
+  exhausted chapters explicitly (`outcome` `kept` or `skipped_known_failed`).
 {{if gt .Round 1}}- On this re-entry round, ACCEPT residuals that a prior round already repaired
   rather than re-queuing them - repeated retranscription of a chapter that keeps
   collapsing at the same point does not improve it. Converge; do not loop.
