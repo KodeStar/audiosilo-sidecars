@@ -75,9 +75,9 @@ func (c *claudeRunner) buildArgs(req Request) []string {
 		// leaving unrelated coding tools in the model's tool catalogue.
 		"--tools", tools,
 		"--allowedTools", tools,
-		// These invocations are disposable ETL jobs, not coding sessions. Avoid
-		// loading project/user customizations and do not persist a resumable session.
-		"--bare",
+		// These invocations are disposable ETL jobs, not coding sessions. Do not
+		// persist a resumable session. Deliberately avoid --bare: it disables keychain
+		// reads, including the Claude subscription login this runner relies on.
 		"--no-session-persistence",
 		"--system-prompt", "You are a deterministic document-processing worker. Follow the stdin task exactly, use only the provided tools and paths, write the requested artifacts, and stop.",
 	}

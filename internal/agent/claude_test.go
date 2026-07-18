@@ -60,10 +60,13 @@ func TestClaudeWebFlagTogglesTools(t *testing.T) {
 	if strings.Contains(argv, "WebSearch") {
 		t.Errorf("no-web run should not enable WebSearch: %q", argv)
 	}
-	for _, flag := range []string{"--tools", "--allowedTools", "--bare", "--no-session-persistence", "--system-prompt"} {
+	for _, flag := range []string{"--tools", "--allowedTools", "--no-session-persistence", "--system-prompt"} {
 		if !strings.Contains(argv, flag) {
 			t.Errorf("optimized invocation missing %s: %q", flag, argv)
 		}
+	}
+	if strings.Contains(argv, "--bare") {
+		t.Errorf("--bare disables keychain reads and breaks subscription authentication: %q", argv)
 	}
 
 	if _, err := r.Run(context.Background(), Request{Dir: t.TempDir(), Prompt: "p", Web: true}); err != nil {
