@@ -77,8 +77,21 @@ func TestRunWithRetryValidationThenSuccess(t *testing.T) {
 	if r.calls != 2 {
 		t.Fatalf("calls=%d, want 2", r.calls)
 	}
-	if got := r.prompts[1]; !strings.Contains(got, "failed validation") || !strings.Contains(got, "missing field foo") {
+	got := r.prompts[1]
+	if !strings.Contains(got, "failed validation") || !strings.Contains(got, "missing field foo") {
 		t.Errorf("retry prompt did not append validator error: %q", got)
+	}
+	// The retry must re-issue the full base prompt (the fresh CLI process needs the
+	// task context) ...
+	if !strings.Contains(got, "base") {
+		t.Errorf("retry prompt dropped the base prompt: %q", got)
+	}
+	// ... and instruct a PATCH of the prior output under out/ rather than a rebuild.
+	if !strings.Contains(got, OutDirName+"/") {
+		t.Errorf("retry prompt did not reference the out/ dir: %q", got)
+	}
+	if !strings.Contains(got, "Do not rebuild the outputs from scratch") {
+		t.Errorf("retry prompt did not instruct patch-not-rebuild: %q", got)
 	}
 }
 

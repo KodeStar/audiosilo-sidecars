@@ -38,6 +38,27 @@ func seedSpellingInputs(t *testing.T, work string, n int) {
 	}
 }
 
+// seedCommonWordText seeds n chapters whose text is only common English words (so the
+// candidate extractor finds ZERO proper-noun candidates), each line repeated reps
+// times to control the total word count relative to the zero-candidates floor.
+func seedCommonWordText(t *testing.T, work string, n, reps int) {
+	t.Helper()
+	body := strings.Repeat("the and of to a over water light dark king queen forest river ", reps)
+	m := audio.Manifest{Source: "/x/b.m4b", Title: "Book", Style: audio.StyleMarkers, Duration: float64(n), ChapterCount: n}
+	for i := 1; i <= n; i++ {
+		m.Chapters = append(m.Chapters, audio.Chapter{
+			Chapter: i, MarkerTitle: fmt.Sprintf("Chapter %d", i),
+			Start: float64(i - 1), End: float64(i), Duration: 1,
+		})
+		if err := transcript.WriteText(filepath.Join(work, transcript.TextDir), i, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := audio.WriteManifest(work, m); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // validSpellingAct writes valid, gate-passing corrections + spellings (no rules, no
 // ledger), reading the chunk plan from the staged dir for the exact chunk_ends.
 func validSpellingAct(t *testing.T, title string, refs []string) func(*fakeRunner, agent.Request, int) (agent.Result, error) {
@@ -79,8 +100,28 @@ func TestSpellingResearchHappyPath(t *testing.T) {
 		t.Error("spelling_research sentinel missing")
 	}
 	// It is the web stage: the request carried the web flag.
-	if r, ok := fake.lastRequest(string(state.SpellingResearch)); !ok || !r.Web {
+	r, ok := fake.lastRequest(string(state.SpellingResearch))
+	if !ok || !r.Web {
 		t.Errorf("spelling request web = %v, want true", r.Web)
+	}
+	// The compact candidates file IS staged; the full transcript is NOT.
+	if _, err := os.Stat(filepath.Join(r.Dir, spelling.CandidatesFile)); err != nil {
+		t.Errorf("%s not staged into the agent dir: %v", spelling.CandidatesFile, err)
+	}
+	if fi, err := os.Stat(filepath.Join(r.Dir, transcript.TextDir)); err == nil && fi.IsDir() {
+		t.Errorf("transcripts-text/ must NOT be staged into the agent dir")
+	}
+	if fi, err := os.Stat(filepath.Join(r.Dir, transcript.RepairedDir)); err == nil && fi.IsDir() {
+		t.Errorf("transcripts-repaired/ must NOT be staged into the agent dir")
+	}
+	// The staged candidates file has plausible content (the seeded chapters mention
+	// "quick brown fox"; capitalized tokens surface as candidates).
+	cb, err := os.ReadFile(filepath.Join(r.Dir, spelling.CandidatesFile))
+	if err != nil {
+		t.Fatalf("read staged candidates: %v", err)
+	}
+	if !strings.Contains(string(cb), "\"candidates\"") {
+		t.Errorf("staged candidates file has no candidates envelope: %s", cb)
 	}
 	assertUsageMetrics(t, res.Metrics, "sonnet", 200, 80)
 }
@@ -140,6 +181,11 @@ func TestSpellingResearchStagesCarryoverRefs(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(r.Dir, spellingRefsDir, "prior-spellings.json")); err != nil {
 		t.Errorf("spelling-refs not staged into the agent dir: %v", err)
 	}
+	// The predecessor's corrected chapter TEXT must NOT be staged (only the small
+	// prior-* files ride into the agent context, never another book of transcript).
+	if _, err := os.Stat(filepath.Join(r.Dir, spellingRefsDir, transcript.TextName(1))); err == nil {
+		t.Errorf("predecessor corrected text %s must NOT be staged into the agent dir", transcript.TextName(1))
+	}
 }
 
 func TestSpellingResearchForbiddenReferenceFileParks(t *testing.T) {
@@ -191,6 +237,146 @@ func TestSpellingResearchDryRunCheckFailureRetries(t *testing.T) {
 	if !strings.Contains(fake.lastPrompt(string(state.SpellingResearch)), "spelling gates") {
 		t.Errorf("retry prompt did not carry the dry-run check failure; got %q", fake.lastPrompt(string(state.SpellingResearch)))
 	}
+}
+
+func TestSpellingResearchDeadRuleParks(t *testing.T) {
+	work := t.TempDir()
+	seedSpellingInputs(t, work, 2)
+
+	fake := newFakeRunner()
+	fake.act = func(_ *fakeRunner, req agent.Request, _ int) (agent.Result, error) {
+		plan, err := loadChunkPlan(req.Dir)
+		if err != nil {
+			t.Fatalf("read staged chunk plan: %v", err)
+		}
+		// A DEAD rule that PASSES every Check gate: its RHS "fox" is attested (the seeded
+		// transcript says "fox"), so gates 1-4 are all satisfied, yet its LHS "Zzqfoo"
+		// matches nothing in the transcript. Only the dead-rule scan catches it.
+		writeOut(t, req, spelling.CorrectionsFile, spelling.Corrections{
+			Rules:          []spelling.Rule{{Pattern: `(?<![A-Za-z])Zzqfoo(?![A-Za-z])`, Replacement: "fox", Note: "dead but gate-passing"}},
+			ReferenceFiles: []string{"marker_titles.txt"},
+		})
+		writeOut(t, req, spelling.SpellingsFile, spelling.Spellings{Title: "Book", ChunkEnds: plan.ChunkEnds, Ledger: []spelling.LedgerEntry{}})
+		return agent.Result{}, nil
+	}
+	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.SpellingResearch, scheduler.StageReport{})
+	var pe *scheduler.ParkError
+	if !errors.As(err, &pe) {
+		t.Fatalf("error = %v, want a ParkError after validation exhaustion", err)
+	}
+	prompt := fake.lastPrompt(string(state.SpellingResearch))
+	if !strings.Contains(prompt, "dead rule") {
+		t.Errorf("retry prompt did not carry the dead-rule failure; got %q", prompt)
+	}
+	// The offending pattern must be named verbatim so the agent can act on it.
+	if !strings.Contains(prompt, "Zzqfoo") {
+		t.Errorf("retry prompt did not name the dead pattern verbatim; got %q", prompt)
+	}
+}
+
+func TestSpellingResearchLedgerCanonicalAbsentRetries(t *testing.T) {
+	work := t.TempDir()
+	seedSpellingInputs(t, work, 2)
+
+	fake := newFakeRunner()
+	fake.act = func(_ *fakeRunner, req agent.Request, _ int) (agent.Result, error) {
+		plan, err := loadChunkPlan(req.Dir)
+		if err != nil {
+			t.Fatalf("read staged chunk plan: %v", err)
+		}
+		// No correction rule, but a non-carryover ledger canonical the corrected text
+		// does not contain (the agent ledgered an external spelling while the text still
+		// reads the ASR form). The sheet gate-1 dry-run must reject it.
+		writeOut(t, req, spelling.CorrectionsFile, spelling.Corrections{Rules: []spelling.Rule{}, ReferenceFiles: []string{"marker_titles.txt"}})
+		writeOut(t, req, spelling.SpellingsFile, spelling.Spellings{
+			Title: "Book", ChunkEnds: plan.ChunkEnds,
+			Ledger: []spelling.LedgerEntry{{Canonical: "Aldemah", Type: "person", Status: "probable"}},
+		})
+		return agent.Result{}, nil
+	}
+	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.SpellingResearch, scheduler.StageReport{})
+	var pe *scheduler.ParkError
+	if !errors.As(err, &pe) {
+		t.Fatalf("error = %v, want a ParkError after validation exhaustion", err)
+	}
+	prompt := fake.lastPrompt(string(state.SpellingResearch))
+	if !strings.Contains(prompt, "gate 1") {
+		t.Errorf("retry prompt did not carry the sheet gate-1 failure; got %q", prompt)
+	}
+	// The offending canonical must be named so the agent can act on it.
+	if !strings.Contains(prompt, "Aldemah") {
+		t.Errorf("retry prompt did not name the missing canonical verbatim; got %q", prompt)
+	}
+}
+
+func TestSpellingResearchLedgerCanonicalPresentPasses(t *testing.T) {
+	work := t.TempDir()
+	seedSpellingInputs(t, work, 2)
+
+	fake := newFakeRunner()
+	fake.act = func(_ *fakeRunner, req agent.Request, _ int) (agent.Result, error) {
+		plan, err := loadChunkPlan(req.Dir)
+		if err != nil {
+			t.Fatalf("read staged chunk plan: %v", err)
+		}
+		// A non-carryover canonical that DOES occur in the corrected text ("fox" is in
+		// the seeded transcript) passes the sheet gate-1 dry-run on the first attempt.
+		writeOut(t, req, spelling.CorrectionsFile, spelling.Corrections{Rules: []spelling.Rule{}, ReferenceFiles: []string{"marker_titles.txt"}})
+		writeOut(t, req, spelling.SpellingsFile, spelling.Spellings{
+			Title: "Book", ChunkEnds: plan.ChunkEnds,
+			Ledger: []spelling.LedgerEntry{{Canonical: "fox", Type: "creature", Status: "probable"}},
+		})
+		return agent.Result{Usage: agent.Usage{Model: "sonnet", Input: 100, Output: 40}}, nil
+	}
+	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.SpellingResearch, scheduler.StageReport{}); err != nil {
+		t.Fatalf("a present ledger canonical must pass validation, got %v", err)
+	}
+	if n := fake.count(string(state.SpellingResearch)); n != 1 {
+		t.Errorf("agent invoked %d times, want 1 (valid on the first attempt)", n)
+	}
+}
+
+func TestSpellingResearchZeroCandidatesFloor(t *testing.T) {
+	// A large transcript that yields ZERO candidates is a broken extractor: fail loudly.
+	t.Run("large corpus fails", func(t *testing.T) {
+		work := t.TempDir()
+		seedCommonWordText(t, work, 1, 600) // ~7800 common-word tokens, no candidates
+
+		fake := newFakeRunner()
+		fake.act = validSpellingAct(t, "Book", []string{"marker_titles.txt"})
+		exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
+		_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.SpellingResearch, scheduler.StageReport{})
+		if err == nil {
+			t.Fatal("expected a hard failure for zero candidates over a large corpus")
+		}
+		var pe *scheduler.ParkError
+		if errors.As(err, &pe) {
+			t.Errorf("want a plain failure (StatusFailed), got a ParkError: %v", err)
+		}
+		if !strings.Contains(err.Error(), "zero candidates") {
+			t.Errorf("error = %v, want it to mention zero candidates", err)
+		}
+		// The agent must never have run - the floor fails before staging.
+		if n := fake.count(string(state.SpellingResearch)); n != 0 {
+			t.Errorf("agent invoked %d times, want 0 (floor fails before the agent runs)", n)
+		}
+	})
+
+	// A genuinely tiny transcript (below the floor) with zero candidates proceeds.
+	t.Run("tiny corpus proceeds", func(t *testing.T) {
+		work := t.TempDir()
+		seedCommonWordText(t, work, 1, 10) // ~130 common-word tokens, no candidates
+
+		fake := newFakeRunner()
+		fake.act = validSpellingAct(t, "Book", []string{"marker_titles.txt"})
+		exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
+		if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.SpellingResearch, scheduler.StageReport{}); err != nil {
+			t.Fatalf("a tiny corpus must proceed past the floor, got %v", err)
+		}
+	})
 }
 
 func TestSpellingResearchChunkEndsMismatchRetries(t *testing.T) {

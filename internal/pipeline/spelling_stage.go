@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -32,8 +33,23 @@ const markerTitlesFile = "marker_titles.txt"
 // source, besides marker_titles.txt, a correction rule may cite.
 const spellingRefsDir = "spelling-refs"
 
+// spellingCorpusFloor is the transcript word count above which zero extracted
+// candidates is treated as a broken extractor (a hard failure) rather than a
+// genuinely tiny book. Below it, an empty shortlist is allowed to proceed.
+const spellingCorpusFloor = 5000
+
 // spellingLedgerStatuses is the closed set of ledger statuses the validator accepts.
 var spellingLedgerStatuses = map[string]bool{"verified": true, "probable": true, "unresolved": true}
+
+// priorRefNames maps each series-predecessor carryover file (src, named in the prior
+// book's work dir) to its prior-* staged name (dst). populateSpellingRefs writes them
+// by src into spelling-refs/; the spelling_research staging loop reads them back by
+// dst. A missing file is skipped silently by design (best-effort carryover).
+var priorRefNames = []struct{ src, dst string }{
+	{markerTitlesFile, "prior-marker_titles.txt"},
+	{spelling.SpellingsFile, "prior-spellings.json"},
+	{spelling.CorrectionsFile, "prior-corrections.json"},
+}
 
 // spellingPromptData feeds spelling.md. Field names MUST match the template (rendered
 // with missingkey=error).
@@ -90,22 +106,47 @@ func (e *Executor) spellingResearch(ctx context.Context, book store.Book, r sche
 	if !isDir(textDir) {
 		return scheduler.StageResult{}, fmt.Errorf("spelling_research: transcripts-text/ missing (sanitizing must run first)")
 	}
-	if err := st.CopyDir(textDir, transcript.TextDir, nil); err != nil {
-		return scheduler.StageResult{}, fmt.Errorf("spelling_research: stage transcripts-text: %w", err)
+	// Stage a COMPACT proper-noun-candidate report instead of the whole transcript.
+	// spelling.ExtractCandidates distills the corrected/repaired layer (~600KB) into a
+	// deterministic ~150KB candidate list, so the agent reads that rather than the
+	// full text.
+	cand, err := spelling.ExtractCandidates(book.WorkDir)
+	if err != nil {
+		return scheduler.StageResult{}, fmt.Errorf("spelling_research: extract candidates: %w", err)
 	}
-	if repDir := filepath.Join(book.WorkDir, transcript.RepairedDir); isDir(repDir) {
-		if err := st.CopyDir(repDir, transcript.RepairedDir, nil); err != nil {
-			return scheduler.StageResult{}, fmt.Errorf("spelling_research: stage transcripts-repaired: %w", err)
-		}
+	// A non-trivial transcript that yields ZERO candidates means the extractor broke;
+	// staging an empty shortlist would silently let the book finish with no corrections
+	// and no signal. Fail loudly (a genuinely tiny book, below the floor, may proceed).
+	if len(cand.Candidates) == 0 && cand.TotalWords > spellingCorpusFloor {
+		return scheduler.StageResult{}, fmt.Errorf("spelling_research: candidate extraction produced zero candidates from a %d-word transcript - the extractor is likely broken; refusing to stage an empty shortlist", cand.TotalWords)
+	}
+	if cand.Truncated > 0 && r.Note != nil {
+		r.Note(fmt.Sprintf("candidate report: %s staged, %s dropped to keep it compact (the highest-signal entries are kept)",
+			countNoun(len(cand.Candidates), "candidate"), countNoun(cand.Truncated, "lower-signal candidate")))
+	}
+	candJSON, err := spelling.MarshalCandidates(cand)
+	if err != nil {
+		return scheduler.StageResult{}, fmt.Errorf("spelling_research: marshal candidates: %w", err)
+	}
+	if err := st.WriteFile(spelling.CandidatesFile, candJSON); err != nil {
+		return scheduler.StageResult{}, fmt.Errorf("spelling_research: stage %s: %w", spelling.CandidatesFile, err)
 	}
 	for _, name := range []string{audio.ManifestName, markerTitlesFile, chunkPlanFile} {
 		if err := st.CopyFile(filepath.Join(book.WorkDir, name), name); err != nil {
 			return scheduler.StageResult{}, fmt.Errorf("spelling_research: stage %s: %w", name, err)
 		}
 	}
-	if refsDir := filepath.Join(book.WorkDir, spellingRefsDir); isDir(refsDir) {
-		if err := st.CopyDir(refsDir, spellingRefsDir, nil); err != nil {
-			return scheduler.StageResult{}, fmt.Errorf("spelling_research: stage spelling-refs: %w", err)
+	// Stage ONLY the small prior-* carryover files, never the predecessor's corrected
+	// chapter texts (that would be another whole book of transcript in the context).
+	// The full spelling-refs/ still lives in the work dir for the dry-run corpus and
+	// the correcting stage; here we hand the agent just the ledger/rules/marker files.
+	for _, ref := range priorRefNames {
+		src := filepath.Join(book.WorkDir, spellingRefsDir, ref.dst)
+		if !fsutil.IsFile(src) {
+			continue // a missing staged file is skipped silently (best-effort carryover)
+		}
+		if err := st.CopyFile(src, filepath.Join(spellingRefsDir, ref.dst)); err != nil {
+			return scheduler.StageResult{}, fmt.Errorf("spelling_research: stage %s: %w", ref.dst, err)
 		}
 	}
 
@@ -191,9 +232,12 @@ func ensureMarkerTitles(workDir string) error {
 }
 
 // populateSpellingRefs fills workDir/spelling-refs/ from the predecessor book: its
-// corrected chapter texts (the carryover attestation corpus) plus its marker titles,
-// ledger, and rules under prior-* names. A missing single-file source is skipped
-// (best effort); the corrected texts are the load-bearing attestation set.
+// corrected chapter texts plus its marker titles, ledger, and rules under prior-*
+// names. A missing single-file source is skipped (best effort). The corrected texts
+// feed the GATE-side attestation union only - the dry-run corpus and the correcting
+// stage read them from the work dir so a rule may cite spelling-refs to attest a
+// series name known from the predecessor's prose; the agent itself is never staged
+// them (it gets only the small prior-* ledger/rules/marker files).
 func populateSpellingRefs(workDir, predDir string) error {
 	dst := filepath.Join(workDir, spellingRefsDir)
 	// Already populated on a prior run: the predecessor's refs are immutable, so a
@@ -219,16 +263,12 @@ func populateSpellingRefs(workDir, predDir string) error {
 			}
 		}
 	}
-	for _, m := range []struct{ src, dst string }{
-		{markerTitlesFile, "prior-marker_titles.txt"},
-		{spelling.SpellingsFile, "prior-spellings.json"},
-		{spelling.CorrectionsFile, "prior-corrections.json"},
-	} {
-		src := filepath.Join(predDir, m.src)
+	for _, ref := range priorRefNames {
+		src := filepath.Join(predDir, ref.src)
 		if !fsutil.IsFile(src) {
 			continue
 		}
-		if err := fsutil.CopyFile(src, filepath.Join(dst, m.dst), 0o644); err != nil {
+		if err := fsutil.CopyFile(src, filepath.Join(dst, ref.dst), 0o644); err != nil {
 			return err
 		}
 	}
@@ -270,7 +310,57 @@ func validateSpellingOutputs(outDir, dryRunDir, title string, plan chunkPlan) (r
 	if err := dryRunCorrections(dryRunDir, corr); err != nil {
 		return 0, 0, err
 	}
+	// The dry-run gates pass a rule that matches nothing (gate 1 wants zero LHS matches;
+	// gates 2/3 pass when the RHS is attested elsewhere), so a mechanical dead-rule scan
+	// against the original transcript layer catches the silent under-correction the
+	// gates miss. Run it AFTER the gates so a genuine gate failure still surfaces first.
+	if err := checkDeadRules(dryRunDir, corr); err != nil {
+		return 0, 0, err
+	}
+	// Dry-run the spoiler-gated sheet generation against the corrected layer the dry-run
+	// Apply just built. GenerateSheets' gate 1 requires every non-carryover ledger
+	// canonical to OCCUR in the corrected layer - a ledger whose canonical is an external
+	// spelling the uncorrected text does not contain (the agent left the name alone but
+	// ledgered the verified form) fails it. Without this dry run that bad ledger passes
+	// validation and kills the mechanical correcting stage instead.
+	if err := dryRunSheets(dryRunDir, sp); err != nil {
+		return 0, 0, err
+	}
 	return len(corr.Rules), len(sp.Ledger), nil
+}
+
+// dryRunSheets removes a prior attempt's facts/ output and re-runs spelling.GenerateSheets
+// inside the pre-built corpus (whose transcripts-corrected/ the dry-run Apply just wrote),
+// surfacing any sheet-gate failure verbatim so it rides into the agent's retry prompt.
+// facts/ under the throwaway corpus is disposable, so removing it keeps attempts
+// independent exactly like dryRunCorrections does for transcripts-corrected/.
+func dryRunSheets(dryRunDir string, sp *spelling.Spellings) error {
+	if err := os.RemoveAll(filepath.Join(dryRunDir, spelling.FactsDir)); err != nil {
+		return err
+	}
+	if _, err := spelling.GenerateSheets(dryRunDir, sp); err != nil {
+		return fmt.Errorf("dry-run spelling-sheet generation failed: %v", err)
+	}
+	return nil
+}
+
+// checkDeadRules rejects any correction rule whose pattern matches nothing in the
+// original transcript layer - a silent no-op the four Check gates do not catch. The
+// message names EACH dead pattern verbatim so it rides into the agent's retry prompt.
+func checkDeadRules(dryRunDir string, corr *spelling.Corrections) error {
+	dead, err := spelling.DeadRules(dryRunDir, corr)
+	if err != nil {
+		return fmt.Errorf("dead-rule check failed: %v", err)
+	}
+	if len(dead) == 0 {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString("one or more correction rules are dead (their pattern matches nothing in the transcript):")
+	for _, r := range dead {
+		fmt.Fprintf(&b, "\nrule pattern %q matches nothing in the transcript - a dead rule; delete it or fix its pattern to a form that actually occurs", r.Pattern)
+	}
+	return errors.New(b.String())
 }
 
 // validateReferenceFiles enforces the gate-3 integrity boundary: a rule may only be

@@ -8,8 +8,9 @@ import (
 
 // maxOutputRetries is the number of RETRIES (not total attempts) allowed for an
 // output that fails the caller's validator: 2 retries = 3 attempts total. Each
-// retry appends the validator's error text to the prompt so the agent can self-
-// correct.
+// retry re-issues the base prompt plus a delimited retry section carrying the
+// validator's error text, and asks the agent to PATCH its prior output rather than
+// regenerate it.
 const maxOutputRetries = 2
 
 // DefaultBackoff is the rate-limit backoff schedule: after a rate-limit failure the
@@ -36,9 +37,17 @@ func RunWithRetry(ctx context.Context, r Runner, req Request, validate func(Resu
 // Policy:
 //   - onUsage is called after EVERY invocation (success or failure) so spend is
 //     captured even on a crash between attempts.
-//   - A validator failure appends the error text to the prompt and retries, up to
-//     maxOutputRetries; when exhausted the last Result and the validator error are
-//     returned.
+//   - A validator failure retries, up to maxOutputRetries; when exhausted the last
+//     Result and the validator error are returned. The retry prompt is the full base
+//     prompt (a fresh CLI process needs the task context) plus a delimited retry
+//     section that carries the validator error verbatim and asks the agent to PATCH
+//     its previous output: read the files still present under out/, make the smallest
+//     change that fixes the reported problems (fixing OR deleting the offending
+//     entries), and leave the corrected outputs there - NOT rebuild them from scratch.
+//     Precondition: the caller must keep req.Dir stable (and its out/ writable) across
+//     the call. The loop never re-stages, so each fresh CLI process runs in that same
+//     cwd and can read the prior attempt's output. Patching instead of regenerating a
+//     whole stage output saves large amounts of output tokens.
 //   - A *RateLimitError sleeps for the next backoff delay (context-cancellable) and
 //     retries, NOT counting against the output-retry budget; after len(backoff)
 //     rate-limit rounds the RateLimitError is returned.
@@ -81,8 +90,13 @@ func RunWithBackoff(ctx context.Context, r Runner, req Request, validate func(Re
 				return res, slept, verr
 			}
 			outputRetries++
-			prompt = basePrompt + "\n\nYour previous attempt failed validation:\n" + verr.Error() +
-				"\nFix the problems and produce the outputs again."
+			prompt = basePrompt + "\n\n---\nRETRY: your previous attempt failed validation:\n" +
+				verr.Error() +
+				"\n\nYour previous attempt's output files are still present under " + OutDirName +
+				"/. Read them, then make the SMALLEST change that fixes the problems reported above" +
+				" (fixing OR deleting the offending entries is acceptable). Keep everything else" +
+				" unchanged and leave the corrected outputs under " + OutDirName +
+				"/. Do not rebuild the outputs from scratch."
 			continue
 		}
 

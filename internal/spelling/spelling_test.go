@@ -20,7 +20,7 @@ func writeLayer(t *testing.T, work, sub string, chapters map[int]string) {
 		t.Fatal(err)
 	}
 	for n, c := range chapters {
-		p := filepath.Join(dir, fmt.Sprintf("ch%03d.txt", n))
+		p := filepath.Join(dir, transcript.TextName(n))
 		if err := os.WriteFile(p, []byte(c), 0o644); err != nil {
 			t.Fatal(err)
 		}

@@ -178,13 +178,32 @@ internal/
             data (reference_files) - nothing implicit. Wired into the pipeline in M5:
             the spelling_research agent generates corrections.json/spellings.json and
             the correcting stage runs Apply/Check/GenerateSheets over them.
+            Post-M8 spelling-cost round: ExtractCandidates (candidates.go) distills
+            the transcript into spelling_candidates.json - a deterministic, capped
+            (never silently: Truncated + a stage note) shortlist of likely proper
+            nouns (multi-word capitalized phrases, non-initial capitalized singles,
+            non-dictionary capitalized singles at count>=3, lowercase variants, rare
+            non-dictionary lowercase; Unicode-aware tokens incl. d'Aston internal
+            capitals) with counts/chapters/up-to-2 snippets - which the stage stages
+            to the agent INSTEAD of the ~600KB transcripts-text/ (the agent may only
+            write rules targeting listed forms). commonwords.go is a generated
+            (scripts/gen_commonwords.py) license-safe common-word list feeding the
+            non-dictionary heuristics. DeadRules (deadrules.go) is the validator-side
+            dead-rule scan: a rule whose pattern matches nothing in the ORIGINAL
+            (pre-Apply, repaired-preferred) layer is rejected with the pattern named
+            - Check's four gates miss that shape whenever the RHS is attested
+            elsewhere, and it is deliberately NOT a fifth Check gate (Check is a
+            contract-frozen golden-tested port).
   agent/    M5: the agent-runner abstraction (Runner{ID,Detect,Run} over a normalized
             Request/Result/Usage) + claude and codex headless-CLI backends (prompt on
             STDIN never argv, --output-format json / codex --json JSONL, usage capture,
             typed RateLimitError/NotAvailableError), Select (auto|claude|codex, explicit
             path knobs, loud on an unresolvable explicit path), ModelFor per-stage
-            routing, RunWithRetry (invalid-output <= 2 retries appending the validator
-            error; rate-limit backoff), staging.go (per-attempt staged dir under
+            routing, RunWithRetry (invalid-output <= 2 PATCH-style retries: the staged
+            cwd + out/ persist across attempts, so the retry prompt carries the
+            validator error and instructs the agent to fix/delete the offending
+            entries in its prior out/ files, never regenerate from scratch;
+            rate-limit backoff), staging.go (per-attempt staged dir under
             _runs/, 0444 copied inputs + out/, Harvest with traversal + size-cap guards),
             and go:embed prompts/ (one template per stage + a vendored authoring.md from
             audiosilo-meta). The child env injects an API key from secrets that NEVER
@@ -795,6 +814,28 @@ Milestones from the workspace plan; each is shippable.
     `GET /books/{id}/events?before_id=` pages, and the Running details render a
     scrollable log with a **Download log** button (`web/src/lib/bookLog.ts`
     `fetchAllEvents`/`logToText`).
+
+- **Post-M8 spelling-cost round (done):** made the spelling_research stage
+  complete reliably instead of burning its retry budget (the first real book spent
+  230K output tokens / $16.70 / 51 min failing it 3x). Three changes: (1)
+  **patch-style validation retries** in `agent.RunWithBackoff` - the staged cwd +
+  `out/` persist across attempts, so a retry now instructs the agent to read its
+  prior output and fix/DELETE exactly the failing entries rather than regenerate
+  the stage from scratch (applies to every agent stage); (2) the **candidate
+  extractor** (`spelling.ExtractCandidates` -> `spelling_candidates.json`, see the
+  package table) staged INSTEAD of the full ~600KB transcript - ~156KB, deterministic,
+  capped-never-silently; for a series book only the small `spelling-refs/prior-*`
+  files are staged (the predecessor's corrected texts stay work-dir-only for the
+  gate corpus); a zero-candidates result over a >5000-word corpus fails loudly
+  before the agent spends anything; (3) **prompt + validator hardening** -
+  spelling.md forbids rules targeting unlisted forms, explains the gates'
+  deriveBase "'s"-stripping trap (the real book-1 killer: `Leafs Crossing ->
+  Leaf's Crossing` attests the nonexistent literal "Leaf Crossing"), tells the
+  agent that deleting a failing rule + marking the name unresolved is always
+  acceptable, and the validator now mechanically rejects **dead rules**
+  (`spelling.DeadRules` against the original layer, naming each dead pattern in
+  the retry feedback) - previously a dead rule whose RHS was attested elsewhere
+  passed all four gates as silent under-correction.
 
 Still **not built**: signed installers / a friendlier packaged client (a possible
 follow-up per the meta EXTRACTION roadmap); a separately-deployable UI-only image
