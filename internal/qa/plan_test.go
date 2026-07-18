@@ -236,6 +236,34 @@ func TestPlanRetranscribeNeeded(t *testing.T) {
 	}
 }
 
+// TestFlaggedAndAllowedChapters pins the two disposition sets: FlaggedChapters is the
+// REQUIRED subset (retranscribe queue + tail rate + mid-chapter runs/loops), while
+// AllowedChapters is the full surface (adds benign end-fade runs and cross/within-segment
+// hits). qa_adjudicating stages every AllowedChapters transcript so the agent can verify
+// and accept an allowed-but-not-flagged chapter against its real text.
+func TestFlaggedAndAllowedChapters(t *testing.T) {
+	rep := baseReport()
+	if got, want := FlaggedChapters(rep), []int{2, 5, 8}; !equalInts(got, want) {
+		t.Errorf("FlaggedChapters = %v, want %v", got, want)
+	}
+	// AllowedChapters is a superset adding end-fade ch3 and cross-segment ch9, sorted.
+	if got, want := AllowedChapters(rep), []int{2, 3, 5, 8, 9}; !equalInts(got, want) {
+		t.Errorf("AllowedChapters = %v, want %v", got, want)
+	}
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestWriteLoadPlanRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	p := fullPlan()

@@ -293,11 +293,17 @@ internal/
             precondition Retry re-admits) instead of hard-failing. The qa_adjudicating ->
             retranscribing -> qa_sweep loop has three convergence guards beyond the
             maxQARounds (5) round cap: (1) a progress-based STALL park - the retranscribing
-            stage writes a retranscribe_stalled marker whenever a repair round splices AND
-            adopts nothing (it made no real progress) and removes it on any progress;
-            qaAdjudicate reads the marker and parks ParkQANoConverge naming the stuck
-            chapters instead of burning another paid agent round on a book the repairs
-            cannot move. This REPLACED an earlier report+ledger sha256 fingerprint, which
+            stage INCREMENTS a retranscribe_stalled counter marker whenever a repair round
+            splices AND adopts nothing (no real progress) and removes it on any progress;
+            qaAdjudicate parks ParkQANoConverge (naming the stuck chapters) only at count
+            >= 2 - a count of 1 grants the agent exactly ONE resolution round, because a
+            no-progress round produces precisely the feedback (clips_unlocatable notes,
+            known-failed skips, kept retranscribes) its terminal accept-or-direct decision
+            needs (live-verified: the one-round park fired before the adjudicator could
+            ever use the unlocatable feedback). The adjudicator's staged transcripts cover
+            qa.AllowedChapters (every disposable chapter), not just the required
+            FlaggedChapters - a textless tail-rate-only chapter made the agent queue
+            conservative clips it could not verify. This REPLACED an earlier report+ledger sha256 fingerprint, which
             thrashed on the exact incident it was meant to catch: a re-degenerating tail
             clip rewrites tail_verdicts.json every round (each CLIP-REDEGENERATED verdict
             relocates its clip_start), so the fingerprint changed every round, the fixed

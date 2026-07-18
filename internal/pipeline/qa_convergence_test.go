@@ -80,6 +80,50 @@ func TestRetranscribeTailClipUnlocatableBuckets(t *testing.T) {
 	}
 }
 
+// TestQAAdjudicateStagesAllowedNotFlaggedChapters is the Fix-A regression: the
+// qa_adjudicating stage stages the transcript for every ALLOWED chapter (the full
+// disposition surface), not just the required/flagged subset - so the agent can VERIFY and
+// accept an allowed-but-not-flagged chapter (here a cross-segment finding on ch3) against
+// its real text instead of blind-queueing a conservative clip. A chapter with NO finding at
+// all (ch1) is still never staged (no spoiler-scope leak).
+func TestQAAdjudicateStagesAllowedNotFlaggedChapters(t *testing.T) {
+	work := t.TempDir()
+	// ch2 is flagged (retranscribe queue); ch3 is ALLOWED but NOT required (cross-segment
+	// only); ch1 carries no finding at all.
+	rep := &qa.Report{
+		Chapters:          3,
+		RetranscribeQueue: []int{2},
+		CrossSegment:      []qa.CrossSegmentHit{{Chapter: 3, Count: 6, Pos: 99, Phrase: "the story continues"}},
+	}
+	if err := qa.WriteReport(work, rep); err != nil {
+		t.Fatal(err)
+	}
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x/book.m4b", Style: audio.StyleMarkers, Duration: 30, ChapterCount: 3, Chapters: markerChapters(1, 2, 3)})
+	for _, ch := range []int{1, 2, 3} {
+		seedText(t, work, ch)
+	}
+	fake := newFakeRunner()
+	fake.act = func(f *fakeRunner, req agent.Request, attempt int) (agent.Result, error) {
+		// Disposition the required chapter 2; ch3 is optional (allowed) so the plan validates.
+		writeOut(t, req, qa.PlanFile, qa.Plan{Entries: []qa.PlanEntry{{Chapter: 2, Action: qa.ActionAccept, Reason: "false positive"}}})
+		return agent.Result{}, nil
+	}
+	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.QAAdjudicating, scheduler.StageReport{}); err != nil {
+		t.Fatalf("qa_adjudicating: %v", err)
+	}
+	req, _ := fake.lastRequest(string(state.QAAdjudicating))
+	staged := filepath.Join(req.Dir, transcript.TextDir)
+	for _, ch := range []int{2, 3} {
+		if !fileExistsT(filepath.Join(staged, transcript.TextName(ch))) {
+			t.Errorf("allowed chapter %d transcript was not staged", ch)
+		}
+	}
+	if fileExistsT(filepath.Join(staged, transcript.TextName(1))) {
+		t.Error("chapter 1 (no findings) transcript was staged - spoiler-scope leak")
+	}
+}
+
 // TestQAAdjudicateLedgerSkipsAgentWhenAllCovered is the item-3 core: a chapter the agent
 // accepted in round 1 is recorded in the durable qa_accepted.json ledger, so round 2 (whose
 // re-sweep re-flags the same chapter off the stale layer) accepts it mechanically and does NOT

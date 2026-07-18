@@ -458,8 +458,34 @@ func TestRetranscribeStallMarkerWrittenWhenNoProgress(t *testing.T) {
 		t.Fatalf("retranscribing: %v", err)
 	}
 	assertRetranscribeMetrics(t, res.Metrics, map[string]int{"adopted": 0, "kept": 1, "clips_spliced": 0})
-	if !fileExistsT(filepath.Join(work, retranscribeStalledMarker)) {
-		t.Error("a no-progress round did not write the stall marker")
+	if got, rerr := os.ReadFile(filepath.Join(work, retranscribeStalledMarker)); rerr != nil || strings.TrimSpace(string(got)) != "1" {
+		t.Errorf("first no-progress round wrote marker %q (%v), want count 1", got, rerr)
+	}
+}
+
+// TestRetranscribeStallMarkerIncrementsOnSecondNoProgress: a no-progress round INCREMENTS
+// an existing stall marker rather than rewriting it - so a marker left at count 1 by the
+// prior no-progress round becomes 2, which is the count qaAdjudicate parks on (two
+// consecutive no-op rounds). A progress round would instead remove it (covered elsewhere).
+func TestRetranscribeStallMarkerIncrementsOnSecondNoProgress(t *testing.T) {
+	work := t.TempDir()
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: 60, ChapterCount: 1, Chapters: []audio.Chapter{{Chapter: 2, Start: 0, End: 60, Duration: 60}}})
+	orig := transcript.Transcript{Schema: transcript.Schema, Chapter: 2, Segments: []transcript.Segment{{ID: 0, Start: 0, End: 60, Text: " ORIGINAL KEEP ME"}}}
+	seedNormalized(t, work, orig)
+	seedFLACs(t, work, 2)
+	seedPlan(t, work, qa.PlanEntry{Chapter: 2, Action: qa.ActionRetranscribe, Reason: "check"})
+	// A marker left at count 1 by the previous no-progress round.
+	if err := os.WriteFile(filepath.Join(work, retranscribeStalledMarker), []byte("1\n"), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+
+	fake := newFakeBackend()
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{}); err != nil {
+		t.Fatalf("retranscribing: %v", err)
+	}
+	if got, rerr := os.ReadFile(filepath.Join(work, retranscribeStalledMarker)); rerr != nil || strings.TrimSpace(string(got)) != "2" {
+		t.Errorf("second no-progress round wrote marker %q (%v), want count 2", got, rerr)
 	}
 }
 

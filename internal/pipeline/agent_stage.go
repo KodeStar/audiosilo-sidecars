@@ -573,12 +573,16 @@ func writeAcceptedLedger(workDir string, ledger map[int]acceptedEntry) error {
 	return fsutil.WriteFileAtomic(filepath.Join(workDir, acceptedLedgerName), append(out, '\n'), 0o644)
 }
 
-// retranscribeStalledMarker is the work-dir file the retranscribing stage writes when a
-// repair round made no progress (it neither spliced nor adopted any chapter) and removes
-// when a round DID make progress. It is the pipeline's QA-loop convergence signal:
-// qaAdjudicate reads it (retranscribeStalled) and parks ParkQANoConverge rather than
-// burning another paid agent round on a book the repairs cannot move. It is not a
-// pipeline sentinel and never gates the state machine.
+// retranscribeStalledMarker is the work-dir file the retranscribing stage writes (and
+// INCREMENTS) each time a repair round made no progress (it neither spliced nor adopted
+// any chapter) and removes when a round DID make progress. Its integer value is the count
+// of consecutive no-progress rounds. It is the pipeline's QA-loop convergence signal:
+// qaAdjudicate reads it (retranscribeStalledCount) and parks ParkQANoConverge only at
+// count >= 2 - TWO consecutive no-progress rounds - rather than burning another paid agent
+// round on a book the repairs cannot move. The FIRST no-progress round (count 1) still gets
+// one resolution agent round, because that round produced the very feedback (unlocatable
+// notes, known-failed skips) the adjudicator needs for its terminal disposition. It is not
+// a pipeline sentinel and never gates the state machine.
 //
 // Why a progress tally and not a report/ledger fingerprint (the design this replaced): a
 // book whose tail-clip repairs keep re-degenerating rewrites tail_verdicts.json every
@@ -594,10 +598,24 @@ func retranscribeStalledPath(workDir string) string {
 	return filepath.Join(workDir, retranscribeStalledMarker)
 }
 
-// retranscribeStalled reports whether the previous repair round left the stall marker
-// (it made no progress), the signal qaAdjudicate parks on.
-func retranscribeStalled(workDir string) bool {
-	return fsutil.IsFile(retranscribeStalledPath(workDir))
+// retranscribeStalledCount reads the stall marker's integer value: the number of
+// CONSECUTIVE no-progress repair rounds. Absent -> 0. A present-but-malformed marker
+// (a legacy "1\n", or any unparseable content) counts as 1 - it records at least one
+// stall. qaAdjudicate parks only at count >= 2 (two consecutive no-progress rounds are
+// a genuine stall); at count 1 it proceeds to one resolution agent round, because the
+// first no-progress round is exactly what produces the feedback (clips_unlocatable
+// notes, known-failed skips, kept retranscribes) the adjudicator needs for a terminal
+// disposition (accept, or a directed window with clip_start_sec).
+func retranscribeStalledCount(workDir string) int {
+	raw, err := os.ReadFile(retranscribeStalledPath(workDir)) //nolint:gosec // path derives from the book's own work dir
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || n < 1 {
+		return 1
+	}
+	return n
 }
 
 // qaStalledEntries resolves the stuck chapter set naming the stall park message: the prior
@@ -676,13 +694,17 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, r schedule
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("qa_adjudicating: load report (qa_sweep must run first): %w", err)
 	}
-	// Stall guard: if the previous repair round made no progress (the retranscribing stage
-	// spliced AND adopted nothing, recorded as the stall marker), the loop is stuck - the
-	// re-sweep re-flagged the same chapters and another agent round would burn money to
-	// reach the same no-op. Park naming the stuck chapters, but first DELETE the marker so a
-	// user Retry gets exactly one fresh agent round before it can re-park (see the done==0
-	// reset above - the marker is cleared on both, so a Retry never inherits it).
-	if retranscribeStalled(book.WorkDir) {
+	// Stall guard: park only after TWO consecutive no-progress repair rounds (marker count
+	// >= 2). The first no-progress round (count 1) is NOT a stall - it is the round that
+	// produced the feedback (clips_unlocatable notes naming chapters that need a
+	// clip_start_sec, known-failed skips, kept retranscribes) the adjudicator needs to
+	// disposition the residue terminally (accept, or a directed window). So at count 1 we
+	// PROCEED to one more agent round, leaving the marker in place: the next retranscribing
+	// round either makes progress (removing it) or increments it to 2, and the following
+	// adjudication parks. Two consecutive no-op rounds mean the repairs genuinely cannot
+	// move the book. When we DO park, delete the marker so a user Retry gets a fresh loop
+	// (see the done==0 reset above - cleared on both, so a Retry never inherits it).
+	if retranscribeStalledCount(book.WorkDir) >= 2 {
 		stuck := qaStalledEntries(book.WorkDir)
 		_ = os.Remove(retranscribeStalledPath(book.WorkDir))
 		return scheduler.StageResult{}, scheduler.ParkWithCode(state.ParkQANoConverge, qaStalledMsg(stuck))
@@ -804,9 +826,13 @@ func (e *Executor) runQAAdjudicateAgent(ctx context.Context, book store.Book, r 
 			return nil, agentUsage{}, fmt.Errorf("qa_adjudicating: stage %s: %w", name, err)
 		}
 	}
-	// The FLAGGED chapters' transcript text (and any repaired copy) - the only
-	// transcripts an agent stage is ever allowed to see, and only these chapters.
-	for _, ch := range qa.FlaggedChapters(rep) {
+	// The ALLOWED chapters' transcript text (and any repaired copy) - the disposition
+	// surface (every chapter the plan validator lets the agent disposition), NOT just the
+	// required/flagged subset. The agent may verify and accept an allowed-but-not-flagged
+	// chapter (a short end-fade repeat, a cross-segment residual) against its real text
+	// rather than blind-queueing a conservative tail_clip; these are still the ONLY
+	// transcripts the stage stages, so a chapter the sweep did not flag at all never leaks.
+	for _, ch := range qa.AllowedChapters(rep) {
 		rel := filepath.Join(transcript.TextDir, transcript.TextName(ch))
 		if err := e.stageIfPresent(st, book.WorkDir, rel, rel); err != nil {
 			return nil, agentUsage{}, fmt.Errorf("qa_adjudicating: stage %s: %w", rel, err)
@@ -1220,16 +1246,21 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 	}
 
 	// Convergence signal for qaAdjudicate: a repair round that neither spliced nor adopted
-	// anything achieved nothing - the qa_sweep re-run will re-flag the same chapters and the
-	// next adjudication round would burn a paid agent pass to reach the same no-op. Persist
-	// that stall as a marker so the next qaAdjudicate parks (ParkQANoConverge) instead of
-	// looping; clear it the moment a round makes real progress. A mid_clip splice increments
-	// spliced (it reuses the tail buckets), so an interior repair counts as progress too.
+	// anything achieved nothing - the qa_sweep re-run will re-flag the same chapters. Persist
+	// that stall by INCREMENTING the marker (the count of consecutive no-progress rounds);
+	// clear it the moment a round makes real progress. qaAdjudicate parks only at count >= 2,
+	// so a single no-progress round still gives the adjudicator one resolution round (its
+	// unlocatable/known-failed feedback drives the next disposition) before the loop is
+	// declared stuck. A mid_clip splice increments spliced (it reuses the tail buckets), so
+	// an interior repair counts as progress too.
 	madeProgress := spliced > 0 || adopted > 0
 	if madeProgress {
 		_ = os.Remove(retranscribeStalledPath(book.WorkDir))
-	} else if err := fsutil.WriteFileAtomic(retranscribeStalledPath(book.WorkDir), []byte("1\n"), 0o644); err != nil {
-		return scheduler.StageResult{}, fmt.Errorf("retranscribing: write stall marker: %w", err)
+	} else {
+		next := retranscribeStalledCount(book.WorkDir) + 1
+		if err := fsutil.WriteFileAtomic(retranscribeStalledPath(book.WorkDir), []byte(strconv.Itoa(next)+"\n"), 0o644); err != nil {
+			return scheduler.StageResult{}, fmt.Errorf("retranscribing: write stall marker: %w", err)
+		}
 	}
 
 	result := scheduler.StageResult{

@@ -539,14 +539,14 @@ func dbBackedQAExecutor(t *testing.T, work string, fake *fakeRunner) (*store.DB,
 	return db, NewExecutor(cfg), book
 }
 
-// TestQAAdjudicateStallMarkerParks is the convergence-signal regression: when the previous
-// repair round left the retranscribe_stalled marker (it spliced and adopted nothing),
-// qa_adjudicating parks ParkQANoConverge WITHOUT another agent round, names the stuck
-// chapters, and DELETES the marker so a Retry gets one fresh round. The old fingerprint
-// design would have THRASHED on this incident: a re-degenerating tail clip rewrites
-// tail_verdicts.json every round (each CLIP-REDEGENERATED verdict relocates its clip_start),
-// so the report+ledger fingerprint changed each round, the fixed point never fired, and the
-// book burned all 3 paid rounds. The progress marker is immune to that ledger churn.
+// TestQAAdjudicateStallMarkerParks is the convergence-signal regression: after TWO
+// consecutive no-progress repair rounds (marker count >= 2), qa_adjudicating parks
+// ParkQANoConverge WITHOUT another agent round, names the stuck chapters, and DELETES the
+// marker so a Retry gets one fresh round. The old fingerprint design would have THRASHED
+// on this incident: a re-degenerating tail clip rewrites tail_verdicts.json every round
+// (each CLIP-REDEGENERATED verdict relocates its clip_start), so the report+ledger
+// fingerprint changed each round, the fixed point never fired, and the book burned all 3
+// paid rounds. The progress marker is immune to that ledger churn.
 func TestQAAdjudicateStallMarkerParks(t *testing.T) {
 	work := t.TempDir()
 	seedQAReport(t, work, []int{2})
@@ -571,7 +571,8 @@ func TestQAAdjudicateStallMarkerParks(t *testing.T) {
 		t.Fatal(err)
 	}
 	markerPath := filepath.Join(work, retranscribeStalledMarker)
-	if err := os.WriteFile(markerPath, []byte("1\n"), 0o644); err != nil {
+	// Count 2 = the SECOND consecutive no-progress round: this is the genuine stall that parks.
+	if err := os.WriteFile(markerPath, []byte("2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -591,6 +592,51 @@ func TestQAAdjudicateStallMarkerParks(t *testing.T) {
 	}
 	if _, serr := os.Stat(markerPath); !os.IsNotExist(serr) {
 		t.Errorf("stall park must delete the marker, stat err = %v", serr)
+	}
+}
+
+// TestQAAdjudicateStallMarkerCountOneRunsAgent is the two-round-grace half of the stall
+// contract: a SINGLE no-progress round (marker count 1) is not yet a stall - it is the
+// round whose feedback (unlocatable notes, known-failed skips) the adjudicator needs, so
+// qa_adjudicating PROCEEDS to one resolution agent round and LEAVES the marker in place
+// (the next retranscribing round either makes progress and clears it, or increments it to
+// 2 and the following adjudication parks).
+func TestQAAdjudicateStallMarkerCountOneRunsAgent(t *testing.T) {
+	work := t.TempDir()
+	seedQAReport(t, work, []int{2})
+	seedText(t, work, 2)
+	fake := newFakeRunner()
+	fake.act = func(f *fakeRunner, req agent.Request, attempt int) (agent.Result, error) {
+		writeOut(t, req, qa.PlanFile, qa.Plan{Entries: []qa.PlanEntry{{Chapter: 2, Action: qa.ActionAccept, Reason: "harmless closing echo"}}})
+		return agent.Result{}, nil
+	}
+	db, exe, book := dbBackedQAExecutor(t, work, fake)
+	// One completed round so done >= 1 (an established loop, not the done==0 reset path).
+	runID, err := db.StartStageRun(context.Background(), book.ID, string(state.QAAdjudicating), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishStageRun(context.Background(), runID, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	markerPath := filepath.Join(work, retranscribeStalledMarker)
+	if err := os.WriteFile(markerPath, []byte("1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The open run the round's agent usage accrues onto.
+	if _, err := db.StartStageRun(context.Background(), book.ID, string(state.QAAdjudicating), 2); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := exe.Execute(context.Background(), book, state.QAAdjudicating, scheduler.StageReport{}); err != nil {
+		t.Fatalf("count-1 marker must run the agent, not park: %v", err)
+	}
+	if n := fake.count(string(state.QAAdjudicating)); n != 1 {
+		t.Errorf("agent invoked %d times, want 1 (one resolution round at count 1)", n)
+	}
+	// The marker is LEFT in place at count 1 (only progress or a park removes it).
+	if got, rerr := os.ReadFile(markerPath); rerr != nil || strings.TrimSpace(string(got)) != "1" {
+		t.Errorf("marker = %q (%v), want it left in place at count 1", got, rerr)
 	}
 }
 

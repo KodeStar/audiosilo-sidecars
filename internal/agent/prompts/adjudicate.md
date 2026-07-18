@@ -12,9 +12,13 @@ You work in the current directory. It contains:
   outliers, repeated-segment runs, cross-segment and within-segment loops,
   multi-loop findings, tail-rate hits, and a `retranscribe_queue`).
 - `manifest.json` - the logical-chapter map (for chapter numbers and durations).
-- `transcripts-text/` and `transcripts-repaired/` - the transcript text for the
-  FLAGGED chapters only. You MAY read these: this is pre-fact-pass QA, so seeing
-  the raw transcript here is allowed.
+- `transcripts-text/` and `transcripts-repaired/` - the transcript text for EVERY
+  chapter you may disposition (not just the required ones - also the chapters
+  carrying only a tail-rate, end-fade, or cross/within-segment finding). You MAY
+  read these: this is pre-fact-pass QA, so seeing the raw transcript here is
+  allowed. VERIFY a short end-fade or tail finding against the actual text and
+  `accept` it when the repeat is a harmless closing echo, instead of queueing a
+  conservative clip you cannot confirm.
 {{if gt .Round 1}}- `qa_plan.json`, `tail_verdicts.json`, `repairs.log` - artifacts from earlier
   rounds. Chapters already repaired last round appear again only if a residual
   survived; do not re-queue a chapter whose repair already landed cleanly.
@@ -42,10 +46,12 @@ web access.
   harmless echo, or a repair whose remaining flag is a residual of a splice that already
   landed). You will not see it again.
 - For a chapter whose repair options are EXHAUSTED - a window already marked
-  `CLIP-REDEGENERATED` under the current decode params, or the same text reproduced by two
-  independent decode paths - an explicit `accept` with your reasoning is the correct
-  terminal disposition: repetition that survives two independent decodes is authentic
-  audio, not corruption. Do not keep re-queuing it.
+  `CLIP-REDEGENERATED` under the current decode params, a full `retranscribe` that already
+  ran and was KEPT (the fresh no-context output was not adoptable, so the original stands),
+  or the same text reproduced by two independent decode paths - an explicit `accept` with
+  your reasoning is the correct terminal disposition: repetition that survives two
+  independent decodes is authentic audio, not corruption. The mechanical options are spent;
+  do not keep re-queuing it.
 {{if gt .Round 1}}- On this re-entry round, ACCEPT residuals that a prior round already repaired
   rather than re-queuing them - repeated retranscription of a chapter that keeps
   collapsing at the same point does not improve it. Converge; do not loop.
@@ -64,13 +70,19 @@ web access.
   the repair stage cuts the affected window, retranscribes just that clip prompt-free,
   and splices it. You MAY add an optional `"clip_start_sec"` (seconds from the chapter
   start) to a tail_clip entry to tell the repair stage where the trailing garbage
-  really begins. Only supply it when re-queuing a tail_clip whose prior verdict in
+  really begins. Supply it UP FRONT for a SHORT trailing repeat - a phrase repeated
+  a handful of times right at the chapter end (e.g. "Grrrr!" x6, "The story
+  continues." x3). Such a repeat is BELOW the mechanical locator's 6-gram reach, so
+  without `clip_start_sec` the stage finds no loop and no-ops (leaving the chapter
+  flagged forever). The report gives the hit's time - start the window a few seconds
+  before it. Also supply it when re-queuing a tail_clip whose prior verdict in
   `tail_verdicts.json` is `CLIP-REDEGENERATED`: the repair stage already tried the
   window it derived on its own and it re-degenerated, so re-cutting the SAME window
-  will fail identically and is skipped as known-failed. Read the transcript, find
-  where the real narration ends and the loop starts, and give that timestamp so the
-  stage cuts a DIFFERENT (usually narrower) window. Omit it otherwise (the stage
-  derives the window itself).
+  will fail identically and is skipped as known-failed - read the transcript, find
+  where the real narration ends and the loop starts, and give a timestamp for a
+  DIFFERENT (usually narrower) window. Omit it only for a long, clearly-located loop
+  the stage can find on its own; for short repeats do NOT leave the derivation to the
+  stage.
 - `mid_clip` - the corruption is a MID-CHAPTER loop: an interior repeated span with
   REAL narration resuming AFTER it (the classic "...the two of the two of the two
   [x80] the pixie queen was still hovering..."). tail_clip cannot reach an interior

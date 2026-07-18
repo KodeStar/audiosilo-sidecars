@@ -239,6 +239,25 @@ func requiredChapters(rep *Report) map[int]bool {
 	return set
 }
 
+// AllowedChapters is the sorted set of every chapter carrying ANY substantive finding
+// (the superset of FlaggedChapters). It is the full DISPOSITION SURFACE: the plan
+// validator accepts a plan entry for any chapter in this set, so the qa_adjudicating
+// stage stages each one's transcript. An allowed-but-not-flagged chapter (a tail-rate
+// or end-fade or cross/within-segment finding the agent may volunteer a disposition for)
+// is thus verified against its real text instead of the agent guessing blind - the fix
+// for a live incident where the agent queued conservative tail_clips for allowed
+// chapters whose transcripts were not staged. Low-confidence stats are informational
+// and excluded (like allowedChapters).
+func AllowedChapters(rep *Report) []int {
+	set := allowedChapters(rep)
+	out := make([]int, 0, len(set))
+	for ch := range set {
+		out = append(out, ch)
+	}
+	sort.Ints(out)
+	return out
+}
+
 // allowedChapters is every chapter carrying ANY substantive finding (the superset of
 // requiredChapters): a plan entry outside this set names a chapter the sweep did not
 // flag, which is rejected. Low-confidence stats are informational and excluded.
