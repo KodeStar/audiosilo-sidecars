@@ -263,31 +263,16 @@ func Run(ctx context.Context, opts Options) error {
 	// explicit configuration gates.
 	var supervisorModel supervisor.Model
 	if cfg.Supervisor.ModelAssisted {
-		modelRunner := agentRunner
-		requestedBackend := cfg.Supervisor.ModelBackend
-		// Codex production runners intentionally cannot satisfy the supervisor's
-		// no-tools boundary. When no supervisor backend was explicitly selected,
-		// probe Claude as the isolated diagnosis runner instead of silently reporting
-		// model_assisted=true/model_available=false forever.
-		if requestedBackend == "" && (modelRunner == nil || !agent.EnforcesNoTools(modelRunner)) {
-			requestedBackend = config.AgentBackendClaude
-		}
-		if requestedBackend != "" && (modelRunner == nil || modelRunner.ID() != requestedBackend) {
-			modelSelect := agentSelect
-			modelSelect.Backend = requestedBackend
-			if selected, available, selectErr := agent.Select(ctx, modelSelect, sec); selectErr == nil && selected != nil && available.Available {
-				modelRunner = selected
-			} else {
-				modelRunner = nil
-			}
-		}
+		modelRunner := resolveSupervisorRunner(ctx, agentRunner, cfg.Supervisor.ModelBackend, agentSelect, sec)
 		supervisorDir := filepath.Join(opts.DataDir, "supervisor")
 		if err := os.MkdirAll(supervisorDir, 0o700); err != nil {
 			return fmt.Errorf("create supervisor context dir: %w", err)
 		}
-		if modelRunner != nil && agent.EnforcesNoTools(modelRunner) {
+		if modelRunner != nil {
 			supervisorModel = supervisor.NewAgentModel(modelRunner, cfg.Supervisor.Model, supervisorDir,
 				time.Duration(cfg.Supervisor.TimeoutSeconds)*time.Second, cfg.Supervisor.MaxTurns, cfg.Pricing)
+		} else {
+			fmt.Fprintln(opts.Out, "[warn] model-assisted supervisor unavailable: configured production backend cannot enforce the no-tools boundary; set supervisor.model_backend explicitly to opt into a separate backend")
 		}
 	}
 	supervisorSvc := supervisor.New(db, cfg.Supervisor, cfg.Pricing, supervisorModel, supervisor.Hooks{
@@ -489,6 +474,28 @@ func Run(ctx context.Context, opts Options) error {
 	// Drain and stop the durable event persister (its queue may hold late events).
 	persister.Close()
 	return runErr
+}
+
+// resolveSupervisorRunner preserves backend intent at the supervision boundary.
+// An empty model_backend means "use the already-selected production runner", never
+// "search for a different provider". A separate backend is selected only when its
+// name is explicit in config. Either way, the runner must enforce NoTools; otherwise
+// model diagnosis fails closed while deterministic supervision remains available.
+func resolveSupervisorRunner(ctx context.Context, production agent.Runner, configured string, selectCfg agent.SelectConfig, sec secrets.Store) agent.Runner {
+	runner := production
+	requested := strings.TrimSpace(configured)
+	if requested != "" && (runner == nil || runner.ID() != requested) {
+		selectCfg.Backend = requested
+		selected, available, err := agent.Select(ctx, selectCfg, sec)
+		if err != nil || selected == nil || !available.Available {
+			return nil
+		}
+		runner = selected
+	}
+	if !agent.EnforcesNoTools(runner) {
+		return nil
+	}
+	return runner
 }
 
 // eventQueueSize bounds the durable-event persister's backlog. A full queue drops

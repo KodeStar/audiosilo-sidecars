@@ -10,9 +10,40 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/events"
+	"github.com/kodestar/audiosilo-sidecars/internal/secrets"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
+
+type supervisorRunnerStub struct {
+	id      string
+	noTools bool
+}
+
+func (r supervisorRunnerStub) ID() string { return r.id }
+func (r supervisorRunnerStub) Detect(context.Context) agent.Availability {
+	return agent.Availability{Backend: r.id, Available: true}
+}
+func (r supervisorRunnerStub) Run(context.Context, agent.Request) (agent.Result, error) {
+	return agent.Result{}, nil
+}
+func (r supervisorRunnerStub) SupportsWeb() bool     { return false }
+func (r supervisorRunnerStub) EnforcesNoTools() bool { return r.noTools }
+
+func TestEmptySupervisorBackendNeverChangesProvider(t *testing.T) {
+	codex := supervisorRunnerStub{id: agent.IDCodex, noTools: false}
+	got := resolveSupervisorRunner(context.Background(), codex, "", agent.SelectConfig{}, secrets.NewMemStore())
+	if got != nil {
+		t.Fatalf("unsafe production runner became supervisor runner: %T", got)
+	}
+
+	claude := supervisorRunnerStub{id: agent.IDClaude, noTools: true}
+	got = resolveSupervisorRunner(context.Background(), claude, "", agent.SelectConfig{}, secrets.NewMemStore())
+	if got == nil || got.ID() != agent.IDClaude {
+		t.Fatalf("safe production runner was not retained: %T", got)
+	}
+}
 
 func TestPrintBannerFirstRunShowsPassword(t *testing.T) {
 	var b strings.Builder
