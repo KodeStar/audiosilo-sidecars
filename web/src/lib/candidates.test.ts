@@ -122,6 +122,25 @@ describe('toCandidate', () => {
     expect('work_id' in unknown).toBe(false);
   });
 
+  it('uses authoritative series metadata from a known match', () => {
+    const candidate = toCandidate(
+      book({
+        series: 'Incorrect Local Series',
+        series_position: '99',
+        coverage: cov({
+          matched_by: 'manual',
+          work_id: 'w-series',
+          series: { name: 'Matched Saga', position: '3' },
+        }),
+      }),
+    );
+
+    expect(candidate.series).toBe('Matched Saga');
+    expect(candidate.series_pos).toBe('3');
+    expect(candidate.sources?.series).toBe('metadata');
+    expect(candidate.sources?.series_position).toBe('metadata');
+  });
+
   it('carries narrators through when the scan found them, else omits the key', () => {
     const withNarrators = toCandidate(
       book({ path: '/n', narrators: ['Nora Narrator', 'Sam Speaker'] }),

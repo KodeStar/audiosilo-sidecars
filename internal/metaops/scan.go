@@ -80,7 +80,8 @@ type ScannedBook struct {
 	// Hidden is true when a persisted (or live) override hides this book from the
 	// default candidate list.
 	Hidden bool `json:"hidden,omitempty"`
-	// Sources records where each field came from ("tag" | "path" | "filename").
+	// Sources records where each field came from ("tag" | "path" | "filename" |
+	// "metadata"). A known metadata match supplies the authoritative series fields.
 	Sources map[string]string `json:"sources,omitempty"`
 	// Coverage is the metadata verdict (Available/Known/HasCharacters/HasRecaps).
 	Coverage Coverage `json:"coverage"`
@@ -519,12 +520,12 @@ func (m *ScanManager) snapshotLocked(job *scanJob) ScanJob {
 			b.Sources = maps.Clone(b.Sources)
 		}
 		if rc, ok := job.resolved[b.Path]; ok && rc.fingerprint == job.idents[b.Path].fp {
-			b.Coverage = rc.coverage
+			applyCoverageMetadata(&b, rc.coverage)
 		}
 		if p, ok := m.patches[b.SourcePath]; ok {
 			b.Hidden = p.hidden
 			if p.coverage != nil {
-				b.Coverage = *p.coverage
+				applyCoverageMetadata(&b, *p.coverage)
 			}
 		}
 		books[i] = b
@@ -539,6 +540,24 @@ func (m *ScanManager) snapshotLocked(job *scanJob) ScanJob {
 		Books:     books,
 		Stats:     job.stats,
 	}
+}
+
+// applyCoverageMetadata attaches the verdict and, for a known work whose metadata
+// declares a primary series, replaces the scanner's absent or weaker series fields.
+// Matching is the user's/identifier's explicit identity decision; discarding its
+// series membership would defeat series locks and predecessor carryover.
+func applyCoverageMetadata(b *ScannedBook, cov Coverage) {
+	b.Coverage = cov
+	if !cov.Known || cov.Series == nil || strings.TrimSpace(cov.Series.Name) == "" {
+		return
+	}
+	b.Series = strings.TrimSpace(cov.Series.Name)
+	b.SeriesPosition = strings.TrimSpace(cov.Series.Position)
+	if b.Sources == nil {
+		b.Sources = map[string]string{}
+	}
+	b.Sources["series"] = "metadata"
+	b.Sources["series_position"] = "metadata"
 }
 
 // progressLocked derives a job's counters without copying its books, so the

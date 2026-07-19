@@ -56,16 +56,24 @@ export function manualWorkId(book: ScannedBook): string {
 // manual) so later pipeline/contribution stages reference the matched work via
 // books.work_id without re-resolving - there is no server-side re-resolution.
 export function toCandidate(book: ScannedBook): BookCandidate {
+  const matchedSeries = book.coverage?.known ? book.coverage.series : undefined;
+  const sources = matchedSeries?.name
+    ? {
+        ...(book.sources ?? {}),
+        series: 'metadata',
+        series_position: 'metadata',
+      }
+    : book.sources;
   const candidate: BookCandidate = {
     source_path: book.source_path,
     title: book.title,
     authors: book.authors ?? [],
-    series: book.series ?? '',
-    series_pos: book.series_position ?? '',
+    series: matchedSeries?.name ?? book.series ?? '',
+    series_pos: matchedSeries?.position ?? book.series_position ?? '',
     asin: book.asin ?? '',
     isbn: book.isbn ?? '',
     coverage: book.coverage,
-    sources: book.sources,
+    sources,
   };
   // Carry narrators through so a later core (add-work) proposal can prefill them
   // (metaissue requires >= 1 narrator). Omit an empty list to keep the payload tidy.

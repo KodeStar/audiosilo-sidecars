@@ -67,6 +67,10 @@ type Coverage struct {
 	// human "manual" matches so the user can eyeball whether the match is right
 	// (an exact asin/isbn match needs no confirmation, so it is omitted there).
 	WorkTitle string `json:"work_title,omitempty"`
+	// Series is the matched work's primary series membership. It is deliberately
+	// carried with the verdict so a successful metadata match can repair missing
+	// or weak local tag/path metadata before the book is enqueued.
+	Series *SeriesRef `json:"series,omitempty"`
 	// HasCharacters / HasRecaps report whether the work already carries that
 	// sidecar (so it does not need contributing).
 	HasCharacters bool `json:"has_characters"`
@@ -153,6 +157,7 @@ type lookupVal struct {
 
 type workVal struct {
 	title    string
+	series   *SeriesRef
 	hasChars bool
 	hasRecap bool
 }
@@ -164,6 +169,7 @@ type workVal struct {
 type searchVal struct {
 	workID    string
 	workTitle string
+	series    *SeriesRef
 	matched   bool
 }
 
@@ -285,7 +291,7 @@ func (c *Client) CoverageForWork(ctx context.Context, workID string) (Coverage, 
 	}
 	return Coverage{
 		Available: true, Known: true, WorkID: workID,
-		MatchedBy: "manual", WorkTitle: v.title,
+		MatchedBy: "manual", WorkTitle: v.title, Series: cloneSeriesRef(v.series),
 		HasCharacters: v.hasChars, HasRecaps: v.hasRecap,
 	}, nil
 }
@@ -316,8 +322,17 @@ func (c *Client) workCoverage(ctx context.Context, workID, matchedBy, workTitle 
 	if v, found, ok := c.workDetail(ctx, workID); ok && found {
 		cov.HasCharacters = v.hasChars
 		cov.HasRecaps = v.hasRecap
+		cov.Series = cloneSeriesRef(v.series)
 	}
 	return cov
+}
+
+func cloneSeriesRef(s *SeriesRef) *SeriesRef {
+	if s == nil {
+		return nil
+	}
+	copy := *s
+	return &copy
 }
 
 // getJSON performs a GET and decodes JSON into v. It returns (found=false) for a
@@ -386,6 +401,7 @@ func (c *Client) workDetail(ctx context.Context, workID string) (v workVal, foun
 	}
 	var res struct {
 		Title      string            `json:"title"`
+		Series     []SeriesRef       `json:"series"`
 		Characters []json.RawMessage `json:"characters"`
 		Recaps     []json.RawMessage `json:"recaps"`
 	}
@@ -397,6 +413,9 @@ func (c *Client) workDetail(ctx context.Context, workID string) (v workVal, foun
 		return workVal{}, false, true
 	}
 	v = workVal{title: res.Title, hasChars: len(res.Characters) > 0, hasRecap: len(res.Recaps) > 0}
+	if len(res.Series) > 0 {
+		v.series = cloneSeriesRef(&res.Series[0])
+	}
 	c.works.put(workID, v)
 	return v, true, true
 }
@@ -419,7 +438,11 @@ func (c *Client) searchMatch(ctx context.Context, id BookIdentity) (Coverage, bo
 		if !v.matched {
 			return Coverage{Available: true, Known: false}, true
 		}
-		return c.workCoverage(ctx, v.workID, "search", v.workTitle), true
+		cov := c.workCoverage(ctx, v.workID, "search", v.workTitle)
+		if cov.Series == nil {
+			cov.Series = cloneSeriesRef(v.series)
+		}
+		return cov, true
 	}
 
 	cards, ok := c.fetchWorkSearch(ctx, title, SearchLimit)
@@ -447,12 +470,17 @@ func (c *Client) searchMatch(ctx context.Context, id BookIdentity) (Coverage, bo
 		v.matched = true
 		v.workID = cards[idx].ID
 		v.workTitle = cards[idx].Title
+		v.series = cloneSeriesRef(cards[idx].Series)
 	}
 	c.searchVerd.put(key, v)
 	if !v.matched {
 		return Coverage{Available: true, Known: false}, true
 	}
-	return c.workCoverage(ctx, v.workID, "search", v.workTitle), true
+	cov := c.workCoverage(ctx, v.workID, "search", v.workTitle)
+	if cov.Series == nil {
+		cov.Series = cloneSeriesRef(v.series)
+	}
+	return cov, true
 }
 
 // fetchWorkSearch runs the search endpoint and returns work-kind hits flattened

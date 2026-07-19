@@ -212,6 +212,9 @@ export interface Coverage {
   has_recaps: boolean;
   matched_by?: MatchedBy;
   work_title?: string;
+  // Primary series membership supplied by the matched metadata work. A known
+  // match takes precedence over absent/weak local scan metadata at enqueue time.
+  series?: MetaSearchSeries | null;
 }
 
 export interface ScannedBook {
@@ -231,7 +234,7 @@ export interface ScannedBook {
   runtime_min?: number;
   chapters?: number;
   audio_files: number;
-  // Where each field came from ("tag" | "path" | "filename").
+  // Where each field came from ("tag" | "path" | "filename" | "metadata").
   sources?: Record<string, string>;
   coverage: Coverage;
   // True when the user has hidden this book from the default candidate list (a

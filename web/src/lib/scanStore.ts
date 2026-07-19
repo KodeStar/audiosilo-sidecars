@@ -54,10 +54,23 @@ export function mergeBooks(
   return books.map((b) => {
     const patch = patches.get(b.source_path);
     if (!patch) return b;
+    const coverage = patch.coverage;
+    const matchedSeries = coverage?.known ? coverage.series : undefined;
     return {
       ...b,
       ...(patch.hidden !== undefined ? { hidden: patch.hidden } : {}),
-      ...(patch.coverage !== undefined ? { coverage: patch.coverage } : {}),
+      ...(coverage !== undefined ? { coverage } : {}),
+      ...(matchedSeries?.name
+        ? {
+            series: matchedSeries.name,
+            series_position: matchedSeries.position,
+            sources: {
+              ...(b.sources ?? {}),
+              series: 'metadata',
+              series_position: 'metadata',
+            },
+          }
+        : {}),
     };
   });
 }

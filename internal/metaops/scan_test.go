@@ -113,7 +113,9 @@ func TestScanManagerStreamsAndResolvesCoverage(t *testing.T) {
 	// A fake meta server that knows one of the two books by ASIN.
 	s := &metaServer{
 		lookup: map[string]string{"B-KNOWN": "w-known"},
-		work:   map[string]workRow{"w-known": {title: "Known Work", c: true}},
+		work: map[string]workRow{"w-known": {
+			title: "Known Work", seriesName: "Authoritative Saga", seriesPos: "3", c: true,
+		}},
 	}
 	c, _ := newMeta(t, s)
 	m := NewScanManager(context.Background(), c, "", nil)
@@ -142,6 +144,9 @@ func TestScanManagerStreamsAndResolvesCoverage(t *testing.T) {
 	}
 	if k := byPath["/lib/known"]; !k.Coverage.Known || k.Coverage.MatchedBy != "asin" || !k.Coverage.HasCharacters {
 		t.Fatalf("known book coverage = %+v", k.Coverage)
+	}
+	if k := byPath["/lib/known"]; k.Series != "Authoritative Saga" || k.SeriesPosition != "3" || k.Sources["series"] != "metadata" {
+		t.Fatalf("known book did not adopt matched series metadata: %+v", k)
 	}
 	if u := byPath["/lib/unknown"]; u.Coverage.Known {
 		t.Fatalf("unknown book should not be known: %+v", u.Coverage)
@@ -192,7 +197,9 @@ func TestScanManagerReportsWalkProgress(t *testing.T) {
 }
 
 func TestScanManagerAppliesOverrides(t *testing.T) {
-	s := &metaServer{work: map[string]workRow{"w-manual": {title: "Manual Pick", r: true}}}
+	s := &metaServer{work: map[string]workRow{"w-manual": {
+		title: "Manual Pick", seriesName: "Manual Saga", seriesPos: "2", r: true,
+	}}}
 	c, _ := newMeta(t, s)
 	// Persisted overrides key on the ABSOLUTE, canonical source path, while metascan
 	// books carry root-relative paths - the manager joins them onto the canonical
@@ -225,6 +232,9 @@ func TestScanManagerAppliesOverrides(t *testing.T) {
 	man := byPath["Author/manual"]
 	if !man.Coverage.Known || man.Coverage.MatchedBy != "manual" || man.Coverage.WorkID != "w-manual" || !man.Coverage.HasRecaps {
 		t.Fatalf("manual override coverage = %+v", man.Coverage)
+	}
+	if man.Series != "Manual Saga" || man.SeriesPosition != "2" || man.Sources["series_position"] != "metadata" {
+		t.Fatalf("manual override did not adopt matched series metadata: %+v", man)
 	}
 	if byPath["Author/plain"].Hidden {
 		t.Errorf("plain book should not be hidden: %+v", byPath["Author/plain"])

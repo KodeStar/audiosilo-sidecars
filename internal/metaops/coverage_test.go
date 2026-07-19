@@ -14,8 +14,9 @@ import (
 
 // workRow is a fake work's title + sidecar presence.
 type workRow struct {
-	title string
-	c, r  bool
+	title                 string
+	seriesName, seriesPos string
+	c, r                  bool
 }
 
 // cardRow is one work-kind search hit the fake returns.
@@ -72,6 +73,9 @@ func (s *metaServer) handler() http.Handler {
 			return
 		}
 		body := `{"id":"` + id + `","title":"` + wk.title + `"`
+		if wk.seriesName != "" {
+			body += `,"series":[{"id":"s","name":"` + wk.seriesName + `","position":"` + wk.seriesPos + `"}]`
+		}
 		if wk.c {
 			body += `,"characters":[{"id":"x","name":"X"}]`
 		}
@@ -122,7 +126,7 @@ func TestCoverageByASINAndISBN(t *testing.T) {
 	s := &metaServer{
 		lookup: map[string]string{"B-ASIN": "w1", "978-ISBN": "w2"},
 		work: map[string]workRow{
-			"w1": {title: "Work One", c: true, r: false},
+			"w1": {title: "Work One", seriesName: "Matched Saga", seriesPos: "2", c: true, r: false},
 			"w2": {title: "Work Two", c: true, r: true},
 		},
 	}
@@ -137,6 +141,9 @@ func TestCoverageByASINAndISBN(t *testing.T) {
 	}
 	if got.WorkID != "w1" {
 		t.Fatalf("asin work id = %q", got.WorkID)
+	}
+	if got.Series == nil || got.Series.Name != "Matched Saga" || got.Series.Position != "2" {
+		t.Fatalf("asin series metadata = %+v", got.Series)
 	}
 
 	// ISBN match (no asin present) resolves via the isbn lookup.
@@ -161,9 +168,12 @@ func TestCoverageByASINAndISBN(t *testing.T) {
 func TestCoverageSearchFallbackAccept(t *testing.T) {
 	// No asin/isbn: the fuzzy fallback matches by title + author.
 	s := &metaServer{
-		work:   map[string]workRow{"w-hedge": {title: "The Hedge Wizard", c: false, r: false}},
-		search: []cardRow{{id: "w-hedge", title: "The Hedge Wizard", author: "Alex Maher"}},
-		extra:  `{"kind":"person","id":"p1","name":"Alex Maher"}`,
+		work: map[string]workRow{"w-hedge": {title: "The Hedge Wizard", c: false, r: false}},
+		search: []cardRow{{
+			id: "w-hedge", title: "The Hedge Wizard", author: "Alex Maher",
+			seriesName: "Hedge", seriesPos: "1",
+		}},
+		extra: `{"kind":"person","id":"p1","name":"Alex Maher"}`,
 	}
 	c, _ := newMeta(t, s)
 	ctx := context.Background()
@@ -175,6 +185,9 @@ func TestCoverageSearchFallbackAccept(t *testing.T) {
 	// The search match carries the work title so the user can verify it.
 	if got.WorkTitle != "The Hedge Wizard" {
 		t.Errorf("search match missing work_title: %+v", got)
+	}
+	if got.Series == nil || got.Series.Name != "Hedge" || got.Series.Position != "1" {
+		t.Errorf("search match missing series metadata: %+v", got.Series)
 	}
 	// The verdict is cached: a second call issues no new search.
 	before := s.reqCount("search")
@@ -232,7 +245,9 @@ func TestSearchVerdictKeyIncludesSeries(t *testing.T) {
 }
 
 func TestCoverageForWork(t *testing.T) {
-	s := &metaServer{work: map[string]workRow{"w-1": {title: "Manual Work", c: true, r: false}}}
+	s := &metaServer{work: map[string]workRow{"w-1": {
+		title: "Manual Work", seriesName: "Manual Saga", seriesPos: "4", c: true, r: false,
+	}}}
 	c, _ := newMeta(t, s)
 	ctx := context.Background()
 
@@ -243,6 +258,9 @@ func TestCoverageForWork(t *testing.T) {
 	}
 	if !got.Known || got.MatchedBy != "manual" || got.WorkTitle != "Manual Work" || !got.HasCharacters {
 		t.Fatalf("manual coverage = %+v", got)
+	}
+	if got.Series == nil || got.Series.Name != "Manual Saga" || got.Series.Position != "4" {
+		t.Fatalf("manual series metadata = %+v", got.Series)
 	}
 
 	// A stale id -> ErrWorkNotFound (a clean upstream 404, mappable to a 4xx).

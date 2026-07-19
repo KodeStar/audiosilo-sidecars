@@ -94,6 +94,28 @@ describe('mergeBooks', () => {
     const c = scannedBook({ path: '/c' });
     expect(mergeBooks([c], patches)[0]).toBe(c);
   });
+
+  it('applies matched series metadata to a manually matched scan row', () => {
+    const patches = new Map<string, BookPatch>([
+      [
+        a.source_path,
+        {
+          coverage: cov({
+            matched_by: 'manual',
+            work_id: 'work-a',
+            series: { name: 'Matched Saga', position: '5' },
+          }),
+        },
+      ],
+    ]);
+
+    const [matched] = mergeBooks([a], patches);
+
+    expect(matched.series).toBe('Matched Saga');
+    expect(matched.series_position).toBe('5');
+    expect(matched.sources?.series).toBe('metadata');
+    expect(matched.sources?.series_position).toBe('metadata');
+  });
 });
 
 describe('error helpers', () => {
