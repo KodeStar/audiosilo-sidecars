@@ -86,6 +86,16 @@ var (
 	reNumberDot     = regexp.MustCompile(`^(\d+)\.\s*(.*)$`)
 )
 
+var chapterNumberWords = map[string]int{
+	"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+	"five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+	"ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+	"fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+	"eighteen": 18, "nineteen": 19, "twenty": 20, "thirty": 30,
+	"forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
+	"eighty": 80, "ninety": 90,
+}
+
 // chapterFromMarker parses a chapter number and optional title from a marker
 // title, or ok=false when it is not a chapter marker.
 func chapterFromMarker(title string) (num int, chapterTitle string, ok bool) {
@@ -97,6 +107,19 @@ func chapterFromMarker(title string) (num int, chapterTitle string, ok bool) {
 		}
 		return n, strings.TrimSpace(m[2]), true
 	}
+	// Some M4B encoders spell marker numbers out ("Chapter Twenty One") rather
+	// than using digits. Treat those exactly like their numeric equivalents so a
+	// complete embedded chapter table does not get discarded and sent through
+	// agent-based marker recovery. A colon, dot, or spaced hyphen separates an
+	// optional chapter title; a hyphen inside "twenty-one" remains part of the
+	// number phrase.
+	if len(t) > len("chapter ") && strings.EqualFold(t[:len("chapter ")], "chapter ") {
+		rest := strings.TrimSpace(t[len("chapter "):])
+		words, suffix := splitWordChapterTitle(rest)
+		if n, valid := parseChapterNumberWords(words); valid {
+			return n, suffix, true
+		}
+	}
 	if m := reNumberDot.FindStringSubmatch(t); m != nil {
 		n, err := strconv.Atoi(m[1])
 		if err != nil {
@@ -105,6 +128,60 @@ func chapterFromMarker(title string) (num int, chapterTitle string, ok bool) {
 		return n, strings.TrimSpace(m[2]), true
 	}
 	return 0, "", false
+}
+
+func splitWordChapterTitle(s string) (words, title string) {
+	cut := len(s)
+	delimLen := 0
+	for _, delim := range []string{" - ", " – ", " — ", ":", "."} {
+		if i := strings.Index(s, delim); i >= 0 && i < cut {
+			cut, delimLen = i, len(delim)
+		}
+	}
+	if cut == len(s) {
+		return strings.TrimSpace(s), ""
+	}
+	return strings.TrimSpace(s[:cut]), strings.TrimSpace(s[cut+delimLen:])
+}
+
+// parseChapterNumberWords parses the conventional English cardinal form used by
+// audiobook chapter markers. It deliberately rejects unknown words rather than
+// guessing, while supporting hyphenated numbers and chapters above one hundred.
+func parseChapterNumberWords(s string) (int, bool) {
+	fields := strings.Fields(strings.ReplaceAll(strings.ToLower(strings.TrimSpace(s)), "-", " "))
+	if len(fields) == 0 {
+		return 0, false
+	}
+	total, current := 0, 0
+	seen := false
+	for _, word := range fields {
+		if word == "and" {
+			continue
+		}
+		if value, ok := chapterNumberWords[word]; ok {
+			current += value
+			seen = true
+			continue
+		}
+		switch word {
+		case "hundred":
+			if current == 0 {
+				current = 1
+			}
+			current *= 100
+			seen = true
+		case "thousand":
+			if current == 0 {
+				current = 1
+			}
+			total += current * 1000
+			current = 0
+			seen = true
+		default:
+			return 0, false
+		}
+	}
+	return total + current, seen
 }
 
 // contiguous reports whether chapters (already sorted by start) number a gapless

@@ -30,7 +30,13 @@ func TestChapterFromMarker(t *testing.T) {
 		{"Chapter 7 - The Hyphen", 7, "The Hyphen", true}, // hyphen style
 		{"Chapter 12", 12, "", true},                      // no title
 		{"chapter 3: lowercase", 3, "lowercase", true},    // case-insensitive
-		{"Opening Credits", 0, "", false},                 // credits excluded
+		{"Chapter One", 1, "", true},                      // word-number marker
+		{"Chapter Twenty One", 21, "", true},              // compound word number
+		{"Chapter Fifty-Four", 54, "", true},              // hyphenated word number
+		{"Chapter One Hundred and Two: Return", 102, "Return", true},
+		{"Chapter Forty Seven - The Gate", 47, "The Gate", true},
+		{"Chapter Seventy-One – Knowing the Risks", 71, "Knowing the Risks", true},
+		{"Opening Credits", 0, "", false}, // credits excluded
 		{"End Credits", 0, "", false},
 		{"Prologue", 0, "", false},
 	}
@@ -258,6 +264,28 @@ func TestInspectAndSplitMarkers(t *testing.T) {
 		if codec != "flac" || chans != 1 || rate != 16000 {
 			t.Errorf("chapter %d FLAC = codec %q, %d ch, %d Hz; want flac/1/16000", ch.Chapter, codec, chans, rate)
 		}
+	}
+}
+
+func TestInspectWordNumberedMarkersExcludesExtras(t *testing.T) {
+	ffmpeg, ffprobe := requireFFmpeg(t)
+	dir := t.TempDir()
+	book := genChapteredM4B(t, ffmpeg, dir,
+		[]string{"Opening Credits", "Chapter One – Arrival", "Chapter Two — Departure", "Bloopers", "End Credits"}, 2)
+	work := filepath.Join(dir, "work")
+
+	m, contig, err := Inspect(context.Background(), book, work, ffprobe)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if !contig {
+		t.Fatal("word-numbered chapter markers should be contiguous")
+	}
+	if m.ChapterCount != 2 || len(m.Chapters) != 2 {
+		t.Fatalf("manifest has %d chapters (%d entries), want 2", m.ChapterCount, len(m.Chapters))
+	}
+	if m.Chapters[0].Chapter != 1 || m.Chapters[0].Start != 2 || m.Chapters[1].Chapter != 2 || m.Chapters[1].End != 6 {
+		t.Errorf("logical chapter intervals = %+v, want only Chapter One and Chapter Two", m.Chapters)
 	}
 }
 
