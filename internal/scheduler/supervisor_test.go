@@ -115,6 +115,24 @@ func TestSupervisorReadmitRetainsExistingRateLimitWindow(t *testing.T) {
 	}
 }
 
+func TestSupervisorParkIncludesIncidentDetail(t *testing.T) {
+	h := newHarness(t)
+	db := h.openDB(t)
+	b := h.addBook(t, db, "detailed-park", "", "")
+	s := New(db, events.NewHub(8), NewStubExecutor(0, 0), 2, h.workRoot, false)
+	const detail = "authentication failed: agent CLI is not logged in"
+	if _, err := s.SupervisorApply(context.Background(), "park_escalate", b.ID, b.State, detail); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.GetBook(context.Background(), b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Error != "supervisor: "+detail || got.ParkCode != string(state.ParkSupervisorEscalated) {
+		t.Fatalf("park did not retain incident detail: %+v", got)
+	}
+}
+
 func TestSupervisorNeverRewindsReadyOrPublishedOutput(t *testing.T) {
 	h := newHarness(t)
 	db := h.openDB(t)

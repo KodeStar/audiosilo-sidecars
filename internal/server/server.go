@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -290,7 +291,11 @@ func Run(ctx context.Context, opts Options) error {
 				sched.Notify()
 				return "pre-approved fallback backend activated within configured concurrency", nil
 			}
-			return sched.SupervisorApply(ctx, string(action), incident.BookID, incident.Stage)
+			detail := incident.Diagnosis
+			if len(incident.Evidence) > 0 {
+				detail += ": " + strings.Join(incident.Evidence, "; ")
+			}
+			return sched.SupervisorApply(ctx, string(action), incident.BookID, incident.Stage, detail)
 		},
 		Publish: func(eventType string, bookID int64, payload any) {
 			if bookID > 0 {

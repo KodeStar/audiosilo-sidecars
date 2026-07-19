@@ -53,7 +53,8 @@ The deterministic classifier covers:
 - duration, tokens, or cost growing beyond the configured factor versus the last
   successful attempt of the same stage;
 - normalized repeated-error fingerprints (volatile paths, IDs, and counters removed);
-- three identical QA metric fingerprints and flat/diverging audit fix counts;
+- three identical QA metric fingerprints and flat/diverging actionable audit
+  findings (diagnostic only: the pipeline's bounded repair loops remain in control);
 - authentication, rate-limit/overload, and backend-unavailable signatures;
 - absent, empty, or invalid completion sentinels and required artifacts;
 - idle agent-book capacity while eligible books are waiting, and idle per-book or
@@ -78,11 +79,14 @@ Safe playbooks only use existing scheduler/store mechanisms:
   enabled and that exact fallback was configured in advance.
 
 The contributing/publishing stage is never automatically superseded. Authentication,
-repeated failures, non-converging repair loops, attempt-limit exhaustion, and any
-unapproved backend change park with `supervisor_escalated` for operator review.
-Automatic parking may contain a problem, but remediation/readmission remains a human
-decision. Existing in-invocation transient retry logic remains the cheapest first
-line of recovery.
+repeated failures, attempt-limit exhaustion, and any unapproved backend change park
+with `supervisor_escalated` for operator review. A supervisor park includes its
+diagnosis and evidence in the book error rather than replacing them with a generic
+message. Non-converging QA and audit/fix incidents are observation-only because those
+production loops already own bounded corrective passes, trajectory-aware acceptance,
+and detailed typed parks at their caps; the supervisor must not interrupt an active
+repair. Existing in-invocation transient retry logic remains the cheapest first line
+of recovery.
 
 ## Configuration
 

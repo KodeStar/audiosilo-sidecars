@@ -56,7 +56,7 @@ func (s *Scheduler) SupervisorRuntime(books []store.Book) SupervisorRuntimeSnaps
 
 // SupervisorApply executes the supervisor's small predefined playbook. The string
 // action is mapped at the server seam so scheduler does not depend on supervisor.
-func (s *Scheduler) SupervisorApply(ctx context.Context, action string, bookID int64, stage string) (string, error) {
+func (s *Scheduler) SupervisorApply(ctx context.Context, action string, bookID int64, stage string, detail ...string) (string, error) {
 	switch action {
 	case "retry", "readmit":
 		b, err := s.db.GetBook(ctx, bookID)
@@ -86,7 +86,11 @@ func (s *Scheduler) SupervisorApply(ctx context.Context, action string, bookID i
 	case "stop_budget":
 		return s.supervisorPark(ctx, bookID, state.ParkSupervisorBudget, "supervisor stopped the stage at its configured duration/token/cost limit")
 	case "park_escalate":
-		return s.supervisorPark(ctx, bookID, state.ParkSupervisorEscalated, "supervisor parked this book for operator review")
+		message := "supervisor parked this book for operator review"
+		if len(detail) > 0 && detail[0] != "" {
+			message = "supervisor: " + detail[0]
+		}
+		return s.supervisorPark(ctx, bookID, state.ParkSupervisorEscalated, message)
 	case "reallocate":
 		s.notify()
 		return "idle configured capacity was offered queued work", nil

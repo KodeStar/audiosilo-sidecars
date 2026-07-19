@@ -133,6 +133,18 @@ func TestQAAndAuditNonConvergence(t *testing.T) {
 	}
 }
 
+func TestAuditBlockerDowngradeIsProgress(t *testing.T) {
+	ok := true
+	runs := []store.StageRun{
+		{ID: 1, Stage: "auditing", FinishedAt: "x", Ok: &ok, Metrics: json.RawMessage(`{"pass":false,"blocker":1,"fix":0}`)},
+		{ID: 2, Stage: "auditing", FinishedAt: "x", Ok: &ok, Metrics: json.RawMessage(`{"pass":false,"blocker":0,"fix":1}`)},
+	}
+	got := kinds(Classify(Snapshot{Book: store.Book{ID: 1, BatchID: "b", State: "fixing"}, Runs: runs}, Policy{MaxErrorRepeats: 2}))
+	if got[IncidentNonConvergingAudit] {
+		t.Fatalf("blocker-to-fix downgrade treated as regression: %#v", got)
+	}
+}
+
 func TestResolvedHistoricalFailuresAndLoopsAreIgnored(t *testing.T) {
 	ok, failed := true, false
 	failure := store.StageRun{ID: 1, Stage: "fact_pass", FinishedAt: "1", Ok: &failed, Metrics: json.RawMessage(`{"error":"not logged in"}`)}
@@ -206,6 +218,12 @@ func TestDecisionRetryEscalationAndApprovalLimits(t *testing.T) {
 	d = Decide(Incident{Kind: IncidentDurationLimit}, 0, p)
 	if d.Action != ActionStopBudget || !d.Automatic {
 		t.Fatalf("duration containment=%+v", d)
+	}
+	for _, kind := range []IncidentKind{IncidentNonConvergingQA, IncidentNonConvergingAudit} {
+		d = Decide(Incident{Kind: kind}, 0, p)
+		if d.Action != ActionObserve || d.Automatic || d.ApprovalRequired {
+			t.Fatalf("bounded pipeline loop %s was interrupted: %+v", kind, d)
+		}
 	}
 }
 

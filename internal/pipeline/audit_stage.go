@@ -132,9 +132,9 @@ func (e *Executor) audit(ctx context.Context, book store.Book, r scheduler.Stage
 	// never by shipping known defects. Record this round in the history, then decide.
 	if e.db != nil && !effectivePass {
 		prev := loadAuditRounds(book.WorkDir) // BEFORE appending: the previous round is last
-		prevFix, prevOK := 0, false
+		prevBlocker, prevFix, prevOK := 0, 0, false
 		if n := len(prev); n > 0 {
-			prevFix, prevOK = prev[n-1].Fix, true
+			prevBlocker, prevFix, prevOK = prev[n-1].Blocker, prev[n-1].Fix, true
 		}
 		if aerr := appendAuditRound(book.WorkDir, auditRound{Round: round, Blocker: blocker, Fix: fix, Nit: nit}); aerr != nil {
 			return scheduler.StageResult{}, fmt.Errorf("auditing: record round history: %w", aerr)
@@ -143,7 +143,7 @@ func (e *Executor) audit(ctx context.Context, book store.Book, r scheduler.Stage
 		if cerr != nil {
 			return scheduler.StageResult{}, fmt.Errorf("auditing: count fix rounds: %w", cerr)
 		}
-		if acceptTrajectory(round, blocker, fix, prevFix, prevOK, fixesDone, valRep.Clean, state.MaxFixAttempts) {
+		if acceptTrajectory(round, blocker, fix, prevBlocker, prevFix, prevOK, fixesDone, valRep.Clean, state.MaxFixAttempts) {
 			acc := auditAccepted{Round: round, Fix: fix, Nit: nit, Findings: nonBlockerFindings(rep)}
 			if werr := writeAuditAccepted(book.WorkDir, acc); werr != nil {
 				return scheduler.StageResult{}, fmt.Errorf("auditing: write acceptance marker: %w", werr)

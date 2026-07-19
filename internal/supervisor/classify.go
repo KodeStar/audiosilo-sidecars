@@ -249,9 +249,10 @@ func classifyFailures(s Snapshot, runs []store.StageRun, p Policy) []Incident {
 }
 
 func classifyConvergence(s Snapshot, runs []store.StageRun) []Incident {
+	type auditCounts struct{ blocker, fix int }
 	var qaFP []string
 	var qaRunIDs []int64
-	var auditFix []int
+	var auditHistory []auditCounts
 	var auditRunIDs []int64
 	for _, r := range runs {
 		if r.Superseded || r.Ok == nil || !*r.Ok {
@@ -267,10 +268,11 @@ func classifyConvergence(s Snapshot, runs []store.StageRun) []Incident {
 		}
 		if r.Stage == "auditing" {
 			if pass, _ := m["pass"].(bool); pass {
-				auditFix = nil
+				auditHistory = nil
 				auditRunIDs = nil
 			} else if f, ok := number(m["fix"]); ok {
-				auditFix = append(auditFix, f)
+				blocker, _ := number(m["blocker"])
+				auditHistory = append(auditHistory, auditCounts{blocker: blocker, fix: f})
 				auditRunIDs = append(auditRunIDs, r.ID)
 			}
 		}
@@ -281,8 +283,16 @@ func classifyConvergence(s Snapshot, runs []store.StageRun) []Incident {
 		out = append(out, Incident{Kind: IncidentNonConvergingQA, BookID: s.Book.ID, BatchID: s.Book.BatchID, Stage: "qa_sweep", StageRunID: qaRunIDs[len(qaRunIDs)-1], Fingerprint: qaFP[len(qaFP)-1], Diagnosis: "QA repair loop repeated the same findings", Evidence: []string{"three identical QA fingerprints"}})
 	}
 	auditPhase := s.Book.State == "auditing" || s.Book.State == "fixing"
-	if auditPhase && len(auditFix) >= 2 && auditFix[len(auditFix)-1] >= auditFix[len(auditFix)-2] {
-		out = append(out, Incident{Kind: IncidentNonConvergingAudit, BookID: s.Book.ID, BatchID: s.Book.BatchID, Stage: "auditing", StageRunID: auditRunIDs[len(auditRunIDs)-1], Diagnosis: "audit repair loop is flat or diverging", Evidence: []string{fmt.Sprintf("fix counts %d -> %d", auditFix[len(auditFix)-2], auditFix[len(auditFix)-1])}})
+	if auditPhase && len(auditHistory) >= 2 {
+		previous, current := auditHistory[len(auditHistory)-2], auditHistory[len(auditHistory)-1]
+		previousTotal, currentTotal := previous.blocker+previous.fix, current.blocker+current.fix
+		// A blocker becoming a fix is a severity improvement even when the total
+		// stays flat. Only diagnose a non-improving severity/count trajectory.
+		if current.blocker >= previous.blocker && currentTotal >= previousTotal {
+			evidence := fmt.Sprintf("actionable findings %d (%d blocker, %d fix) -> %d (%d blocker, %d fix)",
+				previousTotal, previous.blocker, previous.fix, currentTotal, current.blocker, current.fix)
+			out = append(out, Incident{Kind: IncidentNonConvergingAudit, BookID: s.Book.ID, BatchID: s.Book.BatchID, Stage: "auditing", StageRunID: auditRunIDs[len(auditRunIDs)-1], Diagnosis: "audit findings are flat or diverging; the bounded pipeline repair loop remains in control", Evidence: []string{evidence}})
+		}
 	}
 	return out
 }
@@ -347,7 +357,13 @@ func Decide(i Incident, attempts int, p Policy) Decision {
 		}
 	case IncidentSlotInefficiency:
 		d.Action = ActionReallocate
-	case IncidentAuthentication, IncidentRepeatedError, IncidentNonConvergingQA, IncidentNonConvergingAudit:
+	case IncidentNonConvergingQA, IncidentNonConvergingAudit:
+		// QA and audit/fix loops already have bounded, artifact-aware recovery in
+		// the production pipeline. The supervisor may diagnose their trajectory,
+		// but must not interrupt a corrective pass or replace the pipeline's rich
+		// typed park reason with a generic supervisor escalation.
+		d.Action = ActionObserve
+	case IncidentAuthentication, IncidentRepeatedError:
 		d.Action = ActionParkEscalate
 		d.ApprovalRequired = true
 	default:

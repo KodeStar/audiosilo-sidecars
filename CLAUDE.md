@@ -344,8 +344,9 @@ internal/
             planned non-accept chapters, so accepted decisions stay valid). The AUDIT
             loop likewise now terminates by ACCEPTING: audit_rounds.json records each
             round's {blocker,fix,nit}; when a non-passing round is CONVERGING (blocker 0,
-            validation clean, round >= 2, 0 < fix <= auditAcceptMaxFix(2), fix not
-            growing, fix budget left) the stage writes audit_accepted.json (the residual
+            validation clean, round >= 2, 0 < fix <= auditAcceptMaxFix(2), actionable
+            findings not growing (so BLOCKER -> FIX is progress), fix budget left) the
+            stage writes audit_accepted.json (the residual
             findings), routes to ONE final fixing round, and the re-entry runs a focused
             semantic verifier over those exact accepted findings when validation is clean -
             so a mechanically valid but unapplied FIX cannot ship and a
@@ -936,7 +937,8 @@ Milestones from the workspace plan; each is shippable.
   qa_accepted.json ledger** - accepts survive rounds, so stale-layer re-flags stop
   burning a paid re-verification of the same chapters every round; (3) **audit
   trajectory acceptance** - blockers always fail, but a converging non-growing
-  fix count (<= 2) at round >= 2 writes `audit_accepted.json`, takes ONE final fix
+  actionable count with <= 2 FIX findings at round >= 2 (including BLOCKER -> FIX
+  severity improvement) writes `audit_accepted.json`, takes ONE final fix
   round, and runs a bounded verifier over the accepted findings (no known defect
   ever ships merely because mechanical validation is clean; residuals recorded +
   surfaced on the contribution note); Retry on `fix_loop_exhausted`

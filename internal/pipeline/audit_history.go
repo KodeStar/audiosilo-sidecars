@@ -120,11 +120,12 @@ func removeAuditTrajectory(workDir string) {
 //     judging a trajectory, not a first look.
 //   - 0 < fix <= auditAcceptMaxFix: fix==0 is a normal pass (handled elsewhere); more
 //     than the cap is too much residual to auto-ship.
-//   - prevOK and fix <= prevFix: the FIX count is not growing (a shrinking/flat trajectory
-//     is converging; a growing one is diverging and must run to the cap/park).
+//   - prevOK and fix <= prevBlocker+prevFix: the actionable count is not growing.
+//     A BLOCKER becoming a FIX is progress, not the misleading "fix 0 -> 1"
+//     regression that used to reject a one-item tail.
 //   - fixesDone < MaxFixAttempts: the budget still allows the ONE final fixing round the
 //     acceptance path needs to apply this round's items.
-func acceptTrajectory(round, blocker, fix, prevFix int, prevOK bool, fixesDone int, valClean bool, maxFix int) bool {
+func acceptTrajectory(round, blocker, fix, prevBlocker, prevFix int, prevOK bool, fixesDone int, valClean bool, maxFix int) bool {
 	if blocker != 0 || !valClean {
 		return false
 	}
@@ -134,7 +135,7 @@ func acceptTrajectory(round, blocker, fix, prevFix int, prevOK bool, fixesDone i
 	if fix <= 0 || fix > auditAcceptMaxFix {
 		return false
 	}
-	if !prevOK || fix > prevFix {
+	if !prevOK || fix > prevBlocker+prevFix {
 		return false
 	}
 	return fixesDone < maxFix

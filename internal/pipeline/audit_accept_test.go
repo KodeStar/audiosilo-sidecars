@@ -19,29 +19,30 @@ import (
 func TestAcceptTrajectory(t *testing.T) {
 	const maxFix = state.MaxFixAttempts // 3
 	cases := []struct {
-		name                string
-		round, blocker, fix int
-		prevFix             int
-		prevOK              bool
-		fixesDone           int
-		valClean            bool
-		want                bool
+		name                 string
+		round, blocker, fix  int
+		prevBlocker, prevFix int
+		prevOK               bool
+		fixesDone            int
+		valClean             bool
+		want                 bool
 	}{
 		// The converging book-3 case: round 2, fix 1 <= prev 4, budget left -> accept.
-		{"converging", 2, 0, 1, 4, true, 1, true, true},
-		{"flat-trajectory", 3, 0, 2, 2, true, 2, true, true},
-		{"blocker-never-accepts", 2, 1, 1, 4, true, 1, true, false},
-		{"unclean-validation-never-accepts", 2, 0, 1, 4, true, 1, false, false},
-		{"first-round-too-early", 1, 0, 1, 0, false, 0, true, false},
-		{"fix-zero-is-a-pass-not-accept", 2, 0, 0, 1, true, 1, true, false},
-		{"fix-over-cap", 2, 0, 3, 4, true, 1, true, false},
-		{"growing-trajectory", 2, 0, 2, 1, true, 1, true, false},
-		{"budget-exhausted", 4, 0, 1, 1, true, maxFix, true, false},
-		{"no-previous-round", 2, 0, 1, 0, false, 1, true, false},
+		{"converging", 2, 0, 1, 0, 4, true, 1, true, true},
+		{"flat-trajectory", 3, 0, 2, 0, 2, true, 2, true, true},
+		{"blocker-downgraded-to-fix", 2, 0, 1, 1, 0, true, 1, true, true},
+		{"blocker-never-accepts", 2, 1, 1, 0, 4, true, 1, true, false},
+		{"unclean-validation-never-accepts", 2, 0, 1, 0, 4, true, 1, false, false},
+		{"first-round-too-early", 1, 0, 1, 0, 0, false, 0, true, false},
+		{"fix-zero-is-a-pass-not-accept", 2, 0, 0, 0, 1, true, 1, true, false},
+		{"fix-over-cap", 2, 0, 3, 0, 4, true, 1, true, false},
+		{"growing-trajectory", 2, 0, 2, 0, 1, true, 1, true, false},
+		{"budget-exhausted", 4, 0, 1, 0, 1, true, maxFix, true, false},
+		{"no-previous-round", 2, 0, 1, 0, 0, false, 1, true, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := acceptTrajectory(c.round, c.blocker, c.fix, c.prevFix, c.prevOK, c.fixesDone, c.valClean, maxFix)
+			got := acceptTrajectory(c.round, c.blocker, c.fix, c.prevBlocker, c.prevFix, c.prevOK, c.fixesDone, c.valClean, maxFix)
 			if got != c.want {
 				t.Errorf("acceptTrajectory = %v, want %v", got, c.want)
 			}
@@ -295,6 +296,47 @@ func TestAuditAcceptsConvergingTrajectory(t *testing.T) {
 		if !strings.Contains(r.Note, "converged after 2 rounds") || !strings.Contains(r.Note, "2 residual nit") {
 			t.Errorf("row %s note = %q, want the acceptance line", r.Kind, r.Note)
 		}
+	}
+}
+
+// TestAuditAcceptsBlockerDowngradeTrajectory is the Book-2 regression: one
+// BLOCKER becoming one FIX is a severity improvement with a one-item tail. The
+// loop must apply that final fix and verify it, not misreport "fix 0 -> 1" and
+// continue toward a park.
+func TestAuditAcceptsBlockerDowngradeTrajectory(t *testing.T) {
+	fake := newFakeRunner()
+	fake.act = func(_ *fakeRunner, req agent.Request, attempt int) (agent.Result, error) {
+		switch req.Stage {
+		case string(state.Synthesizing), string(state.Fixing):
+			writeOutSidecars(t, req, "book")
+		case string(state.Auditing):
+			if strings.Contains(req.Prompt, "focused semantic verification") {
+				writeOut(t, req, auditReportName, AuditReport{Pass: true})
+				break
+			}
+			severity := SeverityBlocker
+			if attempt == 2 {
+				severity = SeverityFix
+			} else if attempt != 1 {
+				t.Errorf("unexpected fresh audit attempt %d", attempt)
+			}
+			writeOut(t, req, auditReportName, AuditReport{Pass: false, Findings: []AuditFinding{{Severity: severity, Locus: "characters"}}})
+		}
+		return agent.Result{Usage: agent.Usage{Model: "opus"}}, nil
+	}
+	book, db, stop := startSidecarBook(t, fake)
+	defer stop()
+
+	final := waitState(t, db, book.ID, "done", 30*time.Second)
+	if final.State != "done" {
+		t.Fatalf("book state = %q (status %q err %q), want done", final.State, final.Status, final.Error)
+	}
+	if n := fake.count(string(state.Auditing)); n != 3 {
+		t.Errorf("audit agent invoked %d times, want 3 (two broad + focused verification)", n)
+	}
+	acc, ok := loadAuditAccepted(book.WorkDir)
+	if !ok || acc.Round != 2 || acc.Fix != 1 {
+		t.Fatalf("blocker downgrade was not accepted: %+v (ok=%v)", acc, ok)
 	}
 }
 
