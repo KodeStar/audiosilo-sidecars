@@ -218,7 +218,8 @@ func primaryIncident(incidents []Incident) (Incident, bool) {
 	}
 	priority := map[IncidentKind]int{
 		IncidentMissingProcess: 100, IncidentStaleHeartbeat: 95,
-		IncidentCostLimit: 90, IncidentTokenLimit: 90, IncidentDurationLimit: 90,
+		IncidentParkedRecovery: 92,
+		IncidentCostLimit:      90, IncidentTokenLimit: 90, IncidentDurationLimit: 90,
 		IncidentAuthentication: 85, IncidentBackendUnavailable: 84, IncidentRateLimit: 83,
 		IncidentRepeatedError: 80, IncidentNonConvergingQA: 78, IncidentNonConvergingAudit: 78,
 		IncidentArtifactInvalid: 75, IncidentNoProgress: 70, IncidentUnclassified: 60,
@@ -248,11 +249,12 @@ func (s *Service) handleIncident(ctx context.Context, trigger string, i Incident
 	if seen {
 		return nil
 	}
-	attempts := 0
-	for _, r := range runs {
-		if r.Stage == i.Stage {
-			attempts++
-		}
+	// Count recovery decisions for this diagnosis family, not production stage
+	// attempts. Audit/fix and QA loops legitimately create many stage runs; treating
+	// them as supervisor retries caused mature books to escalate immediately.
+	attempts, err := s.db.CountSupervisorIncidentFamily(ctx, string(i.Kind), i.BookID, i.Stage, i.Fingerprint)
+	if err != nil {
+		return err
 	}
 	d := Decide(i, attempts, s.policy)
 	evidence, _ := json.Marshal(i.Evidence)

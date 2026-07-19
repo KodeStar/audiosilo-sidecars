@@ -2,8 +2,9 @@
 // concurrent lanes. One scheduler goroutine wakes on events, computes eligible
 // (book, stage) pairs, and dispatches them to lane workers:
 //
-//   - Lane A (ASR), capacity 1: asr + retranscribing (retranscribe jumps queue;
-//     ordinary ASR is breadth-first across series).
+//   - Lane A (ASR): one ordinary full-book transcription plus one independent
+//     corrective retranscription. Ordinary ASR is breadth-first across series;
+//     corrective work never waits behind a long-running full-book transcription.
 //   - Lane B (agent books), capacity config.agent.queue_concurrency: gated by a SERIES LOCK -
 //     only the lowest-position unfinished book of a series may hold an agent slot,
 //     so different series parallelize but a series is authored in order.
@@ -35,11 +36,14 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
 
-// Lane capacities. ASR is 1 by validated constraint; mechanical is a small fixed
-// pool; the agent capacity is configurable (Config default 2).
+// Lane capacities. Full-book ASR remains serial by validated constraint. A
+// separate single corrective slot lets a targeted retranscription overlap it
+// without allowing two full books (or an unbounded set of repairs) to compete for
+// the transcriber. Mechanical is a small fixed pool; agent capacity is configurable.
 const (
-	asrCapacity  = 1
-	mechCapacity = 2
+	asrCapacity          = 1
+	retranscribeCapacity = 1
+	mechCapacity         = 2
 )
 
 // tickInterval is a safety re-evaluation cadence in case a wake is ever missed.
@@ -109,6 +113,7 @@ type agentFanoutRuntime interface {
 
 type inflightBook struct {
 	lane   state.Lane
+	stage  state.State
 	cancel context.CancelFunc
 }
 
@@ -150,6 +155,11 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	if err := s.Reconcile(ctx); err != nil {
 		return fmt.Errorf("reconcile: %w", err)
 	}
+	// A daemon restart is an explicit availability boundary: configuration, CLI
+	// credentials, binaries, and selected backends may all have changed. Give parks
+	// caused by those external conditions one immediate probe instead of preserving a
+	// stale future retry window or requiring a separate click after Restart.
+	s.readmitRestartRecoverable(ctx)
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 	s.dispatch()
@@ -325,9 +335,18 @@ func (s *Scheduler) dispatch() {
 	s.mu.Lock()
 	counts := map[state.Lane]int{}
 	inflightIDs := map[int64]bool{}
+	asrActive := 0
+	retranscribeActive := 0
 	for id, ib := range s.inflight {
 		counts[ib.lane]++
 		inflightIDs[id] = true
+		if ib.lane == state.LaneASR {
+			if ib.stage == state.Retranscribing {
+				retranscribeActive++
+			} else {
+				asrActive++
+			}
+		}
 	}
 	s.mu.Unlock()
 
@@ -351,22 +370,38 @@ func (s *Scheduler) dispatch() {
 		}
 	}
 
-	// ASR: finish corrective retranscriptions first. Ordinary transcription is
-	// breadth-first across series so each series opens an agent slot before ASR
-	// loops back to later books in a series.
+	// ASR: corrective retranscriptions and ordinary transcription have independent
+	// one-worker slots. Ordinary transcription is breadth-first across series so
+	// each series opens an agent slot before ASR loops back to later books.
 	sortASRLane(asr, books)
+	retranscriptions, transcriptions := partitionASR(asr)
 	sortByID(agent)
 	sortByID(mech)
 
 	// fillLane returns how many it dispatched, so counts ends the pass holding the
 	// post-dispatch per-lane occupancy - the exact numbers queue.stats publishes,
 	// with no second scan of the inflight set.
-	counts[state.LaneASR] += s.fillLane(asr, state.LaneASR, asrCapacity-counts[state.LaneASR])
+	counts[state.LaneASR] += s.fillLane(retranscriptions, state.LaneASR, retranscribeCapacity-retranscribeActive)
+	counts[state.LaneASR] += s.fillLane(transcriptions, state.LaneASR, asrCapacity-asrActive)
 	counts[state.LaneAgent] += s.fillLane(agent, state.LaneAgent, s.agentCap-counts[state.LaneAgent])
 	counts[state.LaneMechanical] += s.fillLane(mech, state.LaneMechanical, mechCapacity-counts[state.LaneMechanical])
 
 	s.publishQueueStats(books, counts)
 	s.publishETAs(ctx, books)
+}
+
+// partitionASR separates the independently-capacity-limited corrective and
+// full-book queues. candidates has already been sorted, so each partition keeps
+// its desired ordering.
+func partitionASR(candidates []store.Book) (retranscriptions, transcriptions []store.Book) {
+	for _, b := range candidates {
+		if state.State(b.State) == state.Retranscribing {
+			retranscriptions = append(retranscriptions, b)
+		} else {
+			transcriptions = append(transcriptions, b)
+		}
+	}
+	return retranscriptions, transcriptions
 }
 
 func sortASRLane(candidates, allBooks []store.Book) {
@@ -417,7 +452,7 @@ func (s *Scheduler) startWorker(b store.Book, lane state.Lane) bool {
 		return false
 	}
 	wctx, cancel := context.WithCancel(s.ctx)
-	s.inflight[b.ID] = &inflightBook{lane: lane, cancel: cancel}
+	s.inflight[b.ID] = &inflightBook{lane: lane, stage: state.State(b.State), cancel: cancel}
 	s.mu.Unlock()
 
 	s.wg.Add(1)
@@ -671,6 +706,54 @@ func (s *Scheduler) advanceWaypoints(ctx context.Context) ([]store.Book, error) 
 // failure, a budget stop, ...) needs a human and is never auto-readmitted.
 var autoReadmitCodes = []state.ParkCode{state.ParkAgentUnavailable, state.ParkAgentRateLimited}
 
+var restartReadmitCodes = []state.ParkCode{
+	state.ParkAgentUnavailable, state.ParkAgentRateLimited,
+	state.ParkASRUnavailable, state.ParkMediaToolsUnavailable,
+}
+
+// readmitRestartRecoverable gives external-availability parks one fresh attempt per
+// daemon start. If the dependency is still unavailable the stage parks again and
+// remains quiet for the rest of this run, so this cannot become a retry loop.
+func (s *Scheduler) readmitRestartRecoverable(ctx context.Context) {
+	books, err := s.db.ListBooks(ctx)
+	if err != nil {
+		slog.Warn("restart-readmit: list books failed", "err", err)
+		return
+	}
+	for _, b := range books {
+		if !restartRecoverablePark(b) {
+			continue
+		}
+		if err := s.readmit(ctx, b); err != nil {
+			slog.Warn("restart-readmit: readmit failed", "book_id", b.ID, "err", err)
+			continue
+		}
+		_ = s.hub.PublishBook("stage.note", b.ID, map[string]any{
+			"book_id": b.ID, "stage": b.State,
+			"msg": "daemon restart: rechecking the changed backend, credentials, or tool availability",
+		})
+	}
+}
+
+func restartRecoverablePark(b store.Book) bool {
+	if state.IsParkedWith(b.Status, b.ParkCode, restartReadmitCodes...) {
+		return true
+	}
+	if !state.IsParkedWith(b.Status, b.ParkCode, state.ParkSupervisorEscalated) {
+		return false
+	}
+	message := strings.ToLower(b.Error)
+	for _, signature := range []string{
+		"authentication", "not logged in", "unauthorized", "invalid api key",
+		"rate limit", "usage limit", "credits", "backend unavailable", "cli not found",
+	} {
+		if strings.Contains(message, signature) {
+			return true
+		}
+	}
+	return false
+}
+
 // autoReadmitDue re-admits every book whose scheduled retry_at has elapsed and whose
 // park code is one the timed self-resume owns (autoReadmitCodes). It re-admits through
 // the SAME readmit path a manual Retry uses (clearing status/error/park_code/retry_at
@@ -709,19 +792,14 @@ func (s *Scheduler) autoReadmitDue(ctx context.Context) {
 
 // --- series lock ---
 
-// lockHolders returns the set of book ids permitted to run an agent stage: the
-// lowest-position unfinished book in each series, plus every seriesless book
-// (each parallelizes freely). A book that has reached ready (or beyond) no longer
-// holds its series.
+// lockHolders returns the lowest-position unfinished book in each series, plus
+// every seriesless book. CanStart consults this only for carryover-sensitive agent
+// stages; independent marker/QA agent work may continue around a parked predecessor.
 //
 // "Unfinished" is purely positional (HoldsSeriesLock tests state order, not
-// status), so a pre-Ready predecessor that is PARKED (needs_attention) OR FAILED/
-// CANCELLED (status=failed) still holds its series lock and blocks its successors'
-// agent work until the user retries or deletes it. This is deliberately
-// conservative: series carryover (the "story so far" recaps) wants earlier books
-// authored first, so a stuck predecessor should hold the line rather than let a
-// later book jump ahead. The plan flags this as a behaviour to revisit once real
-// runs show how often a predecessor gets stuck.
+// status), so a pre-Ready predecessor that is parked/failed still blocks only the
+// successor stages that consume series carryover. This preserves spoiler ordering
+// without idling independent work across the rest of the pipeline.
 func lockHolders(books []store.Book) map[int64]bool {
 	holders := map[int64]bool{}
 	best := seriesLockOwners(books)
@@ -756,7 +834,7 @@ func SeriesBlockers(books []store.Book) map[int64]SeriesBlocker {
 	owners := seriesLockOwners(books)
 	blocked := map[int64]SeriesBlocker{}
 	for _, b := range books {
-		if b.Status != "" || !state.IsAgent(state.State(b.State)) || strings.TrimSpace(b.Series) == "" {
+		if b.Status != "" || !state.IsAgent(state.State(b.State)) || !state.RequiresSeriesOrder(state.State(b.State)) || strings.TrimSpace(b.Series) == "" {
 			continue
 		}
 		owner, ok := owners[b.Series]

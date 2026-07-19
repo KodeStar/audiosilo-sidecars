@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -69,12 +70,15 @@ func runServe(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	return server.Run(ctx, server.Options{
-		DataDir: *data,
-		Listen:  *listen,
-		Version: version,
-		Out:     os.Stderr,
-	})
+	opts := server.Options{DataDir: *data, Listen: *listen, Version: version, Out: os.Stderr}
+	for {
+		err := server.Run(ctx, opts)
+		if errors.Is(err, server.ErrRestartRequested) && ctx.Err() == nil {
+			fmt.Fprintln(os.Stderr, "[info] restarting daemon to apply configuration")
+			continue
+		}
+		return err
+	}
 }
 
 // defaultDataDir returns ~/.audiosilo-sidecars, falling back to ./.audiosilo-sidecars

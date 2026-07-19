@@ -50,12 +50,21 @@ type Options struct {
 	Out     io.Writer // banner destination; defaults to os.Stderr
 }
 
+// ErrRestartRequested is returned after a UI-requested graceful shutdown. The
+// command loop treats it as a reload boundary and calls Run again with the same
+// process arguments, causing config, credentials, runners, and capacities to be
+// resolved afresh without requiring shell access.
+var ErrRestartRequested = errors.New("daemon restart requested")
+
 // Run loads configuration, provisions the admin on first run, and serves HTTP
 // until ctx is cancelled, then shuts down gracefully.
 func Run(ctx context.Context, opts Options) error {
 	if opts.Out == nil {
 		opts.Out = os.Stderr
 	}
+	restartCh := make(chan struct{}, 1)
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
 
 	cfg, err := config.Load(opts.DataDir)
 	if err != nil {
@@ -86,7 +95,7 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	// Keep pruning on a daily cadence so a long-running daemon's event log stays
 	// bounded (the startup prune alone would let it grow between restarts).
-	go pruneEventsLoop(ctx, db, opts.Out)
+	go pruneEventsLoop(runCtx, db, opts.Out)
 
 	mgr := auth.New(db.AuthStore())
 	oneTimePassword, err := mgr.EnsureAdmin()
@@ -107,7 +116,7 @@ func Run(ctx context.Context, opts Options) error {
 	persister := newEventPersister(db, opts.Out, eventQueueSize)
 	persister.start()
 	hub.SetPersister(persister.enqueue)
-	go hub.RunHeartbeat(ctx, heartbeatInterval)
+	go hub.RunHeartbeat(runCtx, heartbeatInterval)
 
 	// Resolve the media tools once at startup (explicit path -> next to the binary
 	// -> $PATH -> on-demand download into <data>/tools). The resolved ffprobe feeds
@@ -185,7 +194,7 @@ func Run(ctx context.Context, opts Options) error {
 		}
 		return out, nil
 	}
-	scanMgr := metaops.NewScanManager(ctx, metaClient, tools.FFprobe, overrideSrc,
+	scanMgr := metaops.NewScanManager(runCtx, metaClient, tools.FFprobe, overrideSrc,
 		metaops.WithScanCache(filepath.Join(opts.DataDir, "library-scan-cache.json")))
 	workRoot := filepath.Join(opts.DataDir, "work")
 	// One GitHub token source shared by the contributing stage (executor) and the
@@ -239,7 +248,7 @@ func Run(ctx context.Context, opts Options) error {
 		ExportRoot:     filepath.Join(opts.DataDir, "export"),
 	})
 	sched := scheduler.New(db, hub, exec, agentCapacity.QueueConcurrency, workRoot, cfg.Contribution.AutoPurge)
-	schedCtx, cancelSched := context.WithCancel(ctx)
+	schedCtx, cancelSched := context.WithCancel(runCtx)
 	defer cancelSched()
 	schedDone := make(chan struct{})
 	go func() {
@@ -256,6 +265,13 @@ func Run(ctx context.Context, opts Options) error {
 	if cfg.Supervisor.ModelAssisted {
 		modelRunner := agentRunner
 		requestedBackend := cfg.Supervisor.ModelBackend
+		// Codex production runners intentionally cannot satisfy the supervisor's
+		// no-tools boundary. When no supervisor backend was explicitly selected,
+		// probe Claude as the isolated diagnosis runner instead of silently reporting
+		// model_assisted=true/model_available=false forever.
+		if requestedBackend == "" && (modelRunner == nil || !agent.EnforcesNoTools(modelRunner)) {
+			requestedBackend = config.AgentBackendClaude
+		}
 		if requestedBackend != "" && (modelRunner == nil || modelRunner.ID() != requestedBackend) {
 			modelSelect := agentSelect
 			modelSelect.Backend = requestedBackend
@@ -421,6 +437,12 @@ func Run(ctx context.Context, opts Options) error {
 			}
 			return data, slug + "-sidecars.zip", err
 		},
+		Restart: func() {
+			select {
+			case restartCh <- struct{}{}:
+			default:
+			}
+		},
 	}).Handler()
 
 	root := http.NewServeMux()
@@ -452,7 +474,11 @@ func Run(ctx context.Context, opts Options) error {
 		runErr = err
 	case <-ctx.Done():
 		_ = shutdown(srv)
+	case <-restartCh:
+		runErr = ErrRestartRequested
+		_ = shutdown(srv)
 	}
+	cancelRun()
 	// Stop the scheduler and wait for its in-flight workers to fully drain BEFORE
 	// the deferred db.Close() runs, so no stage worker writes to a closed database.
 	// sched.Start returns only after ctx is cancelled AND wg.Wait completes.

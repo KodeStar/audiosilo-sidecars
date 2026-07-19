@@ -76,3 +76,33 @@ func TestAutoReadmitDueSkipsNotDueAndNonAuto(t *testing.T) {
 		}
 	}
 }
+
+func TestRestartReadmitsChangedAvailabilityParksOnce(t *testing.T) {
+	h := newHarness(t)
+	db := h.openDB(t)
+	s := New(db, h.hub, NewStubExecutor(0, 0), 1, h.workRoot, false)
+	ctx := context.Background()
+
+	rateLimited := h.addBook(t, db, "rate limited", "", "")
+	parkBook(t, s, rateLimited.ID, state.ParkAgentRateLimited, time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+	auth := h.addBook(t, db, "auth", "", "")
+	parkBook(t, s, auth.ID, state.ParkSupervisorEscalated, "")
+	if err := db.SetBookStatus(ctx, auth.ID, string(state.StatusNeedsAttention), "supervisor: authentication failure: not logged in", string(state.ParkSupervisorEscalated)); err != nil {
+		t.Fatal(err)
+	}
+	budget := h.addBook(t, db, "budget", "", "")
+	parkBook(t, s, budget.ID, state.ParkBudgetExceeded, "")
+
+	s.readmitRestartRecoverable(ctx)
+
+	for _, id := range []int64{rateLimited.ID, auth.ID} {
+		got, _ := db.GetBook(ctx, id)
+		if got.Status != "" || got.ParkCode != "" || got.RetryAt != "" {
+			t.Errorf("restart-recoverable book %d remained parked: %+v", id, got)
+		}
+	}
+	got, _ := db.GetBook(ctx, budget.ID)
+	if got.Status != string(state.StatusNeedsAttention) || got.ParkCode != string(state.ParkBudgetExceeded) {
+		t.Fatalf("budget park was incorrectly readmitted: %+v", got)
+	}
+}

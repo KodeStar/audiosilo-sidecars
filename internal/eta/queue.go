@@ -146,7 +146,7 @@ func startWaiting(sim []*simBook, caps map[state.Lane]int, now float64) {
 			continue
 		}
 		lane := sb.cur().lane
-		if lane == state.LaneAgent && !holders[sb.id] {
+		if lane == state.LaneAgent && state.RequiresSeriesOrder(sb.cur().stage) && !holders[sb.id] {
 			continue // gated by the series lock
 		}
 		waiting[lane] = append(waiting[lane], sb)

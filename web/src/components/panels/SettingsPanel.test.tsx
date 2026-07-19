@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { SettingsPanel } from './SettingsPanel';
 import type { ApiClient } from '@/lib/apiClient';
 import type { AgentInfo, AsrInfo, Settings, SystemInfo, ToolsInfo } from '@/api/types';
@@ -56,6 +56,22 @@ function systemWith(tools: ToolsInfo, asr: AsrInfo = defaultAsr): SystemInfo {
 }
 
 describe('SettingsPanel media tools', () => {
+  it('requests an authenticated daemon restart from the Daemon card', async () => {
+    const restartDaemon = vi.fn().mockResolvedValue({ restarting: true });
+    const client = {
+      getSettings: vi.fn().mockResolvedValue(settings),
+      system: vi
+        .fn()
+        .mockResolvedValue(systemWith({ ffmpeg: '/usr/bin/ffmpeg', ffprobe: '/usr/bin/ffprobe' })),
+      restartDaemon,
+    } as unknown as ApiClient;
+
+    render(<SettingsPanel client={client} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Restart daemon' }));
+    expect(restartDaemon).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText(/Restart requested/)).toBeInTheDocument();
+  });
+
   it('shows a resolved path and "Not found" for a missing tool', async () => {
     const client = {
       getSettings: vi.fn().mockResolvedValue(settings),

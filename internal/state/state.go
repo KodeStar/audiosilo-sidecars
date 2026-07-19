@@ -180,6 +180,20 @@ func MainlineNext(s State) State {
 // agent lane. The scheduler uses this to pick each series' lock holder.
 func HoldsSeriesLock(s State) bool { return Order(s) < Order(Ready) }
 
+// RequiresSeriesOrder reports whether an agent stage consumes series carryover or
+// authors/validates spoiler-sensitive sidecars. Marker normalization and QA
+// adjudication operate only on the current book's audio/transcript, so they may run
+// while an earlier book in the same series is parked. The authoring tail must still
+// wait for the series lock holder to reach Ready.
+func RequiresSeriesOrder(s State) bool {
+	switch s {
+	case SpellingResearch, FactPass, Synthesizing, Auditing, Fixing:
+		return true
+	default:
+		return false
+	}
+}
+
 // legalNext reports whether next is a declared successor of cur.
 func legalNext(cur, next State) bool {
 	for _, n := range table[cur].Next {
@@ -278,7 +292,7 @@ func CanStart(cur State, status Status, lowestInSeries bool) bool {
 	if !IsStage(cur) {
 		return false
 	}
-	if IsAgent(cur) && !lowestInSeries {
+	if IsAgent(cur) && RequiresSeriesOrder(cur) && !lowestInSeries {
 		return false
 	}
 	return true

@@ -25,6 +25,7 @@ const (
 	IncidentRateLimit          IncidentKind = "rate_limit"
 	IncidentBackendUnavailable IncidentKind = "backend_unavailable"
 	IncidentArtifactInvalid    IncidentKind = "artifact_invalid"
+	IncidentParkedRecovery     IncidentKind = "parked_recovery"
 	IncidentSlotInefficiency   IncidentKind = "slot_inefficiency"
 	IncidentUnclassified       IncidentKind = "unclassified"
 )
@@ -104,6 +105,7 @@ type Incident struct {
 	Evidence    []string     `json:"evidence"`
 	Ambiguous   bool         `json:"ambiguous"`
 	Protected   bool         `json:"protected"`
+	ParkCode    string       `json:"park_code,omitempty"`
 }
 
 type Decision struct {

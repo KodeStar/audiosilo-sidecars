@@ -24,6 +24,8 @@ export function SettingsPanel({ client }: SettingsPanelProps) {
   const [asr, setAsr] = useState<AsrInfo | null>(null);
   const [agentInfo, setAgentInfo] = useState<AgentInfo | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [restarting, setRestarting] = useState(false);
+  const [restartFeedback, setRestartFeedback] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -63,6 +65,21 @@ export function SettingsPanel({ client }: SettingsPanelProps) {
     void load();
   }, [load]);
 
+  async function restartDaemon() {
+    setRestarting(true);
+    setRestartFeedback(null);
+    try {
+      await client.restartDaemon();
+      setRestartFeedback('Restart requested. Reconnecting with the saved configuration...');
+      if (import.meta.env.MODE !== 'test') {
+        window.setTimeout(() => window.location.reload(), 3000);
+      }
+    } catch (err) {
+      setRestartFeedback(err instanceof ApiError ? err.message : 'Could not restart the daemon.');
+      setRestarting(false);
+    }
+  }
+
   if (loadError) {
     return (
       <Card>
@@ -93,6 +110,21 @@ export function SettingsPanel({ client }: SettingsPanelProps) {
             {settings.cors_origins.length > 0 ? settings.cors_origins.join(', ') : 'none'}
           </dd>
         </dl>
+        <div className="mt-5 flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            disabled={restarting}
+            onClick={() => void restartDaemon()}
+            className="rounded-md border border-edge bg-raised px-4 py-2 text-sm font-medium text-body hover:bg-edge/40 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {restarting ? 'Restarting daemon...' : 'Restart daemon'}
+          </button>
+          {restartFeedback && (
+            <p role="status" className="text-xs text-dim">
+              {restartFeedback}
+            </p>
+          )}
+        </div>
       </Card>
 
       <Card>

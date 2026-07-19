@@ -151,6 +151,10 @@ export class ApiClient {
     return this.request<SystemInfo>('/api/v1/system');
   }
 
+  restartDaemon(): Promise<{ restarting: boolean }> {
+    return this.request<{ restarting: boolean }>('/api/v1/system/restart', { method: 'POST' });
+  }
+
   getSettings(): Promise<Settings> {
     return this.request<Settings>('/api/v1/settings');
   }

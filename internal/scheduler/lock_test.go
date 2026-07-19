@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"testing"
 	"time"
 
@@ -76,6 +77,83 @@ func TestSortASRLaneRetranscriptionJumpsBreadthQueue(t *testing.T) {
 			t.Fatalf("ASR order = %v, want %v", bookIDs(candidates), want)
 		}
 	}
+}
+
+func TestPartitionASRKeepsRetranscriptionIndependentFromFullBookASR(t *testing.T) {
+	candidates := []store.Book{
+		bk(9, "A", "3", string(state.Retranscribing)),
+		bk(1, "A", "1", string(state.ASR)),
+		bk(8, "B", "2", string(state.Retranscribing)),
+		bk(2, "B", "1", string(state.ASR)),
+	}
+
+	repairs, fullBooks := partitionASR(candidates)
+	if got, want := bookIDs(repairs), []int64{9, 8}; !slices.Equal(got, want) {
+		t.Fatalf("repairs = %v, want %v", got, want)
+	}
+	if got, want := bookIDs(fullBooks), []int64{1, 2}; !slices.Equal(got, want) {
+		t.Fatalf("full books = %v, want %v", got, want)
+	}
+}
+
+type blockingASRExecutor struct {
+	started chan state.State
+}
+
+func (e *blockingASRExecutor) Execute(ctx context.Context, _ store.Book, stage state.State, _ StageReport) (StageResult, error) {
+	e.started <- stage
+	<-ctx.Done()
+	return StageResult{}, ctx.Err()
+}
+
+func TestCorrectiveRetranscriptionRunsBesideSerialFullBookASR(t *testing.T) {
+	h := newHarness(t)
+	db := h.openDB(t)
+	full := h.addBook(t, db, "full", "A", "1")
+	repairOne := h.addBook(t, db, "repair-one", "A", "2")
+	repairTwo := h.addBook(t, db, "repair-two", "B", "1")
+	ctx := context.Background()
+	if err := db.SetBookState(ctx, full.ID, string(state.ASR), "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int64{repairOne.ID, repairTwo.ID} {
+		if err := db.SetBookState(ctx, id, string(state.Retranscribing), "", "", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	exec := &blockingASRExecutor{started: make(chan state.State, 3)}
+	sched := New(db, h.hub, exec, 1, h.workRoot, false)
+	runCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = sched.Start(runCtx); close(done) }()
+
+	seen := map[state.State]int{}
+	for range 2 {
+		select {
+		case stage := <-exec.started:
+			seen[stage]++
+		case <-time.After(2 * time.Second):
+			cancel()
+			<-done
+			t.Fatal("timed out waiting for full ASR and corrective retranscription to overlap")
+		}
+	}
+	if seen[state.ASR] != 1 || seen[state.Retranscribing] != 1 {
+		cancel()
+		<-done
+		t.Fatalf("concurrent starts = %v, want one full ASR and one retranscription", seen)
+	}
+	select {
+	case stage := <-exec.started:
+		cancel()
+		<-done
+		t.Fatalf("unexpected third ASR worker started for %s", stage)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	cancel()
+	<-done
 }
 
 func bookIDs(books []store.Book) []int64 {
@@ -161,6 +239,25 @@ func TestLockHoldersParkedPredecessorHoldsSeries(t *testing.T) {
 	h := lockHolders(books)
 	if !h[1] || h[2] {
 		t.Fatalf("parked predecessor: holders = %v, want only book 1", h)
+	}
+}
+
+func TestParkedPredecessorDoesNotBlockIndependentAgentStages(t *testing.T) {
+	books := []store.Book{
+		{ID: 1, Series: "S", SeriesPos: "1", State: string(state.Auditing), Status: string(state.StatusNeedsAttention)},
+		{ID: 2, Series: "S", SeriesPos: "2", State: string(state.MarkersNormalizing)},
+		{ID: 3, Series: "S", SeriesPos: "3", State: string(state.QAAdjudicating)},
+		{ID: 4, Series: "S", SeriesPos: "4", State: string(state.SpellingResearch)},
+	}
+	holders := lockHolders(books)
+	if !state.CanStart(state.MarkersNormalizing, state.StatusNone, holders[2]) {
+		t.Fatal("marker normalization should continue around a parked predecessor")
+	}
+	if !state.CanStart(state.QAAdjudicating, state.StatusNone, holders[3]) {
+		t.Fatal("QA adjudication should continue around a parked predecessor")
+	}
+	if state.CanStart(state.SpellingResearch, state.StatusNone, holders[4]) {
+		t.Fatal("series-aware authoring must still wait for the parked predecessor")
 	}
 }
 

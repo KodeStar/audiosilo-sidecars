@@ -171,6 +171,9 @@ func Classify(s Snapshot, p Policy) []Incident {
 
 	incidents = append(incidents, classifyFailures(s, runs, p)...)
 	incidents = append(incidents, classifyConvergence(s, runs)...)
+	if parked, ok := classifyParked(s.Book, runs); ok {
+		incidents = append(incidents, parked)
+	}
 	for _, a := range s.Artifacts {
 		if a.Valid {
 			continue
@@ -195,6 +198,34 @@ func Classify(s Snapshot, p Policy) []Incident {
 		}
 	}
 	return dedupeIncidents(incidents)
+}
+
+// classifyParked turns durable needs-attention state into a first-class recovery
+// incident. Previously the supervisor handled only the failure that caused a park;
+// once containment was recorded it never planned readmission. The latest stage-run
+// id identifies each new recovery attempt, while the normalized fingerprint lets
+// the service cap repeated recovery of the same underlying problem.
+func classifyParked(book store.Book, runs []store.StageRun) (Incident, bool) {
+	if book.Status != string(state.StatusNeedsAttention) || book.ParkCode == "" {
+		return Incident{}, false
+	}
+	var stageRunID int64
+	for idx := len(runs) - 1; idx >= 0; idx-- {
+		if runs[idx].Stage == book.State {
+			stageRunID = runs[idx].ID
+			break
+		}
+	}
+	evidence := []string{"park code " + book.ParkCode}
+	if message := strings.TrimSpace(book.Error); message != "" {
+		evidence = append(evidence, truncate(message, 240))
+	}
+	return Incident{
+		Kind: IncidentParkedRecovery, BookID: book.ID, BatchID: book.BatchID,
+		Stage: book.State, StageRunID: stageRunID, ParkCode: book.ParkCode,
+		Fingerprint: ErrorFingerprint(book.ParkCode + " " + book.Error),
+		Diagnosis:   "parked book requires a bounded recovery plan", Evidence: evidence,
+	}, true
 }
 
 func comparableCost(r store.StageRun) (float64, string, bool) {
@@ -327,6 +358,44 @@ func dedupeIncidents(in []Incident) []Incident {
 
 func Decide(i Incident, attempts int, p Policy) Decision {
 	d := Decision{Incident: i, Action: ActionObserve, RetryLimit: p.MaxAttempts, TerminationLimit: 1}
+	if i.Kind == IncidentParkedRecovery {
+		switch state.ParkCode(i.ParkCode) {
+		case state.ParkAgentUnavailable, state.ParkAgentRateLimited:
+			d.Action = ActionReadmit
+		case state.ParkQANoConverge, state.ParkFixLoopExhausted,
+			state.ParkAgentValidationExhausted, state.ParkSpellingGateFailure,
+			state.ParkSupervisorBudget:
+			// These paths preserve and validate their durable inputs. A bounded fresh
+			// pass is more useful than waiting for a human to click the same Retry.
+			d.Action = ActionRetry
+		case state.ParkSupervisorEscalated:
+			if p.ModelAssisted {
+				d.Action = ActionAskModel
+			} else {
+				d.Action = ActionRetry
+			}
+		case state.ParkMarkersNotConfident, state.ParkManifestChanged:
+			if p.ModelAssisted {
+				d.Action = ActionAskModel
+			} else {
+				d.Action = ActionParkEscalate
+				d.ApprovalRequired = true
+			}
+		default:
+			// Book budget, contribution/core, and missing-tool parks express an
+			// external precondition. Restart performs a one-shot availability probe;
+			// periodic retries here would churn forever.
+			d.Action = ActionObserve
+			d.ApprovalRequired = true
+		}
+		if attempts >= p.MaxAttempts && d.Action != ActionObserve {
+			d.Action = ActionParkEscalate
+			d.ApprovalRequired = true
+		}
+		d.Automatic = p.AutomaticActions && !i.Protected && d.Action != ActionObserve && d.Action != ActionAskModel &&
+			(!d.ApprovalRequired || d.Action == ActionParkEscalate)
+		return d
+	}
 	switch i.Kind {
 	case IncidentMissingProcess, IncidentStaleHeartbeat:
 		d.Action = ActionTerminateRequeue

@@ -22,6 +22,7 @@ type testEnv struct {
 	srv      *httptest.Server
 	password string
 	saved    *config.Config
+	restart  chan struct{}
 }
 
 func newTestEnv(t *testing.T) *testEnv {
@@ -32,7 +33,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	if err != nil {
 		t.Fatalf("EnsureAdmin: %v", err)
 	}
-	env := &testEnv{password: pw}
+	env := &testEnv{password: pw, restart: make(chan struct{}, 1)}
 	env.api = New(Deps{
 		Auth:    mgr,
 		Limiter: auth.NewRateLimiter(100, 100),
@@ -50,10 +51,32 @@ func newTestEnv(t *testing.T) *testEnv {
 			env.saved = &cp
 			return nil
 		},
+		Restart: func() { env.restart <- struct{}{} },
 	})
 	env.srv = httptest.NewServer(env.api.Handler())
 	t.Cleanup(env.srv.Close)
 	return env
+}
+
+func TestRestartRequiresAuthAndSignalsDaemon(t *testing.T) {
+	env := newTestEnv(t)
+	resp := env.do(t, http.MethodPost, "/api/v1/system/restart", "", "")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated restart = %d, want 401", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	token := env.login(t)
+	resp = env.do(t, http.MethodPost, "/api/v1/system/restart", token, "")
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("restart = %d, want 202", resp.StatusCode)
+	}
+	resp.Body.Close()
+	select {
+	case <-env.restart:
+	case <-time.After(time.Second):
+		t.Fatal("restart callback was not signalled")
+	}
 }
 
 func (e *testEnv) login(t *testing.T) string {

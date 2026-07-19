@@ -5,6 +5,7 @@ import (
 	"maps"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/auth"
 	"github.com/kodestar/audiosilo-sidecars/internal/config"
@@ -153,6 +154,19 @@ func (a *API) handleSystem(w http.ResponseWriter, r *http.Request) {
 		ScratchBytes: scratchTotal,
 		Supervisor:   supervisorInfo,
 	})
+}
+
+func (a *API) handleRestart(w http.ResponseWriter, _ *http.Request) {
+	if a.restart == nil {
+		writeError(w, http.StatusServiceUnavailable, "daemon restart is unavailable")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]bool{"restarting": true})
+	// Let net/http flush the 202 before graceful shutdown closes this connection.
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		a.restart()
+	}()
 }
 
 // --- settings ---

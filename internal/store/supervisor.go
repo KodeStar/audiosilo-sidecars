@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 )
 
 // SupervisorRun is one deterministic incident/decision or bounded model invocation.
@@ -188,6 +189,21 @@ func (db *DB) HasIncident(ctx context.Context, incidentKey string) (bool, error)
 	err := db.sql.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM supervisor_runs WHERE incident_key=?`, incidentKey).Scan(&n)
 	return n > 0, err
+}
+
+// CountSupervisorIncidentFamily counts prior decisions for the same underlying
+// diagnosis while ignoring the immutable stage-run id embedded in incident_key.
+// Production stage attempts are a separate ledger and must never consume the
+// supervisor's recovery budget.
+func (db *DB) CountSupervisorIncidentFamily(ctx context.Context, kind string, bookID int64, stage, fingerprint string) (int, error) {
+	prefix := fmt.Sprintf("%s/%d/%s/", kind, bookID, stage)
+	suffix := "/" + fingerprint
+	var n int
+	err := db.sql.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM supervisor_runs
+		 WHERE instr(incident_key, ?) = 1
+		   AND substr(incident_key, -length(?)) = ?`, prefix, suffix, suffix).Scan(&n)
+	return n, err
 }
 
 func (db *DB) SupervisorInvocationCountSince(ctx context.Context, since string) (int, error) {

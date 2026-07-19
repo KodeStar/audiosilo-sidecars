@@ -82,6 +82,9 @@ type Deps struct {
 	// ErrNoSidecars when the book has no sidecars (mapped to 404). Injected from
 	// pipeline; nil -> the export endpoint 503s.
 	ExportArchive func(b store.Book) (data []byte, filename string, err error)
+	// Restart requests a graceful in-process daemon restart. The server injects a
+	// non-blocking signal; nil leaves the endpoint unavailable in narrow tests.
+	Restart func()
 }
 
 // ASRInfo is the resolved ASR backend capability shown on /system.
@@ -126,6 +129,7 @@ type API struct {
 	contrib            *contrib.Service
 	coreProposalLoader func(workDir string) (json.RawMessage, error)
 	exportArchive      func(b store.Book) ([]byte, string, error)
+	restart            func()
 
 	mu   sync.Mutex // guards cfg
 	cfg  config.Config
@@ -171,6 +175,7 @@ func New(d Deps) *API {
 		contrib:            d.Contrib,
 		coreProposalLoader: d.CoreProposalLoader,
 		exportArchive:      d.ExportArchive,
+		restart:            d.Restart,
 
 		cfg:  d.Config,
 		save: save,
@@ -211,6 +216,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/auth/logout", a.requireAuth(a.handleLogout))
 	mux.HandleFunc("POST /api/v1/auth/password", a.requireAuth(a.handlePassword))
 	mux.HandleFunc("GET /api/v1/system", a.requireAuth(a.handleSystem))
+	mux.HandleFunc("POST /api/v1/system/restart", a.requireAuth(a.handleRestart))
 	mux.HandleFunc("GET /api/v1/settings", a.requireAuth(a.handleGetSettings))
 	mux.HandleFunc("PUT /api/v1/settings", a.requireAuth(a.handlePutSettings))
 

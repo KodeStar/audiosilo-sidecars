@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
 
@@ -224,6 +225,51 @@ func TestDecisionRetryEscalationAndApprovalLimits(t *testing.T) {
 		if d.Action != ActionObserve || d.Automatic || d.ApprovalRequired {
 			t.Fatalf("bounded pipeline loop %s was interrupted: %+v", kind, d)
 		}
+	}
+}
+
+func TestParkedRecoveryGetsBoundedAutomaticPlan(t *testing.T) {
+	p := Policy{MaxAttempts: 3, AutomaticActions: true, ModelAssisted: true}
+	i := Incident{Kind: IncidentParkedRecovery, ParkCode: string(state.ParkFixLoopExhausted)}
+	d := Decide(i, 0, p)
+	if d.Action != ActionRetry || !d.Automatic {
+		t.Fatalf("first fix-loop recovery = %+v, want automatic retry", d)
+	}
+	d = Decide(i, 3, p)
+	if d.Action != ActionParkEscalate || !d.ApprovalRequired {
+		t.Fatalf("exhausted recovery = %+v, want bounded escalation", d)
+	}
+
+	i.ParkCode = string(state.ParkSupervisorEscalated)
+	d = Decide(i, 0, p)
+	if d.Action != ActionAskModel || d.Automatic {
+		t.Fatalf("ambiguous parked recovery = %+v, want bounded model diagnosis", d)
+	}
+	d = Decide(i, 3, p)
+	if d.Action != ActionParkEscalate || !d.ApprovalRequired {
+		t.Fatalf("exhausted model recovery = %+v, want bounded escalation", d)
+	}
+	i.ParkCode = string(state.ParkBudgetExceeded)
+	d = Decide(i, 0, p)
+	if d.Action != ActionObserve || !d.ApprovalRequired {
+		t.Fatalf("book budget park = %+v, want protected observation", d)
+	}
+}
+
+func TestClassifyParkedRecoveryCarriesTypedReason(t *testing.T) {
+	failed := false
+	runs := []store.StageRun{{ID: 9, Stage: "auditing", FinishedAt: "x", Ok: &failed, Metrics: json.RawMessage(`{"error":"cancelled"}`)}}
+	book := store.Book{ID: 4, BatchID: "b", State: "auditing", Status: string(state.StatusNeedsAttention),
+		ParkCode: string(state.ParkSupervisorBudget), Error: "stage exceeded relative duration"}
+	got := Classify(Snapshot{Book: book, Runs: runs}, Policy{MaxErrorRepeats: 2})
+	var parked *Incident
+	for idx := range got {
+		if got[idx].Kind == IncidentParkedRecovery {
+			parked = &got[idx]
+		}
+	}
+	if parked == nil || parked.ParkCode != string(state.ParkSupervisorBudget) || parked.StageRunID != 9 || parked.Fingerprint == "" {
+		t.Fatalf("parked incident = %+v in %+v", parked, got)
 	}
 }
 
