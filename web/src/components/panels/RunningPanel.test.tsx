@@ -16,8 +16,10 @@ function setCurrentES(es: FakeEventSource) {
 class FakeEventSource {
   static readonly CLOSED = 2;
   readyState = 0;
+  readonly url: string;
   private listeners = new Map<string, Set<ESListener>>();
-  constructor() {
+  constructor(url: string) {
+    this.url = url;
     setCurrentES(this);
   }
   addEventListener(type: string, fn: ESListener) {
@@ -90,7 +92,7 @@ function detail(book: BookView): BookDetail {
 // fakeClient builds a minimal ApiClient with the methods the panel touches.
 function fakeClient(books: BookView[], overrides: Partial<ApiClient> = {}): ApiClient {
   return {
-    listBooks: vi.fn().mockResolvedValue({ books }),
+    listBooks: vi.fn().mockResolvedValue({ books, event_cursor: 0 }),
     system: vi.fn().mockResolvedValue(system(0)),
     getBook: vi.fn((id: number) =>
       Promise.resolve(detail(books.find((b) => b.id === id) ?? bk({}))),
@@ -183,7 +185,10 @@ describe('RunningPanel supervisor', () => {
     expect(screen.getByText(/batch supervision \$0\.1000 reported.*\$0\.1000/)).toBeInTheDocument();
     expect(screen.getByText(/QA loop is not converging.*park_escalate/)).toBeInTheDocument();
 
-    await fireEvent.click(screen.getByRole('button', { name: /ask supervisor/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /ask supervisor/i }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
     await waitFor(() => expect(askSupervisor).toHaveBeenCalledWith(7));
   });
 
@@ -371,9 +376,133 @@ describe('RunningPanel stage timeline', () => {
 
     await screen.findByText('A Book');
     // Compact timeline chips (distinct from the primary "Transcribing" state chip).
-    expect(screen.getByText('ASR')).toBeInTheDocument(); // active chip
+    expect(screen.getByTitle('Transcribing')).toHaveTextContent('ASR'); // active chip
     expect(screen.getByText('Inspect')).toBeInTheDocument(); // done chip
     expect(screen.getByText('Facts')).toBeInTheDocument(); // pending chip
+  });
+});
+
+describe('RunningPanel queue organization', () => {
+  it('splits Processing from ASR and renders current workers before scheduler order', async () => {
+    const client = fakeClient([
+      bk({
+        id: 4,
+        title: 'ASR Next',
+        queue_group: 'asr',
+        queue_bucket: 'transcription',
+        queue_position: 1,
+        queue_active: false,
+      }),
+      bk({
+        id: 2,
+        title: 'Processing Next',
+        state: 'spelling_research',
+        lane: 'agent',
+        queue_group: 'processing',
+        queue_bucket: 'agent',
+        queue_position: 1,
+        queue_active: false,
+      }),
+      bk({
+        id: 3,
+        title: 'ASR Current',
+        queue_group: 'asr',
+        queue_bucket: 'transcribing',
+        queue_position: 1,
+        queue_active: true,
+      }),
+      bk({
+        id: 1,
+        title: 'Processing Current',
+        state: 'fact_pass',
+        lane: 'agent',
+        queue_group: 'processing',
+        queue_bucket: 'agent_active',
+        queue_position: 1,
+        queue_active: true,
+      }),
+    ]);
+    render(<RunningPanel client={client} apiBase="" token="tok" />);
+
+    await screen.findByText('Processing Current');
+    expect(screen.getByRole('heading', { name: 'Processing' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'ASR' })).toBeInTheDocument();
+    expect(screen.getByText('Agent processing now')).toBeInTheDocument();
+    expect(screen.getByText('Transcribing now')).toBeInTheDocument();
+    expect(screen.getByText('Agent queue')).toBeInTheDocument();
+    expect(screen.getByText('Transcription queue')).toBeInTheDocument();
+
+    const titles = ['Processing Current', 'Processing Next', 'ASR Current', 'ASR Next'].map(
+      (title) => screen.getByText(title),
+    );
+    for (let i = 1; i < titles.length; i += 1) {
+      expect(
+        titles[i - 1].compareDocumentPosition(titles[i]) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    }
+  });
+
+  it('uses the REST cursor for a lossless SSE handoff and applies live queue handoffs', async () => {
+    let resolveList!: (value: Awaited<ReturnType<ApiClient['listBooks']>>) => void;
+    const list = new Promise<Awaited<ReturnType<ApiClient['listBooks']>>>((resolve) => {
+      resolveList = resolve;
+    });
+    const first = bk({
+      id: 1,
+      title: 'First ASR',
+      queue_group: 'asr',
+      queue_bucket: 'transcribing',
+      queue_position: 1,
+      queue_active: true,
+    });
+    const second = bk({
+      id: 2,
+      title: 'Second ASR',
+      queue_group: 'asr',
+      queue_bucket: 'transcription',
+      queue_position: 1,
+      queue_active: false,
+    });
+    const client = fakeClient([], { listBooks: vi.fn().mockReturnValue(list) });
+
+    render(<RunningPanel client={client} apiBase="/sidecars" token="tok" />);
+    expect(currentES).toBeNull();
+
+    await act(async () => resolveList({ books: [first, second], event_cursor: 42 }));
+    await screen.findByText('First ASR');
+    await waitFor(() => expect(currentES).not.toBeNull());
+    expect(currentES?.url).toContain('lastEventId=42');
+
+    act(() => {
+      currentES?.emit('queue.stats', {
+        asr_active: 1,
+        agent_active: 0,
+        mechanical_active: 0,
+        queued: 2,
+        queue_books: [
+          { book_id: 2, group: 'asr', bucket: 'transcribing', position: 1, active: true },
+          { book_id: 1, group: 'asr', bucket: 'transcription', position: 1, active: false },
+        ],
+      });
+    });
+    const handedOff = [screen.getByText('Second ASR'), screen.getByText('First ASR')];
+    expect(
+      handedOff[0].compareDocumentPosition(handedOff[1]) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.getByText('Runnable')).toBeInTheDocument();
+
+    act(() => {
+      currentES?.emit('queue.stats', {
+        asr_active: 0,
+        agent_active: 0,
+        mechanical_active: 0,
+        queued: 2,
+        queue_books: [
+          { book_id: 1, group: 'asr', bucket: 'transcription', position: 1, active: false },
+        ],
+      });
+    });
+    expect(screen.getByText('Up next')).toBeInTheDocument();
   });
 });
 

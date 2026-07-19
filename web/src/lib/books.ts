@@ -2,7 +2,14 @@
 // stage.progress) into the books list fetched on mount. Kept React-free and
 // unit-tested; the panel holds the list in state and applies these on each event.
 
-import type { BookStateEvent, BookView, EtaUpdateEvent, StageProgressEvent } from '@/api/types';
+import type {
+  BookStateEvent,
+  BookView,
+  EtaUpdateEvent,
+  QueueBucket,
+  QueueStatsEvent,
+  StageProgressEvent,
+} from '@/api/types';
 import { MAINLINE, OFF_MAINLINE_AFTER } from '@/lib/timeline';
 
 // applyBookState patches the matching book's state + lane + status + error +
@@ -11,7 +18,9 @@ import { MAINLINE, OFF_MAINLINE_AFTER } from '@/lib/timeline';
 // only patches what we already hold). park_code and retry_at ride along the patch
 // (empty/absent on an advance, so a retry/resume clears a prior park reason and any
 // stale scheduled re-admit); retry_at falls back to '' when the frame carries none, so
-// an advance/clear frame drops a book's previous "retries automatically" instant.
+// an advance/clear frame drops a book's previous "retries automatically" instant. Queue
+// placement stays until queue.stats replaces it: consecutive stages may retain an
+// identical placement, in which case the daemon deduplicates the queue frame.
 export function applyBookState(books: BookView[], ev: BookStateEvent): BookView[] {
   let changed = false;
   const next = books.map((b) => {
@@ -28,6 +37,79 @@ export function applyBookState(books: BookView[], ev: BookStateEvent): BookView[
     };
   });
   return changed ? next : books;
+}
+
+// applyQueueSnapshot replaces every book's scheduler-owned placement from a
+// queue.stats frame. Books omitted from the snapshot are exceptional/terminal and
+// have any stale placement cleared. Older daemons omit queue_books; in that case
+// leave the current list untouched so the frontend's deterministic fallback works.
+export function applyQueueSnapshot(books: BookView[], ev: QueueStatsEvent): BookView[] {
+  if (!ev.queue_books) return books;
+  const placements = new Map(ev.queue_books.map((entry) => [entry.book_id, entry]));
+  let changed = false;
+  const next = books.map((book) => {
+    const entry = placements.get(book.id);
+    const group = entry?.group;
+    const bucket = entry?.bucket;
+    const position = entry?.position;
+    const active = entry?.active;
+    if (
+      book.queue_group === group &&
+      book.queue_bucket === bucket &&
+      book.queue_position === position &&
+      book.queue_active === active
+    ) {
+      return book;
+    }
+    changed = true;
+    return {
+      ...book,
+      queue_group: group,
+      queue_bucket: bucket,
+      queue_position: position,
+      queue_active: active,
+    };
+  });
+  return changed ? next : books;
+}
+
+// applyQueueStats folds every per-book field from a daemon-wide queue.stats frame
+// while preserving object identity for unchanged rows. BookRow is memoized and the
+// queue frame always carries queue_books on current daemons, so an unconditional
+// spread here would otherwise re-render the entire board on every occupancy change.
+export function applyQueueStats(books: BookView[], ev: QueueStatsEvent): BookView[] {
+  const placed = applyQueueSnapshot(books, ev);
+  if (!ev.agent_invocations_by_book && !ev.series_blocked_by) return placed;
+
+  let changed = false;
+  const next = placed.map((book) => {
+    const invocations = ev.agent_invocations_by_book
+      ? (ev.agent_invocations_by_book[String(book.id)] ?? 0)
+      : book.active_agent_invocations;
+    const blocker = ev.series_blocked_by
+      ? ev.series_blocked_by[String(book.id)]
+      : book.series_blocked_by;
+    if (
+      invocations === book.active_agent_invocations &&
+      sameSeriesBlocker(blocker, book.series_blocked_by)
+    ) {
+      return book;
+    }
+    changed = true;
+    return {
+      ...book,
+      ...(ev.agent_invocations_by_book ? { active_agent_invocations: invocations } : {}),
+      ...(ev.series_blocked_by ? { series_blocked_by: blocker } : {}),
+    };
+  });
+  return changed ? next : placed;
+}
+
+function sameSeriesBlocker(a: BookView['series_blocked_by'], b: BookView['series_blocked_by']) {
+  return (
+    a === b ||
+    (!!a && !!b && a.book_id === b.book_id && a.title === b.title && a.series_pos === b.series_pos)
+  );
 }
 
 // applyEtaUpdate folds the daemon-wide eta.update frame into the list: each
@@ -168,39 +250,117 @@ export function formatBytes(bytes: number): string {
 // compareByTimestampDesc orders two records newest-first by a daemon timestamp,
 // with the id as a stable descending tiebreak for equal timestamps. The daemon's
 // timestamps are fixed-width UTC (nine fractional digits + Z), so a lexicographic
-// string compare is exactly chronological. Shared by sortBooks (created_at) and the
-// Done board's filterDoneBooks (updated_at).
+// string compare is exactly chronological. Shared by sortBooks and the Done board's
+// filterDoneBooks (both use updated_at).
 export function compareByTimestampDesc(aTs: string, bTs: string, aId: number, bId: number): number {
   if (aTs !== bTs) return aTs < bTs ? 1 : -1;
   return bId - aId;
 }
 
-// bucketRank groups a book for the Running list's top-to-bottom order (lower sorts
-// higher): the active/current book(s) first, then the ready queue, then paused,
-// parked (needs_attention), failed, and done last. isDone is checked first so a
-// finished book (status '', empty lane) never falls into the queued bucket.
-function bucketRank(book: BookView): number {
-  if (isDone(book)) return 5;
+export type RunningSectionKey =
+  'processing' | 'asr' | 'paused' | 'needs_attention' | 'failed' | 'completed';
+
+export interface RunningBookSection {
+  key: RunningSectionKey;
+  label: string;
+  books: BookView[];
+}
+
+const SECTION_LABELS: Record<RunningSectionKey, string> = {
+  processing: 'Processing',
+  asr: 'ASR',
+  paused: 'Paused',
+  needs_attention: 'Needs attention',
+  failed: 'Failed',
+  completed: 'Completed',
+};
+
+const SECTION_ORDER: RunningSectionKey[] = [
+  'processing',
+  'asr',
+  'paused',
+  'needs_attention',
+  'failed',
+  'completed',
+];
+
+// fallbackQueueGroup supports a brief handoff between book.state and queue.stats,
+// and keeps the bundled UI intelligible against an older daemon. The daemon's
+// queue_group remains authoritative whenever it is present.
+function fallbackQueueGroup(book: BookView): 'processing' | 'asr' {
+  const asrIndex = MAINLINE.indexOf('asr');
+  const stateIndex = mainlineIndex(book.state);
+  if (book.state === 'retranscribing' || (stateIndex >= 0 && stateIndex <= asrIndex)) {
+    return 'asr';
+  }
+  return 'processing';
+}
+
+function sectionKey(book: BookView): RunningSectionKey {
+  if (isDone(book)) return 'completed';
+  // Pause is cooperative. Until the current worker exits, scheduler placement
+  // wins so the row remains visibly in "now" while its Paused chip says it is
+  // pausing. The next queue.stats frame clears placement and moves it below.
+  if (book.queue_active && book.queue_group) return book.queue_group;
   switch (book.status) {
     case 'paused':
-      return 2;
+      return 'paused';
     case 'needs_attention':
-      return 3;
+      return 'needs_attention';
     case 'failed':
-      return 4;
+      return 'failed';
     default:
-      // status === '' : on a worker now (non-empty lane) = active, else queued/ready.
-      return book.lane ? 0 : 1;
+      return book.queue_group ?? fallbackQueueGroup(book);
   }
 }
 
+const QUEUE_BUCKET_ORDER: Record<'processing' | 'asr', QueueBucket[]> = {
+  processing: ['agent_active', 'mechanical_active', 'agent', 'mechanical', 'blocked'],
+  asr: [
+    'transcribing',
+    'retranscribing',
+    'preparing_agent_active',
+    'preparing_mechanical_active',
+    'transcription',
+    'retranscription',
+    'asr_blocked',
+    'preparing_agent',
+    'preparing_mechanical',
+    'preparing',
+  ],
+};
+
+const QUEUE_BUCKET_LABELS: Record<QueueBucket, string> = {
+  agent_active: 'Agent processing now',
+  mechanical_active: 'Mechanical processing now',
+  agent: 'Agent queue',
+  mechanical: 'Mechanical queue',
+  blocked: 'Waiting on series',
+  transcribing: 'Transcribing now',
+  retranscribing: 'Re-transcribing now',
+  transcription: 'Transcription queue',
+  retranscription: 'Re-transcription queue',
+  asr_blocked: 'Waiting on series',
+  preparing_agent_active: 'Preparing with agent now',
+  preparing_mechanical_active: 'Preparing audio now',
+  preparing_agent: 'Agent preparation queue',
+  preparing_mechanical: 'Audio preparation queue',
+  preparing: 'Preparing for ASR',
+};
+
+// queueBucketLabel names the scheduler lane shown above a run of rows. The fallback
+// keeps the UI readable during a mixed-version daemon/UI upgrade.
+export function queueBucketLabel(book: BookView): string {
+  if (book.queue_bucket) return QUEUE_BUCKET_LABELS[book.queue_bucket];
+  if (book.queue_active) return book.queue_group === 'asr' ? 'Transcribing now' : 'Processing now';
+  return 'Up next';
+}
+
 // mainlineIndex maps a book's pipeline state to its position along the optimistic
-// MAINLINE (higher = further along), so the active bucket can put the
-// furthest-along ("current") book at the very top. An off-mainline state
-// (markers_normalizing, qa_adjudicating, retranscribing, fixing) resolves to the
-// mainline stage it forks from; an unknown state sorts as not-started (-1). Reuses
-// the timeline module's stage tables (the hand-mirror of the Go state table) so
-// there is a single ordered stage list.
+// MAINLINE. An off-mainline state (markers_normalizing, qa_adjudicating,
+// retranscribing, fixing) resolves to the mainline stage it forks from; an unknown
+// state sorts as not-started (-1). Reuses the timeline module's stage tables (the
+// hand-mirror of the Go state table) so there is a single ordered stage list.
 function mainlineIndex(state: string): number {
   const i = MAINLINE.indexOf(state);
   if (i >= 0) return i;
@@ -208,30 +368,64 @@ function mainlineIndex(state: string): number {
   return anchor ? MAINLINE.indexOf(anchor) : -1;
 }
 
-// sortBooks orders the Running list so the active/current book is on top, then the
-// queue (FIFO: the next-to-run right under it), then paused, parked, and failed
-// books, with done books last. Within the active bucket the furthest-along book
-// sorts first (tie-broken by newest start, then id); the other non-queue buckets
-// keep a stable newest-change-first order. Total and deterministic.
+// sortBooks follows the scheduler's served queue positions: post-ASR Processing
+// first, ASR second, then exceptional and completed sections. Within either live
+// queue, position already puts current workers before the exact waiting order. The
+// older-daemon fallback retains a deterministic active/stage/FIFO order.
 export function sortBooks(books: BookView[]): BookView[] {
   return [...books].sort((a, b) => {
-    const ra = bucketRank(a);
-    const rb = bucketRank(b);
+    const sectionA = sectionKey(a);
+    const sectionB = sectionKey(b);
+    const ra = SECTION_ORDER.indexOf(sectionA);
+    const rb = SECTION_ORDER.indexOf(sectionB);
     if (ra !== rb) return ra - rb;
-    if (ra === 0) {
-      // Active: furthest along the pipeline first, then newest start, then id.
+    if (sectionA === 'processing' || sectionA === 'asr') {
+      const bucketA = a.queue_bucket;
+      const bucketB = b.queue_bucket;
+      if (bucketA !== undefined || bucketB !== undefined) {
+        if (bucketA === undefined) return 1;
+        if (bucketB === undefined) return -1;
+        const ba = QUEUE_BUCKET_ORDER[sectionA].indexOf(bucketA);
+        const bb = QUEUE_BUCKET_ORDER[sectionB as 'processing' | 'asr'].indexOf(bucketB);
+        if (ba !== bb) return ba - bb;
+      }
+      const pa = a.queue_position;
+      const pb = b.queue_position;
+      if (pa !== undefined || pb !== undefined) {
+        if (pa === undefined) return 1;
+        if (pb === undefined) return -1;
+        if (pa !== pb) return pa - pb;
+        return a.id - b.id;
+      }
+      // Compatibility fallback: a book with known live agent work leads, then
+      // furthest-along stage and FIFO id. New daemons always serve positions.
+      const aa = (a.active_agent_invocations ?? 0) > 0;
+      const ab = (b.active_agent_invocations ?? 0) > 0;
+      if (aa !== ab) return aa ? -1 : 1;
       const ia = mainlineIndex(a.state);
       const ib = mainlineIndex(b.state);
       if (ia !== ib) return ib - ia;
-      return compareByTimestampDesc(a.started_at ?? '', b.started_at ?? '', a.id, b.id);
-    }
-    if (ra === 1) {
-      // Queued: FIFO - oldest created first, so the next-to-run sits at the top of
-      // the group right under the active book. Ascending id is the stable tiebreak.
-      if (a.created_at !== b.created_at) return a.created_at < b.created_at ? -1 : 1;
       return a.id - b.id;
     }
-    // Paused / parked / failed / done: newest real change first, id as the tiebreak.
+    // Exceptional/completed sections: newest real change first.
     return compareByTimestampDesc(a.updated_at, b.updated_at, a.id, b.id);
+  });
+}
+
+// groupRunningBooks returns only non-empty display sections, preserving sortBooks'
+// exact order within each. Keeping this pure lets the panel's visual organization
+// remain directly tested without coupling the rule to React markup.
+export function groupRunningBooks(books: BookView[]): RunningBookSection[] {
+  const sorted = sortBooks(books);
+  const members = new Map<RunningSectionKey, BookView[]>();
+  for (const book of sorted) {
+    const key = sectionKey(book);
+    const section = members.get(key);
+    if (section) section.push(book);
+    else members.set(key, [book]);
+  }
+  return SECTION_ORDER.flatMap((key) => {
+    const section = members.get(key);
+    return section ? [{ key, label: SECTION_LABELS[key], books: section }] : [];
   });
 }

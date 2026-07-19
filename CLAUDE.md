@@ -892,9 +892,18 @@ Milestones from the workspace plan; each is shippable.
     `web/src/lib/scanStatus.ts`).
   - **Running tab**: a book **duration** chip (total audio length from inspect,
     persisted as `books.duration_sec`, migration 0007, via a `SetBookDuration`
-    gauge that does not bump `updated_at`) and a **bucketed order** - active/running
-    book(s) on top (furthest-along the mainline first), then the queue FIFO, then
-    paused/needs_attention/failed, then done (`web/src/lib/books.ts` `sortBooks`).
+    gauge that does not bump `updated_at`) and scheduler-owned queue placement.
+    `QueueSnapshot` serves `queue_group`/`queue_bucket`/`queue_position`/
+    `queue_active` on book views and the full `queue_books` snapshot on
+    `queue.stats`; buckets preserve the exact order inside independently dispatched
+    agent, mechanical, full-ASR, and corrective-ASR queues without inventing a
+    global serial order across workers. The UI renders separate **Processing**
+    (post-ASR) and **ASR** sections with current workers first, followed by labelled
+    queues and paused/needs_attention/failed/done sections
+    (`web/src/lib/books.ts` `sortBooks`/`groupRunningBooks`). A cooperatively paused
+    in-flight stage remains in its active bucket until the worker exits. This avoids
+    treating every book with a non-empty lane as active - waiting stages have a lane
+    too.
   - **Pipeline observability**: the stage reporter is now
     `scheduler.StageReport{Progress, Note}`; `Note` publishes a durable `stage.note`
     event. A **heartbeat** (`agent.Request.Heartbeat`, ticked from inside

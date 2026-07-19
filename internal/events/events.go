@@ -90,6 +90,15 @@ type Hub struct {
 // with Publish; set it once at wiring time.
 func (h *Hub) SetPersister(fn func(Event)) { h.persist = fn }
 
+// Cursor returns the id of the newest real event. A caller can capture it before
+// constructing a REST snapshot, then subscribe from that id to replay every event
+// that raced with the snapshot.
+func (h *Hub) Cursor() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.nextID
+}
+
 // NewHub returns a hub retaining ringSize recent events for replay. A ringSize
 // <= 0 uses DefaultRingSize.
 func NewHub(ringSize int) *Hub {

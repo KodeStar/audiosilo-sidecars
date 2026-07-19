@@ -32,6 +32,7 @@ type pipelineEnv struct {
 	*testEnv
 	db  *store.DB
 	cfg config.Config
+	hub *events.Hub
 }
 
 func newPipelineEnv(t *testing.T, libraryRoots []string, opts ...func(*Deps)) *pipelineEnv {
@@ -103,7 +104,7 @@ func newPipelineEnv(t *testing.T, libraryRoots []string, opts ...func(*Deps)) *p
 	env.api = New(deps)
 	env.srv = httptest.NewServer(env.api.Handler())
 	t.Cleanup(env.srv.Close)
-	return &pipelineEnv{testEnv: env, db: db, cfg: cfg}
+	return &pipelineEnv{testEnv: env, db: db, cfg: cfg, hub: hub}
 }
 
 func TestScanPathAllowListAllowedAndDenied(t *testing.T) {
@@ -330,13 +331,29 @@ func TestBooksCreateListDedupAndDetail(t *testing.T) {
 		t.Fatalf("dedup result = %+v", cr.Results)
 	}
 
-	// List shows 3 books.
+	// List shows 3 books and returns the event cursor used for the REST/SSE handoff.
+	if err := env.hub.Publish("test.cursor", nil); err != nil {
+		t.Fatal(err)
+	}
 	resp = env.do(t, http.MethodGet, "/api/v1/books", token, "")
 	var lr listBooksResponse
 	_ = json.NewDecoder(resp.Body).Decode(&lr)
 	resp.Body.Close()
 	if len(lr.Books) != 3 {
 		t.Fatalf("list = %d, want 3", len(lr.Books))
+	}
+	if lr.EventCursor == 0 {
+		t.Error("list event_cursor = 0 after create events, want a replay handoff cursor")
+	}
+	positions := map[int]bool{}
+	for _, b := range lr.Books {
+		if b.QueueGroup != "asr" || b.QueueBucket != "preparing" || b.QueuePosition < 1 || b.QueuePosition > 3 || b.QueueActive {
+			t.Errorf("book %d queue placement = (%q,%q,%d,%v), want an inactive ASR preparation position 1..3", b.ID, b.QueueGroup, b.QueueBucket, b.QueuePosition, b.QueueActive)
+		}
+		positions[b.QueuePosition] = true
+	}
+	if len(positions) != 3 {
+		t.Errorf("queue positions = %v, want each of 1,2,3 exactly once", positions)
 	}
 
 	// Detail includes a (possibly empty) stage-run ledger.

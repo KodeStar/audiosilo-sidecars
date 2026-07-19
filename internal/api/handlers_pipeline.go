@@ -236,8 +236,16 @@ type bookView struct {
 	WorkID          string            `json:"work_id,omitempty"`
 	State           string            `json:"state"`
 	Lane            string            `json:"lane"`
-	Status          string            `json:"status"`
-	Error           string            `json:"error,omitempty"`
+	// QueueGroup/Position/Active are the scheduler-owned Running-board placement.
+	// They are omitted for idle exceptional and terminal books; cooperatively paused
+	// in-flight work remains active. Lane alone cannot indicate activity because
+	// waiting books also have a stage lane.
+	QueueGroup    string `json:"queue_group,omitempty"`
+	QueueBucket   string `json:"queue_bucket,omitempty"`
+	QueuePosition int    `json:"queue_position,omitempty"`
+	QueueActive   bool   `json:"queue_active,omitempty"`
+	Status        string `json:"status"`
+	Error         string `json:"error,omitempty"`
 	// ParkCode is the typed park reason beside Error (empty = none), from books.park_code.
 	ParkCode string `json:"park_code,omitempty"`
 	// RetryAt is the scheduled automatic re-admit instant (RFC3339 UTC) for a book parked
@@ -312,12 +320,16 @@ func (a *API) bookToView(ctx context.Context, b store.Book, contribRows []store.
 	timing, _ := a.store.BookTiming(ctx, b.ID)
 	activeInvocations, _ := a.store.ActiveAgentInvocationCount(ctx, b.ID)
 	var blocker *scheduler.SeriesBlocker
+	var queue scheduler.QueueBook
 	if books, err := a.store.ListBooks(ctx); err == nil {
 		if value, ok := scheduler.SeriesBlockers(books)[b.ID]; ok {
 			blocker = &value
 		}
+		if a.sched != nil {
+			queue = a.sched.QueueSnapshot(books)[b.ID]
+		}
 	}
-	return buildBookView(b, progress, totalCost, startedAt, a.bookETA(b.ID), contribRows, timing, activeInvocations, a.snapshot().Agent.Capacity().MaxAgentsPerBook, blocker)
+	return buildBookView(b, progress, totalCost, startedAt, a.bookETA(b.ID), contribRows, timing, activeInvocations, a.snapshot().Agent.Capacity().MaxAgentsPerBook, blocker, queue)
 }
 
 // bookETA reads a book's latest ETA from the scheduler (never computed here). It
@@ -348,7 +360,7 @@ func (a *API) bookETASnapshot() map[int64]int64 {
 // summed agent cost, earliest stage-run start, and ETA seconds, normalizing the
 // always-present JSON fields. scratch_bytes is served from the persisted column
 // (written by the split stage / PurgeScratch), so no read walks the work dir.
-func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64, startedAt string, etaSeconds int64, contribRows []store.Contribution, timing store.BookTiming, activeInvocations, maxAgentsPerBook int, seriesBlockedBy *scheduler.SeriesBlocker) bookView {
+func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64, startedAt string, etaSeconds int64, contribRows []store.Contribution, timing store.BookTiming, activeInvocations, maxAgentsPerBook int, seriesBlockedBy *scheduler.SeriesBlocker, queue scheduler.QueueBook) bookView {
 	authors := b.Authors
 	if authors == nil {
 		authors = []string{}
@@ -378,6 +390,7 @@ func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64
 		Series: b.Series, SeriesPos: b.SeriesPos, ASIN: b.ASIN, ISBN: b.ISBN,
 		IdentitySources: idsrc, WorkID: b.WorkID,
 		State: b.State, Lane: string(state.LaneOf(state.State(b.State))),
+		QueueGroup: queue.Group, QueueBucket: queue.Bucket, QueuePosition: queue.Position, QueueActive: queue.Active,
 		Status: b.Status, Error: b.Error, ParkCode: b.ParkCode, RetryAt: b.RetryAt, Coverage: b.Coverage,
 		ETASeconds: etaSeconds, StartedAt: startedAt,
 		Timing: timing, ActiveAgentInvocations: activeInvocations, MaxAgentsPerBook: maxAgentsPerBook, SeriesBlockedBy: seriesBlockedBy, FanoutSupported: state.SupportsAgentFanout(state.State(b.State)),
@@ -389,11 +402,19 @@ func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64
 }
 
 type listBooksResponse struct {
-	Books []bookView `json:"books"`
+	Books       []bookView `json:"books"`
+	EventCursor uint64     `json:"event_cursor"`
 }
 
 func (a *API) handleListBooks(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	// Capture the event cursor before the first database read. The browser opens
+	// SSE from this cursor only after receiving the baseline, so every transition
+	// concurrent with this multi-query snapshot is replayed over it.
+	var eventCursor uint64
+	if a.events != nil {
+		eventCursor = a.events.Cursor()
+	}
 	books, err := a.store.ListBooks(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not list books")
@@ -436,6 +457,10 @@ func (a *API) handleListBooks(w http.ResponseWriter, r *http.Request) {
 	// One ETA snapshot for the whole list (a single scheduler lock, not one per book).
 	etaByBook := a.bookETASnapshot()
 	seriesBlockedBy := scheduler.SeriesBlockers(books)
+	queueByBook := map[int64]scheduler.QueueBook{}
+	if a.sched != nil {
+		queueByBook = a.sched.QueueSnapshot(books)
+	}
 	maxAgentsPerBook := a.snapshot().Agent.Capacity().MaxAgentsPerBook
 	views := make([]bookView, 0, len(books))
 	for _, b := range books {
@@ -444,9 +469,9 @@ func (a *API) handleListBooks(w http.ResponseWriter, r *http.Request) {
 			blocker = &value
 		}
 		views = append(views, buildBookView(b, progressByBook[b.ID], costByBook[b.ID],
-			startsByBook[b.ID], etaByBook[b.ID], contribByBook[b.ID], timingsByBook[b.ID], activeByBook[b.ID], maxAgentsPerBook, blocker))
+			startsByBook[b.ID], etaByBook[b.ID], contribByBook[b.ID], timingsByBook[b.ID], activeByBook[b.ID], maxAgentsPerBook, blocker, queueByBook[b.ID]))
 	}
-	writeJSON(w, http.StatusOK, listBooksResponse{Books: views})
+	writeJSON(w, http.StatusOK, listBooksResponse{Books: views, EventCursor: eventCursor})
 }
 
 func (a *API) handleGetBook(w http.ResponseWriter, r *http.Request) {

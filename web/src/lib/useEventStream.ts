@@ -40,6 +40,9 @@ export interface EventStreamOptions {
   // Invoked for every pipeline event frame with the parsed JSON payload. Held in
   // a ref internally, so passing a fresh closure each render does NOT reconnect.
   onEvent?: (type: PipelineEventType, data: unknown) => void;
+  // Optional replay cursor captured with a REST baseline. The daemon accepts the
+  // query fallback because browser code cannot set Last-Event-ID on EventSource.
+  lastEventId?: number;
 }
 
 // Opens an EventSource to `${apiBase}/api/v1/events?token=${token}` and tracks
@@ -66,7 +69,8 @@ export function useEventStream(
     }
 
     setStatus('connecting');
-    const url = `${apiBase}/api/v1/events?token=${encodeURIComponent(token)}`;
+    const cursor = options.lastEventId === undefined ? '' : `&lastEventId=${options.lastEventId}`;
+    const url = `${apiBase}/api/v1/events?token=${encodeURIComponent(token)}${cursor}`;
     const source = new EventSource(url);
     sourceRef.current = source;
 
@@ -108,7 +112,7 @@ export function useEventStream(
       source.close();
       sourceRef.current = null;
     };
-  }, [apiBase, token]);
+  }, [apiBase, token, options.lastEventId]);
 
   return { status, lastHeartbeat };
 }

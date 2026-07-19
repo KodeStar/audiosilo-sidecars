@@ -24,6 +24,18 @@ func TestReplayFromLastEventID(t *testing.T) {
 	}
 }
 
+func TestCursorTracksNewestPublishedEvent(t *testing.T) {
+	h := NewHub(0)
+	if got := h.Cursor(); got != 0 {
+		t.Fatalf("initial cursor = %d, want 0", got)
+	}
+	_ = h.Publish("one", nil)
+	_ = h.Publish("two", nil)
+	if got := h.Cursor(); got != 2 {
+		t.Fatalf("cursor = %d, want 2", got)
+	}
+}
+
 func TestReplayAllAndNone(t *testing.T) {
 	h := NewHub(0)
 	for i := 0; i < 3; i++ {

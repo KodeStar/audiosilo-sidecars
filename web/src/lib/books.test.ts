@@ -3,10 +3,13 @@ import type { BookView } from '@/api/types';
 import {
   applyBookState,
   applyEtaUpdate,
+  applyQueueSnapshot,
+  applyQueueStats,
   applyStageProgress,
   availableActions,
   bumpBookEventCount,
   formatBytes,
+  groupRunningBooks,
   isDone,
   pruneBookEventCounts,
   sortBooks,
@@ -58,6 +61,30 @@ describe('applyBookState', () => {
     });
     expect(out[0].status).toBe('');
     expect(out[0].error).toBe('');
+  });
+
+  it('preserves queue placement until a queue snapshot actually changes it', () => {
+    const books = [
+      bk({
+        id: 1,
+        state: 'fact_pass',
+        queue_group: 'processing',
+        queue_position: 1,
+        queue_active: true,
+      }),
+    ];
+    const out = applyBookState(books, {
+      book_id: 1,
+      state: 'synthesizing',
+      lane: 'agent',
+      status: '',
+      error: '',
+    });
+    expect(out[0]).toMatchObject({
+      queue_group: 'processing',
+      queue_position: 1,
+      queue_active: true,
+    });
   });
 
   it('carries park_code from the event (set on park, cleared on advance)', () => {
@@ -145,6 +172,107 @@ describe('applyEtaUpdate', () => {
       ],
     });
     expect(out).toBe(books);
+  });
+});
+
+describe('applyQueueSnapshot', () => {
+  it('replaces live placements and clears books omitted from the scheduler snapshot', () => {
+    const books = [
+      bk({
+        id: 1,
+        queue_group: 'asr',
+        queue_bucket: 'transcribing',
+        queue_position: 1,
+        queue_active: true,
+      }),
+      bk({
+        id: 2,
+        queue_group: 'asr',
+        queue_bucket: 'transcription',
+        queue_position: 1,
+        queue_active: false,
+      }),
+    ];
+    const out = applyQueueSnapshot(books, {
+      asr_active: 0,
+      agent_active: 1,
+      mechanical_active: 0,
+      queued: 1,
+      queue_books: [
+        { book_id: 2, group: 'processing', bucket: 'agent_active', position: 1, active: true },
+      ],
+    });
+    expect(out[0]).toMatchObject({
+      queue_group: undefined,
+      queue_bucket: undefined,
+      queue_position: undefined,
+      queue_active: undefined,
+    });
+    expect(out[1]).toMatchObject({
+      queue_group: 'processing',
+      queue_bucket: 'agent_active',
+      queue_position: 1,
+      queue_active: true,
+    });
+  });
+
+  it('leaves placements untouched when an older daemon omits queue_books', () => {
+    const books = [bk({ id: 1, queue_group: 'asr', queue_position: 1 })];
+    expect(
+      applyQueueSnapshot(books, {
+        asr_active: 1,
+        agent_active: 0,
+        mechanical_active: 0,
+        queued: 1,
+      }),
+    ).toBe(books);
+  });
+});
+
+describe('applyQueueStats', () => {
+  it('preserves array and row identity when a full queue frame changes nothing', () => {
+    const blocker = { book_id: 9, title: 'Earlier', series_pos: '1' };
+    const books = [
+      bk({
+        id: 1,
+        queue_group: 'processing',
+        queue_bucket: 'agent_active',
+        queue_position: 1,
+        queue_active: true,
+        active_agent_invocations: 2,
+        series_blocked_by: blocker,
+      }),
+    ];
+    const out = applyQueueStats(books, {
+      asr_active: 0,
+      agent_active: 1,
+      mechanical_active: 0,
+      queued: 1,
+      agent_invocations_by_book: { '1': 2 },
+      series_blocked_by: { '1': { ...blocker } },
+      queue_books: [
+        { book_id: 1, group: 'processing', bucket: 'agent_active', position: 1, active: true },
+      ],
+    });
+    expect(out).toBe(books);
+    expect(out[0]).toBe(books[0]);
+  });
+
+  it('clones only the row whose occupancy changed', () => {
+    const books = [
+      bk({ id: 1, active_agent_invocations: 0 }),
+      bk({ id: 2, active_agent_invocations: 0 }),
+    ];
+    const out = applyQueueStats(books, {
+      asr_active: 0,
+      agent_active: 1,
+      mechanical_active: 0,
+      queued: 2,
+      agent_invocations_by_book: { '1': 1, '2': 0 },
+    });
+    expect(out[0]).not.toBe(books[0]);
+    expect(out[0].active_agent_invocations).toBe(1);
+    expect(out[1]).toBe(books[1]);
   });
 });
 
@@ -258,15 +386,41 @@ describe('formatBytes', () => {
 });
 
 describe('sortBooks', () => {
-  it('orders active-on-top, queued FIFO, then paused/parked/failed, done last', () => {
-    // Active bucket: status '' with a non-empty lane (on a worker now). Furthest
-    // along the mainline sorts first.
-    const activeEarly = bk({ id: 1, state: 'asr', lane: 'asr', status: '' });
-    const activeLate = bk({ id: 2, state: 'auditing', lane: 'agent', status: '' });
-    // Queued bucket: status '' with an empty lane. FIFO by created_at (oldest first
-    // = the next to run, right under the active book).
-    const queuedOld = bk({ id: 3, state: 'queued', created_at: '2026-01-01T00:00:00Z' });
-    const queuedNew = bk({ id: 4, state: 'queued', created_at: '2026-01-02T00:00:00Z' });
+  it('uses served Processing and ASR positions, then exceptional and completed sections', () => {
+    const processingNow = bk({
+      id: 1,
+      state: 'fact_pass',
+      lane: 'agent',
+      queue_group: 'processing',
+      queue_bucket: 'agent_active',
+      queue_position: 1,
+      queue_active: true,
+    });
+    const processingNext = bk({
+      id: 2,
+      state: 'spelling_research',
+      lane: 'agent',
+      queue_group: 'processing',
+      queue_bucket: 'agent',
+      queue_position: 1,
+    });
+    const asrNow = bk({
+      id: 3,
+      state: 'asr',
+      lane: 'asr',
+      queue_group: 'asr',
+      queue_bucket: 'transcribing',
+      queue_position: 1,
+      queue_active: true,
+    });
+    const asrNext = bk({
+      id: 4,
+      state: 'asr',
+      lane: 'asr',
+      queue_group: 'asr',
+      queue_bucket: 'transcription',
+      queue_position: 1,
+    });
     const paused = bk({ id: 5, state: 'asr', status: 'paused' });
     const parked = bk({ id: 6, state: 'auditing', status: 'needs_attention' });
     const failed = bk({ id: 7, state: 'asr', status: 'failed' });
@@ -277,30 +431,104 @@ describe('sortBooks', () => {
       failed,
       parked,
       paused,
-      queuedNew,
-      queuedOld,
-      activeEarly,
-      activeLate,
+      asrNext,
+      processingNext,
+      asrNow,
+      processingNow,
     ]);
-    expect(out.map((x) => x.id)).toEqual([2, 1, 3, 4, 5, 6, 7, 8]);
+    expect(out.map((x) => x.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
   });
 
-  it('orders the active bucket furthest-along first, then newest start', () => {
+  it('keeps a deterministic stage-then-id fallback when queue positions are absent', () => {
     const a = bk({
       id: 1,
       state: 'asr',
       lane: 'asr',
       status: '',
-      started_at: '2026-01-01T00:00:00Z',
     });
     const b = bk({
       id: 2,
-      state: 'asr',
-      lane: 'asr',
+      state: 'splitting',
+      lane: 'mechanical',
       status: '',
-      started_at: '2026-01-02T00:00:00Z',
     });
-    // Same stage -> the newer start sorts first.
-    expect(sortBooks([a, b]).map((x) => x.id)).toEqual([2, 1]);
+    expect(sortBooks([b, a]).map((x) => x.id)).toEqual([1, 2]);
+  });
+
+  it('keeps independent scheduler buckets in their served display order', () => {
+    const books = [
+      bk({ id: 4, queue_group: 'asr', queue_bucket: 'retranscription', queue_position: 1 }),
+      bk({ id: 3, queue_group: 'asr', queue_bucket: 'transcription', queue_position: 1 }),
+      bk({
+        id: 2,
+        queue_group: 'asr',
+        queue_bucket: 'retranscribing',
+        queue_position: 1,
+        queue_active: true,
+      }),
+      bk({
+        id: 1,
+        queue_group: 'asr',
+        queue_bucket: 'transcribing',
+        queue_position: 1,
+        queue_active: true,
+      }),
+    ];
+    expect(sortBooks(books).map((book) => book.id)).toEqual([1, 2, 3, 4]);
+  });
+
+  it('keeps a cooperatively paused in-flight book in its active queue', () => {
+    const sections = groupRunningBooks([
+      bk({
+        id: 1,
+        status: 'paused',
+        queue_group: 'asr',
+        queue_bucket: 'transcribing',
+        queue_position: 1,
+        queue_active: true,
+      }),
+      bk({ id: 2, status: 'paused' }),
+    ]);
+    expect(sections.map((section) => [section.key, section.books.map((book) => book.id)])).toEqual([
+      ['asr', [1]],
+      ['paused', [2]],
+    ]);
+  });
+
+  it('groups the ordered books into labelled, non-empty sections', () => {
+    const sections = groupRunningBooks([
+      bk({ id: 4, state: 'done' }),
+      bk({ id: 3, state: 'asr', queue_group: 'asr', queue_position: 1 }),
+      bk({
+        id: 2,
+        state: 'fact_pass',
+        queue_group: 'processing',
+        queue_position: 2,
+      }),
+      bk({
+        id: 1,
+        state: 'synthesizing',
+        queue_group: 'processing',
+        queue_position: 1,
+      }),
+    ]);
+    expect(
+      sections.map((section) => [section.label, section.books.map((book) => book.id)]),
+    ).toEqual([
+      ['Processing', [1, 2]],
+      ['ASR', [3]],
+      ['Completed', [4]],
+    ]);
+  });
+
+  it('uses the off-mainline anchor when falling back without served queue fields', () => {
+    const sections = groupRunningBooks([
+      bk({ id: 1, state: 'markers_normalizing', lane: 'agent' }),
+      bk({ id: 2, state: 'qa_adjudicating', lane: 'agent' }),
+    ]);
+    expect(sections.map((section) => [section.key, section.books.map((book) => book.id)])).toEqual([
+      ['processing', [2]],
+      ['asr', [1]],
+    ]);
   });
 });

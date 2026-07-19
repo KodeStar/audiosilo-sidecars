@@ -90,6 +90,12 @@ library again. It is a snapshot: run **Scan** after changing files. UI tabs are
 deep-linkable and refresh-safe with `?tab=library`, `?tab=running`,
 `?tab=done`, or `?tab=settings`.
 
+The Running tab separates post-transcription **Processing** from **ASR**. Current
+workers appear first, followed by labelled agent, mechanical, transcription, and
+corrective re-transcription queues in the daemon's actual dispatch order. Paused,
+needs-attention, failed, and completed books remain in separate sections; a paused
+book whose current stage is still winding down stays visible under its active worker.
+
 ### Docker
 
 Use a published image (see **Install**) or build locally:

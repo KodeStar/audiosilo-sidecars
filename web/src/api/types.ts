@@ -421,6 +421,15 @@ export interface BookView {
   // 'mechanical' | '' for a waypoint). The daemon computes it (state.LaneOf), so
   // the web UI no longer mirrors the state->lane table.
   lane: string;
+  // Scheduler-owned Running-board placement. Active, unexceptional books are
+  // split into the post-transcription Processing group and the ASR group. Bucket
+  // identifies the independently dispatched worker/queue within that group;
+  // position is one-based within the bucket. queue_active identifies a worker
+  // actually handling the book now (lane alone cannot - waiting books have a lane).
+  queue_group?: 'processing' | 'asr';
+  queue_bucket?: QueueBucket;
+  queue_position?: number;
+  queue_active?: boolean;
   status: string;
   error?: string;
   // Typed machine-readable park reason beside the free-text error (see the
@@ -651,6 +660,9 @@ export interface BatchCostSummary {
 
 export interface ListBooksResponse {
   books: BookView[];
+  // Event id captured before the REST snapshot. Opening SSE from this cursor
+  // provides a lossless handoff for transitions that raced with the list query.
+  event_cursor: number;
 }
 
 // --- SSE event payloads (see internal/scheduler publish sites) ---
@@ -698,9 +710,39 @@ export interface QueueStatsEvent {
   // Live scheduler-derived blocker map, keyed by the waiting book id. An empty
   // map clears blockers after the earlier book reaches Ready.
   series_blocked_by?: Record<string, SeriesBlocker>;
+  // Full live scheduler placement. An empty array clears stale placements; this
+  // keeps activity and ordering current when a worker hands its slot to a new book
+  // without requiring a full GET /books reload.
+  queue_books?: QueueBookPlacement[];
   mechanical_active: number;
+  // Legacy wire name: all runnable nonterminal books, including active workers.
   queued: number;
 }
+
+export interface QueueBookPlacement {
+  book_id: number;
+  group: 'processing' | 'asr';
+  bucket: QueueBucket;
+  position: number;
+  active: boolean;
+}
+
+export type QueueBucket =
+  | 'agent_active'
+  | 'mechanical_active'
+  | 'agent'
+  | 'mechanical'
+  | 'blocked'
+  | 'transcribing'
+  | 'retranscribing'
+  | 'transcription'
+  | 'retranscription'
+  | 'asr_blocked'
+  | 'preparing_agent_active'
+  | 'preparing_mechanical_active'
+  | 'preparing_agent'
+  | 'preparing_mechanical'
+  | 'preparing';
 
 // EtaUpdateEvent is the daemon-wide `eta.update` SSE frame (book_id 0). books
 // lists only books that currently have an ETA (active, unparked). queue_seconds

@@ -79,6 +79,62 @@ func TestSortASRLaneRetranscriptionJumpsBreadthQueue(t *testing.T) {
 	}
 }
 
+func TestQueueSnapshotSeparatesLiveProcessingFromActualASROrder(t *testing.T) {
+	books := []store.Book{
+		bk(1, "A", "1", string(state.FactPass)),
+		bk(2, "A", "2", string(state.ASR)),
+		bk(3, "A", "3", string(state.ASR)),
+		bk(4, "B", "1", string(state.ASR)),
+		bk(5, "B", "2", string(state.ASR)),
+		bk(6, "", "", string(state.Splitting)),
+		bk(7, "C", "1", string(state.Synthesizing)),
+		bk(8, "C", "2", string(state.SpellingResearch)),
+		bk(9, "D", "1", string(state.Retranscribing)),
+		{ID: 10, State: string(state.Auditing), Status: string(state.StatusPaused)},
+		{ID: 11, State: string(state.Done)},
+		bk(12, "E", "1", string(state.SpellingResearch)),
+		{ID: 13, State: string(state.FactPass), Status: string(state.StatusPaused)},
+	}
+	active := map[int64]inflightBook{
+		1:  {lane: state.LaneAgent, stage: state.FactPass},
+		4:  {lane: state.LaneASR, stage: state.ASR},
+		6:  {lane: state.LaneMechanical, stage: state.Splitting},
+		7:  {lane: state.LaneAgent, stage: state.Synthesizing},
+		9:  {lane: state.LaneASR, stage: state.Retranscribing},
+		13: {lane: state.LaneAgent, stage: state.FactPass},
+	}
+
+	snapshot := queueSnapshot(books, active)
+	assertQueue := func(id int64, group, bucket string, position int, running bool) {
+		t.Helper()
+		got, ok := snapshot[id]
+		if !ok || got.Group != group || got.Bucket != bucket || got.Position != position || got.Active != running {
+			t.Errorf("book %d queue = %+v (present %v), want group=%s bucket=%s position=%d active=%v", id, got, ok, group, bucket, position, running)
+		}
+	}
+	// Processing: each independent worker/queue gets its own exact FIFO positions;
+	// the lower-id C2 is explicitly blocked because C1 holds its series lock.
+	assertQueue(1, queueGroupProcessing, queueBucketAgentActive, 1, true)
+	assertQueue(7, queueGroupProcessing, queueBucketAgentActive, 2, true)
+	assertQueue(13, queueGroupProcessing, queueBucketAgentActive, 3, true)
+	assertQueue(12, queueGroupProcessing, queueBucketAgent, 1, false)
+	assertQueue(8, queueGroupProcessing, queueBucketBlocked, 1, false)
+	// Corrective and full-book ASR have independent active/ready buckets. The
+	// in-flight split remains visible as active preparation, not transcription.
+	assertQueue(9, queueGroupASR, queueBucketRetranscribing, 1, true)
+	assertQueue(4, queueGroupASR, queueBucketTranscribing, 1, true)
+	assertQueue(2, queueGroupASR, queueBucketTranscription, 1, false)
+	assertQueue(5, queueGroupASR, queueBucketTranscription, 2, false)
+	assertQueue(3, queueGroupASR, queueBucketTranscription, 3, false)
+	assertQueue(6, queueGroupASR, queueBucketPreparingMechActive, 1, true)
+	if _, ok := snapshot[10]; ok {
+		t.Error("idle paused book should not have a live queue placement")
+	}
+	if _, ok := snapshot[11]; ok {
+		t.Error("done book should not have a live queue placement")
+	}
+}
+
 func TestPartitionASRKeepsRetranscriptionIndependentFromFullBookASR(t *testing.T) {
 	candidates := []store.Book{
 		bk(9, "A", "3", string(state.Retranscribing)),
@@ -200,29 +256,35 @@ func TestQueueStatsPublishesAndClearsSeriesBlockers(t *testing.T) {
 		{ID: 1, Title: "Saga One", Series: "Saga", SeriesPos: "1", State: string(state.FactPass)},
 		{ID: 2, Title: "Saga Two", Series: "Saga", SeriesPos: "2", State: string(state.SpellingResearch)},
 	}
-	decode := func() map[string]SeriesBlocker {
+	type statsPayload struct {
+		SeriesBlockedBy map[string]SeriesBlocker `json:"series_blocked_by"`
+		QueueBooks      []QueueBook              `json:"queue_books"`
+	}
+	decode := func() statsPayload {
 		t.Helper()
 		ev := <-sub.C
 		if ev.Type != "queue.stats" {
 			t.Fatalf("event type = %q", ev.Type)
 		}
-		var payload struct {
-			SeriesBlockedBy map[string]SeriesBlocker `json:"series_blocked_by"`
-		}
+		var payload statsPayload
 		if err := json.Unmarshal(ev.Data, &payload); err != nil {
 			t.Fatal(err)
 		}
-		return payload.SeriesBlockedBy
+		return payload
 	}
 
 	s.publishQueueStats(books, map[state.Lane]int{})
-	if got := decode()["2"]; got.BookID != 1 || got.Title != "Saga One" {
+	first := decode()
+	if got := first.SeriesBlockedBy["2"]; got.BookID != 1 || got.Title != "Saga One" {
 		t.Fatalf("published blocker = %+v", got)
+	}
+	if len(first.QueueBooks) != 2 || first.QueueBooks[0].Group != queueGroupProcessing || first.QueueBooks[0].Bucket != queueBucketAgent || first.QueueBooks[0].Position != 1 {
+		t.Fatalf("published queue books = %+v, want exact Processing bucket placement", first.QueueBooks)
 	}
 
 	books[0].State = string(state.Ready)
 	s.publishQueueStats(books, map[state.Lane]int{})
-	if got := decode(); len(got) != 0 {
+	if got := decode().SeriesBlockedBy; len(got) != 0 {
 		t.Fatalf("published blockers after release = %+v, want empty", got)
 	}
 }

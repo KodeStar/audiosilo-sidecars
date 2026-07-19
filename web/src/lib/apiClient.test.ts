@@ -134,6 +134,46 @@ describe('ApiClient', () => {
     expect(JSON.parse(init.body as string).candidates).toHaveLength(1);
   });
 
+  it('preserves scheduler queue placement from the book list', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(200, {
+        event_cursor: 17,
+        books: [
+          {
+            id: 7,
+            source_path: '/b7',
+            title: 'Seven',
+            authors: [],
+            state: 'asr',
+            lane: 'asr',
+            queue_group: 'asr',
+            queue_bucket: 'transcribing',
+            queue_position: 1,
+            queue_active: true,
+            status: '',
+            progress: [],
+            scratch_bytes: 0,
+            total_cost_usd: 0,
+            created_at: '2026-01-01T00:00:00Z',
+            updated_at: '2026-01-01T00:00:00Z',
+          },
+        ],
+      }),
+    );
+    const client = pipelineClient();
+
+    const result = await client.listBooks();
+
+    expect(result.books[0]).toMatchObject({
+      queue_group: 'asr',
+      queue_bucket: 'transcribing',
+      queue_position: 1,
+      queue_active: true,
+    });
+    expect(result.event_cursor).toBe(17);
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/books');
+  });
+
   it('GETs the scan list for reattach', async () => {
     fetchMock.mockResolvedValue(jsonResponse(200, { scans: [] }));
     const client = pipelineClient();

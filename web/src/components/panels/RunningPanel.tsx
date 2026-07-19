@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ApiClient } from '@/lib/apiClient';
 import { ApiError } from '@/lib/apiClient';
 import type {
@@ -16,12 +16,14 @@ import type {
 import {
   applyBookState,
   applyEtaUpdate,
+  applyQueueStats,
   applyStageProgress,
   bumpBookEventCount,
   formatBytes,
+  groupRunningBooks,
   isDone,
   pruneBookEventCounts,
-  sortBooks,
+  queueBucketLabel,
   type BookAction,
 } from '@/lib/books';
 import { formatEta } from '@/lib/duration';
@@ -52,6 +54,9 @@ interface RunningPanelProps {
 
 export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
   const [books, setBooks] = useState<BookView[] | null>(null);
+  const [eventCursor, setEventCursor] = useState<number | null>(null);
+  const lastBaselineCursor = useRef<number | null>(null);
+  const loadGeneration = useRef(0);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [stats, setStats] = useState<QueueStatsEvent | null>(null);
   const [queueSeconds, setQueueSeconds] = useState<number | null>(null);
@@ -90,9 +95,17 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
   // purge, which drops the total. The two calls are independent, so a gauge
   // failure never blocks the pipeline list.
   const load = useCallback(async () => {
+    const generation = ++loadGeneration.current;
+    // Close the existing stream while replacing its baseline. The response cursor
+    // then replays every event that raced with any REST reload, not only mount.
+    setEventCursor(null);
     try {
-      const { books: list } = await client.listBooks();
-      setBooks(sortBooks(list));
+      const { books: list, event_cursor: cursor } = await client.listBooks();
+      if (generation !== loadGeneration.current) return;
+      setBooks(list);
+      const baselineCursor = cursor ?? 0;
+      lastBaselineCursor.current = baselineCursor;
+      setEventCursor(baselineCursor);
       // Drop counters for books the reload no longer holds (functional setState so a
       // concurrent bump is not clobbered).
       const liveIds = new Set(list.map((b) => b.id));
@@ -100,7 +113,10 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
       setLoadError(null);
       void refreshSupervisor(newestRelevantBatch(list)).catch(() => undefined);
     } catch (err) {
+      if (generation !== loadGeneration.current) return;
       setLoadError(err instanceof ApiError ? err.message : 'Could not load the pipeline.');
+      // A failed refresh must not permanently silence a previously live board.
+      setEventCursor(lastBaselineCursor.current);
     }
     try {
       const info = await client.system();
@@ -136,7 +152,7 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
     (type: PipelineEventType, data: unknown) => {
       if (type === 'book.state') {
         const ev = data as BookStateEvent;
-        setBooks((prev) => (prev ? sortBooks(applyBookState(prev, ev)) : prev));
+        setBooks((prev) => (prev ? applyBookState(prev, ev) : prev));
         setBookEventCounts((prev) => bumpBookEventCount(prev, ev.book_id));
       } else if (type === 'stage.progress') {
         const ev = data as StageProgressEvent;
@@ -154,21 +170,8 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
         // Invocation occupancy changes more often than book state. Fold the
         // daemon-wide map into each row so the per-book fan-out indicator stays
         // live without polling or one request per book.
-        if (ev.agent_invocations_by_book || ev.series_blocked_by) {
-          setBooks(
-            (prev) =>
-              prev?.map((book) => ({
-                ...book,
-                ...(ev.agent_invocations_by_book
-                  ? {
-                      active_agent_invocations: ev.agent_invocations_by_book[String(book.id)] ?? 0,
-                    }
-                  : {}),
-                ...(ev.series_blocked_by
-                  ? { series_blocked_by: ev.series_blocked_by[String(book.id)] }
-                  : {}),
-              })) ?? prev,
-          );
+        if (ev.agent_invocations_by_book || ev.series_blocked_by || ev.queue_books) {
+          setBooks((prev) => (prev ? applyQueueStats(prev, ev) : prev));
         }
       } else if (type === 'eta.update') {
         const ev = data as EtaUpdateEvent;
@@ -191,7 +194,10 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
     [refreshSupervisor],
   );
 
-  useEventStream(apiBase, token, { onEvent });
+  useEventStream(apiBase, eventCursor === null ? null : token, {
+    onEvent,
+    lastEventId: eventCursor ?? undefined,
+  });
 
   // Stable callback for a row to lazily fetch its detail (with the stage-run cost
   // ledger) when expanded.
@@ -270,6 +276,10 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
     [client, load],
   );
 
+  // Queue ordering is derived once per books snapshot. The shared elapsed clock
+  // still re-renders active rows every 30s, but it need not re-sort the full board.
+  const sections = useMemo(() => groupRunningBooks(books ?? []), [books]);
+
   if (loadError) {
     return (
       <div className="rounded-xl border border-edge bg-surface p-6">
@@ -290,13 +300,12 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
 
   const active = books.filter((b) => !isDone(b));
   const done = books.filter(isDone);
-
   return (
     <div className="flex flex-col gap-4">
       <QueueStrip
         stats={stats}
         queueSeconds={queueSeconds}
-        activeCount={active.length}
+        inPipelineCount={active.length}
         doneCount={done.length}
         scratchBytes={scratchBytes}
       />
@@ -316,30 +325,58 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
           Nothing in the pipeline yet. Scan a folder in the Library tab and process some books.
         </div>
       ) : (
-        <div className="flex flex-col gap-2">
-          {books.map((b) => (
-            <BookRow
-              key={b.id}
-              book={b}
-              busy={busyId === b.id}
-              // Only rows that can render an elapsed readout (active, with a start
-              // time) receive the ticking clock; the rest get a stable 0 so the
-              // 30s tick does not break their memo (notably done rows, which render
-              // no elapsed).
-              now={!isDone(b) && b.started_at ? now : 0}
-              // Changes on each durable book-scoped SSE frame, triggering the open
-              // log panel's throttled refetch.
-              eventCount={bookEventCounts[b.id] ?? 0}
-              onAction={handleAction}
-              getDetail={getDetail}
-              getEvents={getEvents}
-              onCompleteCoreProposal={handleCompleteCoreProposal}
-              onAskSupervisor={handleAskSupervisor}
-              modelSupervisorEnabled={
-                !!(supervisorStatus?.model_assisted && supervisorStatus.model_available)
-              }
-              supervisorIncident={incidents.find((incident) => incident.book_id === b.id)}
-            />
+        <div className="flex flex-col gap-5">
+          {sections.map((section) => (
+            <section key={section.key} aria-labelledby={`running-${section.key}`}>
+              <div className="mb-2 flex items-baseline justify-between gap-3 px-1">
+                <h2
+                  id={`running-${section.key}`}
+                  className="text-xs font-semibold uppercase tracking-[0.16em] text-dim"
+                >
+                  {section.label}
+                </h2>
+                <span className="text-xs text-dim">{section.books.length}</span>
+              </div>
+              <div className="flex flex-col gap-2">
+                {section.books.map((b, index) => {
+                  const isLive = section.key === 'processing' || section.key === 'asr';
+                  const bucketLabel = isLive ? queueBucketLabel(b) : '';
+                  const firstInBucket =
+                    isLive &&
+                    (index === 0 || queueBucketLabel(section.books[index - 1]) !== bucketLabel);
+                  return (
+                    <div key={b.id}>
+                      {firstInBucket && (
+                        <p className="mb-1 px-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-dim">
+                          {bucketLabel}
+                        </p>
+                      )}
+                      <BookRow
+                        book={b}
+                        busy={busyId === b.id}
+                        // Only rows that can render an elapsed readout (active, with a start
+                        // time) receive the ticking clock; the rest get a stable 0 so the
+                        // 30s tick does not break their memo (notably done rows, which render
+                        // no elapsed).
+                        now={!isDone(b) && b.started_at ? now : 0}
+                        // Changes on each durable book-scoped SSE frame, triggering the open
+                        // log panel's throttled refetch.
+                        eventCount={bookEventCounts[b.id] ?? 0}
+                        onAction={handleAction}
+                        getDetail={getDetail}
+                        getEvents={getEvents}
+                        onCompleteCoreProposal={handleCompleteCoreProposal}
+                        onAskSupervisor={handleAskSupervisor}
+                        modelSupervisorEnabled={
+                          !!(supervisorStatus?.model_assisted && supervisorStatus.model_available)
+                        }
+                        supervisorIncident={incidents.find((incident) => incident.book_id === b.id)}
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
           ))}
         </div>
       )}
@@ -427,7 +464,7 @@ interface QueueStripProps {
   // Estimated makespan for the whole queue (from eta.update); null when it cannot
   // be estimated or none has arrived yet.
   queueSeconds: number | null;
-  activeCount: number;
+  inPipelineCount: number;
   doneCount: number;
   // Daemon-total on-disk scratch (from /system); null until first fetched.
   scratchBytes: number | null;
@@ -436,13 +473,13 @@ interface QueueStripProps {
 function QueueStrip({
   stats,
   queueSeconds,
-  activeCount,
+  inPipelineCount,
   doneCount,
   scratchBytes,
 }: QueueStripProps) {
   return (
     <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-xl border border-edge bg-surface px-4 py-3 text-sm">
-      <Stat label="Active" value={activeCount} />
+      <Stat label="In pipeline" value={inPipelineCount} />
       <Stat label="Done" value={doneCount} />
       {stats && (
         <>
@@ -461,7 +498,7 @@ function QueueStrip({
             />
           )}
           <Stat label="Mechanical" value={stats.mechanical_active} muted />
-          <Stat label="Queued" value={stats.queued} muted />
+          <Stat label="Runnable" value={stats.queued} muted />
         </>
       )}
       {queueSeconds !== null && (

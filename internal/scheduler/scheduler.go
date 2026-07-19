@@ -101,6 +101,7 @@ type queueStats struct {
 	asr, agent, invocations, invocationCap, mech, queued int
 	invocationsByBook                                    string
 	seriesBlockedBy                                      string
+	queueBooks                                           string
 }
 
 type agentInvocationRuntime interface {
@@ -116,6 +117,41 @@ type inflightBook struct {
 	stage  state.State
 	cancel context.CancelFunc
 }
+
+// QueueBook is the scheduler-owned placement of one runnable book on the Running
+// board. Group separates the post-transcription pipeline from the ASR pipeline;
+// Bucket identifies an independently dispatched worker/queue within that group;
+// Position is one-based within the bucket. Active means the book is occupying that
+// worker now. The web UI consumes this instead of inventing a serial order across
+// independent workers or guessing activity from a book's stage lane.
+type QueueBook struct {
+	BookID   int64  `json:"book_id"`
+	Group    string `json:"group"`
+	Bucket   string `json:"bucket"`
+	Position int    `json:"position"`
+	Active   bool   `json:"active"`
+}
+
+const (
+	queueGroupProcessing = "processing"
+	queueGroupASR        = "asr"
+
+	queueBucketAgentActive          = "agent_active"
+	queueBucketMechanicalActive     = "mechanical_active"
+	queueBucketAgent                = "agent"
+	queueBucketMechanical           = "mechanical"
+	queueBucketBlocked              = "blocked"
+	queueBucketTranscribing         = "transcribing"
+	queueBucketRetranscribing       = "retranscribing"
+	queueBucketTranscription        = "transcription"
+	queueBucketRetranscription      = "retranscription"
+	queueBucketASRBlocked           = "asr_blocked"
+	queueBucketPreparingAgentActive = "preparing_agent_active"
+	queueBucketPreparingMechActive  = "preparing_mechanical_active"
+	queueBucketPreparingAgent       = "preparing_agent"
+	queueBucketPreparingMechanical  = "preparing_mechanical"
+	queueBucketPreparing            = "preparing"
+)
 
 // New constructs a scheduler. agentCap < 1 is clamped to 1. workRoot is the
 // daemon's <data>/work directory (Delete's on-disk cleanup is confined to it);
@@ -405,11 +441,18 @@ func partitionASR(candidates []store.Book) (retranscriptions, transcriptions []s
 }
 
 func sortASRLane(candidates, allBooks []store.Book) {
+	sortASRLaneWithRanks(candidates, asrBreadthRanks(allBooks))
+}
+
+func asrBreadthRanks(allBooks []store.Book) map[int64]int {
 	items := make([]state.SeriesQueueItem, 0, len(allBooks))
 	for _, b := range allBooks {
 		items = append(items, state.SeriesQueueItem{ID: b.ID, Series: b.Series, SeriesPos: b.SeriesPos})
 	}
-	ranks := state.SeriesBreadthRanks(items)
+	return state.SeriesBreadthRanks(items)
+}
+
+func sortASRLaneWithRanks(candidates []store.Book, ranks map[int64]int) {
 	sort.Slice(candidates, func(i, j int) bool {
 		ri := state.State(candidates[i].State) == state.Retranscribing
 		rj := state.State(candidates[j].State) == state.Retranscribing
@@ -425,6 +468,173 @@ func sortASRLane(candidates, allBooks []store.Book) {
 
 func sortByID(b []store.Book) {
 	sort.Slice(b, func(i, j int) bool { return b[i].ID < b[j].ID })
+}
+
+// QueueSnapshot returns the current scheduler-owned Running-board order. It uses
+// the same in-flight set and ASR breadth ranks as dispatch, so the UI can distinguish
+// a worker actually running a book from another book merely waiting at a stage in
+// that lane. Idle exceptional and terminal books are absent; a cooperatively paused
+// in-flight stage remains active until its worker exits.
+func (s *Scheduler) QueueSnapshot(books []store.Book) map[int64]QueueBook {
+	s.mu.Lock()
+	active := make(map[int64]inflightBook, len(s.inflight))
+	for id, ib := range s.inflight {
+		active[id] = *ib
+	}
+	s.mu.Unlock()
+	return queueSnapshot(books, active)
+}
+
+// queueSnapshot is the pure half of QueueSnapshot, split out for exact ordering
+// tests. Books through their first full-book ASR form the ASR group; a corrective
+// retranscription rejoins it. Each independently capacity-limited worker has its
+// own bucket, because there is no truthful total order between (for example) the
+// full-book and corrective ASR workers, or the agent and mechanical workers.
+func queueSnapshot(books []store.Book, inflight map[int64]inflightBook) map[int64]QueueBook {
+	buckets := make(map[string][]store.Book)
+	holders := lockHolders(books)
+	for _, b := range books {
+		st := state.State(b.State)
+		if state.IsTerminal(st) {
+			continue
+		}
+		ib, running := inflight[b.ID]
+		// Pause is cooperative: the current stage remains in flight until its worker
+		// exits. Keep that book in its active bucket so occupancy and the board agree;
+		// an idle exceptional book has no scheduler placement.
+		if b.Status != "" && !running {
+			continue
+		}
+		if queueGroup(st) == queueGroupASR {
+			bucket := asrQueueBucket(b, ib, running, holders[b.ID])
+			buckets[bucket] = append(buckets[bucket], b)
+			continue
+		}
+		if running {
+			bucket := queueBucketAgentActive
+			if ib.lane == state.LaneMechanical {
+				bucket = queueBucketMechanicalActive
+			}
+			buckets[bucket] = append(buckets[bucket], b)
+		} else if state.CanStart(st, state.Status(b.Status), holders[b.ID]) {
+			bucket := queueBucketAgent
+			if state.LaneOf(st) == state.LaneMechanical {
+				bucket = queueBucketMechanical
+			}
+			buckets[bucket] = append(buckets[bucket], b)
+		} else {
+			buckets[queueBucketBlocked] = append(buckets[queueBucketBlocked], b)
+		}
+	}
+
+	// Dispatch sorts every agent/mechanical/retranscription queue by book id.
+	for _, bucket := range []string{
+		queueBucketAgentActive, queueBucketMechanicalActive, queueBucketAgent,
+		queueBucketMechanical, queueBucketBlocked, queueBucketRetranscribing,
+		queueBucketRetranscription, queueBucketPreparingAgentActive,
+		queueBucketASRBlocked,
+		queueBucketPreparingMechActive, queueBucketPreparingAgent,
+		queueBucketPreparingMechanical, queueBucketPreparing,
+	} {
+		sortByID(buckets[bucket])
+	}
+	// The ordinary full-book ASR worker is breadth-first across series. Compute the
+	// ranks once for all ASR buckets rather than rebuilding them for every view.
+	ranks := asrBreadthRanks(books)
+	sortASRLaneWithRanks(buckets[queueBucketTranscribing], ranks)
+	sortASRLaneWithRanks(buckets[queueBucketTranscription], ranks)
+
+	out := make(map[int64]QueueBook, len(books))
+	add := func(group, bucket string, active bool) {
+		ordered := buckets[bucket]
+		for i, b := range ordered {
+			out[b.ID] = QueueBook{BookID: b.ID, Group: group, Bucket: bucket, Position: i + 1, Active: active}
+		}
+	}
+	for _, spec := range []struct {
+		group, bucket string
+		active        bool
+	}{
+		{queueGroupProcessing, queueBucketAgentActive, true},
+		{queueGroupProcessing, queueBucketMechanicalActive, true},
+		{queueGroupProcessing, queueBucketAgent, false},
+		{queueGroupProcessing, queueBucketMechanical, false},
+		{queueGroupProcessing, queueBucketBlocked, false},
+		{queueGroupASR, queueBucketTranscribing, true},
+		{queueGroupASR, queueBucketRetranscribing, true},
+		{queueGroupASR, queueBucketPreparingAgentActive, true},
+		{queueGroupASR, queueBucketPreparingMechActive, true},
+		{queueGroupASR, queueBucketTranscription, false},
+		{queueGroupASR, queueBucketRetranscription, false},
+		{queueGroupASR, queueBucketASRBlocked, false},
+		{queueGroupASR, queueBucketPreparingAgent, false},
+		{queueGroupASR, queueBucketPreparingMechanical, false},
+		{queueGroupASR, queueBucketPreparing, false},
+	} {
+		add(spec.group, spec.bucket, spec.active)
+	}
+	return out
+}
+
+func asrQueueBucket(b store.Book, ib inflightBook, running, holdsSeriesLock bool) string {
+	st := state.State(b.State)
+	if running {
+		if ib.lane == state.LaneASR {
+			if ib.stage == state.Retranscribing {
+				return queueBucketRetranscribing
+			}
+			return queueBucketTranscribing
+		}
+		if ib.lane == state.LaneAgent {
+			return queueBucketPreparingAgentActive
+		}
+		return queueBucketPreparingMechActive
+	}
+	if state.LaneOf(st) == state.LaneASR {
+		if !state.CanStart(st, state.Status(b.Status), holdsSeriesLock) {
+			return queueBucketASRBlocked
+		}
+		if st == state.Retranscribing {
+			return queueBucketRetranscription
+		}
+		return queueBucketTranscription
+	}
+	if state.CanStart(st, state.Status(b.Status), holdsSeriesLock) {
+		if state.LaneOf(st) == state.LaneAgent {
+			return queueBucketPreparingAgent
+		}
+		if state.LaneOf(st) == state.LaneMechanical {
+			return queueBucketPreparingMechanical
+		}
+	}
+	return queueBucketPreparing
+}
+
+func queueGroup(st state.State) string {
+	if st == state.Retranscribing || state.Order(st) <= state.Order(state.ASR) {
+		return queueGroupASR
+	}
+	return queueGroupProcessing
+}
+
+func queueBooksPayload(snapshot map[int64]QueueBook) []QueueBook {
+	out := make([]QueueBook, 0, len(snapshot))
+	for _, entry := range snapshot {
+		out = append(out, entry)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Group != out[j].Group {
+			return out[i].Group < out[j].Group
+		}
+		if out[i].Bucket != out[j].Bucket {
+			return out[i].Bucket < out[j].Bucket
+		}
+		if out[i].Position != out[j].Position {
+			return out[i].Position < out[j].Position
+		}
+		return out[i].BookID < out[j].BookID
+	})
+	return out
 }
 
 // fillLane dispatches up to free candidates into a lane and returns how many it
@@ -900,6 +1110,9 @@ func (s *Scheduler) publishState(bookID int64, st, status, errMsg, parkCode, ret
 // emit an SSE frame, persist a durable row, or re-render every client. Start
 // resets the dedup so the first pass always publishes.
 func (s *Scheduler) publishQueueStats(books []store.Book, counts map[state.Lane]int) {
+	// "queued" is a legacy wire name: it counts every runnable, nonterminal book,
+	// including books currently occupying workers. The UI labels it Runnable so it
+	// is not mistaken for waiting-only accounting.
 	queued := 0
 	for _, b := range books {
 		st := state.State(b.State)
@@ -915,6 +1128,8 @@ func (s *Scheduler) publishQueueStats(books []store.Book, counts map[state.Lane]
 	perBookJSON, _ := json.Marshal(perBook) // int-key map is emitted in stable key order
 	seriesBlockedBy := SeriesBlockers(books)
 	seriesBlockedJSON, _ := json.Marshal(seriesBlockedBy)
+	queueBooks := queueBooksPayload(s.QueueSnapshot(books))
+	queueBooksJSON, _ := json.Marshal(queueBooks)
 	next := queueStats{
 		asr:               counts[state.LaneASR],
 		agent:             counts[state.LaneAgent],
@@ -922,6 +1137,7 @@ func (s *Scheduler) publishQueueStats(books []store.Book, counts map[state.Lane]
 		invocationCap:     invocationCap,
 		invocationsByBook: string(perBookJSON),
 		seriesBlockedBy:   string(seriesBlockedJSON),
+		queueBooks:        string(queueBooksJSON),
 		mech:              counts[state.LaneMechanical],
 		queued:            queued,
 	}
@@ -938,6 +1154,7 @@ func (s *Scheduler) publishQueueStats(books []store.Book, counts map[state.Lane]
 		"agent_invocation_capacity": next.invocationCap,
 		"agent_invocations_by_book": perBook,
 		"series_blocked_by":         seriesBlockedBy,
+		"queue_books":               queueBooks,
 		"mechanical_active":         next.mech,
 		"queued":                    next.queued,
 	})
