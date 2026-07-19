@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/kodestar/audiosilo-sidecars/internal/state"
 )
 
 // StageResult is what a stage execution reports back: the branch decisions the
@@ -28,6 +30,19 @@ type StageResult struct {
 	// book did not converge, instead of the generic hardcoded message. Empty = use the
 	// scheduler's default. Additive/omitempty; persisted so a crash-resume park keeps it.
 	ParkMessage string `json:"park_message,omitempty"`
+}
+
+// Outcome converts a completed stage result into the branch input consumed by
+// state.NextState. Keeping this mapping beside StageResult prevents alternate
+// pipeline drivers from drifting from the scheduler's transition semantics.
+func (r StageResult) Outcome(fixAttempts int) state.Outcome {
+	return state.Outcome{
+		MarkersContiguous:  r.MarkersContiguous,
+		QAClean:            r.QAClean,
+		RetranscribeNeeded: r.RetranscribeNeeded,
+		AuditPassed:        r.AuditPassed,
+		FixAttempts:        fixAttempts,
+	}
 }
 
 // Audit-loop trajectory artifacts, written by the pipeline's auditing stage in a

@@ -18,7 +18,9 @@ func rawOpenAI(text string) []byte {
 		"text":     text,
 		"language": "en",
 		"segments": []map[string]any{
-			{"id": 0, "start": 0.0, "end": 1.0, "text": text, "words": []any{}},
+			// A deliberately broad timestamp keeps this generic no-word fake usable when
+			// tail tests trim decode-only context. Production MLX clips carry word times.
+			{"id": 0, "start": 0.0, "end": 3600.0, "text": text, "words": []any{}},
 		},
 	}
 	b, _ := json.Marshal(doc)
@@ -195,11 +197,13 @@ func TestClipAndSplice_UnlocatableOverrideSplices(t *testing.T) {
 	if !res.Spliced || res.Verdict != VerdictTailRepaired {
 		t.Fatalf("res = %+v, want a TAIL-REPAIRED splice", res)
 	}
-	if len(rc.starts) != 1 || rc.starts[0] != override {
-		t.Fatalf("cut window starts = %v, want a single cut at %.1f (the override)", rc.starts, override)
+	if len(rc.starts) != 1 || rc.starts[0] != 0 {
+		t.Fatalf("cut window starts = %v, want a single 30-second context cut at 0", rc.starts)
 	}
-	if res.ClipStart != override {
-		t.Errorf("res.ClipStart = %.1f, want %.1f", res.ClipStart, override)
+	// The override lands inside a synthetic segment, so the splice snaps backward to
+	// that segment's safe leading edge while decode expands to the chapter start.
+	if res.ClipStart != 4.8 {
+		t.Errorf("res.ClipStart = %.1f, want 4.8", res.ClipStart)
 	}
 	// The repaired text has the fresh clip ending and dropped nothing before the override.
 	body := readFile(t, filepath.Join(dir, transcript.RepairedDir, transcript.TextName(9)))
@@ -219,6 +223,79 @@ func TestClipAndSplice_UnlocatableOverrideSplices(t *testing.T) {
 	}
 	if vs[0].Chapter != 9 || vs[0].Verdict != VerdictTailRepaired || vs[0].ClipEnd != 0 || vs[0].IsMidWindow() {
 		t.Errorf("verdict = %+v, want a TAIL-REPAIRED tail window for ch9", vs[0])
+	}
+}
+
+// TestClipAndSplice_DirectedTailUsesContextButPreservesBoundaryClause reproduces the
+// audiobook failure that motivated the context split: a requested 94s cut crossed the
+// genuine "you aren't wrong" segment. The old 6s decode began mid-sentence and the splice
+// dropped that clause. The new path snaps the splice to 92s, decodes the final 30s from
+// 70s, trims the decode-only lead-in, and preserves the complete genuine ending.
+func TestClipAndSplice_DirectedTailUsesContextButPreservesBoundaryClause(t *testing.T) {
+	dir := t.TempDir()
+	orig := transcript.Transcript{Schema: transcript.Schema, Chapter: 36, Segments: []transcript.Segment{
+		{ID: 0, Start: 0, End: 70, Text: " Earlier narration."},
+		{ID: 1, Start: 70, End: 92, Text: " Even with support, we will have to risk ourselves to make progress."},
+		{ID: 2, Start: 92, End: 96, Text: " True, you aren't wrong, she grinned wryly."},
+		{ID: 3, Start: 96, End: 98, Text: " But I think I have a way to make it manageable."},
+		{ID: 4, Start: 98, End: 98.1, Text: " Amen."},
+		{ID: 5, Start: 98.1, End: 98.2, Text: " Amen."},
+		{ID: 6, Start: 98.2, End: 98.3, Text: " Amen."},
+	}}
+	raw, _ := json.Marshal(map[string]any{
+		"text":     " decode-only context True, you aren't wrong, she grinned wryly. But I think I have a way to make it manageable.",
+		"language": "en",
+		"segments": []map[string]any{
+			{"id": 0, "start": 0.0, "end": 22.0, "text": " decode-only context", "words": []any{}},
+			{"id": 1, "start": 22.0, "end": 26.0, "text": " True, you aren't wrong, she grinned wryly.", "words": []any{}},
+			{"id": 2, "start": 26.0, "end": 28.0, "text": " But I think I have a way to make it manageable.", "words": []any{}},
+		},
+	})
+	rc := &recordingCut{}
+	res, err := ClipAndSplice(context.Background(), ClipSpliceRequest{
+		WorkDir:          dir,
+		Chapter:          36,
+		Transcript:       orig,
+		ChapterEnd:       100,
+		Cut:              rc.cut,
+		Transcribe:       func(context.Context, string) ([]byte, error) { return raw, nil },
+		StartOverrideSec: 94,
+		DecodeTag:        "nocontext-v1+tail-context-v2",
+	})
+	if err != nil {
+		t.Fatalf("ClipAndSplice: %v", err)
+	}
+	if !res.Spliced || res.ClipStart != 92 {
+		t.Fatalf("result = %+v, want a splice at the safe 92s boundary", res)
+	}
+	if len(rc.starts) != 1 || rc.starts[0] != 70 {
+		t.Fatalf("cut starts = %v, want a 30-second ending decode from 70s", rc.starts)
+	}
+	body := readFile(t, filepath.Join(dir, transcript.RepairedDir, transcript.TextName(36)))
+	for _, want := range []string{"Even with support", "you aren't wrong", "way to make it manageable"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("repaired text lost %q: %s", want, body)
+		}
+	}
+	for _, unwanted := range []string{"decode-only context", "Amen"} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("repaired text retained %q: %s", unwanted, body)
+		}
+	}
+}
+
+func TestTextAfterTrimsAWordTimedStraddlingSegment(t *testing.T) {
+	clip := transcript.Transcript{Segments: []transcript.Segment{{
+		Start: 20, End: 24, Text: " before boundary after boundary",
+		Words: []transcript.Word{
+			{W: " before", Start: 20, End: 21},
+			{W: " boundary", Start: 21, End: 22},
+			{W: " after", Start: 22, End: 23},
+			{W: " boundary", Start: 23, End: 24},
+		},
+	}}}
+	if got := textAfter(clip, 22); got != "after boundary" {
+		t.Errorf("textAfter = %q, want %q", got, "after boundary")
 	}
 }
 

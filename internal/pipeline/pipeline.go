@@ -80,6 +80,15 @@ type AgentModels struct {
 	OpenAI map[string]string
 }
 
+// AgentEfforts routes optional reasoning-effort overrides independently from
+// model selection. Production currently leaves both maps empty, preserving the
+// backend defaults; the benchmark harness uses them to make effort a controlled
+// experimental variable rather than ambient CLI configuration.
+type AgentEfforts struct {
+	Claude map[string]string
+	OpenAI map[string]string
+}
+
 // Config configures a composite Executor. FFmpeg/FFprobe are the tool paths
 // resolved at startup ("" when unresolved); Tools carries the explicit config
 // paths honored on a later re-resolution. ASR is the backend chosen at startup and
@@ -106,6 +115,7 @@ type Config struct {
 	AgentAvail   agent.Availability
 	AgentSelect  agent.SelectConfig
 	AgentModels  AgentModels
+	AgentEfforts AgentEfforts
 	AgentTimeout time.Duration
 	// AgentConcurrency is the effective global invocation cap inside the executor.
 	// MaxAgentsPerBook independently bounds safe fan-out within one book. Keeping
@@ -163,6 +173,7 @@ type Executor struct {
 	asrSelect             asr.SelectConfig
 	agentSelect           agent.SelectConfig
 	agentModels           AgentModels
+	agentEfforts          AgentEfforts
 	agentTimeout          time.Duration
 	agentWorkers          int // per-book fan-out ceiling
 	agentSlots            chan struct{}
@@ -229,6 +240,7 @@ func NewExecutor(cfg Config) *Executor {
 		asrSelect:             cfg.ASRSelect,
 		agentSelect:           cfg.AgentSelect,
 		agentModels:           cfg.AgentModels,
+		agentEfforts:          cfg.AgentEfforts,
 		agentTimeout:          cfg.AgentTimeout,
 		agentWorkers:          agentWorkers,
 		agentSlots:            make(chan struct{}, globalWorkers),

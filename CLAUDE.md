@@ -92,6 +92,8 @@ This mirrors audiosilo-server's `-tags embedplayer`. Do not commit
 
 ```
 cmd/audiosilo-sidecars/   entrypoint: `serve` (default) + `version`; flags --data, --listen
+cmd/audiosilo-bench/      private corpus preparation, isolated model-matrix runs,
+                          aggregate reports, and snapshot-only historical telemetry
 internal/
   config/   config.yaml in <data>/ + AUDIOSILO_SIDECARS_* env overrides; Load/Save/Validate.
             M1 added library_roots (scan allow-list), metadata.base_url;
@@ -219,6 +221,12 @@ internal/
             RateLimitError carries a best-effort ResetAt via ParseResetTime (the
             |<epoch> suffix within (now, now+48h], or "resets at H[:MM] am/pm" as the
             next host-local occurrence).
+  benchmark/ private, provider-neutral post-ASR evaluation: allow-listed corpus
+            preparation with input digests; fresh per-run work trees and databases;
+            stage-specific model/effort routes; the real fact/synthesis/audit/fix
+            pipeline; independent holdout audits; hard-gated aggregate/Pareto reports;
+            and read-only historical telemetry over a caller-supplied DB snapshot.
+            Transcript corpora and generated results must remain outside the repo.
   repair/   M5: the mechanical tail-clip + adoption machinery (ports the historical
             tail_clip_check/adjudicate_tails/build_repairs): ClipAndSplice (locate the
             tail loop, cut+re-transcribe the window prompt-free, health-check, rotation-

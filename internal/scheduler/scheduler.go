@@ -800,21 +800,16 @@ func (s *Scheduler) recordRate(ctx context.Context, stage string, sample *RateSa
 // advance computes the next state from the completed stage's result and applies
 // it, publishing book.state. The audit fix-loop cap parks the book instead.
 func (s *Scheduler) advance(ctx context.Context, b store.Book, stage state.State, result StageResult) {
-	out := state.Outcome{
-		MarkersContiguous:  result.MarkersContiguous,
-		QAClean:            result.QAClean,
-		RetranscribeNeeded: result.RetranscribeNeeded,
-		AuditPassed:        result.AuditPassed,
-	}
+	fixes := 0
 	if stage == state.Auditing {
-		fixes, err := s.db.CountStageSuccesses(ctx, b.ID, string(state.Fixing))
+		var err error
+		fixes, err = s.db.CountStageSuccesses(ctx, b.ID, string(state.Fixing))
 		if err != nil {
 			return
 		}
-		out.FixAttempts = fixes
 	}
 
-	next, status, err := state.NextState(stage, out)
+	next, status, err := state.NextState(stage, result.Outcome(fixes))
 	if err != nil {
 		s.setStatus(b.ID, state.StatusFailed, err.Error(), "", time.Time{})
 		return

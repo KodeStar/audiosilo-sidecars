@@ -123,11 +123,11 @@ func LoadPlan(workDir string) (*Plan, error) {
 }
 
 // Validate checks the plan against the QA report: every chapter that REQUIRES a
-// disposition (the retranscribe queue, every tail-rate hit, and every mid-chapter
-// repeated-run / multi-loop) has exactly one entry; no entry names a chapter the sweep
+// disposition (the retranscribe queue, every tail-rate hit, every repeated run, and every
+// mid-chapter multi-loop) has exactly one entry; no entry names a chapter the sweep
 // did not flag at all; every action is valid and every reason non-empty. The
-// informational low-confidence stats and benign end-fade runs never require an entry
-// but a chapter they touch may still legitimately carry an "accept".
+// informational low-confidence stats never require an entry. A repeated end fade does
+// require adjudication, but may still legitimately receive an "accept" after verification.
 func (p *Plan) Validate(rep *Report) error {
 	if rep == nil {
 		return errors.New("qa plan: nil report")
@@ -200,7 +200,7 @@ func (p *Plan) Validate(rep *Report) error {
 
 // FlaggedChapters is the sorted set of chapters that REQUIRE a disposition - the same
 // set (*Plan).Validate forces a plan entry for: the retranscribe queue, every tail-rate
-// hit, and every MID-CHAPTER repeated-run and multi-loop. The qa_adjudicating stage
+// hit, every repeated run, and every MID-CHAPTER multi-loop. The qa_adjudicating stage
 // stages exactly these chapters' transcripts for the agent, so staging and validation
 // share one definition of "flagged" (no drift between what the agent sees and what its
 // plan must cover).
@@ -215,9 +215,10 @@ func FlaggedChapters(rep *Report) []int {
 }
 
 // requiredChapters is the set that MUST be dispositioned: the retranscribe queue, every
-// tail-rate hit, and every MID-CHAPTER repeated-run and multi-loop (the dangerous
-// findings that overwrite real narration). End fades and cross/within-segment hits are
-// not forced (they ride into spelling/fact-pass adjudication).
+// tail-rate hit, every repeated run, and every MID-CHAPTER multi-loop. End-fade runs are
+// forced because short hallucinated suffixes can sit below every n-gram/tail-rate floor;
+// the adjudicator may still accept a verified authentic repetition. Cross/within-segment
+// hits remain optional (they ride into spelling/fact-pass adjudication).
 func requiredChapters(rep *Report) map[int]bool {
 	set := make(map[int]bool)
 	for _, ch := range rep.RetranscribeQueue {
@@ -227,9 +228,7 @@ func requiredChapters(rep *Report) map[int]bool {
 		set[h.Chapter] = true
 	}
 	for _, r := range rep.RepeatedRuns {
-		if r.Kind == KindMidChapter {
-			set[r.Chapter] = true
-		}
+		set[r.Chapter] = true
 	}
 	for _, f := range rep.MultiLoop {
 		if f.MidChapter {
@@ -242,8 +241,8 @@ func requiredChapters(rep *Report) map[int]bool {
 // AllowedChapters is the sorted set of every chapter carrying ANY substantive finding
 // (the superset of FlaggedChapters). It is the full DISPOSITION SURFACE: the plan
 // validator accepts a plan entry for any chapter in this set, so the qa_adjudicating
-// stage stages each one's transcript. An allowed-but-not-flagged chapter (a tail-rate
-// or end-fade or cross/within-segment finding the agent may volunteer a disposition for)
+// stage stages each one's transcript. An allowed-but-not-flagged chapter (a
+// cross/within-segment finding the agent may volunteer a disposition for)
 // is thus verified against its real text instead of the agent guessing blind - the fix
 // for a live incident where the agent queued conservative tail_clips for allowed
 // chapters whose transcripts were not staged. Low-confidence stats are informational

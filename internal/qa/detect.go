@@ -65,11 +65,13 @@ func wphOutliers(docs []chapterDoc) (chapters int, mean, sd float64, outliers []
 	return len(rows), mean, sd, outliers
 }
 
-// repeatedRuns ports qa_sweep.py's repeated-segment run detector: runs of >= 3
-// consecutive segments whose NORMALIZED text is identical and non-empty. Each run is
-// classified end-fade (starts at >= 85% of the chapter) or MID-CHAPTER LOOP.
-// Excludes chapter 0. The run that extends to the final segment is flushed after the
-// loop, exactly as the Python does.
+// repeatedRuns detects runs of >= 3 consecutive NON-EMPTY segments whose normalized
+// text is identical. Empty segments are ignored: MLX can interleave zero-duration empty
+// records with a hallucinated one-word tail ("Amen." was observed five times with empty
+// records between copies), and treating those records as narration boundaries hides the
+// loop. Each run is classified end-fade (starts at >= 85% of the chapter) or
+// MID-CHAPTER LOOP. Excludes chapter 0. The run that extends to the final non-empty
+// segment is flushed after the loop.
 func repeatedRuns(docs []chapterDoc) []RepeatedRun {
 	out := make([]RepeatedRun, 0)
 	for _, d := range docs {
@@ -79,7 +81,8 @@ func repeatedRuns(docs []chapterDoc) []RepeatedRun {
 		segs := d.t.Segments
 		runStart := -1
 		runLen := 0
-		prev := "" // Python starts prev=None; a non-empty cur can never equal "", so this matches
+		prev := ""
+		prevIndex := -1
 		emit := func() {
 			if runStart == -1 || runLen < repeatRunMin {
 				return
@@ -103,9 +106,13 @@ func repeatedRuns(docs []chapterDoc) []RepeatedRun {
 		}
 		for i, seg := range segs {
 			cur := normalizeUnicode(seg.Text)
-			if cur != "" && cur == prev {
+			if cur == "" {
+				// Empty/zero-duration backend artifacts do not interrupt adjacent speech.
+				continue
+			}
+			if cur == prev {
 				if runStart == -1 {
-					runStart = i - 1
+					runStart = prevIndex
 					runLen = 2
 				} else {
 					runLen++
@@ -116,6 +123,7 @@ func repeatedRuns(docs []chapterDoc) []RepeatedRun {
 				runLen = 0
 			}
 			prev = cur
+			prevIndex = i
 		}
 		emit()
 	}

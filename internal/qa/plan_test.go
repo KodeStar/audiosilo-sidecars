@@ -24,7 +24,8 @@ func writePlan(t *testing.T, workDir string, p *Plan) {
 
 // baseReport builds a report flagging: chapter 2 (retranscribe queue + tail rate),
 // chapter 5 (mid-chapter repeated run), chapter 8 (mid-chapter multi-loop), and
-// chapter 9 (cross-segment only, allowed but not required).
+// chapter 3 (end-fade requiring adjudication), and chapter 9 (cross-segment only,
+// allowed but not required).
 func baseReport() *Report {
 	return &Report{
 		Chapters:          10,
@@ -32,7 +33,7 @@ func baseReport() *Report {
 		TailRate:          []TailRateHit{{Chapter: 2, WPS: 9}},
 		RepeatedRuns: []RepeatedRun{
 			{Chapter: 5, Kind: KindMidChapter, Length: 4},
-			{Chapter: 3, Kind: KindEndFade, Length: 3}, // benign, allowed not required
+			{Chapter: 3, Kind: KindEndFade, Length: 3},
 		},
 		MultiLoop: []MultiLoopFinding{
 			{Chapter: 8, Count: 6, MidChapter: true},
@@ -48,6 +49,7 @@ func fullPlan() *Plan {
 		{Chapter: 2, Action: ActionRetranscribe, Reason: "wph outlier + tail rate"},
 		{Chapter: 5, Action: ActionTailClip, Reason: "mid-chapter loop"},
 		{Chapter: 8, Action: ActionAccept, Reason: "benign echo"},
+		{Chapter: 3, Action: ActionTailClip, Reason: "repeated terminal suffix"},
 	}}
 }
 
@@ -65,7 +67,7 @@ func TestPlanValidate_Valid(t *testing.T) {
 
 func TestPlanValidate_MissingRequired(t *testing.T) {
 	p := fullPlan()
-	p.Entries = p.Entries[:2] // drop the ch8 entry
+	p.Entries = append(p.Entries[:2], p.Entries[3]) // drop only the ch8 entry
 	err := p.Validate(baseReport())
 	if err == nil || !strings.Contains(err.Error(), "chapter 8") {
 		t.Fatalf("expected missing-ch8 error, got %v", err)
@@ -237,16 +239,16 @@ func TestPlanRetranscribeNeeded(t *testing.T) {
 }
 
 // TestFlaggedAndAllowedChapters pins the two disposition sets: FlaggedChapters is the
-// REQUIRED subset (retranscribe queue + tail rate + mid-chapter runs/loops), while
-// AllowedChapters is the full surface (adds benign end-fade runs and cross/within-segment
+// REQUIRED subset (retranscribe queue + tail rate + all repeated runs + mid-chapter
+// multi-loops), while AllowedChapters is the full surface (adds cross/within-segment
 // hits). qa_adjudicating stages every AllowedChapters transcript so the agent can verify
 // and accept an allowed-but-not-flagged chapter against its real text.
 func TestFlaggedAndAllowedChapters(t *testing.T) {
 	rep := baseReport()
-	if got, want := FlaggedChapters(rep), []int{2, 5, 8}; !equalInts(got, want) {
+	if got, want := FlaggedChapters(rep), []int{2, 3, 5, 8}; !equalInts(got, want) {
 		t.Errorf("FlaggedChapters = %v, want %v", got, want)
 	}
-	// AllowedChapters is a superset adding end-fade ch3 and cross-segment ch9, sorted.
+	// AllowedChapters is a superset adding cross-segment ch9, sorted.
 	if got, want := AllowedChapters(rep), []int{2, 3, 5, 8, 9}; !equalInts(got, want) {
 		t.Errorf("AllowedChapters = %v, want %v", got, want)
 	}

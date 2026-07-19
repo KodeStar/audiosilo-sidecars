@@ -77,18 +77,23 @@ func (f *fakeBackend) Transcribe(ctx context.Context, job asr.Job) error {
 	f.mu.Unlock()
 
 	empty := mode == "always" || (mode == "once" && attempt == 1)
+	stem := strings.TrimSuffix(filepath.Base(job.Audio), filepath.Ext(job.Audio))
 	var raw string
 	if empty {
 		// Structurally complete (passes transcript.Complete) but segmentless - the
 		// empty-transcript failure mode the asr stage must double-check.
 		raw = `{"text":"","language":"en","segments":[]}`
+	} else if strings.HasPrefix(stem, "t") || strings.HasPrefix(stem, "m") {
+		// Clip repairs may decode context before their splice boundary. Put this fake
+		// segment safely after any realistic relative boundary so the repair test double
+		// behaves like a fresh tail transcript instead of being trimmed as lead-in.
+		raw = fmt.Sprintf(`{"text":" fake chapter %d","language":"en","segments":[{"id":0,"start":3599,"end":3600,"text":" fake chapter %d","avg_logprob":NaN,"words":[]}]}`, job.Chapter, job.Chapter)
 	} else {
 		raw = fmt.Sprintf(`{"text":" fake chapter %d","language":"en","segments":[{"id":0,"start":0,"end":1,"text":" fake chapter %d","avg_logprob":NaN,"words":[{"word":" fake","start":0,"end":0.5,"probability":0.9}]}]}`, job.Chapter, job.Chapter)
 	}
 	// Both real backends name the raw <audio-stem>.json - hand-mirrored here (not via
 	// asr.RawOutputName) so a wrapper or helper that drifts from the tools' naming fails
 	// this test.
-	stem := strings.TrimSuffix(filepath.Base(job.Audio), filepath.Ext(job.Audio))
 	return os.WriteFile(filepath.Join(job.OutDir, stem+".json"), []byte(raw+"\n"), 0o644) //nolint:gosec // test artifact
 }
 

@@ -89,6 +89,9 @@ func (r *codexRunner) buildArgs(req Request, lastMsgFile string) []string {
 	if req.Model != "" {
 		args = append(args, "--model", req.Model)
 	}
+	if req.Effort != "" {
+		args = append(args, "-c", fmt.Sprintf("model_reasoning_effort=%q", req.Effort))
+	}
 	if req.Web {
 		args = append(args, "-c", `web_search="live"`)
 	}

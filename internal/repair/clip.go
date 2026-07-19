@@ -19,6 +19,18 @@ import (
 // adopted blind.
 const clipHealthMax6gram = 1
 
+const (
+	shortSuffixMaxPeriod = 5
+	shortSuffixRepeats   = 3
+)
+
+// tailDecodeWindowSec is the minimum amount of ending audio supplied to a short tail
+// repair. A 5-7 second clip did not give Whisper enough lead-in to recover a sentence
+// crossing the requested cut point; the model then produced a healthy-looking splice
+// with genuine words missing. Thirty seconds is one native Whisper window, so it adds
+// useful context without materially increasing inference work for short endings.
+const tailDecodeWindowSec = 30.0
+
 // knownFailedTolSec is how close (seconds) an effective clip window start must be to a
 // prior CLIP-REDEGENERATED verdict's recorded clip_start to count as "the same window
 // that already failed" - so a re-queued identical tail_clip is skipped rather than
@@ -136,15 +148,15 @@ func ClipAndSplice(ctx context.Context, req ClipSpliceRequest) (ClipResult, erro
 	}
 	res.Located = true
 
-	// Window start: the transcript-derived snap by default, or the agent's override when
-	// supplied. The override relocates a window the derived cut kept re-degenerating; the
-	// end geometry (+2s pad) and everything downstream are unchanged, so the derived path
-	// stays byte-identical.
+	// The requested repair boundary comes from the mechanical locator or the agent. Snap it
+	// backward to a completed original segment so the splice never discards a segment that
+	// straddles an arbitrary timestamp. Decode may start earlier still to provide a full
+	// 30-second ending window; only fresh words at/after clipStart are adopted.
 	snapped := ClipWindow(req.Transcript, run)
 	if req.StartOverrideSec > 0 {
 		snapped = req.StartOverrideSec
 	}
-	clipStart := pyRound(snapped, 1)
+	clipStart, decodeStart := tailStarts(req.Transcript, snapped, req.ChapterEnd)
 	res.ClipStart = clipStart
 
 	// Known-failed skip: if this exact window already re-degenerated in a prior round
@@ -160,24 +172,24 @@ func ClipAndSplice(ctx context.Context, req ClipSpliceRequest) (ClipResult, erro
 		return res, nil
 	}
 
-	// The clip filename is keyed on the chapter AND the effective window start, so a
-	// same-window resume reuses the file but a RELOCATED window (StartOverrideSec) forces
-	// a fresh cut instead of reusing the prior window's audio spliced at the new boundary.
-	// The start is encoded as an INTEGER number of deciseconds (clipStart is already
-	// pyRound'd to 0.1s, so this is exact and collision-free) - the stem must stay
+	// The clip filename is keyed on the chapter plus the splice AND decode starts, so a
+	// same-window resume reuses the file while either a relocated repair or a changed
+	// context boundary forces a fresh cut. Both starts are encoded as integer deciseconds;
+	// the stem must stay
 	// dot-free because the ASR backends derive the raw-output name from the input stem
 	// (asr.RawOutputName), and a '.' in the name makes their splitext-style naming
 	// disagree with outputStem (mlx wrote t005-660.json for a t005-660.0.flac input),
 	// breaking the read-back. A stale old-window clip lingers in clips/ until the scratch
 	// purge - acceptable.
-	clipFlac := filepath.Join(req.WorkDir, ClipsDir, fmt.Sprintf("t%03d-%d.flac", req.Chapter, int(math.Round(clipStart*10))))
-	// Cut [snapped, chend - snapped + 2] (tail_clip_check.py adds 2s of tail so the real
-	// ending is fully captured), transcribe prompt-free, and health-check.
-	clipText, healthy, err := cutTranscribeHealth(ctx, req, "clip", clipFlac, snapped, req.ChapterEnd-snapped+2)
+	clipFlac := tailClipPath(req.WorkDir, req.Chapter, clipStart, decodeStart)
+	// Decode from the earlier context boundary through the chapter end (+2s request pad;
+	// ffmpeg naturally stops at EOF), then discard the context text before clipStart.
+	clipT, _, _, err := cutTranscribeHealth(ctx, req, "clip", clipFlac, decodeStart, req.ChapterEnd-decodeStart+2)
 	if err != nil {
 		return res, err
 	}
-	res.ClipHealthy = healthy
+	clipText := textAfter(clipT, clipStart-decodeStart)
+	res.ClipHealthy = strings.TrimSpace(clipText) != "" && ClipHealthy(clipText)
 
 	adj := Adjudicate(run, transcript.PlainText(req.Transcript), clipText)
 	res.Verdict = adj.Verdict
@@ -199,7 +211,7 @@ func ClipAndSplice(ctx context.Context, req ClipSpliceRequest) (ClipResult, erro
 	newText, before, after := Splice(req.Transcript, clipStart, clipText)
 	res.WordsBefore, res.WordsAfter = before, after
 	line := buildRepairLine(req.Chapter, adj.Verdict, adj.Unit, run.Count, run.LoopWords,
-		snapped, req.ChapterEnd, run.LoopSeconds(), run.ClaimedWPS(), before, after)
+		clipStart, req.ChapterEnd, run.LoopSeconds(), run.ClaimedWPS(), before, after)
 	if err := writeSplice(req.WorkDir, req.Chapter, newText, line,
 		tailVerdict(run, adj, clipStart, req.ChapterEnd, adj.Verdict, req.DecodeTag)); err != nil {
 		return res, err
@@ -211,9 +223,10 @@ func ClipAndSplice(ctx context.Context, req ClipSpliceRequest) (ClipResult, erro
 // clipAndSpliceDirected runs the run-less TAIL repair from an agent-supplied window start,
 // taken by ClipAndSplice when the mechanical locator found no loop (LocateTailRun failed) but
 // req.StartOverrideSec > 0. It is the recourse for a SHORT tail repeat the 6-gram locator
-// cannot reach (a 3x "Kill!" is below TailGramThreshold's cluster reach): cut [override,
-// chend - override + 2], transcribe prompt-free, and - because there is NO located run to
-// rotation-adjudicate - gate the splice on the ClipHealthy check ALONE, exactly like the MID
+// cannot reach (a 3x "Kill!" is below TailGramThreshold's cluster reach): snap the splice
+// boundary safely, expand the decode window backward to provide context, transcribe
+// prompt-free, and - because there is NO located run to rotation-adjudicate - gate the
+// splice on the ClipHealthy check ALONE, exactly like the MID
 // path (ClipAndSpliceWindow). A healthy clip splices to the chapter end and writes the usual
 // durable evidence (repaired file + repairs.log line + a TAIL-REPAIRED verdict), so
 // tailClipAlreadyDone, resume-idempotency and the residual auto-accept all work; an unhealthy
@@ -235,7 +248,7 @@ func clipAndSpliceDirected(ctx context.Context, req ClipSpliceRequest) (ClipResu
 	if req.StartOverrideSec > req.ChapterEnd-1 {
 		return res, nil
 	}
-	clipStart := pyRound(req.StartOverrideSec, 1)
+	clipStart, decodeStart := tailStarts(req.Transcript, req.StartOverrideSec, req.ChapterEnd)
 	res.ClipStart = clipStart
 
 	// Known-failed skip: identical to the located path (knownFailedWindow reads a TAIL verdict
@@ -249,19 +262,20 @@ func clipAndSpliceDirected(ctx context.Context, req ClipSpliceRequest) (ClipResu
 
 	// Same tail clip filename scheme as the located path (t-prefix, integer deciseconds start;
 	// the stem must stay dot-free - see the located path's note).
-	clipFlac := filepath.Join(req.WorkDir, ClipsDir, fmt.Sprintf("t%03d-%d.flac", req.Chapter, int(math.Round(clipStart*10))))
-	// Cut [override, chend - override + 2] (the same +2s tail pad as the located path),
-	// transcribe prompt-free, and health-check.
-	clipText, healthy, err := cutTranscribeHealth(ctx, req, "clip", clipFlac, req.StartOverrideSec, req.ChapterEnd-req.StartOverrideSec+2)
+	clipFlac := tailClipPath(req.WorkDir, req.Chapter, clipStart, decodeStart)
+	// Decode with the same bounded context as the located path, then adopt only the
+	// portion at/after the safe splice boundary.
+	clipT, _, _, err := cutTranscribeHealth(ctx, req, "clip", clipFlac, decodeStart, req.ChapterEnd-decodeStart+2)
 	if err != nil {
 		return res, err
 	}
-	res.ClipHealthy = healthy
+	clipText := textAfter(clipT, clipStart-decodeStart)
+	res.ClipHealthy = strings.TrimSpace(clipText) != "" && ClipHealthy(clipText)
 
 	// No located run -> no rotation-adjudication possible; the health check is the only guard
 	// (as in ClipAndSpliceWindow). An unhealthy fresh clip re-degenerated: record a TAIL
 	// CLIP-REDEGENERATED verdict (ClipEnd stays 0) and keep the original.
-	if !healthy {
+	if !res.ClipHealthy {
 		res.Verdict = VerdictClipRedegenerated
 		if err := MergeTailVerdict(req.WorkDir, runlessTailVerdict(req.Chapter, clipStart, req.ChapterEnd, VerdictClipRedegenerated, req.DecodeTag)); err != nil {
 			return res, err
@@ -271,7 +285,7 @@ func clipAndSpliceDirected(ctx context.Context, req ClipSpliceRequest) (ClipResu
 
 	newText, before, after := Splice(req.Transcript, clipStart, clipText)
 	res.WordsBefore, res.WordsAfter = before, after
-	line := buildDirectedRepairLine(req.Chapter, req.StartOverrideSec, req.ChapterEnd, before, after)
+	line := buildDirectedRepairLine(req.Chapter, clipStart, req.ChapterEnd, before, after)
 	if err := writeSplice(req.WorkDir, req.Chapter, newText, line,
 		runlessTailVerdict(req.Chapter, clipStart, req.ChapterEnd, VerdictTailRepaired, req.DecodeTag)); err != nil {
 		return res, err
@@ -325,7 +339,7 @@ func ClipAndSpliceWindow(ctx context.Context, req ClipSpliceRequest) (ClipResult
 	// from a tail clip (t-prefix) for the same chapter, so the two never collide in clips/.
 	clipFlac := filepath.Join(req.WorkDir, ClipsDir, fmt.Sprintf("m%03d-%d-%d.flac", req.Chapter, int(math.Round(clipStart*10)), int(math.Round(clipEnd*10))))
 	// Cut [snappedStart, snappedEnd], transcribe prompt-free, and health-check.
-	clipText, healthy, err := cutTranscribeHealth(ctx, req, "mid-clip", clipFlac, snappedStart, snappedEnd-snappedStart)
+	_, clipText, healthy, err := cutTranscribeHealth(ctx, req, "mid-clip", clipFlac, snappedStart, snappedEnd-snappedStart)
 	if err != nil {
 		return res, err
 	}
@@ -357,28 +371,89 @@ func ClipAndSpliceWindow(ctx context.Context, req ClipSpliceRequest) (ClipResult
 // clips dir, cut the [startSec, startSec+durSec] window into clipFlac when absent (a
 // present clip is reused for resume), transcribe it prompt-free, normalize, and run the
 // max-6-gram-x1 health check. label ("clip" / "mid-clip") only shapes the wrapped error
-// text so each public func's messages stay unchanged. It returns the fresh clip's plain
-// text and whether it passed the health check.
-func cutTranscribeHealth(ctx context.Context, req ClipSpliceRequest, label, clipFlac string, startSec, durSec float64) (string, bool, error) {
+// text so each public func's messages stay unchanged. It returns the normalized clip,
+// its plain text, and whether the full text passed the health check.
+func cutTranscribeHealth(ctx context.Context, req ClipSpliceRequest, label, clipFlac string, startSec, durSec float64) (transcript.Transcript, string, bool, error) {
 	if err := os.MkdirAll(filepath.Join(req.WorkDir, ClipsDir), 0o750); err != nil {
-		return "", false, err
+		return transcript.Transcript{}, "", false, err
 	}
 	if !fsutil.IsFile(clipFlac) {
 		srcFlac := filepath.Join(req.WorkDir, audio.ChaptersDir, audio.ChapterFileName(req.Chapter))
 		if err := req.Cut(ctx, srcFlac, clipFlac, startSec, durSec); err != nil {
-			return "", false, fmt.Errorf("cut %s ch%03d: %w", label, req.Chapter, err)
+			return transcript.Transcript{}, "", false, fmt.Errorf("cut %s ch%03d: %w", label, req.Chapter, err)
 		}
 	}
 	rawJSON, err := req.Transcribe(ctx, clipFlac)
 	if err != nil {
-		return "", false, fmt.Errorf("transcribe %s ch%03d: %w", label, req.Chapter, err)
+		return transcript.Transcript{}, "", false, fmt.Errorf("transcribe %s ch%03d: %w", label, req.Chapter, err)
 	}
 	clipT, err := transcript.Normalize(rawJSON, transcript.Meta{Chapter: req.Chapter})
 	if err != nil {
-		return "", false, fmt.Errorf("normalize %s ch%03d: %w", label, req.Chapter, err)
+		return transcript.Transcript{}, "", false, fmt.Errorf("normalize %s ch%03d: %w", label, req.Chapter, err)
 	}
 	clipText := transcript.PlainText(clipT)
-	return clipText, ClipHealthy(clipText), nil
+	return clipT, clipText, ClipHealthy(clipText), nil
+}
+
+// tailStarts separates the splice boundary from the decode boundary. When requestedStart
+// falls inside an original segment, spliceStart is snapped backward to the latest
+// completed segment, preventing the straddling segment from being dropped. decodeStart
+// expands a short repair backward so the clip contains at least the final
+// tailDecodeWindowSec of the chapter, while never starting after the splice boundary.
+// Both are rounded to the persisted 0.1s precision so cutting, trimming, splicing,
+// resume keys and verdicts agree exactly.
+func tailStarts(t transcript.Transcript, requestedStart, chapterEnd float64) (spliceStart, decodeStart float64) {
+	spliceStart = requestedStart
+	straddles := false
+	for _, s := range t.Segments {
+		if s.Start < requestedStart && s.End > requestedStart {
+			straddles = true
+			spliceStart = s.Start
+			break
+		}
+	}
+	found := false
+	for _, s := range t.Segments {
+		if straddles && s.End <= requestedStart && (!found || s.End > spliceStart) {
+			spliceStart = s.End
+			found = true
+		}
+	}
+	spliceStart = pyRound(math.Max(0, spliceStart), 1)
+	decodeStart = math.Min(spliceStart, math.Max(0, chapterEnd-tailDecodeWindowSec))
+	decodeStart = pyRound(math.Max(0, decodeStart), 1)
+	return spliceStart, decodeStart
+}
+
+// tailClipPath keys scratch audio on BOTH the splice and decode boundaries. Including
+// decodeStart prevents a resume from reusing a legacy short clip whose filename was keyed
+// only on clipStart.
+func tailClipPath(workDir string, chapter int, spliceStart, decodeStart float64) string {
+	return filepath.Join(workDir, ClipsDir, fmt.Sprintf("t%03d-%d-%d.flac", chapter,
+		int(math.Round(spliceStart*10)), int(math.Round(decodeStart*10))))
+}
+
+// textAfter removes decode-only context from a fresh clip transcript. Whole segments
+// after relStart retain the backend's punctuation and casing. A segment that straddles
+// the boundary is trimmed by word timestamps; production tail clips always request word
+// timestamps. The no-word fallback keeps the segment rather than silently losing text.
+func textAfter(t transcript.Transcript, relStart float64) string {
+	var b strings.Builder
+	for _, s := range t.Segments {
+		if s.End <= relStart {
+			continue
+		}
+		if s.Start >= relStart || len(s.Words) == 0 {
+			b.WriteString(s.Text)
+			continue
+		}
+		for _, w := range s.Words {
+			if w.End > relStart {
+				b.WriteString(w.W)
+			}
+		}
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // writeSplice persists a successful splice's three durable artifacts in the fixed order
@@ -447,13 +522,35 @@ func runlessTailVerdict(chapter int, clipStart, chapterEnd float64, verdict Verd
 	}
 }
 
-// ClipHealthy reports whether a fresh clip transcription did NOT re-degenerate: its
-// most-common 6-gram repeats at most once (build_repairs.py's max-6-gram-x1 guard). It
-// tokenizes with the same apostrophe-preserving normalizer LocateTailRun uses.
+// ClipHealthy reports whether a fresh clip transcription did NOT re-degenerate. It keeps
+// the historical max-6-gram-x1 guard and adds a repeated-suffix check for 1-5 token units:
+// a short retry ending in "Amen" x5 is just as broken as a long six-word loop, but cannot
+// produce any repeated 6-gram. It tokenizes with the same apostrophe-preserving normalizer
+// LocateTailRun uses.
 func ClipHealthy(clipText string) bool {
 	toks := strings.Fields(normTail(clipText))
 	_, count := qa.TopGram(toks)
-	return count <= clipHealthMax6gram
+	return count <= clipHealthMax6gram && !hasRepeatedSuffix(toks)
+}
+
+func hasRepeatedSuffix(toks []string) bool {
+	for period := 1; period <= shortSuffixMaxPeriod && period*shortSuffixRepeats <= len(toks); period++ {
+		start := len(toks) - period
+		match := true
+		for rep := 2; rep <= shortSuffixRepeats && match; rep++ {
+			other := len(toks) - rep*period
+			for i := range period {
+				if toks[start+i] != toks[other+i] {
+					match = false
+					break
+				}
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
 }
 
 // redegenVerdictFor returns chapter's recorded verdict when the ledger carries a

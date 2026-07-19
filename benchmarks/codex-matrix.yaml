@@ -1,0 +1,93 @@
+version: 1
+
+# These are operator-supplied API-equivalent proxies, not ChatGPT subscription
+# charges. Luna is intentionally unpriced until a defensible rate is available;
+# its reports still contain measured tokens and latency and mark cost incomplete.
+pricing:
+  version: llm-2026-07
+  rates:
+    codex/gpt-5.6-sol:
+      input_usd_per_million: 5
+      output_usd_per_million: 30
+      cached_input_usd_per_million: 0.5
+    codex/gpt-5.6-terra:
+      input_usd_per_million: 2.5
+      output_usd_per_million: 15
+      cached_input_usd_per_million: 0.25
+
+profiles:
+  - id: luna_all_medium_f3
+    backend: codex
+    max_agents_per_book: 3
+    models: &luna_models
+      spelling_research: gpt-5.6-luna
+      fact_pass: gpt-5.6-luna
+      synthesizing: gpt-5.6-luna
+      auditing: gpt-5.6-luna
+      fixing: gpt-5.6-luna
+    efforts: &medium_efforts
+      spelling_research: medium
+      fact_pass: medium
+      synthesizing: medium
+      auditing: medium
+      fixing: medium
+    judges: &codex_judge
+      - backend: codex
+        model: gpt-5.6-sol
+        effort: high
+
+  - id: terra_all_medium_f3
+    backend: codex
+    max_agents_per_book: 3
+    models: &terra_models
+      spelling_research: gpt-5.6-terra
+      fact_pass: gpt-5.6-terra
+      synthesizing: gpt-5.6-terra
+      auditing: gpt-5.6-terra
+      fixing: gpt-5.6-terra
+    efforts: *medium_efforts
+    judges: *codex_judge
+
+  - id: sol_all_medium_f3
+    backend: codex
+    max_agents_per_book: 3
+    models: &sol_models
+      spelling_research: gpt-5.6-sol
+      fact_pass: gpt-5.6-sol
+      synthesizing: gpt-5.6-sol
+      auditing: gpt-5.6-sol
+      fixing: gpt-5.6-sol
+    efforts: *medium_efforts
+    judges: *codex_judge
+
+  - id: luna_sol_medium_f3
+    backend: codex
+    max_agents_per_book: 3
+    models: &luna_sol_models
+      spelling_research: gpt-5.6-luna
+      fact_pass: gpt-5.6-luna
+      synthesizing: gpt-5.6-sol
+      auditing: gpt-5.6-sol
+      fixing: gpt-5.6-sol
+    efforts: *medium_efforts
+    judges: *codex_judge
+
+  - id: terra_sol_medium_f3
+    backend: codex
+    max_agents_per_book: 3
+    models:
+      spelling_research: gpt-5.6-terra
+      fact_pass: gpt-5.6-terra
+      synthesizing: gpt-5.6-sol
+      auditing: gpt-5.6-sol
+      fixing: gpt-5.6-sol
+    efforts: *medium_efforts
+    judges: *codex_judge
+
+  # Paired with luna_sol_medium_f3 to isolate within-book fact-pass fan-out.
+  - id: luna_sol_medium_f1
+    backend: codex
+    max_agents_per_book: 1
+    models: *luna_sol_models
+    efforts: *medium_efforts
+    judges: *codex_judge

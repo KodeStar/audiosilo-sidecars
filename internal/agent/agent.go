@@ -106,10 +106,15 @@ func (b binResolver) Detect(ctx context.Context) Availability {
 
 // Request is one agent invocation.
 type Request struct {
-	Stage   string        // pipeline stage name; telemetry only
-	Dir     string        // staged dir; becomes the child's cwd
-	Prompt  string        // full prompt text, delivered on stdin
-	Model   string        // "" = the backend CLI's default model
+	Stage  string // pipeline stage name; telemetry only
+	Dir    string // staged dir; becomes the child's cwd
+	Prompt string // full prompt text, delivered on stdin
+	Model  string // "" = the backend CLI's default model
+	// Effort is the backend's reasoning-effort name (low/medium/high/xhigh/max).
+	// Empty leaves the CLI default unchanged. Keeping it on the normalized request
+	// lets benchmarks vary model and effort independently without loading a user's
+	// CLI profile into the otherwise-ephemeral pipeline invocation.
+	Effort  string
 	Web     bool          // allow the web search/fetch tools
 	Timeout time.Duration // per-invocation wall-clock cap; 0 = no timeout
 	// MaxTurns overrides the backend's runaway ceiling when positive. Stages set a

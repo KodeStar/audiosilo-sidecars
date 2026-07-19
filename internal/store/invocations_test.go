@@ -76,6 +76,38 @@ func TestConcurrentAgentInvocationAccountingAndLifecycle(t *testing.T) {
 	}
 }
 
+func TestAgentInvocationsAllOrdersAcrossBooks(t *testing.T) {
+	ctx := context.Background()
+	db := open(t)
+	b1, err := db.CreateBook(ctx, NewBook{SourcePath: "/one", WorkDir: "/work/one", Title: "one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, err := db.CreateBook(ctx, NewBook{SourcePath: "/two", WorkDir: "/work/two", Title: "two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range []Book{b2, b1} {
+		runID, err := db.StartStageRun(ctx, b.ID, "fact_pass", 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.StartAgentInvocation(ctx, b.ID, "fact_pass", "unit", "codex", "model"); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.FinishStageRun(ctx, runID, true, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := db.AgentInvocationsAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].BookID != b1.ID || got[1].BookID != b2.ID {
+		t.Fatalf("AgentInvocationsAll = %+v, want book order %d, %d", got, b1.ID, b2.ID)
+	}
+}
+
 func TestBookTimingUsesStablePrimaryASRCompletion(t *testing.T) {
 	db := open(t)
 	ctx := context.Background()

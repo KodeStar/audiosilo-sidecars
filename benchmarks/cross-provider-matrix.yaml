@@ -1,0 +1,96 @@
+version: 1
+
+pricing:
+  version: llm-2026-07
+  rates:
+    codex/gpt-5.6-sol: {input_usd_per_million: 5, output_usd_per_million: 30, cached_input_usd_per_million: 0.5}
+    codex/gpt-5.6-terra: {input_usd_per_million: 2.5, output_usd_per_million: 15, cached_input_usd_per_million: 0.25}
+    claude/opus: {input_usd_per_million: 5, output_usd_per_million: 25, cached_input_usd_per_million: 0.5}
+    claude/sonnet: {input_usd_per_million: 3, output_usd_per_million: 15, cached_input_usd_per_million: 0.3}
+    claude/haiku: {input_usd_per_million: 1, output_usd_per_million: 5, cached_input_usd_per_million: 0.1}
+
+# On Monday, run these against the exact same prepared suite. Every candidate gets
+# both a Codex Sol and Claude Opus fresh-session audit to expose same-model judge bias.
+profiles:
+  - id: codex_luna_sol_cross_judged
+    backend: codex
+    max_agents_per_book: 3
+    models:
+      spelling_research: gpt-5.6-luna
+      fact_pass: gpt-5.6-luna
+      synthesizing: gpt-5.6-sol
+      auditing: gpt-5.6-sol
+      fixing: gpt-5.6-sol
+    efforts: &all_medium
+      spelling_research: medium
+      fact_pass: medium
+      synthesizing: medium
+      auditing: medium
+      fixing: medium
+    judges: &cross_judges
+      - {backend: codex, model: gpt-5.6-sol, effort: high}
+      - {backend: claude, model: opus, effort: high}
+
+  - id: claude_sonnet_all_cross_judged
+    backend: claude
+    max_agents_per_book: 3
+    models:
+      spelling_research: sonnet
+      fact_pass: sonnet
+      synthesizing: sonnet
+      auditing: sonnet
+      fixing: sonnet
+    efforts: *all_medium
+    judges: *cross_judges
+
+  # Claude Code does not support an effort override for Haiku, so this profile
+  # deliberately omits efforts instead of pretending they are controlled.
+  - id: claude_haiku_all_cross_judged
+    backend: claude
+    max_agents_per_book: 3
+    models:
+      spelling_research: haiku
+      fact_pass: haiku
+      synthesizing: haiku
+      auditing: haiku
+      fixing: haiku
+    judges: *cross_judges
+
+  - id: claude_haiku_opus_cross_judged
+    backend: claude
+    max_agents_per_book: 3
+    models:
+      spelling_research: haiku
+      fact_pass: haiku
+      synthesizing: opus
+      auditing: opus
+      fixing: opus
+    efforts:
+      synthesizing: medium
+      auditing: medium
+      fixing: medium
+    judges: *cross_judges
+
+  - id: claude_sonnet_opus_cross_judged
+    backend: claude
+    max_agents_per_book: 3
+    models:
+      spelling_research: sonnet
+      fact_pass: sonnet
+      synthesizing: opus
+      auditing: opus
+      fixing: opus
+    efforts: *all_medium
+    judges: *cross_judges
+
+  - id: claude_opus_all_cross_judged
+    backend: claude
+    max_agents_per_book: 3
+    models:
+      spelling_research: opus
+      fact_pass: opus
+      synthesizing: opus
+      auditing: opus
+      fixing: opus
+    efforts: *all_medium
+    judges: *cross_judges

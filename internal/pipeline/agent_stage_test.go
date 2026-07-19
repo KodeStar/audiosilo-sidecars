@@ -557,7 +557,7 @@ func TestQAAdjudicateAutoAcceptsRepairedTails(t *testing.T) {
 	if err := transcript.WriteText(filepath.Join(work, transcript.RepairedDir), 2, "the real ending text"); err != nil {
 		t.Fatal(err)
 	}
-	if err := repair.MergeTailVerdict(work, repair.TailVerdict{Chapter: 2, Verdict: repair.VerdictBenign}); err != nil {
+	if err := repair.MergeTailVerdict(work, repair.TailVerdict{Chapter: 2, Verdict: repair.VerdictBenign, DecodeTag: tailClipDecodeTag}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -590,6 +590,87 @@ func TestQAAdjudicateAutoAcceptsRepairedTails(t *testing.T) {
 	}
 	if next != state.SpellingResearch {
 		t.Errorf("next state = %q, want spelling_research", next)
+	}
+}
+
+// A mechanical accept written by the legacy short-window tail repair must not hide the
+// chapter forever after the tail geometry changes. The adjudicator should reopen it once,
+// let the agent queue a context-expanded tail repair, and only auto-accept it again after
+// that repair records tailClipDecodeTag.
+func TestQAAdjudicateReopensLegacyAutoAcceptedTailRepair(t *testing.T) {
+	work := t.TempDir()
+	rep := &qa.Report{Chapters: 3, TailRate: []qa.TailRateHit{{Chapter: 2, WPS: 5, Span: 2, Tail: "do do do"}}}
+	if err := qa.WriteReport(work, rep); err != nil {
+		t.Fatalf("write report: %v", err)
+	}
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: 30, ChapterCount: 3, Chapters: markerChapters(1, 2, 3)})
+	if err := transcript.WriteText(filepath.Join(work, transcript.RepairedDir), 2, "legacy short-window splice"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repair.MergeTailVerdict(work, repair.TailVerdict{Chapter: 2, Verdict: repair.VerdictBenign, DecodeTag: retranscribeDecodeTag}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAcceptedLedger(work, map[int]acceptedEntry{
+		2: {Round: 2, Reason: autoAcceptTailReason, Source: "auto"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := newFakeRunner()
+	fake.act = func(_ *fakeRunner, req agent.Request, _ int) (agent.Result, error) {
+		writeOut(t, req, qa.PlanFile, qa.Plan{Entries: []qa.PlanEntry{{
+			Chapter:      2,
+			Action:       qa.ActionTailClip,
+			Reason:       "replace the legacy short-window splice with a context-expanded decode",
+			ClipStartSec: 5,
+		}}})
+		return agent.Result{}, nil
+	}
+	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.QAAdjudicating, scheduler.StageReport{})
+	if err != nil {
+		t.Fatalf("qa_adjudicating: %v", err)
+	}
+	if n := fake.count(string(state.QAAdjudicating)); n != 1 {
+		t.Fatalf("agent invoked %d times, want 1 to reconsider the legacy repair", n)
+	}
+	if !res.RetranscribeNeeded {
+		t.Fatal("RetranscribeNeeded = false, want true for the replacement tail repair")
+	}
+	plan, err := qa.LoadPlan(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Entries) != 1 || plan.Entries[0].Chapter != 2 || plan.Entries[0].Action != qa.ActionTailClip {
+		t.Fatalf("plan = %+v, want chapter 2 tail_clip", plan.Entries)
+	}
+}
+
+func TestQAAdjudicatePromotesReopenedLegacyAutoAccept(t *testing.T) {
+	work := t.TempDir()
+	rep := &qa.Report{Chapters: 3, TailRate: []qa.TailRateHit{{Chapter: 2, WPS: 5, Span: 2, Tail: "do do do"}}}
+	if err := qa.WriteReport(work, rep); err != nil {
+		t.Fatal(err)
+	}
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: 30, ChapterCount: 3, Chapters: markerChapters(1, 2, 3)})
+	if err := repair.MergeTailVerdict(work, repair.TailVerdict{Chapter: 2, Verdict: repair.VerdictBenign, DecodeTag: retranscribeDecodeTag}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAcceptedLedger(work, map[int]acceptedEntry{2: {Round: 1, Reason: autoAcceptTailReason, Source: "auto"}}); err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeRunner()
+	fake.act = func(_ *fakeRunner, req agent.Request, _ int) (agent.Result, error) {
+		writeOut(t, req, qa.PlanFile, qa.Plan{Entries: []qa.PlanEntry{{Chapter: 2, Action: qa.ActionAccept, Reason: "verified authentic closing repetition"}}})
+		return agent.Result{}, nil
+	}
+	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.QAAdjudicating, scheduler.StageReport{}); err != nil {
+		t.Fatal(err)
+	}
+	entry := loadAcceptedLedger(work)[2]
+	if entry.Source != "agent" || entry.Reason != "verified authentic closing repetition" {
+		t.Fatalf("accepted ledger entry = %+v, want promoted agent acceptance", entry)
 	}
 }
 
@@ -898,7 +979,7 @@ func TestAutoAcceptRepairedTailsIncident(t *testing.T) {
 		if err := transcript.WriteText(filepath.Join(work, transcript.RepairedDir), ch, "the real ending"); err != nil {
 			t.Fatal(err)
 		}
-		if err := repair.MergeTailVerdict(work, repair.TailVerdict{Chapter: ch, ClipStart: cs, Verdict: repair.VerdictBenign}); err != nil {
+		if err := repair.MergeTailVerdict(work, repair.TailVerdict{Chapter: ch, ClipStart: cs, Verdict: repair.VerdictBenign, DecodeTag: tailClipDecodeTag}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -942,6 +1023,35 @@ func TestAutoAcceptRepairedTailsIncident(t *testing.T) {
 	}
 }
 
+func TestAutoAcceptDoesNotUseMidRepairForNewTailFinding(t *testing.T) {
+	work := t.TempDir()
+	if err := transcript.WriteText(filepath.Join(work, transcript.RepairedDir), 2, "mid-window repaired text"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repair.MergeTailVerdict(work, repair.TailVerdict{
+		Chapter: 2, ClipStart: 10, ClipEnd: 20, Verdict: repair.VerdictMidRepaired, DecodeTag: retranscribeDecodeTag,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rep := &qa.Report{Chapters: 2, TailRate: []qa.TailRateHit{{Chapter: 2, Tail: "new tail loop"}}}
+	if got := (&Executor{}).autoAcceptRepairedTails(rep, work); len(got) != 0 {
+		t.Fatalf("bounded mid repair auto-accepted an unrelated tail finding: %+v", got)
+	}
+	verdicts, err := repair.TailVerdictsByChapter(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retranscribeEntryDone(work, qa.PlanEntry{Chapter: 2, Action: qa.ActionTailClip}, verdicts) {
+		t.Fatal("prior mid repair satisfied a new tail_clip entry")
+	}
+	tailVerdicts := map[int]repair.TailVerdict{2: {
+		Chapter: 2, Verdict: repair.VerdictBenign, DecodeTag: tailClipDecodeTag,
+	}}
+	if retranscribeEntryDone(work, qa.PlanEntry{Chapter: 2, Action: qa.ActionMidClip}, tailVerdicts) {
+		t.Fatal("prior tail repair satisfied a new mid_clip entry")
+	}
+}
+
 // TestTailOnlyChaptersMidWindowCoverage is the mid_clip residual-coverage matrix: after a
 // MID splice the raw-layer cross-segment / MID-CHAPTER multi-loop hit persists on re-sweep,
 // so the residual auto-accept must cover a hit inside the recorded MID window [clip_start,
@@ -959,12 +1069,15 @@ func TestTailOnlyChaptersMidWindowCoverage(t *testing.T) {
 	}
 	rep := &qa.Report{
 		Chapters: 50,
-		TailRate: []qa.TailRateHit{{Chapter: 40}, {Chapter: 41}, {Chapter: 42}, {Chapter: 43}, {Chapter: 44}, {Chapter: 45}},
 		MultiLoop: []qa.MultiLoopFinding{
 			// ch40: a MID-CHAPTER multi-loop INSIDE the recorded mid window -> covered.
 			{Chapter: 40, Count: 6, AtSec: f64ptr(1690), Pos: 55, MidChapter: true},
+			// ch41: an in-window loop makes the chapter required; its cross hit is also covered.
+			{Chapter: 41, Count: 6, AtSec: f64ptr(1690), Pos: 55, MidChapter: true},
 			// ch42: a MID-CHAPTER multi-loop OUTSIDE the mid window (too early) -> disq.
 			{Chapter: 42, Count: 6, AtSec: f64ptr(1500), Pos: 40, MidChapter: true},
+			// ch43: the loop is covered, but its cross hit straddles the upper bound -> disq.
+			{Chapter: 43, Count: 6, AtSec: f64ptr(1690), Pos: 55, MidChapter: true},
 			// ch44: a MID-CHAPTER multi-loop with NO recorded mid window -> disq.
 			{Chapter: 44, Count: 6, AtSec: f64ptr(1690), Pos: 55, MidChapter: true},
 			// ch45: a MID-CHAPTER multi-loop against a TAIL window -> disq (a tail splice

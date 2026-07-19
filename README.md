@@ -72,6 +72,11 @@ Agent capacity has separate controls for concurrent books and safe per-book
 invocation fan-out. See [Agent capacity and per-book fan-out](docs/AGENT-CAPACITY.md)
 for compatibility, supported stages, timing, liveness, cost, and safe testing.
 
+Model-routing research uses the private, provider-neutral `audiosilo-bench`
+harness. It replays the real post-ASR pipeline without copying source audio or raw
+ASR into the repository; see [Agent pipeline benchmarking](docs/BENCHMARKING.md)
+and the [initial Codex findings](docs/CODEX-BENCHMARK-2026-07-19.md).
+
 ### Frontend dev loop
 
 ```sh

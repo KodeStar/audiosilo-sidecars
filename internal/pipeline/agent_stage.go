@@ -390,6 +390,7 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 	}
 	e.mu.Lock()
 	model := agent.ModelFor(e.agentModels.Claude, e.agentModels.OpenAI, runner.ID(), string(stage))
+	effort := agent.ModelFor(e.agentEfforts.Claude, e.agentEfforts.OpenAI, runner.ID(), string(stage))
 	e.mu.Unlock()
 
 	prompt, err := prompts.Render(promptName, promptData)
@@ -408,6 +409,7 @@ func (e *Executor) runAgent(ctx context.Context, book store.Book, stage state.St
 		Dir:      st.Dir(),
 		Prompt:   prompt,
 		Model:    model,
+		Effort:   effort,
 		Web:      web,
 		Timeout:  e.agentTimeout,
 		MaxTurns: stageMaxTurns(stage),
@@ -746,10 +748,11 @@ const autoAcceptTailReason = "already repaired via clip splice - splice present 
 // round. Without it most detectors re-flag an already-accepted chapter each qa_sweep round
 // (they read the stale unrepaired layer), so the agent re-opens and re-accepts the SAME
 // chapters every round at full cost - the round-cap burner one real book exhausted its budget
-// on. The decisions stay valid because repairs only ever touch PLANNED non-accept chapters, so
-// an accepted chapter's transcript never changes afterwards; the ledger is therefore
-// deliberately NOT cleared by the done==0 reset or a Retry (unlike the stall marker). A
-// deleted + re-enqueued book gets a fresh work dir, so it never inherits a stale ledger.
+// on. Agent decisions stay valid because repairs only ever touch PLANNED non-accept chapters.
+// Mechanical accepts are carried forward only while their clip verdict uses the current repair
+// geometry, so a decoder-window upgrade can reopen legacy splices once. The ledger itself is
+// deliberately NOT cleared by the done==0 reset or a Retry (unlike the stall marker). A deleted
+// + re-enqueued book gets a fresh work dir, so it never inherits a stale ledger.
 const acceptedLedgerName = "qa_accepted.json"
 
 // acceptedEntry records one accepted chapter's disposition: the round it was first accepted,
@@ -1013,6 +1016,15 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, r schedule
 		}
 		le, ok := ledger[ch]
 		if !ok {
+			continue
+		}
+		// A mechanical acceptance inherited the repair geometry that produced it. Do not
+		// carry one unless autoAcceptRepairedTails independently proved that the current
+		// report's findings are covered by the current successful repair. (A valid one
+		// was already folded into autoSet above.) Agent-authored accepts remain durable
+		// because they may attest genuine audio independently of a splice.
+		if le.Source == "auto" {
+			delete(ledger, ch)
 			continue
 		}
 		autoEntries = append(autoEntries, qa.PlanEntry{
@@ -1287,8 +1299,8 @@ func (e *Executor) runQAAdjudicatePartition(ctx context.Context, book store.Book
 
 // autoAcceptRepairedTails returns an accept entry for every flagged chapter whose only
 // findings are tail-related (or tail-residuals the chapter's splice covers) AND which a
-// prior tail_clip round already repaired (both transcripts-repaired/<ch>.txt and a
-// tail_verdicts.json entry present). The result is deterministic (FlaggedChapters is
+// prior tail_clip round already repaired using the current clip geometry (both
+// transcripts-repaired/<ch>.txt and a current tail_verdicts.json entry present). The result is deterministic (FlaggedChapters is
 // sorted). It loads the verdict ledger ONCE and uses that same map for both the
 // tail-residual classification (tailOnlyChapters reads each verdict's ClipStart) and the
 // ledger-presence half of the repaired-evidence check (the repaired-file existence stays a
@@ -1308,7 +1320,8 @@ func (e *Executor) autoAcceptRepairedTails(rep *qa.Report, workDir string) []qa.
 		}
 		// Repaired evidence (the tailClipAlreadyDone pair): a splice wrote the repaired text
 		// AND the ledger carries a verdict for the chapter (both from byCh, loaded once).
-		if _, ok := byCh[ch]; !ok {
+		v, ok := byCh[ch]
+		if !clipVerdictCurrent(v, ok) {
 			continue
 		}
 		if !fsutil.IsFile(filepath.Join(workDir, transcript.RepairedDir, transcript.TextName(ch))) {
@@ -1334,7 +1347,7 @@ const (
 )
 
 // tailOnlyChapters is the set of flagged (required-disposition) chapters whose findings
-// are all addressable by a clip splice: a tail_rate hit, a benign end_fade run, or a
+// are all addressable by a clip splice: a tail_rate hit, a terminal end_fade run, or a
 // cross-segment / tail-classified multi-loop finding that is itself a RESIDUAL the
 // chapter's recorded splice window covers. The window is [clip_start, windowEnd] where
 // windowEnd is the verdict's ClipEnd for a MID splice (a bounded interior window) or the
@@ -1353,8 +1366,15 @@ func tailOnlyChapters(rep *qa.Report, verdicts map[int]repair.TailVerdict) map[i
 		disq[o.Chapter] = true
 	}
 	for _, r := range rep.RepeatedRuns {
-		if r.Kind != qa.KindEndFade {
+		v, ok := verdicts[r.Chapter]
+		if r.Kind != qa.KindEndFade || !ok || v.IsMidWindow() {
 			disq[r.Chapter] = true
+		}
+	}
+	for _, h := range rep.TailRate {
+		v, ok := verdicts[h.Chapter]
+		if !ok || v.IsMidWindow() {
+			disq[h.Chapter] = true
 		}
 	}
 	for _, h := range rep.WithinSegment {
@@ -1756,8 +1776,12 @@ func retranscribeEntryDone(workDir string, entry qa.PlanEntry, verdicts map[int]
 	switch entry.Action {
 	case qa.ActionRetranscribe:
 		return rawComplete(filepath.Join(workDir, repair.RetranscribeDir, transcript.RawName(entry.Chapter)))
-	case qa.ActionTailClip, qa.ActionMidClip:
-		return tailClipAlreadyDone(workDir, entry.Chapter, verdicts)
+	case qa.ActionTailClip:
+		v, ok := verdicts[entry.Chapter]
+		return clipTailVerdictCurrent(v, ok) && tailClipAlreadyDone(workDir, entry.Chapter, verdicts)
+	case qa.ActionMidClip:
+		v, ok := verdicts[entry.Chapter]
+		return clipMidVerdictCurrent(v, ok) && tailClipAlreadyDone(workDir, entry.Chapter, verdicts)
 	default:
 		return false
 	}
@@ -1770,6 +1794,12 @@ func retranscribeEntryDone(workDir string, entry qa.PlanEntry, verdicts map[int]
 // never reused to deny a chapter its one fresh NoContext attempt. Bump the suffix whenever
 // the repair decode params change again.
 const retranscribeDecodeTag = "nocontext-v1"
+
+// tailClipDecodeTag additionally versions the tail-window geometry. The v2 repair
+// decodes a context-expanded ending and trims it back to a safe segment boundary, so a
+// legacy CLIP-REDEGENERATED verdict from the old short-window geometry must not suppress
+// the improved attempt. Full-chapter and mid-window retries retain their existing tag.
+const tailClipDecodeTag = retranscribeDecodeTag + "+tail-context-v2"
 
 // retranscribeDecodeMarker is the file in retranscribe/ recording the decode params the
 // stored fresh raws were produced under (retranscribeDecodeTag).
@@ -1899,7 +1929,14 @@ func (e *Executor) retranscribeChapter(ctx context.Context, setup ASRSetup, book
 // splice, a re-degeneration, a known-failed skip, and the tail unlocatable no-op (which it
 // buckets as clips_unlocatable and re-queues asking for a clip_start_sec).
 func (e *Executor) clipChapter(ctx context.Context, setup ASRSetup, cut repair.ClipCutter, book store.Book, chapter int, verdicts map[int]repair.TailVerdict, label string, req repair.ClipSpliceRequest, splice func(context.Context, repair.ClipSpliceRequest) (repair.ClipResult, error)) (repair.ClipResult, error) {
-	if tailClipAlreadyDone(book.WorkDir, chapter, verdicts) {
+	decodeTag := retranscribeDecodeTag
+	verdict, verdictExists := verdicts[chapter]
+	versionCurrent := clipMidVerdictCurrent(verdict, verdictExists)
+	if label == "tail-clip" {
+		decodeTag = tailClipDecodeTag
+		versionCurrent = clipTailVerdictCurrent(verdict, verdictExists)
+	}
+	if versionCurrent && tailClipAlreadyDone(book.WorkDir, chapter, verdicts) {
 		return repair.ClipResult{Chapter: chapter, Spliced: true}, nil // a prior run already spliced this chapter
 	}
 	origT, err := transcript.ReadNormalized(filepath.Join(book.WorkDir, transcript.JSONDir), chapter)
@@ -1924,7 +1961,14 @@ func (e *Executor) clipChapter(ctx context.Context, setup ASRSetup, cut repair.C
 	req.Transcript = origT
 	req.Cut = cut
 	req.Transcribe = transcribe
-	req.DecodeTag = retranscribeDecodeTag
+	req.DecodeTag = decodeTag
+	// A failed or obsolete verdict must not leave an older repaired/corrected layer
+	// looking like durable evidence. In particular, upgrading a legacy tail splice
+	// can re-degenerate under the new geometry; remove the stale preferred layers
+	// immediately before that retry so failure safely falls back to the raw text.
+	if verdictExists && !versionCurrent {
+		removeChapterDerived(book.WorkDir, chapter)
+	}
 	res, err := splice(ctx, req)
 	if err != nil {
 		return repair.ClipResult{Chapter: chapter}, fmt.Errorf("retranscribing: %s chapter %d: %w", label, chapter, err)
@@ -1977,8 +2021,36 @@ func tailClipAlreadyDone(workDir string, chapter int, verdicts map[int]repair.Ta
 	if !fsutil.IsFile(filepath.Join(workDir, transcript.RepairedDir, transcript.TextName(chapter))) {
 		return false
 	}
-	_, ok := verdicts[chapter]
-	return ok
+	v, ok := verdicts[chapter]
+	return clipVerdictSuccessful(v, ok)
+}
+
+// clipVerdictCurrent reports whether a successful clip verdict is reusable under the
+// current geometry. Mid-window geometry did not change and remains reusable. Tail
+// verdicts must carry tailClipDecodeTag; legacy nocontext-v1 tail splices used short
+// decode windows and are deliberately reconsidered once.
+func clipVerdictCurrent(v repair.TailVerdict, ok bool) bool {
+	return clipTailVerdictCurrent(v, ok) || clipMidVerdictCurrent(v, ok)
+}
+
+func clipTailVerdictCurrent(v repair.TailVerdict, ok bool) bool {
+	return clipVerdictSuccessful(v, ok) && !v.IsMidWindow() && v.DecodeTag == tailClipDecodeTag
+}
+
+func clipMidVerdictCurrent(v repair.TailVerdict, ok bool) bool {
+	return clipVerdictSuccessful(v, ok) && v.IsMidWindow()
+}
+
+func clipVerdictSuccessful(v repair.TailVerdict, ok bool) bool {
+	if !ok {
+		return false
+	}
+	switch v.Verdict {
+	case repair.VerdictFabricated, repair.VerdictBenign, repair.VerdictTailRepaired, repair.VerdictMidRepaired:
+		return true
+	default:
+		return false
+	}
 }
 
 // removeChapterDerived drops a chapter's stale repaired and corrected text so a later

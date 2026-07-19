@@ -250,6 +250,9 @@ func TestClipHealthy(t *testing.T) {
 	if ClipHealthy(strings.Repeat("a b c d e f ", 4)) {
 		t.Error("expected a looping clip (6-gram repeated) to be unhealthy")
 	}
+	if ClipHealthy("the narrator finished the real ending amen amen amen") {
+		t.Error("expected a short repeated suffix below 6-gram reach to be unhealthy")
+	}
 }
 
 // --- buildRepairLine (byte-identical to build_repairs.py) -------------------

@@ -160,16 +160,17 @@ func (db *DB) ListAgentInvocations(ctx context.Context, bookID int64) ([]AgentIn
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
-	var out []AgentInvocation
-	for rows.Next() {
-		v, e := scanInvocation(rows)
-		if e != nil {
-			return nil, e
-		}
-		out = append(out, v)
+	return collectAgentInvocations(rows)
+}
+
+// AgentInvocationsAll returns every invocation in one catalogue query. Batch
+// telemetry consumers use this instead of issuing one query per book.
+func (db *DB) AgentInvocationsAll(ctx context.Context) ([]AgentInvocation, error) {
+	rows, err := db.sql.QueryContext(ctx, `SELECT `+invocationCols+` FROM agent_invocations ORDER BY book_id, id`)
+	if err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	return collectAgentInvocations(rows)
 }
 
 func (db *DB) ActiveAgentInvocations(ctx context.Context) ([]AgentInvocation, error) {
@@ -177,6 +178,10 @@ func (db *DB) ActiveAgentInvocations(ctx context.Context) ([]AgentInvocation, er
 	if err != nil {
 		return nil, err
 	}
+	return collectAgentInvocations(rows)
+}
+
+func collectAgentInvocations(rows *sql.Rows) ([]AgentInvocation, error) {
 	defer func() { _ = rows.Close() }()
 	var out []AgentInvocation
 	for rows.Next() {

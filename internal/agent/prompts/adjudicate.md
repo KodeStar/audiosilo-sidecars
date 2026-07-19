@@ -13,8 +13,8 @@ You work in the current directory. It contains:
   multi-loop findings, tail-rate hits, and a `retranscribe_queue`).
 - `manifest.json` - the logical-chapter map (for chapter numbers and durations).
 - `transcripts-text/` and `transcripts-repaired/` - the transcript text for EVERY
-  chapter you may disposition (not just the required ones - also the chapters
-  carrying only a tail-rate, end-fade, or cross/within-segment finding). You MAY
+  chapter you may disposition (including optional chapters carrying only a
+  cross/within-segment finding). You MAY
   read these: this is pre-fact-pass QA, so seeing the raw transcript here is
   allowed. VERIFY a short end-fade or tail finding against the actual text and
   `accept` it when the repeat is a harmless closing echo, instead of queueing a
@@ -45,7 +45,7 @@ web access.
 
 ## How to judge each finding (hard-won heuristics)
 
-- A detector's "benign end-fade" label is often WRONG. In real books a large
+- A detector's "end-fade" label is often fabricated audio, not benign. In real books a large
   fraction of supposed end-fades actually hid fabricated or overwritten endings.
   Do not accept a chapter just because the loop sits near the end - check whether
   real narration was swallowed.
@@ -91,7 +91,10 @@ web access.
   continues." x3). Such a repeat is BELOW the mechanical locator's 6-gram reach, so
   without `clip_start_sec` the stage finds no loop and no-ops (leaving the chapter
   flagged forever). The report gives the hit's time - start the window a few seconds
-  before it. Also supply it when re-queuing a tail_clip whose prior verdict in
+  before it. The repair stage automatically expands the decode window backward to
+  provide up to 30 seconds of context, snaps the splice to a safe segment boundary,
+  and retains only the fresh words at or after that boundary. Also supply it when
+  re-queuing a tail_clip whose prior verdict in
   `tail_verdicts.json` is `CLIP-REDEGENERATED`: the repair stage already tried the
   window it derived on its own and it re-degenerated, so re-cutting the SAME window
   will fail identically and is skipped as known-failed - read the transcript, find
@@ -144,8 +147,8 @@ disposition ONLY the other flagged chapters.
 }
 ```
 
-Rules: EVERY flagged chapter (every chapter in the report's `retranscribe_queue`
-and every tail-rate or mid-chapter finding) gets EXACTLY ONE entry, EXCEPT any
+Rules: EVERY flagged chapter (every chapter in the report's `retranscribe_queue`,
+every repeated run, and every tail-rate or mid-chapter finding) gets EXACTLY ONE entry, EXCEPT any
 chapter listed under "Already repaired" above, which you must NOT disposition. Do
 not add an entry for a chapter that was not flagged. Every `reason` must be
 non-empty and in your own words; use hyphens, never em dashes.

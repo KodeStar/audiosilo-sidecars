@@ -1,0 +1,9 @@
+version: 1
+cases:
+  - id: short-series-opener
+    title: Example Book
+    authors: [Example Author]
+    series: Example Series
+    series_pos: "1"
+    work_id: example-book
+    source_work_dir: /private/path/to/completed/work-dir

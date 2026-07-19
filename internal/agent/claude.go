@@ -88,6 +88,9 @@ func (c *claudeRunner) buildArgs(req Request) []string {
 	if req.Model != "" {
 		args = append(args, "--model", req.Model)
 	}
+	if req.Effort != "" {
+		args = append(args, "--effort", req.Effort)
+	}
 	return args
 }
 

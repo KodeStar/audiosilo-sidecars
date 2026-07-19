@@ -90,6 +90,17 @@ func TestClaudeMaxTurnsOverride(t *testing.T) {
 	}
 }
 
+func TestClaudeEffortOverride(t *testing.T) {
+	path, capDir := fakeCLI(t, fakeCLIOpts{versionLine: "v", response: claudeOK})
+	r := newClaudeRunner(path, secrets.NewMemStore())
+	if _, err := r.Run(context.Background(), Request{Dir: t.TempDir(), Prompt: "p", Effort: "high"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if argv := readCapture(t, capDir, "argv.txt"); !strings.Contains(argv, "--effort high") {
+		t.Errorf("argv missing effort override: %q", argv)
+	}
+}
+
 func TestClaudeIsErrorEnvelope(t *testing.T) {
 	resp := `{"type":"result","is_error":true,"result":"boom","num_turns":2,"total_cost_usd":0.03,"usage":{"input_tokens":120,"output_tokens":30,"cache_read_input_tokens":10}}`
 	path, _ := fakeCLI(t, fakeCLIOpts{versionLine: "v", response: resp})

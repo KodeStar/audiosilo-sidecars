@@ -105,6 +105,18 @@ func TestCodexWebFlagAddsOverride(t *testing.T) {
 	}
 }
 
+func TestCodexEffortAddsIsolatedOverride(t *testing.T) {
+	path, capDir := fakeCLI(t, fakeCLIOpts{versionLine: "v", response: codexOK, lastMsg: "x"})
+	r := newCodexRunner(path, secrets.NewMemStore())
+	if _, err := r.Run(context.Background(), Request{Dir: t.TempDir(), Prompt: "p", Effort: "medium"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	argv := readCapture(t, capDir, "argv.txt")
+	if !strings.Contains(argv, `model_reasoning_effort="medium"`) {
+		t.Errorf("argv missing effort override: %q", argv)
+	}
+}
+
 func TestCodexSecretInjectedNotLeaked(t *testing.T) {
 	const secret = "sk-openai-TESTSECRET"
 	resp := `{"type":"turn.failed","error":"boom without the key"}`

@@ -11,3 +11,7 @@ data/
 web/node_modules/
 web/dist/
 internal/web/dist/
+
+# Private benchmark corpora/results contain transcripts and derived fact notes.
+benchmarks/private/
+benchmarks/results/

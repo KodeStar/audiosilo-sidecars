@@ -16,6 +16,7 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/qa"
 	"github.com/kodestar/audiosilo-sidecars/internal/repair"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
+	"github.com/kodestar/audiosilo-sidecars/internal/spelling"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 	"github.com/kodestar/audiosilo-sidecars/internal/transcript"
@@ -187,6 +188,56 @@ func TestRetranscribeTailClipSplices(t *testing.T) {
 	// cut is a context-conditioned collapse, so a context-on retry would just replay it.
 	if !fake.sawNoContext(2) {
 		t.Error("tailClipChapter did not set NoContext on the clip re-transcription Job")
+	}
+}
+
+func TestTailClipUpgradeClearsLegacyLayersBeforeFailedRetry(t *testing.T) {
+	work := t.TempDir()
+	orig := transcript.Transcript{Schema: transcript.Schema, Chapter: 2, Segments: []transcript.Segment{{ID: 0, Start: 0, End: 10, Text: " original"}}}
+	seedNormalized(t, work, orig)
+	if err := transcript.WriteText(filepath.Join(work, transcript.RepairedDir), 2, "legacy repaired"); err != nil {
+		t.Fatal(err)
+	}
+	if err := transcript.WriteText(filepath.Join(work, spelling.CorrectedDir), 2, "legacy corrected"); err != nil {
+		t.Fatal(err)
+	}
+	legacy := repair.TailVerdict{Chapter: 2, Verdict: repair.VerdictBenign, DecodeTag: retranscribeDecodeTag}
+	if err := repair.MergeTailVerdict(work, legacy); err != nil {
+		t.Fatal(err)
+	}
+	verdicts := map[int]repair.TailVerdict{2: legacy}
+	exe := NewExecutor(Config{})
+	cut := func(context.Context, string, string, float64, float64) error { return nil }
+	res, err := exe.clipChapter(context.Background(), ASRSetup{}, cut, store.Book{ID: 1, WorkDir: work}, 2, verdicts, "tail-clip",
+		repair.ClipSpliceRequest{ChapterEnd: 10},
+		func(_ context.Context, req repair.ClipSpliceRequest) (repair.ClipResult, error) {
+			for _, dir := range []string{transcript.RepairedDir, spelling.CorrectedDir} {
+				if _, statErr := os.Stat(filepath.Join(work, dir, transcript.TextName(2))); !os.IsNotExist(statErr) {
+					t.Errorf("stale %s layer still present during retry: %v", dir, statErr)
+				}
+			}
+			failed := repair.TailVerdict{Chapter: 2, Verdict: repair.VerdictClipRedegenerated, DecodeTag: req.DecodeTag}
+			if mergeErr := repair.MergeTailVerdict(work, failed); mergeErr != nil {
+				return repair.ClipResult{}, mergeErr
+			}
+			return repair.ClipResult{Chapter: 2, Verdict: repair.VerdictClipRedegenerated}, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Spliced || res.Verdict != repair.VerdictClipRedegenerated {
+		t.Fatalf("result = %+v, want a failed v2 retry", res)
+	}
+	current, err := repair.TailVerdictsByChapter(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tailClipAlreadyDone(work, 2, current) || clipVerdictCurrent(current[2], true) {
+		t.Fatal("failed v2 verdict plus stale output was treated as a successful current repair")
+	}
+	rep := &qa.Report{TailRate: []qa.TailRateHit{{Chapter: 2}}}
+	if got := exe.autoAcceptRepairedTails(rep, work); len(got) != 0 {
+		t.Fatalf("failed v2 retry auto-accepted: %+v", got)
 	}
 }
 
@@ -384,12 +435,16 @@ func TestRetranscribeTailClipKnownFailedSkipped(t *testing.T) {
 	seedFLACs(t, work, 2)
 	// A prior round already cut this window and it re-degenerated UNDER THE CURRENT decode
 	// params (verdict only, no splice; the tag matches what the stage passes today).
-	const window = 10.0
-	if err := repair.MergeTailVerdict(work, repair.TailVerdict{Chapter: 2, ClipStart: window, Verdict: repair.VerdictClipRedegenerated, DecodeTag: retranscribeDecodeTag}); err != nil {
+	// The requested 10s point lies inside this synthetic chapter's single segment, so
+	// the v2 geometry safely snaps its effective splice boundary to that segment's 0s
+	// start. Seed the verdict at the effective boundary the repair persists.
+	const requestedWindow = 10.0
+	const effectiveWindow = 0.0
+	if err := repair.MergeTailVerdict(work, repair.TailVerdict{Chapter: 2, ClipStart: effectiveWindow, Verdict: repair.VerdictClipRedegenerated, DecodeTag: tailClipDecodeTag}); err != nil {
 		t.Fatal(err)
 	}
 	// The agent re-queues the SAME window via clip_start_sec.
-	seedPlan(t, work, qa.PlanEntry{Chapter: 2, Action: qa.ActionTailClip, Reason: "tail loop", ClipStartSec: window})
+	seedPlan(t, work, qa.PlanEntry{Chapter: 2, Action: qa.ActionTailClip, Reason: "tail loop", ClipStartSec: requestedWindow})
 
 	fake := newFakeBackend()
 	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})

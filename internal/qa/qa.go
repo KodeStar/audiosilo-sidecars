@@ -13,10 +13,12 @@
 //     deviations from the book mean. A chapter that transcribed far too fast or
 //     slow is suspect. Excludes chapter 0 (a publisher "story so far" recap that
 //     sits outside the position model).
-//   - Repeated-segment runs (qa_sweep.py): >= 3 consecutive segments with identical
-//     normalized text. Split into a benign chapter-END fade (run starts at >= 85% of
-//     the chapter) and a dangerous MID-CHAPTER loop (it overwrites real narration).
-//     Excludes chapter 0.
+//   - Repeated-segment runs (qa_sweep.py plus the empty-record hardening): >= 3
+//     consecutive non-empty segments with identical normalized text, ignoring empty
+//     timestamp artifacts between them. Split into a chapter-END fade (run starts at
+//     >= 85% of the chapter) and a dangerous MID-CHAPTER loop. Both require a QA
+//     disposition: end fades commonly append invented text over closing silence, while
+//     mid-chapter loops overwrite real narration. Excludes chapter 0.
 //   - Low-confidence words (qa_sweep.py): the rate of words the model scored below
 //     0.5. Informational only - it never affects the clean verdict or the queue.
 //   - Cross-segment 6-gram loops (cross_segment_scan.py): a 6-gram repeated >= 5x
@@ -82,12 +84,13 @@ const (
 	KindMidChapter = "mid_chapter"
 )
 
-// Detector thresholds and constants - ported verbatim from the Python scripts. Do
-// not tune these without re-validating against the historical books; they are the
-// contract, not a default.
+// Detector thresholds and constants inherited from the Python scripts. Do not tune
+// these without re-validating against the historical books; they are the contract,
+// not a default. repeatedRuns intentionally adds one hardening rule: empty backend
+// records do not break an otherwise consecutive run.
 const (
 	wphZThreshold   = 2.5  // qa_sweep.py: flag |z| > 2.5
-	endFadePosition = 0.85 // qa_sweep.py: a run starting at >= 85% of the chapter is a benign end fade
+	endFadePosition = 0.85 // qa_sweep.py: a run starting at >= 85% of the chapter is an end fade
 	repeatRunMin    = 3    // qa_sweep.py: >= 3 identical consecutive segments is a run
 
 	gramSize = 6 // every 6-gram detector uses a window of 6 tokens
@@ -138,7 +141,7 @@ type WPHOutlier struct {
 }
 
 // RepeatedRun is a run of >= 3 consecutive identical (normalized) segments. Kind is
-// KindEndFade (benign) or KindMidChapter (flagged).
+// KindEndFade (tail repair/accept adjudication) or KindMidChapter (usually lost content).
 type RepeatedRun struct {
 	Chapter  int     `json:"chapter"`
 	Kind     string  `json:"kind"`
@@ -227,18 +230,16 @@ type Report struct {
 }
 
 // Clean reports whether the sweep found nothing that warrants re-transcription or
-// human adjudication. It is true iff there are NO wph outliers, NO mid-chapter runs
-// (end fades are benign), NO cross-segment hits, NO within-segment hits, NO
-// multi-loop findings and NO tail-rate hits. Low-confidence stats and end fades
-// never affect cleanliness. This drives the pipeline's QAClean branch.
+// human adjudication. It is true iff there are NO wph outliers, NO repeated runs,
+// NO cross-segment hits, NO within-segment hits, NO multi-loop findings and NO
+// tail-rate hits. Low-confidence stats never affect cleanliness. End fades are
+// actionable because Whisper frequently appends them over closing silence.
 func (r *Report) Clean() bool {
 	if len(r.WPHOutliers) > 0 {
 		return false
 	}
-	for _, run := range r.RepeatedRuns {
-		if run.Kind == KindMidChapter {
-			return false
-		}
+	if len(r.RepeatedRuns) > 0 {
+		return false
 	}
 	return len(r.CrossSegment) == 0 &&
 		len(r.WithinSegment) == 0 &&

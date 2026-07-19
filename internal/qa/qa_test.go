@@ -82,7 +82,7 @@ func TestRepeatedRunsMidChapterLoop(t *testing.T) {
 	}
 }
 
-func TestRepeatedRunsEndFadeBenign(t *testing.T) {
+func TestRepeatedRunsEndFadeStaysOutOfFullRetranscribeQueue(t *testing.T) {
 	segs := []transcript.Segment{
 		seg(0, 0, 5, "Earlier prose."),
 		seg(1, 900, 902, "same fade line"),
@@ -93,15 +93,38 @@ func TestRepeatedRunsEndFadeBenign(t *testing.T) {
 	if len(runs) != 1 || runs[0].Kind != KindEndFade {
 		t.Fatalf("want one end-fade, got %+v", runs)
 	}
-	// end fades never enter the queue
+	// End fades require adjudication, but never enter the full-chapter retranscribe queue.
 	if q := retranscribeQueue(nil, runs); len(q) != 0 {
 		t.Errorf("queue = %v, want empty", q)
 	}
 }
 
+func TestRepeatedRunsIgnoresEmptyTimestampArtifacts(t *testing.T) {
+	// Real MLX output interleaved zero-duration empty records between five fabricated
+	// "Amen." segments. Empty records are not speech and must not hide the suffix loop.
+	segs := []transcript.Segment{
+		seg(0, 0, 10, "The real ending."),
+		seg(1, 97.00, 97.08, "Amen."),
+		seg(2, 97.08, 97.08, ""),
+		seg(3, 97.20, 97.22, "Amen."),
+		seg(4, 97.22, 97.22, ""),
+		seg(5, 97.22, 97.28, "Amen."),
+		seg(6, 97.28, 97.28, ""),
+		seg(7, 97.28, 97.32, "Amen."),
+		seg(8, 97.32, 97.36, "Amen."),
+	}
+	runs := repeatedRuns([]chapterDoc{mkDoc(37, 100, segs...)})
+	if len(runs) != 1 {
+		t.Fatalf("want one suffix run across empty records, got %+v", runs)
+	}
+	if runs[0].Kind != KindEndFade || runs[0].Length != 5 || runs[0].StartSec != 97 {
+		t.Errorf("run = %+v, want five-copy end fade starting at 97s", runs[0])
+	}
+}
+
 func TestRepeatedRunsBoundary(t *testing.T) {
 	// A 1000s chapter: a run starting at 849 is mid-chapter (< 85%); at 850 it is a
-	// benign end fade (>= 85%).
+	// end fade (>= 85%).
 	mk := func(start float64) RepeatedRun {
 		segs := []transcript.Segment{
 			seg(0, 0, 1, "lead in prose"),
@@ -491,7 +514,7 @@ func TestRetranscribeQueueUnionSortDedup(t *testing.T) {
 	runs := []RepeatedRun{
 		{Chapter: 2, Kind: KindMidChapter},
 		{Chapter: 9, Kind: KindMidChapter},
-		{Chapter: 3, Kind: KindEndFade}, // end fades excluded
+		{Chapter: 3, Kind: KindEndFade}, // end fades excluded from full retranscription
 	}
 	got := retranscribeQueue(outliers, runs)
 	want := []int{2, 5, 9}
@@ -511,7 +534,7 @@ func TestClean(t *testing.T) {
 		{"empty", Report{}, true},
 		{"wph outlier", Report{WPHOutliers: []WPHOutlier{{Chapter: 1}}}, false},
 		{"mid-chapter run", Report{RepeatedRuns: []RepeatedRun{{Kind: KindMidChapter}}}, false},
-		{"end-fade only", Report{RepeatedRuns: []RepeatedRun{{Kind: KindEndFade}}}, true},
+		{"end-fade only", Report{RepeatedRuns: []RepeatedRun{{Kind: KindEndFade}}}, false},
 		{"cross", Report{CrossSegment: []CrossSegmentHit{{Chapter: 1}}}, false},
 		{"within", Report{WithinSegment: []WithinSegmentHit{{Chapter: 1}}}, false},
 		{"multi", Report{MultiLoop: []MultiLoopFinding{{Chapter: 1}}}, false},
