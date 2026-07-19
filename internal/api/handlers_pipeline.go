@@ -74,6 +74,20 @@ func (a *API) handleGetScan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "scan not found")
 		return
 	}
+	tracked, err := a.store.ListBookTracking(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not read queued books")
+		return
+	}
+	for i := range job.Books {
+		book, exists := tracked[job.Books[i].SourcePath]
+		if !exists {
+			continue
+		}
+		job.Books[i].PipelineBook = &metaops.PipelineBookRef{
+			ID: book.ID, State: book.State, Status: book.Status,
+		}
+	}
 	writeJSON(w, http.StatusOK, job)
 }
 

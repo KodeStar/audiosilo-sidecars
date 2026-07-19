@@ -141,6 +141,17 @@ type Book struct {
 	UpdatedAt string
 }
 
+// BookTracking is the small, read-only projection needed to mark library-scan
+// candidates that are already persisted. SourcePath is the durable identity;
+// state/status let the UI distinguish completed work from active or exceptional
+// queue entries without loading every book's JSON metadata on each scan poll.
+type BookTracking struct {
+	ID         int64
+	SourcePath string
+	State      string
+	Status     string
+}
+
 // NewBook is the input to CreateBook: the identity/metadata fields a caller
 // supplies. State defaults to "queued".
 type NewBook struct {
@@ -320,6 +331,27 @@ func (db *DB) ListBooks(ctx context.Context) ([]Book, error) {
 			return nil, err
 		}
 		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// ListBookTracking returns every persisted book keyed by its unique source path.
+// It deliberately selects only the four fields the Library scan join needs: scan
+// polling can be frequent, and decoding the full authors/coverage JSON for the
+// entire queue on every poll would be wasted work.
+func (db *DB) ListBookTracking(ctx context.Context) (map[string]BookTracking, error) {
+	rows, err := db.sql.QueryContext(ctx, `SELECT id, source_path, state, status FROM books`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]BookTracking{}
+	for rows.Next() {
+		var tracked BookTracking
+		if err := rows.Scan(&tracked.ID, &tracked.SourcePath, &tracked.State, &tracked.Status); err != nil {
+			return nil, err
+		}
+		out[tracked.SourcePath] = tracked
 	}
 	return out, rows.Err()
 }

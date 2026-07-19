@@ -85,6 +85,19 @@ type ScannedBook struct {
 	Sources map[string]string `json:"sources,omitempty"`
 	// Coverage is the metadata verdict (Available/Known/HasCharacters/HasRecaps).
 	Coverage Coverage `json:"coverage"`
+	// PipelineBook is attached dynamically by the API when this source path is
+	// already persisted. It is intentionally absent from ScanManager/cache state:
+	// queue state changes independently of an expensive filesystem scan.
+	PipelineBook *PipelineBookRef `json:"pipeline_book,omitempty"`
+}
+
+// PipelineBookRef identifies the persisted pipeline book occupying a scanned
+// source path. The Library UI uses it to show the candidate but prevent an
+// enqueue that the books.source_path uniqueness constraint would reject.
+type PipelineBookRef struct {
+	ID     int64  `json:"id"`
+	State  string `json:"state"`
+	Status string `json:"status"`
 }
 
 // ScanProgress is the fine-grained progress of a scan job. The folder walk drives

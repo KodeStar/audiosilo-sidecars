@@ -12,7 +12,14 @@
 
 import { useSyncExternalStore } from 'react';
 import { ApiError, type ApiClient } from '@/lib/apiClient';
-import type { BookCandidate, Coverage, ScanJob, ScannedBook, SetOverrideBody } from '@/api/types';
+import type {
+  BookCandidate,
+  Coverage,
+  PipelineBookRef,
+  ScanJob,
+  ScannedBook,
+  SetOverrideBody,
+} from '@/api/types';
 import { clearedCoverage, overridePayload, summarizeTally, tallyResults } from '@/lib/candidates';
 
 const DEFAULT_POLL_MS = 700;
@@ -40,6 +47,7 @@ export interface ScanState {
 export interface BookPatch {
   hidden?: boolean;
   coverage?: Coverage;
+  pipelineBook?: PipelineBookRef;
 }
 
 // mergeBooks applies the optimistic overlay (keyed by absolute source_path, the
@@ -60,6 +68,7 @@ export function mergeBooks(
       ...b,
       ...(patch.hidden !== undefined ? { hidden: patch.hidden } : {}),
       ...(coverage !== undefined ? { coverage } : {}),
+      ...(patch.pipelineBook !== undefined ? { pipeline_book: patch.pipelineBook } : {}),
       ...(matchedSeries?.name
         ? {
             series: matchedSeries.name,
@@ -176,7 +185,8 @@ export class ScanStore {
 
   toggleOne(path: string, on: boolean): void {
     const next = new Set(this.state.selected);
-    if (on) next.add(path);
+    const tracked = this.state.job?.books.some((b) => b.path === path && b.pipeline_book);
+    if (on && !tracked) next.add(path);
     else next.delete(path);
     this.set({ selected: next });
   }
@@ -185,8 +195,11 @@ export class ScanStore {
   // selectable subset - hidden books are never passed in).
   toggleAll(paths: readonly string[], on: boolean): void {
     const next = new Set(this.state.selected);
+    const trackedPaths = new Set(
+      (this.state.job?.books ?? []).filter((b) => b.pipeline_book).map((b) => b.path),
+    );
     for (const p of paths) {
-      if (on) next.add(p);
+      if (on && !trackedPaths.has(p)) next.add(p);
       else next.delete(p);
     }
     this.set({ selected: next });
@@ -316,7 +329,10 @@ export class ScanStore {
 
   private applyPolledJob(job: ScanJob): void {
     this.rawBooks = job.books ?? [];
-    this.set({ job: { ...job, books: mergeBooks(this.rawBooks, this.patches) } });
+    const books = mergeBooks(this.rawBooks, this.patches);
+    const trackedPaths = new Set(books.filter((b) => b.pipeline_book).map((b) => b.path));
+    const selected = new Set([...this.state.selected].filter((path) => !trackedPaths.has(path)));
+    this.set({ job: { ...job, books }, selected });
   }
 
   private recompute(): void {
@@ -332,6 +348,19 @@ export class ScanStore {
     try {
       const { results } = await client.createBooks(candidates);
       const tally = tallyResults(results);
+      for (const result of results) {
+        if (!result.created || !result.book) continue;
+        const current = this.patches.get(result.source_path) ?? {};
+        this.patches.set(result.source_path, {
+          ...current,
+          pipelineBook: {
+            id: result.book.id,
+            state: result.book.state,
+            status: result.book.status,
+          },
+        });
+      }
+      this.recompute();
       this.set({ processing: false, selected: new Set() });
       if (tally.created > 0) return { started: true };
       this.set({

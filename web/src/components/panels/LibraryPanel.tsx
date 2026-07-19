@@ -79,15 +79,24 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
     [hidden, search],
   );
   const selectedVisible = useMemo(
-    () => visible.filter((b) => selected.has(b.path)),
+    () => visible.filter((b) => !b.pipeline_book && selected.has(b.path)),
     [visible, selected],
   );
+  const selectableVisible = useMemo(() => visible.filter((b) => !b.pipeline_book), [visible]);
+  const satisfiedPaths = useMemo(() => {
+    const paths = new Set(selectedVisible.map((b) => b.path));
+    for (const b of visible) {
+      if (b.pipeline_book) paths.add(b.path);
+    }
+    return paths;
+  }, [visible, selectedVisible]);
   const gapSeries = useMemo(
-    () => seriesGapHint(visible, new Set(selectedVisible.map((b) => b.path))),
-    [visible, selectedVisible],
+    () => seriesGapHint(visible, satisfiedPaths),
+    [visible, satisfiedPaths],
   );
 
-  const allVisibleSelected = visible.length > 0 && visible.every((b) => selected.has(b.path));
+  const allVisibleSelected =
+    selectableVisible.length > 0 && selectableVisible.every((b) => selected.has(b.path));
 
   // Bound once so the memoized CandidateRow only reconciles rows that actually
   // changed across a streaming scan poll (a fresh inline closure would defeat it).
@@ -215,12 +224,13 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
                       checked={allVisibleSelected}
                       onChange={(e) =>
                         scanStore.toggleAll(
-                          visible.map((b) => b.path),
+                          selectableVisible.map((b) => b.path),
                           e.target.checked,
                         )
                       }
+                      disabled={selectableVisible.length === 0}
                       aria-label="Select all visible books"
-                      className="h-4 w-4 accent-pink-600"
+                      className="h-4 w-4 accent-pink-600 disabled:cursor-not-allowed disabled:opacity-40"
                     />
                   </th>
                   <th className="px-3 py-2 font-medium">Book</th>
@@ -235,7 +245,7 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
                   <CandidateRow
                     key={b.path}
                     book={b}
-                    checked={selected.has(b.path)}
+                    checked={!b.pipeline_book && selected.has(b.path)}
                     onToggle={handleToggle}
                     onMatch={setMatchTarget}
                     onClearMatch={handleClearMatch}

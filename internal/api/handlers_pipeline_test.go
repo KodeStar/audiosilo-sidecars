@@ -171,6 +171,85 @@ func TestScanUnknownJob(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestScanMarksBooksAlreadyTrackedByPipeline(t *testing.T) {
+	root := t.TempDir()
+	doneDir := filepath.Join(root, "Author", "Series", "01 - Finished")
+	activeDir := filepath.Join(root, "Author", "Series", "02 - Active")
+	newDir := filepath.Join(root, "Author", "Series", "03 - New")
+	for _, dir := range []string{doneDir, activeDir, newDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "audio.m4b"), []byte("fake"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	canonical := func(path string) string {
+		t.Helper()
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return filepath.Clean(resolved)
+	}
+
+	env := newPipelineEnv(t, []string{root})
+	done, err := env.db.CreateBook(context.Background(), store.NewBook{
+		SourcePath: canonical(doneDir), WorkDir: filepath.Join(t.TempDir(), "done"),
+		Title: "Finished", State: string(state.Done),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := env.db.CreateBook(context.Background(), store.NewBook{
+		SourcePath: canonical(activeDir), WorkDir: filepath.Join(t.TempDir(), "active"),
+		Title: "Active", State: string(state.ASR),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	token := env.login(t)
+	body, _ := json.Marshal(createScanRequest{Path: root})
+	resp := env.do(t, http.MethodPost, "/api/v1/scans", token, string(body))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("create scan = %d, want 202", resp.StatusCode)
+	}
+	var created createScanResponse
+	_ = json.NewDecoder(resp.Body).Decode(&created)
+	resp.Body.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		resp = env.do(t, http.MethodGet, "/api/v1/scans/"+created.JobID, token, "")
+		var job metaops.ScanJob
+		_ = json.NewDecoder(resp.Body).Decode(&job)
+		resp.Body.Close()
+		if job.Status == metaops.ScanError {
+			t.Fatalf("scan errored: %s", job.Error)
+		}
+		if job.Status != metaops.ScanDone {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		byPath := make(map[string]metaops.ScannedBook, len(job.Books))
+		for _, book := range job.Books {
+			byPath[book.SourcePath] = book
+		}
+		if got := byPath[canonical(doneDir)].PipelineBook; got == nil || got.ID != done.ID || got.State != string(state.Done) {
+			t.Fatalf("done pipeline marker = %+v, want book %d done", got, done.ID)
+		}
+		if got := byPath[canonical(activeDir)].PipelineBook; got == nil || got.ID != active.ID || got.State != string(state.ASR) {
+			t.Fatalf("active pipeline marker = %+v, want book %d asr", got, active.ID)
+		}
+		if got := byPath[canonical(newDir)].PipelineBook; got != nil {
+			t.Fatalf("new candidate unexpectedly marked tracked: %+v", got)
+		}
+		return
+	}
+	t.Fatal("scan did not finish")
+}
+
 // TestCreateBooksPersistsNarrators asserts the POST /books candidate's narrators are
 // stored via NewBook (they ride to the contributing stage's core proposal).
 func TestCreateBooksPersistsNarrators(t *testing.T) {

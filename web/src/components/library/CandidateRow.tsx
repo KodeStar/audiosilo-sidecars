@@ -1,6 +1,7 @@
 import { memo } from 'react';
 import type { ScannedBook } from '@/api/types';
 import { isManualMatch, matchProvenanceLabel } from '@/lib/candidates';
+import { stateLabel } from '@/lib/pipelineState';
 import { CoverageBadge } from './CoverageBadge';
 
 interface CandidateRowProps {
@@ -94,8 +95,10 @@ export const CandidateRow = memo(function CandidateRow({
   const chapterText = book.chapters && book.chapters > 0 ? `${book.chapters} ch` : '';
 
   const hidden = !!book.hidden;
+  const pipelineBook = book.pipeline_book;
   const provenance = matchProvenanceLabel(book.coverage);
   const manual = isManualMatch(book.coverage);
+  const pipeline = pipelineBook ? pipelinePresence(pipelineBook.state, pipelineBook.status) : null;
 
   return (
     <tr
@@ -104,17 +107,33 @@ export const CandidateRow = memo(function CandidateRow({
       }
     >
       <td className="px-3 py-3">
-        <input
-          type="checkbox"
-          checked={checked}
-          disabled={hidden}
-          onChange={(e) => onToggle(book.path, e.target.checked)}
-          aria-label={`Select ${book.title}`}
-          className="mt-0.5 h-4 w-4 accent-pink-600 disabled:cursor-not-allowed disabled:opacity-40"
-        />
+        {pipelineBook ? (
+          <span className="text-dim" aria-hidden="true">
+            -
+          </span>
+        ) : (
+          <input
+            type="checkbox"
+            checked={checked}
+            disabled={hidden}
+            onChange={(e) => onToggle(book.path, e.target.checked)}
+            aria-label={`Select ${book.title}`}
+            className="mt-0.5 h-4 w-4 accent-pink-600 disabled:cursor-not-allowed disabled:opacity-40"
+          />
+        )}
       </td>
       <td className="px-3 py-3">
-        <div className="font-medium text-hi">{book.title}</div>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-medium text-hi">{book.title}</span>
+          {pipeline && pipelineBook && (
+            <span
+              className={`inline-flex rounded border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${pipeline.className}`}
+              title={`Pipeline book #${pipelineBook.id}: ${stateLabel(pipelineBook.state)}`}
+            >
+              {pipeline.label}
+            </span>
+          )}
+        </div>
         {book.subtitle && <div className="text-xs text-dim">{book.subtitle}</div>}
         {authors && <div className="text-xs text-body">{authors}</div>}
         <div className="mt-1 flex flex-wrap items-center gap-1.5">
@@ -157,7 +176,7 @@ export const CandidateRow = memo(function CandidateRow({
             )
           ) : (
             <>
-              {onMatch && (
+              {!pipelineBook && onMatch && (
                 <RowButton
                   onClick={() => onMatch(book)}
                   disabled={busy}
@@ -166,7 +185,7 @@ export const CandidateRow = memo(function CandidateRow({
                   Match
                 </RowButton>
               )}
-              {manual && onClearMatch && (
+              {!pipelineBook && manual && onClearMatch && (
                 <RowButton
                   onClick={() => onClearMatch(book)}
                   disabled={busy}
@@ -191,6 +210,34 @@ export const CandidateRow = memo(function CandidateRow({
     </tr>
   );
 });
+
+function pipelinePresence(state: string, status: string): { label: string; className: string } {
+  if (state === 'done') {
+    return { label: 'Completed', className: 'border-success/40 bg-success/10 text-success' };
+  }
+  switch (status) {
+    case 'paused':
+      return {
+        label: 'Paused',
+        className: 'border-amber-500/40 bg-amber-500/10 text-amber-300',
+      };
+    case 'needs_attention':
+      return {
+        label: 'Needs attention',
+        className: 'border-orange-500/40 bg-orange-500/10 text-orange-300',
+      };
+    case 'failed':
+      return {
+        label: 'Failed',
+        className: 'border-pink-500/40 bg-pink-500/10 text-pink-300',
+      };
+    default:
+      return {
+        label: 'In queue',
+        className: 'border-sky-500/40 bg-sky-500/10 text-sky-300',
+      };
+  }
+}
 
 function formatRuntime(minutes: number): string {
   const h = Math.floor(minutes / 60);

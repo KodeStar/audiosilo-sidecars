@@ -476,7 +476,11 @@ internal/
             (running + last 10 finished) so a reloaded UI reattaches. The newest
             successful result is atomically cached under the daemon data dir and
             restored after restart (explicit stale-until-rescanned snapshot;
-            failed/incomplete scans never replace it). Persisted
+            failed/incomplete scans never replace it). GET /scans dynamically
+            joins each candidate's canonical source_path to the store's lightweight
+            BookTracking projection, so cached results always identify active/done
+            pipeline books without baking volatile queue state into the scan cache.
+            Persisted
             candidate_overrides (hide / manual work match, keyed by the CANONICAL
             absolute source_path - scan roots and override paths are resolved via
             the same helper) are applied at scan time and reflected live on
@@ -523,7 +527,10 @@ web/          the SPA: Vite + React 19 + TS + Tailwind v4 (npm, Node 24); dist/ 
               browser back/forward navigation;
               sign-out calls scanStore.reset(). API calls key books by the
               daemon-computed absolute source_path (NEVER a client-side join);
-              the relative path is display/selection only.
+              the relative path is display/selection only. Scan candidates with a
+              pipeline_book match stay visible with an In queue/Completed badge but
+              have no selection or rematch control; select-all skips them, and a
+              successful enqueue patches the row immediately before the next poll.
 scripts/build-web.sh   build the SPA + embed it into bin/ (-tags embedui)
 Dockerfile             multi-stage: node build -> go build (embedui) -> two runtime
                        targets from the SAME shared stages: `runtime` (debian-slim,

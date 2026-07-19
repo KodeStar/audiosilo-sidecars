@@ -240,6 +240,15 @@ export interface ScannedBook {
   // True when the user has hidden this book from the default candidate list (a
   // persisted daemon-side override). Excluded from the default view; re-showable.
   hidden?: boolean;
+  // Present when this exact canonical source_path is already persisted in the
+  // pipeline. Such a row remains visible in Library but cannot be selected again.
+  pipeline_book?: PipelineBookRef;
+}
+
+export interface PipelineBookRef {
+  id: number;
+  state: string;
+  status: string;
 }
 
 // ScanStats is the end-of-scan summary the daemon attaches once status is "done".

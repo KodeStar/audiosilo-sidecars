@@ -448,6 +448,46 @@ describe('ScanStore process', () => {
     expect(outcome).toEqual({ started: false });
     expect(store.getSnapshot().note).toEqual({ kind: 'error', text: '1 already enqueued.' });
   });
+
+  it('immediately marks a newly created scan row as tracked', async () => {
+    const { store } = makeStore();
+    const b1 = scannedBook({ path: '/b1', source_path: '/root/b1' });
+    const client = {
+      createScan: vi.fn().mockResolvedValue({ job_id: 'j1' }),
+      getScan: vi.fn().mockResolvedValue(job({ status: 'done', books: [b1] })),
+      createBooks: vi.fn().mockResolvedValue({
+        results: [
+          {
+            source_path: '/root/b1',
+            created: true,
+            book: { id: 41, state: 'queued', status: '' },
+          },
+        ],
+      }),
+    } as unknown as ApiClient;
+    await store.startScan(client, '/root');
+    await flush();
+
+    await store.process(client, [
+      {
+        source_path: '/root/b1',
+        title: 'x',
+        authors: [],
+        series: '',
+        series_pos: '',
+        asin: '',
+        isbn: '',
+      },
+    ]);
+
+    expect(store.getSnapshot().job?.books[0].pipeline_book).toEqual({
+      id: 41,
+      state: 'queued',
+      status: '',
+    });
+    store.toggleOne('/b1', true);
+    expect(store.getSnapshot().selected.has('/b1')).toBe(false);
+  });
 });
 
 describe('ScanStore selection + preferences', () => {
