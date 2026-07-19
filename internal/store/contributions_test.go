@@ -269,3 +269,21 @@ func TestContributionSummary(t *testing.T) {
 		})
 	}
 }
+
+func TestContributionNeedsAttention(t *testing.T) {
+	if ContributionNeedsAttention(nil) {
+		t.Fatal("empty rows should not need attention")
+	}
+	if ContributionNeedsAttention([]Contribution{{Note: "audit converged after 2 rounds"}}) {
+		t.Fatal("informational audit note should not need attention")
+	}
+	if !ContributionNeedsAttention([]Contribution{{Status: ContribStatusSubmitted, Note: "audit passed; " + ContribNoteIntakePRStale}}) {
+		t.Fatal("stale intake marker should need attention")
+	}
+	if !ContributionNeedsAttention([]Contribution{{Status: ContribStatusSubmitted, Note: ContribNoteLabelsMissingPrefix + " - apply data:recaps"}}) {
+		t.Fatal("missing routing labels should need attention")
+	}
+	if ContributionNeedsAttention([]Contribution{{Status: ContribStatusPROpen, Note: ContribNoteLabelsMissingPrefix}}) {
+		t.Fatal("resolved routing-label note should not need attention after a PR opens")
+	}
+}

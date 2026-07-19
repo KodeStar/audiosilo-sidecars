@@ -236,6 +236,78 @@ func TestPollIssueClosedWithoutMerge(t *testing.T) {
 	}
 }
 
+// --- poller: an open issue that never produces a PR becomes visibly stalled ---
+
+func TestPollIssueWithoutPRMarksAndClearsStaleNote(t *testing.T) {
+	db := openDB(t)
+	b := makeBook(t, db, "Stalled Book", "")
+	created := addRow(t, db, b.ID, store.ContribKindCharacters, store.ContribModeIssue, 12, store.ContribStatusSubmitted)
+	if err := db.SetContributionStatus(context.Background(), created.ID, created.Status, 0, "", "audit passed"); err != nil {
+		t.Fatal(err)
+	}
+
+	var hasPR bool
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pulls") && r.Method == http.MethodGet:
+			if hasPR {
+				io.WriteString(w, `[{"number":22,"html_url":"https://gh/pull/22","state":"open","merged":false}]`)
+			} else {
+				io.WriteString(w, `[]`)
+			}
+		case strings.HasSuffix(r.URL.Path, "/issues/12"):
+			io.WriteString(w, `{"number":12,"html_url":"u","state":"open","labels":[{"name":"data:characters"}]}`)
+		default:
+			http.Error(w, "unexpected "+r.URL.Path, http.StatusInternalServerError)
+		}
+	}))
+	defer gh.Close()
+
+	cap := &capture{}
+	svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, cap, nil, nil)
+	row := getRow(t, db, b.ID, store.ContribKindCharacters)
+	updatedAt, err := time.Parse(time.RFC3339Nano, row.UpdatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An otherwise identical tick inside the grace period changes no persisted
+	// state and emits no accounting event.
+	svc.now = func() time.Time { return updatedAt.Add(intakePRGracePeriod - time.Minute) }
+	svc.Poll(context.Background())
+	row = getRow(t, db, b.ID, store.ContribKindCharacters)
+	if row.Note != "audit passed" || len(cap.all()) != 0 {
+		t.Fatalf("fresh row = %+v, publishes = %d", row, len(cap.all()))
+	}
+
+	// The first stale tick adds one actionable note without losing the audit note.
+	svc.now = func() time.Time { return updatedAt.Add(intakePRGracePeriod + time.Minute) }
+	svc.Poll(context.Background())
+	row = getRow(t, db, b.ID, store.ContribKindCharacters)
+	if row.Status != store.ContribStatusSubmitted || row.Note != "audit passed; "+store.ContribNoteIntakePRStale {
+		t.Fatalf("stale row = %+v", row)
+	}
+	if len(cap.all()) != 1 {
+		t.Fatalf("stale tick publishes = %d, want 1", len(cap.all()))
+	}
+
+	// A steady stale tick is deduplicated.
+	svc.Poll(context.Background())
+	if len(cap.all()) != 1 {
+		t.Fatalf("repeat stale tick publishes = %d, want 1", len(cap.all()))
+	}
+
+	// Once the intake PR appears, the warning clears and the original note remains.
+	hasPR = true
+	svc.Poll(context.Background())
+	row = getRow(t, db, b.ID, store.ContribKindCharacters)
+	if row.Status != store.ContribStatusPROpen || row.PRNumber != 22 || row.Note != "audit passed" {
+		t.Fatalf("recovered row = %+v", row)
+	}
+	if len(cap.all()) != 2 {
+		t.Fatalf("recovery tick publishes = %d, want 2", len(cap.all()))
+	}
+}
+
 // --- poller: core merged -> slug extracted, work_id set, book re-admitted ---
 
 func TestPollCoreMergedResolvesSlug(t *testing.T) {

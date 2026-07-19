@@ -286,8 +286,9 @@ type bookView struct {
 
 // contributionSummaryView is the aggregate contribution chip on a bookView.
 type contributionSummaryView struct {
-	Status string `json:"status"`
-	URL    string `json:"url,omitempty"`
+	Status    string `json:"status"`
+	URL       string `json:"url,omitempty"`
+	Attention bool   `json:"attention,omitempty"`
 }
 
 // bookDetail adds the per-execution stage-run ledger and the full contribution rows.
@@ -361,7 +362,9 @@ func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64
 	}
 	var contribution *contributionSummaryView
 	if status, url := store.ContributionSummary(contribRows); status != "" {
-		contribution = &contributionSummaryView{Status: status, URL: url}
+		contribution = &contributionSummaryView{
+			Status: status, URL: url, Attention: store.ContributionNeedsAttention(contribRows),
+		}
 	}
 	current, completed, remaining := 0, 0, 0
 	for _, p := range progress {

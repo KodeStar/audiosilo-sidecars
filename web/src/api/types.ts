@@ -382,6 +382,7 @@ export type ContributionStatus =
 export interface ContributionSummary {
   status: string;
   url: string;
+  attention?: boolean;
 }
 
 // ContributionRow is one per-kind contribution record from the book detail view.
@@ -711,8 +712,9 @@ export interface EtaUpdateEvent {
 }
 
 // ContributionUpdateEvent is the `contrib.update` SSE frame (M7): published by the
-// contributing stage after a submission and by the intake poller on every status
-// change. The Done tab refetches on it so the contribution chip stays live.
+// contributing stage after a submission and by the intake poller on every row
+// change, including actionable-note changes. The Done tab refetches on it so the
+// contribution chip stays live.
 export interface ContributionUpdateEvent {
   book_id: number;
   kind: string;

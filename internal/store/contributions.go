@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 )
 
 // Contribution kind values (which artifact this row tracks). characters/recaps are
@@ -14,6 +15,16 @@ const (
 	ContribKindRecaps     = "recaps"
 	ContribKindCore       = "core"
 )
+
+// ContribNoteIntakePRStale is appended by the poller when an issue-mode
+// contribution remains open without producing its intake PR past the normal
+// workflow window. The API uses the marker to give the aggregate Done-board chip
+// an attention state while preserving the truthful submitted lifecycle status.
+const ContribNoteIntakePRStale = "intake PR overdue - review the GitHub issue"
+
+// ContribNoteLabelsMissingPrefix identifies the actionable note recorded when
+// GitHub drops the requested routing label from a newly created intake issue.
+const ContribNoteLabelsMissingPrefix = "labels missing"
 
 // Contribution mode values (how the artifact was contributed). Mirrors
 // config.ContributionConfig.Mode.
@@ -243,6 +254,18 @@ func ContributionSummary(rows []Contribution) (status, url string) {
 	}
 	// all local, or any mixed remainder: least-committal chip.
 	return ContribStatusLocal, ""
+}
+
+// ContributionNeedsAttention reports whether any contribution row carries a
+// machine-recognized actionable note. Informational audit notes stay neutral.
+func ContributionNeedsAttention(rows []Contribution) bool {
+	for _, row := range rows {
+		if row.Status == ContribStatusSubmitted &&
+			(strings.Contains(row.Note, ContribNoteIntakePRStale) || strings.Contains(row.Note, ContribNoteLabelsMissingPrefix)) {
+			return true
+		}
+	}
+	return false
 }
 
 // contribURL picks a row's most relevant link: the intake/PR url when present, else

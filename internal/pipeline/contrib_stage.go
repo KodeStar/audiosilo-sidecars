@@ -437,7 +437,7 @@ func (e *Executor) submitIssue(ctx context.Context, book store.Book, slug string
 		note := ""
 		if got, gerr := cli.GetIssue(ctx, e.contribRepo, issue.Number); gerr == nil {
 			if !labelStuck(got.Labels, routingLabel(a.kind)) {
-				note = fmt.Sprintf("labels missing - a maintainer must apply %s for intake to run", routingLabel(a.kind))
+				note = fmt.Sprintf("%s - a maintainer must apply %s for intake to run", store.ContribNoteLabelsMissingPrefix, routingLabel(a.kind))
 			}
 		}
 		if err := e.upsertRow(ctx, book.ID, a.kind, store.ContribModeIssue, issue.Number, issue.URL, store.ContribStatusSubmitted, joinNotes(note, auditNote)); err != nil {

@@ -16,12 +16,17 @@ import (
 // non-positive.
 const defaultPollInterval = 10 * time.Minute
 
+// intakePRGracePeriod gives the metadata intake workflow ample time to start,
+// compose, and open its PR before an issue-without-PR is surfaced as stalled.
+const intakePRGracePeriod = 30 * time.Minute
+
 // rowTarget is the lifecycle state a poll tick wants to write onto a contribution
-// row: the new status plus the discovered intake-PR pointer (issue mode).
+// row: the new status, note, and discovered intake-PR pointer (issue mode).
 type rowTarget struct {
 	status   string
 	prNumber int
 	prURL    string
+	note     string
 }
 
 // RunPoller polls the upstream repo for open-contribution and core-pending state
@@ -112,10 +117,10 @@ func (s *Service) advanceRow(ctx context.Context, cli *Client, row store.Contrib
 	if err != nil {
 		return err
 	}
-	if target.status == row.Status && target.prNumber == row.PRNumber && target.prURL == row.PRURL {
+	if target.status == row.Status && target.prNumber == row.PRNumber && target.prURL == row.PRURL && target.note == row.Note {
 		return nil // steady state: no persist, no publish
 	}
-	if err := s.deps.DB.SetContributionStatus(ctx, row.ID, target.status, target.prNumber, target.prURL, row.Note); err != nil {
+	if err := s.deps.DB.SetContributionStatus(ctx, row.ID, target.status, target.prNumber, target.prURL, target.note); err != nil {
 		return err
 	}
 	url := target.prURL
@@ -136,23 +141,27 @@ func (s *Service) pollIssueMode(ctx context.Context, cli *Client, row store.Cont
 			return rowTarget{}, err
 		}
 		if found {
-			return prTarget(pr.Number, pr.URL, pr), nil
+			return prTarget(pr.Number, pr.URL, pr, withoutStaleIntakeNote(row.Note)), nil
 		}
 		issue, err := cli.GetIssue(ctx, row.Repo, row.Number)
 		if err != nil {
 			return rowTarget{}, err
 		}
 		if issue.State == "closed" {
-			return rowTarget{status: store.ContribStatusClosed}, nil
+			return rowTarget{status: store.ContribStatusClosed, note: withoutStaleIntakeNote(row.Note)}, nil
 		}
-		return rowTarget{status: row.Status}, nil // still open, no PR yet
+		note := row.Note
+		if issueWithoutPRStale(row.UpdatedAt, s.now()) {
+			note = withStaleIntakeNote(note)
+		}
+		return rowTarget{status: row.Status, note: note}, nil // still open, no PR yet
 	}
 	// The intake PR is already known: track its merge/close.
 	pr, err := cli.GetPull(ctx, row.Repo, row.PRNumber)
 	if err != nil {
 		return rowTarget{}, err
 	}
-	return prTarget(row.PRNumber, prURLOr(pr.URL, row.PRURL), pr), nil
+	return prTarget(row.PRNumber, prURLOr(pr.URL, row.PRURL), pr, withoutStaleIntakeNote(row.Note)), nil
 }
 
 // pollPRMode advances a pr-mode row (a direct sidecar PR): the row's own number is
@@ -163,19 +172,43 @@ func (s *Service) pollPRMode(ctx context.Context, cli *Client, row store.Contrib
 	if err != nil {
 		return rowTarget{}, err
 	}
-	return prTarget(0, "", pr), nil
+	return prTarget(0, "", pr, row.Note), nil
+}
+
+func issueWithoutPRStale(lastUpdatedAt string, now time.Time) bool {
+	lastUpdated, err := time.Parse(time.RFC3339Nano, lastUpdatedAt)
+	return err == nil && !now.Before(lastUpdated.Add(intakePRGracePeriod))
+}
+
+func withStaleIntakeNote(note string) string {
+	if strings.Contains(note, store.ContribNoteIntakePRStale) {
+		return note
+	}
+	if strings.TrimSpace(note) == "" {
+		return store.ContribNoteIntakePRStale
+	}
+	return note + "; " + store.ContribNoteIntakePRStale
+}
+
+func withoutStaleIntakeNote(note string) string {
+	note = strings.ReplaceAll(note, "; "+store.ContribNoteIntakePRStale, "")
+	note = strings.ReplaceAll(note, store.ContribNoteIntakePRStale+"; ", "")
+	if note == store.ContribNoteIntakePRStale {
+		return ""
+	}
+	return note
 }
 
 // prTarget maps a PR's merge/close state to a rowTarget, carrying the given intake
 // PR pointer (number/url).
-func prTarget(prNumber int, prURL string, pr PR) rowTarget {
+func prTarget(prNumber int, prURL string, pr PR, note string) rowTarget {
 	switch {
 	case pr.Merged:
-		return rowTarget{status: store.ContribStatusMerged, prNumber: prNumber, prURL: prURL}
+		return rowTarget{status: store.ContribStatusMerged, prNumber: prNumber, prURL: prURL, note: note}
 	case pr.State == "closed":
-		return rowTarget{status: store.ContribStatusClosed, prNumber: prNumber, prURL: prURL}
+		return rowTarget{status: store.ContribStatusClosed, prNumber: prNumber, prURL: prURL, note: note}
 	default:
-		return rowTarget{status: store.ContribStatusPROpen, prNumber: prNumber, prURL: prURL}
+		return rowTarget{status: store.ContribStatusPROpen, prNumber: prNumber, prURL: prURL, note: note}
 	}
 }
 

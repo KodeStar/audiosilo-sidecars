@@ -149,6 +149,13 @@ describe('contributionChip', () => {
       url: 'https://x/i/1',
       attention: false,
     });
+    expect(
+      contributionChip({ status: 'submitted', url: 'https://x/i/1', attention: true }),
+    ).toEqual({
+      label: 'Issue stalled',
+      url: 'https://x/i/1',
+      attention: true,
+    });
     expect(contributionChip({ status: 'pr_open', url: 'https://x/p/2' })).toEqual({
       label: 'PR open',
       url: 'https://x/p/2',

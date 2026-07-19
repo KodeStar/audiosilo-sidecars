@@ -349,4 +349,29 @@ func TestBookViewContributionAggregate(t *testing.T) {
 	if len(detail.Contributions) != 1 || detail.Contributions[0].Number != 7 {
 		t.Fatalf("detail rows = %+v", detail.Contributions)
 	}
+
+	// An actionable row note also raises attention on the aggregate Done-board chip.
+	rows, err := env.db.ListContributionsByBook(context.Background(), b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("stored contribution rows = %d, want 1", len(rows))
+	}
+	row := rows[0]
+	if err := env.db.SetContributionStatus(context.Background(), row.ID, row.Status, row.PRNumber, row.PRURL, store.ContribNoteIntakePRStale); err != nil {
+		t.Fatal(err)
+	}
+	resp = env.do(t, http.MethodGet, "/api/v1/books", token, "")
+	_ = json.NewDecoder(resp.Body).Decode(&list)
+	resp.Body.Close()
+	found = nil
+	for i := range list.Books {
+		if list.Books[i].ID == b.ID {
+			found = &list.Books[i]
+		}
+	}
+	if found == nil || found.Contribution == nil || !found.Contribution.Attention {
+		t.Fatalf("stalled aggregate should need attention: %+v", found)
+	}
 }

@@ -77,13 +77,17 @@ export interface ContributionChip {
 
 // contributionChip maps a book's aggregate contribution summary to its chip. An
 // absent summary (a book with no contribution rows) and any unrecognized status
-// both read as the legacy "Local only" chip with no link. Only a `closed` status
-// carries the attention tint (a contribution that will not land without help).
+// both read as the legacy "Local only" chip with no link. A `closed` contribution
+// or a submitted issue carrying an actionable intake note gets the attention tint.
 export function contributionChip(summary: ContributionSummary | undefined): ContributionChip {
   const url = summary?.url ? summary.url : null;
   switch (summary?.status) {
     case 'submitted':
-      return { label: 'Issue open', url, attention: false };
+      return {
+        label: summary.attention ? 'Issue stalled' : 'Issue open',
+        url,
+        attention: summary.attention === true,
+      };
     case 'pr_open':
       return { label: 'PR open', url, attention: false };
     case 'merged':

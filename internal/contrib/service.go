@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kodestar/audiosilo-meta/pkg/model"
 
@@ -24,7 +25,8 @@ var ErrInvalidSlug = errors.New("contrib: invalid work id")
 var ErrWorkNotFound = errors.New("contrib: work not found upstream")
 
 // ContribUpdate is the SSE `contrib.update` payload published on every
-// contribution row change (by the poller) and on a core submit. The server
+// contribution row change, including actionable-note changes (by the poller),
+// and on a core submit. The server
 // marshals it through the event hub; contrib itself never imports events.
 type ContribUpdate struct {
 	BookID int64  `json:"book_id"`
@@ -77,6 +79,7 @@ type TokenResolver interface {
 // endpoint and the intake poller.
 type Service struct {
 	deps ServiceDeps
+	now  func() time.Time // clock seam for age-based poller decisions
 
 	// mu guards bookLocks; bookLocks holds one mutex per book id so concurrent
 	// SubmitCore calls for the SAME book serialize (opening exactly one intake issue),
@@ -87,7 +90,7 @@ type Service struct {
 
 // NewService constructs a Service from its dependencies.
 func NewService(deps ServiceDeps) *Service {
-	return &Service{deps: deps, bookLocks: make(map[int64]*sync.Mutex)}
+	return &Service{deps: deps, now: time.Now, bookLocks: make(map[int64]*sync.Mutex)}
 }
 
 // bookLock returns the per-book mutex, creating it on first use.
