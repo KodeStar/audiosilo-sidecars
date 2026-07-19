@@ -117,6 +117,41 @@ func inspectMarkers(ctx context.Context, bookFile, workDir, ffprobePath string) 
 		return Manifest{}, false, err
 	}
 
+	m, contig := markerManifestFromProbe(bookFile, meta)
+	if err := WriteManifest(workDir, m); err != nil {
+		return Manifest{}, false, err
+	}
+	return m, contig, nil
+}
+
+// ReparseMarkerManifest rebuilds an already-inspected marker manifest from its
+// durable probe.json using the current marker parser. It is the upgrade recovery
+// path for books inspected by an older parser that discarded a now-supported
+// marker style: marker normalization can recover deterministically without another
+// ffprobe call or an agent guessing a manifest schema.
+func ReparseMarkerManifest(workDir string, draft Manifest) (Manifest, bool, error) {
+	if draft.Style != StyleMarkers {
+		return Manifest{}, false, fmt.Errorf("cannot reparse non-marker manifest style %q", draft.Style)
+	}
+	raw, err := os.ReadFile(filepath.Join(workDir, ProbeName)) //nolint:gosec // workDir is the book's managed scratch directory
+	if err != nil {
+		return Manifest{}, false, fmt.Errorf("read %s: %w", ProbeName, err)
+	}
+	var meta probeMeta
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return Manifest{}, false, fmt.Errorf("parse %s: %w", ProbeName, err)
+	}
+	m, contig := markerManifestFromProbe(draft.Source, meta)
+	if draft.Title != "" {
+		m.Title = draft.Title
+	}
+	if err := WriteManifest(workDir, m); err != nil {
+		return Manifest{}, false, err
+	}
+	return m, contig, nil
+}
+
+func markerManifestFromProbe(source string, meta probeMeta) (Manifest, bool) {
 	var chapters []Chapter
 	for _, ch := range meta.Chapters {
 		num, title, ok := chapterFromMarker(ch.Tags["title"])
@@ -138,17 +173,14 @@ func inspectMarkers(ctx context.Context, bookFile, workDir, ffprobePath string) 
 	// sends the book to markers_normalizing before split, which never runs on a draft.
 	contig := contiguous(chapters)
 	m := Manifest{
-		Source:       bookFile,
+		Source:       source,
 		Title:        meta.Format.Tags["title"],
 		Style:        StyleMarkers,
 		Duration:     parseFloat(meta.Format.Duration),
 		ChapterCount: len(chapters),
 		Chapters:     chapters,
 	}
-	if err := WriteManifest(workDir, m); err != nil {
-		return Manifest{}, false, err
-	}
-	return m, contig, nil
+	return m, contig
 }
 
 // inspectFiles builds a synthesized-chapter manifest for a multi-file book: one

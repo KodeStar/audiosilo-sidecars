@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -553,6 +554,37 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, r sche
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("markers_normalizing: read manifest (inspect must run first): %w", err)
 	}
+	// Upgrade recovery: an older parser may have written an empty marker draft even
+	// though probe.json contains a fully explicit chapter sequence. Reparse with the
+	// current deterministic rules before paying an agent to reconstruct it. When the
+	// result is contiguous, this stage is complete without any model invocation.
+	if draft.Style == audio.StyleMarkers && len(draft.Chapters) == 0 {
+		started := time.Now()
+		rebuilt, contiguous, reparseErr := audio.ReparseMarkerManifest(book.WorkDir, draft)
+		if reparseErr != nil {
+			return scheduler.StageResult{}, fmt.Errorf("markers_normalizing: deterministic probe reparse: %w", reparseErr)
+		}
+		draft = rebuilt
+		if contiguous {
+			if e.db != nil {
+				_ = e.db.SetBookChapters(context.WithoutCancel(ctx), book.ID, draft.ChapterCount)
+				_ = e.db.SetBookDuration(context.WithoutCancel(ctx), book.ID, draft.Duration)
+			}
+			if r.Note != nil {
+				r.Note(fmt.Sprintf("deterministic marker reparse recovered %s", countNoun(draft.ChapterCount, "chapter")))
+			}
+			if r.Progress != nil {
+				r.Progress(1, 1)
+			}
+			result := scheduler.StageResult{Metrics: metrics(map[string]any{
+				"chapter_count": draft.ChapterCount, "deterministic_reparse": true,
+			}), RateSample: rateSample(1, time.Since(started).Seconds())}
+			if err := scheduler.WriteSentinel(book.WorkDir, string(state.MarkersNormalizing), result); err != nil {
+				return scheduler.StageResult{}, err
+			}
+			return result, nil
+		}
+	}
 	if r.Note != nil {
 		r.Note(fmt.Sprintf("normalizing markers over %s", countNoun(draft.ChapterCount, "chapter")))
 	}
@@ -643,8 +675,17 @@ func validateMarkersManifest(outDir string, draft audio.Manifest, inputPaths map
 		return fmt.Errorf("out/manifest.json: %v", err)
 	}
 	var m audio.Manifest
-	if err := json.Unmarshal(raw, &m); err != nil {
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&m); err != nil {
 		return fmt.Errorf("out/manifest.json is not valid manifest JSON: %v", err)
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("additional JSON value")
+		}
+		return fmt.Errorf("out/manifest.json has trailing content: %v", err)
 	}
 	if m.Style != draft.Style {
 		return fmt.Errorf("style changed from %q to %q - you may not change the recording layout", draft.Style, m.Style)

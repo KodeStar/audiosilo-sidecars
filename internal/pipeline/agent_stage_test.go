@@ -95,6 +95,64 @@ func TestMarkersNormalizeHappyPath(t *testing.T) {
 	}
 }
 
+func TestMarkersNormalizeEmptyLegacyDraftReparsesProbeWithoutAgent(t *testing.T) {
+	work := t.TempDir()
+	probe := `{
+		"format":{"duration":"180.000","tags":{"title":"Mageling"}},
+		"chapters":[
+			{"start_time":"0.000","end_time":"10.000","tags":{"title":"Opening Credits"}},
+			{"start_time":"10.000","end_time":"90.000","tags":{"title":"Chapter: 1 – New Beginnings"}},
+			{"start_time":"90.000","end_time":"170.000","tags":{"title":"Chapter: 2 — The Road"}},
+			{"start_time":"170.000","end_time":"180.000","tags":{"title":"End Credits"}}
+		]
+	}`
+	if err := os.WriteFile(filepath.Join(work, audio.ProbeName), []byte(probe), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+	writeManifestStruct(t, work, audio.Manifest{Source: "/books/mageling.m4b", Title: "Mageling", Style: audio.StyleMarkers, Duration: 180})
+
+	fake := newFakeRunner()
+	fake.act = func(_ *fakeRunner, _ agent.Request, _ int) (agent.Result, error) {
+		t.Fatal("deterministically reparsable markers must not invoke an agent")
+		return agent.Result{}, nil
+	}
+	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Mageling", WorkDir: work}, state.MarkersNormalizing, scheduler.StageReport{})
+	if err != nil {
+		t.Fatalf("markers_normalize: %v", err)
+	}
+	if fake.count(string(state.MarkersNormalizing)) != 0 {
+		t.Fatalf("agent ran %d times, want zero", fake.count(string(state.MarkersNormalizing)))
+	}
+	m, err := audio.ReadManifest(work)
+	if err != nil || !audio.Contiguous(m.Chapters) || m.ChapterCount != 2 {
+		t.Fatalf("recovered manifest = %+v err=%v", m, err)
+	}
+	if !scheduler.SentinelExists(work, string(state.MarkersNormalizing)) {
+		t.Fatal("markers sentinel missing")
+	}
+	var metrics map[string]any
+	if err := json.Unmarshal(res.Metrics, &metrics); err != nil || metrics["deterministic_reparse"] != true {
+		t.Fatalf("metrics = %s err=%v", res.Metrics, err)
+	}
+}
+
+func TestValidateMarkersManifestRejectsNumberAliasExplicitly(t *testing.T) {
+	out := t.TempDir()
+	raw := `{
+		"source":"/x/book.m4b","style":"markers","duration":2,"chapter_count":1,
+		"chapters":[{"number":1,"start":0,"end":2,"duration":2}]
+	}`
+	if err := os.WriteFile(filepath.Join(out, audio.ManifestName), []byte(raw), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+	draft := audio.Manifest{Source: "/x/book.m4b", Style: audio.StyleMarkers, Duration: 2}
+	err := validateMarkersManifest(out, draft, nil)
+	if err == nil || !strings.Contains(err.Error(), `unknown field "number"`) {
+		t.Fatalf("validation error = %v, want explicit unknown number field", err)
+	}
+}
+
 // TestAgentStageRateSampleExcludesBackoff drives markers_normalizing through a
 // rate-limit backoff (first attempt rate-limited, second succeeds) with a short
 // injected backoff, and asserts the reported RateSample charges only productive agent

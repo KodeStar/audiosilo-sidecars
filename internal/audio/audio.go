@@ -82,7 +82,10 @@ func IsAudio(name string) bool {
 // "Chapter N. Title", "Chapter N - Title" (hyphen), and the bare "N. Title" form.
 // Credits ("Opening Credits" / "End Credits") match none and are excluded.
 var (
-	reChapterMarker = regexp.MustCompile(`(?i)^Chapter\s+(\d+)(?:\s*[.:-]\s*(.*))?$`)
+	// Some Audible-style M4Bs use "Chapter: 1 – Title": a separator appears
+	// between the word Chapter and its number, and a Unicode dash separates the
+	// title. Accept that alongside the older "Chapter 1: Title" forms.
+	reChapterMarker = regexp.MustCompile(`(?i)^Chapter(?:\s*:\s*|\s+)(\d+)(?:\s*[.:\-–—]\s*(.*))?$`)
 	reNumberDot     = regexp.MustCompile(`^(\d+)\.\s*(.*)$`)
 )
 

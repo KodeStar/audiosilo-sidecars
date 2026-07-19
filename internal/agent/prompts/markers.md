@@ -63,4 +63,29 @@ for a human, which is correct.
    unchanged. The chapter numbers must be unique, ordered, and contiguous, and every
    interval must have start < end and sit within the recording duration.
 
+The manifest schema is exactly:
+
+```json
+{
+  "source": "unchanged source path",
+  "title": "unchanged recording title",
+  "style": "markers",
+  "duration": 123.456,
+  "chapter_count": 2,
+  "chapters": [
+    {
+      "chapter": 1,
+      "title": "optional logical title",
+      "marker_title": "optional original marker label",
+      "start": 0.0,
+      "end": 60.0,
+      "duration": 60.0
+    }
+  ]
+}
+```
+
+The logical-number field is named `chapter`. Never use `number` or `id`, and do
+not copy ffprobe's raw chapter-object shape into the manifest.
+
 Write `reason` in your own words; use hyphens, never em dashes.

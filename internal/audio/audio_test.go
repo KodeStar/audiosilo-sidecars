@@ -30,9 +30,11 @@ func TestChapterFromMarker(t *testing.T) {
 		{"Chapter 7 - The Hyphen", 7, "The Hyphen", true}, // hyphen style
 		{"Chapter 12", 12, "", true},                      // no title
 		{"chapter 3: lowercase", 3, "lowercase", true},    // case-insensitive
-		{"Chapter One", 1, "", true},                      // word-number marker
-		{"Chapter Twenty One", 21, "", true},              // compound word number
-		{"Chapter Fifty-Four", 54, "", true},              // hyphenated word number
+		{"Chapter: 1 – New Beginnings", 1, "New Beginnings", true},
+		{"Chapter: 2 — The Caravanner’s Guild", 2, "The Caravanner’s Guild", true},
+		{"Chapter One", 1, "", true},         // word-number marker
+		{"Chapter Twenty One", 21, "", true}, // compound word number
+		{"Chapter Fifty-Four", 54, "", true}, // hyphenated word number
 		{"Chapter One Hundred and Two: Return", 102, "Return", true},
 		{"Chapter Forty Seven - The Gate", 47, "The Gate", true},
 		{"Chapter Seventy-One – Knowing the Risks", 71, "Knowing the Risks", true},
@@ -74,6 +76,38 @@ func TestContiguous(t *testing.T) {
 		if got := contiguous(c.chs); got != c.want {
 			t.Errorf("%s: contiguous = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+func TestReparseMarkerManifestRecoversColonBeforeNumber(t *testing.T) {
+	work := t.TempDir()
+	probe := `{
+		"format":{"duration":"180.000","tags":{"title":"Mageling"}},
+		"chapters":[
+			{"start_time":"0.000","end_time":"10.000","tags":{"title":"Opening Credits"}},
+			{"start_time":"10.000","end_time":"90.000","tags":{"title":"Chapter: 1 – New Beginnings"}},
+			{"start_time":"90.000","end_time":"170.000","tags":{"title":"Chapter: 2 — The Road"}},
+			{"start_time":"170.000","end_time":"180.000","tags":{"title":"End Credits"}}
+		]
+	}`
+	if err := os.WriteFile(filepath.Join(work, ProbeName), []byte(probe), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+	draft := Manifest{Source: "/books/mageling.m4b", Title: "Mageling", Style: StyleMarkers, Duration: 180}
+
+	m, contiguous, err := ReparseMarkerManifest(work, draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contiguous || m.ChapterCount != 2 || len(m.Chapters) != 2 {
+		t.Fatalf("reparsed manifest = %+v contiguous=%v, want two contiguous chapters", m, contiguous)
+	}
+	if m.Chapters[0].Chapter != 1 || m.Chapters[0].Title != "New Beginnings" || m.Chapters[1].Chapter != 2 {
+		t.Fatalf("reparsed chapters = %+v", m.Chapters)
+	}
+	stored, err := ReadManifest(work)
+	if err != nil || stored.ChapterCount != 2 {
+		t.Fatalf("stored manifest = %+v err=%v", stored, err)
 	}
 }
 
