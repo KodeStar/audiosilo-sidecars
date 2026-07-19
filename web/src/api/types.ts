@@ -435,6 +435,9 @@ export interface BookView {
   timing?: BookTiming;
   active_agent_invocations?: number;
   max_agents_per_book?: number;
+  // Earlier unfinished book currently holding this book's series lock. Present
+  // only while this unparked book is waiting to start an agent stage.
+  series_blocked_by?: SeriesBlocker;
   fanout_supported?: boolean;
   current_work_units?: number;
   completed_work_units?: number;
@@ -454,6 +457,12 @@ export interface BookView {
   contribution?: ContributionSummary;
   created_at: string;
   updated_at: string;
+}
+
+export interface SeriesBlocker {
+  book_id: number;
+  title: string;
+  series_pos?: string;
 }
 
 export interface BookTiming {
@@ -676,6 +685,9 @@ export interface QueueStatsEvent {
   agent_invocations_active?: number;
   agent_invocation_capacity?: number;
   agent_invocations_by_book?: Record<string, number>;
+  // Live scheduler-derived blocker map, keyed by the waiting book id. An empty
+  // map clears blockers after the earlier book reaches Ready.
+  series_blocked_by?: Record<string, SeriesBlocker>;
   mechanical_active: number;
   queued: number;
 }

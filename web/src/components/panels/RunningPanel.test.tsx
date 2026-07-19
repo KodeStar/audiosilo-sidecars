@@ -311,6 +311,54 @@ describe('RunningPanel stage timeline', () => {
   });
 });
 
+describe('RunningPanel series waiting state', () => {
+  it('shows the scheduler blocker and clears it from a live queue update', async () => {
+    const client = fakeClient([
+      bk({
+        id: 1,
+        title: 'Matched Saga One',
+        series: 'Matched Saga',
+        series_pos: '1',
+        state: 'fact_pass',
+        lane: 'agent',
+        active_agent_invocations: 1,
+      }),
+      bk({
+        id: 2,
+        title: 'Matched Saga Two',
+        series: 'Matched Saga',
+        series_pos: '2',
+        state: 'spelling_research',
+        lane: 'agent',
+        series_blocked_by: { book_id: 1, title: 'Matched Saga One', series_pos: '1' },
+      }),
+    ]);
+    render(<RunningPanel client={client} apiBase="" token="tok" />);
+
+    expect(
+      await screen.findByText('Waiting for earlier series book: Matched Saga One #1'),
+    ).toBeInTheDocument();
+
+    act(() => {
+      currentES?.emit('queue.stats', {
+        asr_active: 0,
+        agent_active: 1,
+        agent_invocations_by_book: { '2': 1 },
+        series_blocked_by: {},
+        mechanical_active: 0,
+        queued: 1,
+      });
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.queryByText('Waiting for earlier series book: Matched Saga One #1'),
+      ).not.toBeInTheDocument(),
+    );
+    expect(screen.getByText('1 active agent invocation')).toBeInTheDocument();
+  });
+});
+
 describe('RunningPanel eta.update', () => {
   it('patches each row ETA and shows the queue ETA in the strip', async () => {
     const client = fakeClient([bk({ id: 1, state: 'asr' })]);

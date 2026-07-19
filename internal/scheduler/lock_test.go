@@ -2,9 +2,11 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
+	"github.com/kodestar/audiosilo-sidecars/internal/events"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
@@ -29,6 +31,69 @@ func TestLockHoldersSeriesOrdering(t *testing.T) {
 	h = lockHolders(books)
 	if h[1] || !h[2] {
 		t.Fatalf("after pos1 ready, holders = %v, want only book 2", h)
+	}
+}
+
+func TestSeriesBlockersReportsOnlyAgentBooksActuallyWaiting(t *testing.T) {
+	books := []store.Book{
+		{ID: 1, Title: "Saga One", Series: "Saga", SeriesPos: "1", State: string(state.FactPass)},
+		{ID: 2, Title: "Saga Two", Series: "Saga", SeriesPos: "2", State: string(state.SpellingResearch)},
+		// ASR is allowed to run ahead and therefore must not be labelled series-blocked.
+		{ID: 3, Title: "Saga Three", Series: "Saga", SeriesPos: "3", State: string(state.ASR)},
+		// A paused agent-stage book is not waiting until it is resumed.
+		{ID: 4, Title: "Saga Four", Series: "Saga", SeriesPos: "4", State: string(state.SpellingResearch), Status: string(state.StatusPaused)},
+		{ID: 5, Title: "Other One", Series: "Other", SeriesPos: "1", State: string(state.SpellingResearch)},
+	}
+
+	blocked := SeriesBlockers(books)
+	if len(blocked) != 1 {
+		t.Fatalf("blockers = %+v, want only Saga Two", blocked)
+	}
+	if got := blocked[2]; got.BookID != 1 || got.Title != "Saga One" || got.SeriesPos != "1" {
+		t.Fatalf("Saga Two blocker = %+v", got)
+	}
+
+	// Once the predecessor reaches Ready it releases the lock and Saga Two becomes
+	// the owner, so it must disappear from the waiting map immediately.
+	books[0].State = string(state.Ready)
+	if got := SeriesBlockers(books); len(got) != 0 {
+		t.Fatalf("blockers after predecessor ready = %+v, want none", got)
+	}
+}
+
+func TestQueueStatsPublishesAndClearsSeriesBlockers(t *testing.T) {
+	hub := events.NewHub(8)
+	_, sub := hub.Subscribe(0)
+	defer sub.Close()
+	s := &Scheduler{hub: hub, agentCap: 2}
+	books := []store.Book{
+		{ID: 1, Title: "Saga One", Series: "Saga", SeriesPos: "1", State: string(state.FactPass)},
+		{ID: 2, Title: "Saga Two", Series: "Saga", SeriesPos: "2", State: string(state.SpellingResearch)},
+	}
+	decode := func() map[string]SeriesBlocker {
+		t.Helper()
+		ev := <-sub.C
+		if ev.Type != "queue.stats" {
+			t.Fatalf("event type = %q", ev.Type)
+		}
+		var payload struct {
+			SeriesBlockedBy map[string]SeriesBlocker `json:"series_blocked_by"`
+		}
+		if err := json.Unmarshal(ev.Data, &payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload.SeriesBlockedBy
+	}
+
+	s.publishQueueStats(books, map[state.Lane]int{})
+	if got := decode()["2"]; got.BookID != 1 || got.Title != "Saga One" {
+		t.Fatalf("published blocker = %+v", got)
+	}
+
+	books[0].State = string(state.Ready)
+	s.publishQueueStats(books, map[state.Lane]int{})
+	if got := decode(); len(got) != 0 {
+		t.Fatalf("published blockers after release = %+v, want empty", got)
 	}
 }
 

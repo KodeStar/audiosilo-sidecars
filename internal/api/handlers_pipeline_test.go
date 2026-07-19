@@ -21,6 +21,7 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/pipeline"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/secrets"
+	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
 
@@ -334,6 +335,57 @@ func TestBookControlEndpoints(t *testing.T) {
 		r.Body.Close()
 	} else {
 		r.Body.Close()
+	}
+}
+
+func TestBookViewsExposeSeriesBlocker(t *testing.T) {
+	env := newPipelineEnv(t, nil)
+	token := env.login(t)
+	ctx := context.Background()
+	makeBook := func(title, pos string) store.Book {
+		b, err := env.db.CreateBook(ctx, store.NewBook{
+			SourcePath: "/b/" + pos,
+			WorkDir:    filepath.Join(t.TempDir(), pos),
+			Title:      title,
+			Series:     "Matched Saga",
+			SeriesPos:  pos,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := env.db.SetBookState(ctx, b.ID, string(state.SpellingResearch), "", "", ""); err != nil {
+			t.Fatal(err)
+		}
+		b.State = string(state.SpellingResearch)
+		return b
+	}
+	first := makeBook("Matched Saga One", "1")
+	second := makeBook("Matched Saga Two", "2")
+
+	resp := env.do(t, http.MethodGet, "/api/v1/books", token, "")
+	var listed listBooksResponse
+	_ = json.NewDecoder(resp.Body).Decode(&listed)
+	resp.Body.Close()
+	var secondView *bookView
+	for i := range listed.Books {
+		if listed.Books[i].ID == second.ID {
+			secondView = &listed.Books[i]
+		}
+	}
+	if secondView == nil || secondView.SeriesBlockedBy == nil {
+		t.Fatalf("second book blocker missing: %+v", secondView)
+	}
+	if got := secondView.SeriesBlockedBy; got.BookID != first.ID || got.Title != first.Title || got.SeriesPos != "1" {
+		t.Fatalf("second book blocker = %+v", got)
+	}
+
+	// The single-book detail view carries the same scheduler-derived explanation.
+	resp = env.do(t, http.MethodGet, "/api/v1/books/"+strconv.FormatInt(second.ID, 10), token, "")
+	var detail bookDetail
+	_ = json.NewDecoder(resp.Body).Decode(&detail)
+	resp.Body.Close()
+	if detail.SeriesBlockedBy == nil || detail.SeriesBlockedBy.BookID != first.ID {
+		t.Fatalf("detail blocker = %+v", detail.SeriesBlockedBy)
 	}
 }
 

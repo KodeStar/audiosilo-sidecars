@@ -159,6 +159,15 @@ export const BookRow = memo(function BookRow({
                 {badge.label}
               </span>
             )}
+            {book.series_blocked_by && (
+              <span
+                className="inline-flex items-center rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300"
+                title={`${book.series_blocked_by.title} must reach Ready before this agent stage can start.`}
+              >
+                Waiting for earlier series book: {book.series_blocked_by.title}
+                {book.series_blocked_by.series_pos ? ` #${book.series_blocked_by.series_pos}` : ''}
+              </span>
+            )}
             {stageProgress && (
               <span className="text-[11px] text-dim">
                 {stageProgress.done}/{stageProgress.total}

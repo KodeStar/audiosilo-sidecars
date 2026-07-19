@@ -154,12 +154,19 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
         // Invocation occupancy changes more often than book state. Fold the
         // daemon-wide map into each row so the per-book fan-out indicator stays
         // live without polling or one request per book.
-        if (ev.agent_invocations_by_book) {
+        if (ev.agent_invocations_by_book || ev.series_blocked_by) {
           setBooks(
             (prev) =>
               prev?.map((book) => ({
                 ...book,
-                active_agent_invocations: ev.agent_invocations_by_book?.[String(book.id)] ?? 0,
+                ...(ev.agent_invocations_by_book
+                  ? {
+                      active_agent_invocations: ev.agent_invocations_by_book[String(book.id)] ?? 0,
+                    }
+                  : {}),
+                ...(ev.series_blocked_by
+                  ? { series_blocked_by: ev.series_blocked_by[String(book.id)] }
+                  : {}),
               })) ?? prev,
           );
         }

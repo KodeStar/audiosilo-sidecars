@@ -95,6 +95,7 @@ type Scheduler struct {
 type queueStats struct {
 	asr, agent, invocations, invocationCap, mech, queued int
 	invocationsByBook                                    string
+	seriesBlockedBy                                      string
 }
 
 type agentInvocationRuntime interface {
@@ -708,13 +709,59 @@ func (s *Scheduler) autoReadmitDue(ctx context.Context) {
 // runs show how often a predecessor gets stuck.
 func lockHolders(books []store.Book) map[int64]bool {
 	holders := map[int64]bool{}
-	best := map[string]store.Book{}
+	best := seriesLockOwners(books)
 	for _, b := range books {
 		if !state.HoldsSeriesLock(state.State(b.State)) {
 			continue // finished for lock purposes (ready or beyond)
 		}
 		if strings.TrimSpace(b.Series) == "" {
 			holders[b.ID] = true
+		}
+	}
+	for _, b := range best {
+		holders[b.ID] = true
+	}
+	return holders
+}
+
+// SeriesBlocker describes the earlier unfinished book currently holding a later
+// book's series lock. It is served to the UI so a queued agent-stage card can say
+// exactly why it is waiting instead of looking like a second active worker.
+type SeriesBlocker struct {
+	BookID    int64  `json:"book_id"`
+	Title     string `json:"title"`
+	SeriesPos string `json:"series_pos,omitempty"`
+}
+
+// SeriesBlockers returns only books that are presently waiting at an agent stage
+// because another book owns their series lock. Non-agent stages still run through
+// their independent lanes, and paused/parked/failed books are not described as
+// waiting until the user re-admits them.
+func SeriesBlockers(books []store.Book) map[int64]SeriesBlocker {
+	owners := seriesLockOwners(books)
+	blocked := map[int64]SeriesBlocker{}
+	for _, b := range books {
+		if b.Status != "" || !state.IsAgent(state.State(b.State)) || strings.TrimSpace(b.Series) == "" {
+			continue
+		}
+		owner, ok := owners[b.Series]
+		if !ok || owner.ID == b.ID {
+			continue
+		}
+		blocked[b.ID] = SeriesBlocker{
+			BookID: owner.ID, Title: owner.Title, SeriesPos: owner.SeriesPos,
+		}
+	}
+	return blocked
+}
+
+// seriesLockOwners returns the lowest-position unfinished book in each named
+// series. lockHolders and SeriesBlockers share it so display truth cannot drift
+// from dispatch truth.
+func seriesLockOwners(books []store.Book) map[string]store.Book {
+	best := map[string]store.Book{}
+	for _, b := range books {
+		if !state.HoldsSeriesLock(state.State(b.State)) || strings.TrimSpace(b.Series) == "" {
 			continue
 		}
 		cur, ok := best[b.Series]
@@ -722,10 +769,7 @@ func lockHolders(books []store.Book) map[int64]bool {
 			best[b.Series] = b
 		}
 	}
-	for _, b := range best {
-		holders[b.ID] = true
-	}
-	return holders
+	return best
 }
 
 // seriesLess orders two books of the same series by numeric position, then id. It
@@ -776,12 +820,15 @@ func (s *Scheduler) publishQueueStats(books []store.Book, counts map[state.Lane]
 		invocations, perBook, invocationCap = runtime.AgentInvocationRuntime()
 	}
 	perBookJSON, _ := json.Marshal(perBook) // int-key map is emitted in stable key order
+	seriesBlockedBy := SeriesBlockers(books)
+	seriesBlockedJSON, _ := json.Marshal(seriesBlockedBy)
 	next := queueStats{
 		asr:               counts[state.LaneASR],
 		agent:             counts[state.LaneAgent],
 		invocations:       invocations,
 		invocationCap:     invocationCap,
 		invocationsByBook: string(perBookJSON),
+		seriesBlockedBy:   string(seriesBlockedJSON),
 		mech:              counts[state.LaneMechanical],
 		queued:            queued,
 	}
@@ -797,6 +844,7 @@ func (s *Scheduler) publishQueueStats(books []store.Book, counts map[state.Lane]
 		"agent_invocations_active":  next.invocations,
 		"agent_invocation_capacity": next.invocationCap,
 		"agent_invocations_by_book": perBook,
+		"series_blocked_by":         seriesBlockedBy,
 		"mechanical_active":         next.mech,
 		"queued":                    next.queued,
 	})

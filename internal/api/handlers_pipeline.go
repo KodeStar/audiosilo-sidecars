@@ -243,11 +243,14 @@ type bookView struct {
 	Timing                 store.BookTiming `json:"timing"`
 	ActiveAgentInvocations int              `json:"active_agent_invocations"`
 	MaxAgentsPerBook       int              `json:"max_agents_per_book"`
-	FanoutSupported        bool             `json:"fanout_supported"`
-	CurrentWorkUnits       int              `json:"current_work_units,omitempty"`
-	CompletedWorkUnits     int              `json:"completed_work_units,omitempty"`
-	RemainingWorkUnits     int              `json:"remaining_work_units,omitempty"`
-	Progress               []store.Progress `json:"progress"`
+	// SeriesBlockedBy identifies the earlier unfinished series book holding this
+	// book's agent-stage lock. Nil means this book is not series-blocked now.
+	SeriesBlockedBy    *scheduler.SeriesBlocker `json:"series_blocked_by,omitempty"`
+	FanoutSupported    bool                     `json:"fanout_supported"`
+	CurrentWorkUnits   int                      `json:"current_work_units,omitempty"`
+	CompletedWorkUnits int                      `json:"completed_work_units,omitempty"`
+	RemainingWorkUnits int                      `json:"remaining_work_units,omitempty"`
+	Progress           []store.Progress         `json:"progress"`
 	// ScratchBytes is the current on-disk size of the book's work dir (chapters +
 	// durables), so the UI can show disk usage and offer a purge. 0 when the work
 	// dir does not exist yet (or was purged).
@@ -293,7 +296,13 @@ func (a *API) bookToView(ctx context.Context, b store.Book, contribRows []store.
 	startedAt, _, _ := a.store.FirstStageRunStart(ctx, b.ID)
 	timing, _ := a.store.BookTiming(ctx, b.ID)
 	activeInvocations, _ := a.store.ActiveAgentInvocationCount(ctx, b.ID)
-	return buildBookView(b, progress, totalCost, startedAt, a.bookETA(b.ID), contribRows, timing, activeInvocations, a.snapshot().Agent.Capacity().MaxAgentsPerBook)
+	var blocker *scheduler.SeriesBlocker
+	if books, err := a.store.ListBooks(ctx); err == nil {
+		if value, ok := scheduler.SeriesBlockers(books)[b.ID]; ok {
+			blocker = &value
+		}
+	}
+	return buildBookView(b, progress, totalCost, startedAt, a.bookETA(b.ID), contribRows, timing, activeInvocations, a.snapshot().Agent.Capacity().MaxAgentsPerBook, blocker)
 }
 
 // bookETA reads a book's latest ETA from the scheduler (never computed here). It
@@ -324,7 +333,7 @@ func (a *API) bookETASnapshot() map[int64]int64 {
 // summed agent cost, earliest stage-run start, and ETA seconds, normalizing the
 // always-present JSON fields. scratch_bytes is served from the persisted column
 // (written by the split stage / PurgeScratch), so no read walks the work dir.
-func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64, startedAt string, etaSeconds int64, contribRows []store.Contribution, timing store.BookTiming, activeInvocations, maxAgentsPerBook int) bookView {
+func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64, startedAt string, etaSeconds int64, contribRows []store.Contribution, timing store.BookTiming, activeInvocations, maxAgentsPerBook int, seriesBlockedBy *scheduler.SeriesBlocker) bookView {
 	authors := b.Authors
 	if authors == nil {
 		authors = []string{}
@@ -354,7 +363,7 @@ func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64
 		State: b.State, Lane: string(state.LaneOf(state.State(b.State))),
 		Status: b.Status, Error: b.Error, ParkCode: b.ParkCode, RetryAt: b.RetryAt, Coverage: b.Coverage,
 		ETASeconds: etaSeconds, StartedAt: startedAt,
-		Timing: timing, ActiveAgentInvocations: activeInvocations, MaxAgentsPerBook: maxAgentsPerBook, FanoutSupported: state.SupportsAgentFanout(state.State(b.State)),
+		Timing: timing, ActiveAgentInvocations: activeInvocations, MaxAgentsPerBook: maxAgentsPerBook, SeriesBlockedBy: seriesBlockedBy, FanoutSupported: state.SupportsAgentFanout(state.State(b.State)),
 		CurrentWorkUnits: current, CompletedWorkUnits: completed, RemainingWorkUnits: remaining,
 		Progress: progress, ScratchBytes: b.ScratchBytes, DurationSec: b.DurationSec,
 		TotalCostUSD: totalCostUSD, Contribution: contribution,
@@ -409,11 +418,16 @@ func (a *API) handleListBooks(w http.ResponseWriter, r *http.Request) {
 	}
 	// One ETA snapshot for the whole list (a single scheduler lock, not one per book).
 	etaByBook := a.bookETASnapshot()
+	seriesBlockedBy := scheduler.SeriesBlockers(books)
 	maxAgentsPerBook := a.snapshot().Agent.Capacity().MaxAgentsPerBook
 	views := make([]bookView, 0, len(books))
 	for _, b := range books {
+		var blocker *scheduler.SeriesBlocker
+		if value, ok := seriesBlockedBy[b.ID]; ok {
+			blocker = &value
+		}
 		views = append(views, buildBookView(b, progressByBook[b.ID], costByBook[b.ID],
-			startsByBook[b.ID], etaByBook[b.ID], contribByBook[b.ID], timingsByBook[b.ID], activeByBook[b.ID], maxAgentsPerBook))
+			startsByBook[b.ID], etaByBook[b.ID], contribByBook[b.ID], timingsByBook[b.ID], activeByBook[b.ID], maxAgentsPerBook, blocker))
 	}
 	writeJSON(w, http.StatusOK, listBooksResponse{Books: views})
 }
