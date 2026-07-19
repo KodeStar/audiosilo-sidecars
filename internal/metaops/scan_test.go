@@ -393,6 +393,126 @@ func TestScanManagerRunnerError(t *testing.T) {
 	}
 }
 
+func TestScanManagerRestoresLatestSuccessfulScan(t *testing.T) {
+	root := t.TempDir()
+	cachePath := filepath.Join(t.TempDir(), "library-scan-cache.json")
+	m := NewScanManager(context.Background(), NewClient(""), "", nil, WithScanCache(cachePath))
+	m.scan = fakeScan([]metascan.Book{{
+		Path: "Author/Book", Title: "Cached Book", Series: "Cached Saga",
+		SeriesPosition: "2", AudioFiles: 1,
+	}}, metascan.Stats{Books: 1})
+
+	id, err := m.Start(root)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	want := waitDone(t, m, id)
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(cachePath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("completed scan cache was not written")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	restored := NewScanManager(context.Background(), NewClient(""), "", nil, WithScanCache(cachePath))
+	list := restored.List()
+	if len(list) != 1 || list[0].ID != id || list[0].Status != ScanDone {
+		t.Fatalf("restored summaries = %+v", list)
+	}
+	got, ok := restored.Get(id)
+	if !ok {
+		t.Fatal("restored scan is not addressable by its original id")
+	}
+	if got.Path != want.Path || len(got.Books) != 1 || got.Books[0].Title != "Cached Book" {
+		t.Fatalf("restored scan = %+v, want %+v", got, want)
+	}
+	if got.Progress.Phase != "done" || got.Progress.CoverageDone != 1 || got.Progress.CoverageTotal != 1 {
+		t.Fatalf("restored progress = %+v", got.Progress)
+	}
+	if got.Stats == nil || got.Stats.Books != 1 {
+		t.Fatalf("restored stats = %+v", got.Stats)
+	}
+}
+
+func TestScanManagerCacheTracksLiveOverrides(t *testing.T) {
+	root := t.TempDir()
+	cachePath := filepath.Join(t.TempDir(), "library-scan-cache.json")
+	m := NewScanManager(context.Background(), NewClient(""), "", nil, WithScanCache(cachePath))
+	m.scan = fakeScan([]metascan.Book{{Path: "Author/Book", Title: "Book", AudioFiles: 1}}, metascan.Stats{Books: 1})
+	id, err := m.Start(root)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	job := waitDone(t, m, id)
+	sourcePath := job.Books[0].SourcePath
+	manual := Coverage{
+		Available: true, Known: true, MatchedBy: "manual", WorkID: "cached-work",
+		Series: &SeriesRef{Name: "Cached Saga", Position: "4"},
+	}
+	m.ApplyOverride(sourcePath, true, &manual)
+
+	restored := NewScanManager(context.Background(), NewClient(""), "", nil, WithScanCache(cachePath))
+	got, ok := restored.Get(id)
+	if !ok || len(got.Books) != 1 || !got.Books[0].Hidden {
+		t.Fatalf("restored live hide = %+v (ok=%v)", got.Books, ok)
+	}
+	if got.Books[0].Coverage.WorkID != "cached-work" || got.Books[0].Series != "Cached Saga" {
+		t.Fatalf("restored live match = %+v", got.Books[0])
+	}
+
+	// A full-state unhide remains authoritative even though the cached snapshot
+	// recorded the book as hidden.
+	restored.ApplyOverride(sourcePath, false, nil)
+	got, _ = restored.Get(id)
+	if got.Books[0].Hidden {
+		t.Fatalf("unhide did not supersede cached hidden state: %+v", got.Books[0])
+	}
+}
+
+func TestScanManagerFailedScanDoesNotReplaceSuccessfulCache(t *testing.T) {
+	root := t.TempDir()
+	cachePath := filepath.Join(t.TempDir(), "library-scan-cache.json")
+	m := NewScanManager(context.Background(), NewClient(""), "", nil, WithScanCache(cachePath))
+	m.scan = fakeScan([]metascan.Book{{Path: "good", Title: "Good", AudioFiles: 1}}, metascan.Stats{Books: 1})
+	goodID, err := m.Start(root)
+	if err != nil {
+		t.Fatalf("Start(success): %v", err)
+	}
+	waitDone(t, m, goodID)
+
+	m.scan = func(string, metascan.Options) (*metascan.Result, metascan.Stats, error) {
+		return nil, metascan.Stats{}, fmt.Errorf("later failure")
+	}
+	failedID, err := m.Start(root)
+	if err != nil {
+		t.Fatalf("Start(failure): %v", err)
+	}
+	if failed := waitDone(t, m, failedID); failed.Status != ScanError {
+		t.Fatalf("failed scan = %+v", failed)
+	}
+
+	restored := NewScanManager(context.Background(), NewClient(""), "", nil, WithScanCache(cachePath))
+	got := restored.List()
+	if len(got) != 1 || got[0].ID != goodID {
+		t.Fatalf("failed scan displaced successful cache: %+v", got)
+	}
+}
+
+func TestScanManagerIgnoresInvalidCache(t *testing.T) {
+	cachePath := filepath.Join(t.TempDir(), "library-scan-cache.json")
+	if err := os.WriteFile(cachePath, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewScanManager(context.Background(), NewClient(""), "", nil, WithScanCache(cachePath))
+	if got := m.List(); len(got) != 0 {
+		t.Fatalf("invalid cache restored jobs: %+v", got)
+	}
+}
+
 func TestScanManagerRejectsBadPath(t *testing.T) {
 	m := NewScanManager(context.Background(), NewClient(""), "", nil)
 	if _, err := m.Start(filepath.Join(t.TempDir(), "nope")); err == nil {

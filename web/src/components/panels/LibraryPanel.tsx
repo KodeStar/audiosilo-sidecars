@@ -367,10 +367,15 @@ function ScanProgressLine({ job }: { job: ScanJob }) {
 
   const count = job.books.length;
   return (
-    <p className="text-sm text-dim">
-      Scanned {count} book{count === 1 ? '' : 's'} under{' '}
-      <span className="font-mono text-body">{job.path}</span>.
-    </p>
+    <div className="text-sm text-dim">
+      <p>
+        Scanned {count} book{count === 1 ? '' : 's'} under{' '}
+        <span className="font-mono text-body">{job.path}</span>.
+      </p>
+      <p className="mt-1 text-xs">
+        This result is cached across daemon restarts. Scan again after changing files.
+      </p>
+    </div>
   );
 }
 

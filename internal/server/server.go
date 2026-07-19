@@ -184,7 +184,8 @@ func Run(ctx context.Context, opts Options) error {
 		}
 		return out, nil
 	}
-	scanMgr := metaops.NewScanManager(ctx, metaClient, tools.FFprobe, overrideSrc)
+	scanMgr := metaops.NewScanManager(ctx, metaClient, tools.FFprobe, overrideSrc,
+		metaops.WithScanCache(filepath.Join(opts.DataDir, "library-scan-cache.json")))
 	workRoot := filepath.Join(opts.DataDir, "work")
 	// One GitHub token source shared by the contributing stage (executor) and the
 	// core-submit/poller service - both resolve the same PAT-then-`gh auth token`

@@ -471,7 +471,10 @@ internal/
             sorted final list replaces the array), coverage resolves in a bounded
             pool gated by precomputed identity fingerprints (a stale worker can
             never clobber a fresh verdict), and List() serves job summaries
-            (running + last 10 finished) so a reloaded UI reattaches. Persisted
+            (running + last 10 finished) so a reloaded UI reattaches. The newest
+            successful result is atomically cached under the daemon data dir and
+            restored after restart (explicit stale-until-rescanned snapshot;
+            failed/incomplete scans never replace it). Persisted
             candidate_overrides (hide / manual work match, keyed by the CANONICAL
             absolute source_path - scan roots and override paths are resolved via
             the same helper) are applied at scan time and reflected live on
@@ -500,7 +503,7 @@ internal/
   server/   http.Server wiring, graceful shutdown, the startup banner
 web/          the SPA: Vite + React 19 + TS + Tailwind v4 (npm, Node 24); dist/ is embedded
               src/lib/ holds pure, vitest-tested logic (apiClient, candidates, books,
-              pipelineState, recentRoots, useEventStream, scanStore; M6 added timeline,
+              pipelineState, recentRoots, tabNavigation, useEventStream, scanStore; M6 added timeline,
               duration, bookLog, parkReasons, doneBoard, time, useLazyDetail, and
               expressive.ts - VENDORED from audiosilo-meta site/src/lib/expressive.ts
               with its tests, keep it tracking upstream; M7 added coreProposal,
@@ -514,6 +517,8 @@ web/          the SPA: Vite + React 19 + TS + Tailwind v4 (npm, Node 24); dist/ 
               scanStore.ts - a module-level external store (useSyncExternalStore)
               owning the 700ms poll loop, so tab switches (AppShell unmounts
               panels) and reloads (GET /scans reattach) never lose a running scan;
+              `?tab=<id>` is the refresh-safe/deep-linkable active tab and follows
+              browser back/forward navigation;
               sign-out calls scanStore.reset(). API calls key books by the
               daemon-computed absolute source_path (NEVER a client-side join);
               the relative path is display/selection only.

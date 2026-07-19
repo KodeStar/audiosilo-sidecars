@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import type { ApiClient } from '@/lib/apiClient';
 import type { SystemInfo } from '@/api/types';
 import { useEventStream } from '@/lib/useEventStream';
+import { readTabFromURL, resolveTab, writeTabToURL } from '@/lib/tabNavigation';
 import { Header } from './Header';
 import { TabBar } from './TabBar';
 import { LibraryPanel } from './panels/LibraryPanel';
@@ -30,9 +31,9 @@ export function AppShell({ client, apiBase, token, onSignOut }: AppShellProps) {
       .then((info) => {
         if (cancelled) return;
         setSystem(info);
-        // Default to the first "ready" tab, else the first tab.
-        const ready = info.tabs.find((t) => t.status === 'ready');
-        setActive((ready ?? info.tabs[0])?.id ?? 'settings');
+        const next = resolveTab(info.tabs, readTabFromURL());
+        setActive(next);
+        writeTabToURL(next, 'replace');
       })
       .catch(() => {
         // A 401 is handled by the client's onAuthError (bounces to login).
@@ -42,6 +43,19 @@ export function AppShell({ client, apiBase, token, onSignOut }: AppShellProps) {
       cancelled = true;
     };
   }, [client]);
+
+  useEffect(() => {
+    if (!system) return;
+    const handlePopState = () => setActive(resolveTab(system.tabs, readTabFromURL()));
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [system]);
+
+  function selectTab(id: string) {
+    if (id === active) return;
+    setActive(id);
+    writeTabToURL(id, 'push');
+  }
 
   async function handleSignOut() {
     setSigningOut(true);
@@ -58,13 +72,13 @@ export function AppShell({ client, apiBase, token, onSignOut }: AppShellProps) {
   return (
     <div className="flex min-h-screen flex-col">
       <Header stream={stream} onSignOut={handleSignOut} signingOut={signingOut} />
-      {tabs.length > 0 && <TabBar tabs={tabs} active={active} onSelect={setActive} />}
+      {tabs.length > 0 && <TabBar tabs={tabs} active={active} onSelect={selectTab} />}
       <main className="mx-auto w-full max-w-4xl flex-1 p-6">
         {renderPanel(active, {
           client,
           apiBase,
           token,
-          goToRunning: () => setActive('running'),
+          goToRunning: () => selectTab('running'),
         })}
       </main>
       {system && (

@@ -84,6 +84,12 @@ npm run dev        # Vite dev server; proxies /api to 127.0.0.1:8090
 Run the daemon (`./bin/audiosilo-sidecars serve`) alongside `npm run dev` and the
 SPA proxies API/SSE calls to it.
 
+The Library page caches its latest successful folder-scan result in the daemon
+data directory, so a daemon restart can restore the book list without walking the
+library again. It is a snapshot: run **Scan** after changing files. UI tabs are
+deep-linkable and refresh-safe with `?tab=library`, `?tab=running`,
+`?tab=done`, or `?tab=settings`.
+
 ### Docker
 
 Use a published image (see **Install**) or build locally:

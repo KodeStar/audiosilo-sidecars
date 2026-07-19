@@ -199,14 +199,17 @@ type overridePatch struct {
 	coverage *Coverage // non-nil for a manual match
 }
 
-// ScanManager runs and tracks folder-scan jobs. Results are held in memory (a
-// large folder can take a while due to ffprobe), keyed by job id.
+// ScanManager runs and tracks folder-scan jobs, keyed by job id. Jobs are held in
+// memory; when configured, the newest successful result is also restored from an
+// on-disk snapshot because a large folder can take a while to walk and ffprobe.
 type ScanManager struct {
 	ctx         context.Context //nolint:containedctx // daemon-lifetime ctx for background jobs
 	client      *Client
 	ffprobePath string
 	overrides   OverrideLookup // may be nil (no persisted overrides)
 	scan        scanFunc       // defaults to metascan.Scan
+	cachePath   string         // optional completed-scan snapshot (empty disables persistence)
+	cacheMu     sync.Mutex     // serializes atomic cache writes
 
 	mu      sync.Mutex
 	seq     int64
@@ -214,12 +217,24 @@ type ScanManager struct {
 	patches map[string]overridePatch // path -> live override patch
 }
 
+// ScanManagerOption customizes scan persistence without making tests and
+// embedders provide a cache path when they only need in-memory jobs.
+type ScanManagerOption func(*ScanManager)
+
+// WithScanCache persists the most recent successful scan at path and restores it
+// when the manager is recreated. The cache is a stale-until-rescanned snapshot:
+// it avoids another filesystem walk after a daemon restart but never claims to
+// watch the library for changes.
+func WithScanCache(path string) ScanManagerOption {
+	return func(m *ScanManager) { m.cachePath = strings.TrimSpace(path) }
+}
+
 // NewScanManager returns a manager whose background jobs live under ctx (the
 // daemon lifetime). client resolves coverage; ffprobePath enriches runtimes
 // ("" disables enrichment); overrides supplies persisted hide/manual-match state
 // (nil = none).
-func NewScanManager(ctx context.Context, client *Client, ffprobePath string, overrides OverrideLookup) *ScanManager {
-	return &ScanManager{
+func NewScanManager(ctx context.Context, client *Client, ffprobePath string, overrides OverrideLookup, opts ...ScanManagerOption) *ScanManager {
+	m := &ScanManager{
 		ctx:         ctx,
 		client:      client,
 		ffprobePath: ffprobePath,
@@ -228,6 +243,11 @@ func NewScanManager(ctx context.Context, client *Client, ffprobePath string, ove
 		jobs:        map[string]*scanJob{},
 		patches:     map[string]overridePatch{},
 	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	m.restoreCache()
+	return m
 }
 
 // newJobID returns a random hex job id.
@@ -310,17 +330,15 @@ func (m *ScanManager) List() []ScanJobSummary {
 
 // ApplyOverride reflects a just-persisted override on the in-memory jobs at read
 // time: matching books (by source path) show the new hidden flag and, for a
-// manual match, the resolved coverage. Clearing an override (hidden=false and
-// cov=nil) drops the patch. Cheap - it stores one map entry consulted per book at
-// snapshot time - so a completed job reflects the change on the next poll.
+// manual match, the resolved coverage. The full desired hidden state is retained
+// even when false so an unhide can override a cached scan that recorded the book
+// as hidden. Cheap - it stores one map entry consulted per book at snapshot time
+// - so a completed job reflects the change on the next poll.
 func (m *ScanManager) ApplyOverride(sourcePath string, hidden bool, cov *Coverage) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if !hidden && cov == nil {
-		delete(m.patches, sourcePath)
-		return
-	}
 	m.patches[sourcePath] = overridePatch{hidden: hidden, coverage: cov}
+	m.mu.Unlock()
+	m.persistCache()
 }
 
 // pruneLocked drops finished jobs beyond retainedFinished (newest kept), keeping
@@ -495,7 +513,6 @@ func (m *ScanManager) finishError(id, msg string) {
 
 func (m *ScanManager) finishDone(id string, stats metascan.Stats) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if job, ok := m.jobs[id]; ok {
 		job.status = ScanDone
 		job.phase = "done"
@@ -503,6 +520,8 @@ func (m *ScanManager) finishDone(id string, stats metascan.Stats) {
 		job.stats = &st
 	}
 	m.pruneLocked()
+	m.mu.Unlock()
+	m.persistCache()
 }
 
 // snapshotLocked builds a serialize-safe ScanJob: it deep-copies the book list,
