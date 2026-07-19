@@ -380,3 +380,33 @@ func TestArtifactStatusIgnoresDoneBookSplitSentinelRemovedByPurge(t *testing.T) 
 		t.Fatalf("intentional done-book purge reported as incident: %+v", statuses)
 	}
 }
+
+func TestArtifactStatusIgnoresSentinelRemovedForCurrentStageRerun(t *testing.T) {
+	// The scheduler deliberately removes a stage's old sentinel when a loop enters
+	// that stage again. A prior successful audit therefore has no auditing sentinel
+	// while the fresh audit is queued/running; that is expected, not corruption.
+	ok := true
+	work := t.TempDir()
+	runs := []store.StageRun{
+		{ID: 408, Stage: "auditing", FinishedAt: "2026-07-19T09:50:07Z", Ok: &ok},
+		{ID: 411, Stage: "auditing", StartedAt: "2026-07-19T09:52:25Z"},
+	}
+	statuses := artifactStatuses(store.Book{State: "auditing", WorkDir: work}, runs)
+	if len(statuses) != 0 {
+		t.Fatalf("current audit rerun reported its intentionally absent sentinel: %+v", statuses)
+	}
+}
+
+func TestArtifactStatusStillChecksCompletedEarlierStagesDuringRerun(t *testing.T) {
+	// Skipping current-stage history must not suppress validation of genuinely
+	// completed prerequisites. With no files present, validating remains invalid.
+	ok := true
+	runs := []store.StageRun{
+		{ID: 410, Stage: "validating", FinishedAt: "2026-07-19T09:52:25Z", Ok: &ok},
+		{ID: 411, Stage: "auditing", StartedAt: "2026-07-19T09:52:25Z"},
+	}
+	statuses := artifactStatuses(store.Book{State: "auditing", WorkDir: t.TempDir()}, runs)
+	if len(statuses) != 2 || statuses[0].Stage != "validating" || statuses[0].Valid || statuses[1].Valid {
+		t.Fatalf("completed prerequisite statuses = %+v", statuses)
+	}
+}

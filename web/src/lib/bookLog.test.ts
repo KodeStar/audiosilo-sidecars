@@ -78,6 +78,23 @@ describe('formatLogEvent', () => {
       'stage.note',
     );
   });
+
+  it('renders a supervisor decision with its action and concrete evidence', () => {
+    expect(
+      formatLogEvent(
+        ev({
+          type: 'supervisor.decision',
+          payload: {
+            diagnosis: 'required artifact is missing',
+            selected_action: 'park_escalate',
+            evidence: ['_done/auditing.json', 'no such file'],
+          },
+        }),
+      ),
+    ).toBe(
+      'supervisor: required artifact is missing -> park_escalate; evidence: _done/auditing.json; no such file',
+    );
+  });
 });
 
 describe('fetchAllEvents', () => {

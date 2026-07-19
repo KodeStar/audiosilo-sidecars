@@ -18,6 +18,10 @@ function num(v: unknown): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
 
+function strings(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((item): item is string => typeof item === 'string') : [];
+}
+
 // formatLogEvent renders a one-line summary for a logged event. Recognized types
 // (book.state, stage.progress) get a human phrasing; anything else falls back to
 // the raw event type so an unknown/new event is still shown.
@@ -45,6 +49,15 @@ export function formatLogEvent(ev: LoggedEvent): string {
       if (!msg) return ev.type;
       if (!stage || msg.startsWith(`${stage}:`)) return msg;
       return `${stage}: ${msg}`;
+    }
+    case 'supervisor.decision': {
+      const diagnosis = str(p.diagnosis) || 'no diagnosis supplied';
+      const action = str(p.selected_action);
+      const evidence = strings(p.evidence);
+      let out = `supervisor: ${diagnosis}`;
+      if (action) out += ` -> ${action}`;
+      if (evidence.length > 0) out += `; evidence: ${evidence.join('; ')}`;
+      return out;
     }
     default:
       return ev.type;

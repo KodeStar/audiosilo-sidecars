@@ -338,6 +338,7 @@ export function RunningPanel({ client, apiBase, token }: RunningPanelProps) {
               modelSupervisorEnabled={
                 !!(supervisorStatus?.model_assisted && supervisorStatus.model_available)
               }
+              supervisorIncident={incidents.find((incident) => incident.book_id === b.id)}
             />
           ))}
         </div>

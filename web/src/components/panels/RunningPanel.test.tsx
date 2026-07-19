@@ -219,6 +219,72 @@ describe('RunningPanel supervisor', () => {
     expect(costs).toHaveBeenCalledWith('batch-current');
   });
 
+  it('shows the parked book supervisor diagnosis, action outcome, and evidence', async () => {
+    const book = bk({
+      id: 4,
+      batch_id: 'legacy',
+      title: 'Matched Saga Two',
+      state: 'auditing',
+      lane: 'agent',
+      status: 'needs_attention',
+      park_code: 'supervisor_escalated',
+      error: 'supervisor parked this book for operator review',
+    });
+    const client = fakeClient([book], {
+      supervisorStatus: vi.fn().mockResolvedValue({
+        state: 'monitoring',
+        enabled: true,
+        automatic_actions: true,
+        model_assisted: false,
+        model_available: false,
+        allow_backend_failover: false,
+        runtime: { active_books: {}, agent_active: 0, agent_capacity: 2, eligible_agent_books: 0 },
+      }),
+      supervisorIncidents: vi.fn().mockResolvedValue({
+        incidents: [
+          {
+            id: 11,
+            batch_id: 'legacy',
+            book_id: 4,
+            stage_run_id: 408,
+            trigger: 'health_tick',
+            diagnosis: 'required artifact or completion sentinel is missing or invalid',
+            confidence: 1,
+            evidence: ['_done/auditing.json', 'no such file or directory'],
+            decision: 'artifact_invalid',
+            selected_action: 'park_escalate',
+            suggested_retry_limit: 3,
+            suggested_termination_limit: 1,
+            action_outcome: 'book parked and escalated',
+            automatic: true,
+            approval_required: true,
+            state: 'completed',
+            model_calls: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            provider_cost_complete: false,
+            estimate_complete: false,
+            started_at: '2026-07-19T09:52:42Z',
+          },
+        ],
+      }),
+      supervisorCosts: vi.fn().mockResolvedValue(null),
+    });
+
+    render(<RunningPanel client={client} apiBase="" token="tok" />);
+
+    expect(await screen.findByText('Supervisor diagnosis:')).toBeInTheDocument();
+    expect(
+      screen.getByText('required artifact or completion sentinel is missing or invalid'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText('Action: park_escalate — book parked and escalated'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('_done/auditing.json')).toBeInTheDocument();
+    expect(screen.getByText('no such file or directory')).toBeInTheDocument();
+  });
+
   it('does not offer manual diagnosis when the configured model is unavailable', async () => {
     const client = fakeClient([bk({ id: 4, batch_id: 'batch-4' })], {
       supervisorStatus: vi.fn().mockResolvedValue({

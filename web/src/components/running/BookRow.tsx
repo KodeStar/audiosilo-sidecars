@@ -1,5 +1,11 @@
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
-import type { BookDetail, BookEventsResponse, BookView, LoggedEvent } from '@/api/types';
+import type {
+  BookDetail,
+  BookEventsResponse,
+  BookView,
+  LoggedEvent,
+  SupervisorRun,
+} from '@/api/types';
 import { availableActions, formatBytes, isDone, type BookAction } from '@/lib/books';
 import { fetchAllEvents, formatLogEvent, formatLogTime, logToText } from '@/lib/bookLog';
 import { formatCost } from '@/lib/cost';
@@ -34,6 +40,7 @@ interface BookRowProps {
   onCompleteCoreProposal: (book: BookView) => void;
   onAskSupervisor: (book: BookView) => Promise<void>;
   modelSupervisorEnabled: boolean;
+  supervisorIncident?: SupervisorRun;
 }
 
 const ACTION_LABEL: Record<BookAction, string> = {
@@ -74,6 +81,7 @@ export const BookRow = memo(function BookRow({
   onCompleteCoreProposal,
   onAskSupervisor,
   modelSupervisorEnabled,
+  supervisorIncident,
 }: BookRowProps) {
   const done = isDone(book);
   // A book only actively advertises live readouts (a ticking elapsed clock and an
@@ -232,6 +240,34 @@ export const BookRow = memo(function BookRow({
             <p className="mt-1 text-xs text-pink-500">{book.error}</p>
           )}
           {hint && <p className="mt-1 text-xs text-dim">{hint}</p>}
+          {book.status === 'needs_attention' &&
+            book.park_code?.startsWith('supervisor_') &&
+            supervisorIncident && (
+              <div className="mt-2 rounded-md border border-amber-500/30 bg-amber-500/5 p-2 text-xs text-body">
+                <p>
+                  <span className="font-semibold text-amber-300">Supervisor diagnosis:</span>{' '}
+                  {supervisorIncident.diagnosis}
+                </p>
+                <p className="mt-1 text-dim">
+                  Action: {supervisorIncident.selected_action}
+                  {supervisorIncident.action_outcome
+                    ? ` — ${supervisorIncident.action_outcome}`
+                    : ''}
+                </p>
+                {supervisorIncident.evidence.length > 0 && (
+                  <div className="mt-1">
+                    <span className="font-medium text-body">Evidence:</span>
+                    <ul className="mt-0.5 list-inside list-disc">
+                      {supervisorIncident.evidence.map((item, index) => (
+                        <li key={`${index}-${item}`} className="break-all text-dim">
+                          {item}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            )}
           {book.park_code === 'core_needed' && (
             <button
               type="button"
