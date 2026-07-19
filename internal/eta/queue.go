@@ -31,13 +31,14 @@ func atLeastOne(n int) int {
 // segments and how far it has progressed (idx), whether it currently occupies a lane
 // slot, and when that running segment finishes.
 type simBook struct {
-	id       int64
-	series   string
-	pos      float64
-	segs     []segment
-	idx      int
-	running  bool
-	finishAt float64
+	id         int64
+	series     string
+	pos        float64
+	seriesRank int
+	segs       []segment
+	idx        int
+	running    bool
+	finishAt   float64
 }
 
 // done reports whether the book has consumed all its segments.
@@ -64,11 +65,17 @@ func (sb *simBook) holdsSeriesLock() bool {
 // greedy, event-driven simulation over the three lanes. It considers only books with
 // status none and a non-terminal state; each is a sequence of lane-bound segments
 // run strictly in order. Lane capacities come from caps (each clamped to >= 1). The
-// ASR lane serves retranscribing before other work then FIFO by id; the agent lane
+// ASR lane serves retranscribing before other work then breadth-first across series;
+// the agent lane
 // runs a book only while it holds its series lock (the lowest-position book with
 // agent work remaining per series; seriesless books are always eligible), recomputed
 // as books progress. It is pure and reads no clock.
 func QueueETA(books []Book, rates map[string]float64, caps LaneCaps) float64 {
+	seriesItems := make([]state.SeriesQueueItem, 0, len(books))
+	for _, b := range books {
+		seriesItems = append(seriesItems, state.SeriesQueueItem{ID: b.ID, Series: b.Series, SeriesPos: b.SeriesPos})
+	}
+	seriesRanks := state.SeriesBreadthRanks(seriesItems)
 	sim := make([]*simBook, 0, len(books))
 	for _, b := range books {
 		// BookETA describes an isolated book and may use its full fan-out. QueueETA
@@ -85,10 +92,8 @@ func QueueETA(books []Book, rates map[string]float64, caps LaneCaps) float64 {
 			continue
 		}
 		sim = append(sim, &simBook{
-			id:     b.ID,
-			series: strings.TrimSpace(b.Series),
-			pos:    state.ParseSeriesPos(b.SeriesPos),
-			segs:   segs,
+			id: b.ID, series: strings.TrimSpace(b.Series), pos: state.ParseSeriesPos(b.SeriesPos),
+			seriesRank: seriesRanks[b.ID], segs: segs,
 		})
 	}
 	if len(sim) == 0 {
@@ -161,7 +166,7 @@ func startWaiting(sim []*simBook, caps map[state.Lane]int, now float64) {
 }
 
 // sortLane orders a lane's waiting candidates: the ASR lane puts retranscribing
-// first then FIFO by id; other lanes are FIFO by id.
+// first, then ordinary ASR by series breadth rank and id; other lanes are FIFO.
 func sortLane(lane state.Lane, cands []*simBook) {
 	if lane == state.LaneASR {
 		sort.Slice(cands, func(i, j int) bool {
@@ -169,6 +174,9 @@ func sortLane(lane state.Lane, cands []*simBook) {
 			rj := cands[j].cur().stage == state.Retranscribing
 			if ri != rj {
 				return ri
+			}
+			if !ri && cands[i].seriesRank != cands[j].seriesRank {
+				return cands[i].seriesRank < cands[j].seriesRank
 			}
 			return cands[i].id < cands[j].id
 		})

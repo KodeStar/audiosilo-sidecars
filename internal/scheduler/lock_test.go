@@ -34,6 +34,58 @@ func TestLockHoldersSeriesOrdering(t *testing.T) {
 	}
 }
 
+func TestSortASRLaneBreadthFirstAcrossSeries(t *testing.T) {
+	// Series A book 1 has already left ASR. Its presence in the full library must
+	// keep A2 at depth 1, allowing the first books from B and C to transcribe before
+	// ASR loops back to A. The input ids reflect depth-first enqueue order.
+	all := []store.Book{
+		bk(1, "A", "1", string(state.SpellingResearch)),
+		bk(2, "A", "2", string(state.ASR)),
+		bk(3, "A", "3", string(state.ASR)),
+		bk(4, "B", "1", string(state.ASR)),
+		bk(5, "B", "2", string(state.ASR)),
+		bk(6, "C", "1", string(state.ASR)),
+		bk(7, "", "", string(state.ASR)),
+	}
+	candidates := []store.Book{all[4], all[2], all[1], all[6], all[5], all[3]}
+
+	sortASRLane(candidates, all)
+
+	want := []int64{4, 6, 7, 2, 5, 3}
+	for i, id := range want {
+		if candidates[i].ID != id {
+			t.Fatalf("ASR order = %v, want %v", bookIDs(candidates), want)
+		}
+	}
+}
+
+func TestSortASRLaneRetranscriptionJumpsBreadthQueue(t *testing.T) {
+	all := []store.Book{
+		bk(1, "A", "1", string(state.ASR)),
+		bk(2, "A", "2", string(state.ASR)),
+		bk(3, "B", "1", string(state.ASR)),
+		bk(9, "A", "3", string(state.Retranscribing)),
+	}
+	candidates := append([]store.Book(nil), all...)
+
+	sortASRLane(candidates, all)
+
+	want := []int64{9, 1, 3, 2}
+	for i, id := range want {
+		if candidates[i].ID != id {
+			t.Fatalf("ASR order = %v, want %v", bookIDs(candidates), want)
+		}
+	}
+}
+
+func bookIDs(books []store.Book) []int64 {
+	ids := make([]int64, len(books))
+	for i, b := range books {
+		ids[i] = b.ID
+	}
+	return ids
+}
+
 func TestSeriesBlockersReportsOnlyAgentBooksActuallyWaiting(t *testing.T) {
 	books := []store.Book{
 		{ID: 1, Title: "Saga One", Series: "Saga", SeriesPos: "1", State: string(state.FactPass)},

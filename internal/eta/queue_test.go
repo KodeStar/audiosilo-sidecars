@@ -92,18 +92,20 @@ func TestQueueETAAgentCapLimitsParallelism(t *testing.T) {
 }
 
 func TestSortLaneRetranscribePriority(t *testing.T) {
-	// The ASR lane serves retranscribing before ordinary ASR, then FIFO by id.
+	// The ASR lane serves retranscribing before ordinary ASR, then orders the
+	// ordinary work by series breadth rank before id.
 	cands := []*simBook{
-		{id: 3, segs: []segment{{stage: state.ASR, lane: state.LaneASR}}},
-		{id: 1, segs: []segment{{stage: state.Retranscribing, lane: state.LaneASR}}},
-		{id: 2, segs: []segment{{stage: state.ASR, lane: state.LaneASR}}},
+		{id: 3, seriesRank: 2, segs: []segment{{stage: state.ASR, lane: state.LaneASR}}},
+		{id: 9, seriesRank: 3, segs: []segment{{stage: state.Retranscribing, lane: state.LaneASR}}},
+		{id: 2, seriesRank: 1, segs: []segment{{stage: state.ASR, lane: state.LaneASR}}},
+		{id: 4, seriesRank: 0, segs: []segment{{stage: state.ASR, lane: state.LaneASR}}},
 	}
 	sortLane(state.LaneASR, cands)
-	gotIDs := []int64{cands[0].id, cands[1].id, cands[2].id}
-	want := []int64{1, 2, 3} // retranscribe (id 1) first, then ASR by id
+	gotIDs := []int64{cands[0].id, cands[1].id, cands[2].id, cands[3].id}
+	want := []int64{9, 4, 2, 3}
 	for i := range want {
 		if gotIDs[i] != want[i] {
-			t.Fatalf("ASR order = %v, want %v (retranscribe first, then id)", gotIDs, want)
+			t.Fatalf("ASR order = %v, want %v (retranscribe first, then series breadth)", gotIDs, want)
 		}
 	}
 

@@ -415,15 +415,16 @@ internal/
             MainlineNext (the optimistic mainline
             successor the ETA engine walks - the table's Next ordering is load-bearing:
             conditional/loop target first, mainline continuation LAST),
-            ParseSeriesPos (moved here from scheduler so eta/scheduler share one
-            parser), and IsParkedWith (the one status+park-code predicate api/contrib
-            share instead of hand-rolling it).
+            ParseSeriesPos + SeriesBreadthRanks (shared scheduler/ETA series ordering),
+            and IsParkedWith (the one status+park-code predicate api/contrib share
+            instead of hand-rolling it).
   eta/      the PURE ETA engine (no I/O, no clock): per-stage unit kinds
             (chapter/chunk/book) + seed rates from the historical extraction metrics,
             EWMA Observe (alpha 0.3), book ETA = rate x remaining units over the
             optimistic mainline (loops are not predicted - documented), queue ETA = a
             greedy three-lane event simulation (LaneCaps injected from the scheduler,
-            series locks via state.HoldsSeriesLock, retranscribe-first ASR ordering).
+            series locks via state.HoldsSeriesLock, retranscribe-first then
+            breadth-first-across-series ASR ordering).
   scheduler/ one wake-on-event goroutine over three lanes (ASR cap 1 / agent cap =
             config, series-locked / mechanical cap 2) over an injected Executor +
             _done/<stage>.json sentinels (the CONTENT truth) and crash reconcile.
@@ -766,7 +767,8 @@ Milestones from the workspace plan; each is shippable.
   `rates` table), book ETA (rate x remaining units over the optimistic mainline derived
   from `state.MainlineNext` - loops are not predicted), and queue ETA (a greedy
   three-lane simulation with injected LaneCaps, `state.HoldsSeriesLock` series locks,
-  and retranscribe-first ASR ordering). Rate observation is stage-owned: each stage
+  and retranscribe-first then breadth-first-across-series ASR ordering). Rate
+  observation is stage-owned: each stage
   returns a `StageResult.RateSample` (units actually processed this run + productive
   seconds measured after setup, agent rate-limit backoff excluded via the runner's
   slept-time return) so resumes, first-run tool/model downloads, and backoff never

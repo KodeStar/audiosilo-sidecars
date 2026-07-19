@@ -10,7 +10,8 @@
 //   - QueueETA: the wall-clock makespan of the whole active queue, a greedy
 //     event-driven simulation over the three lanes (ASR cap 1, mechanical cap 2,
 //     agent cap = configured), honouring the scheduler's ordering (retranscribe
-//     jumps the ASR queue) and the series lock (only the lowest-position unfinished
+//     jumps the ASR queue, then ordinary ASR runs breadth-first across series) and
+//     the series lock (only the lowest-position unfinished
 //     book of a series runs agent work).
 //
 // Rates are EWMA-updated per stage (seconds per unit) via Observe and stored in the

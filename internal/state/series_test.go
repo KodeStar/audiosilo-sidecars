@@ -36,3 +36,20 @@ func TestParseSeriesPos(t *testing.T) {
 		t.Error("unparseable position should sort last (largest)")
 	}
 }
+
+func TestSeriesBreadthRanks(t *testing.T) {
+	ranks := SeriesBreadthRanks([]SeriesQueueItem{
+		{ID: 1, Series: "A", SeriesPos: "1"},
+		{ID: 2, Series: "A", SeriesPos: "2"},
+		{ID: 3, Series: "A", SeriesPos: "3"},
+		{ID: 4, Series: "B", SeriesPos: "5"},
+		{ID: 5, Series: "B", SeriesPos: "6"},
+		{ID: 6, Series: "", SeriesPos: ""},
+	})
+	want := map[int64]int{1: 0, 2: 1, 3: 2, 4: 0, 5: 1, 6: 0}
+	for id, rank := range want {
+		if ranks[id] != rank {
+			t.Errorf("book %d rank = %d, want %d", id, ranks[id], rank)
+		}
+	}
+}

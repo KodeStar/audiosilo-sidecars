@@ -2,7 +2,8 @@
 // concurrent lanes. One scheduler goroutine wakes on events, computes eligible
 // (book, stage) pairs, and dispatches them to lane workers:
 //
-//   - Lane A (ASR), capacity 1: asr + retranscribing (retranscribe jumps queue).
+//   - Lane A (ASR), capacity 1: asr + retranscribing (retranscribe jumps queue;
+//     ordinary ASR is breadth-first across series).
 //   - Lane B (agent books), capacity config.agent.queue_concurrency: gated by a SERIES LOCK -
 //     only the lowest-position unfinished book of a series may hold an agent slot,
 //     so different series parallelize but a series is authored in order.
@@ -350,15 +351,10 @@ func (s *Scheduler) dispatch() {
 		}
 	}
 
-	// ASR: retranscribe jumps the queue, then FIFO by id.
-	sort.Slice(asr, func(i, j int) bool {
-		ri := state.State(asr[i].State) == state.Retranscribing
-		rj := state.State(asr[j].State) == state.Retranscribing
-		if ri != rj {
-			return ri
-		}
-		return asr[i].ID < asr[j].ID
-	})
+	// ASR: finish corrective retranscriptions first. Ordinary transcription is
+	// breadth-first across series so each series opens an agent slot before ASR
+	// loops back to later books in a series.
+	sortASRLane(asr, books)
 	sortByID(agent)
 	sortByID(mech)
 
@@ -371,6 +367,25 @@ func (s *Scheduler) dispatch() {
 
 	s.publishQueueStats(books, counts)
 	s.publishETAs(ctx, books)
+}
+
+func sortASRLane(candidates, allBooks []store.Book) {
+	items := make([]state.SeriesQueueItem, 0, len(allBooks))
+	for _, b := range allBooks {
+		items = append(items, state.SeriesQueueItem{ID: b.ID, Series: b.Series, SeriesPos: b.SeriesPos})
+	}
+	ranks := state.SeriesBreadthRanks(items)
+	sort.Slice(candidates, func(i, j int) bool {
+		ri := state.State(candidates[i].State) == state.Retranscribing
+		rj := state.State(candidates[j].State) == state.Retranscribing
+		if ri != rj {
+			return ri
+		}
+		if !ri && ranks[candidates[i].ID] != ranks[candidates[j].ID] {
+			return ranks[candidates[i].ID] < ranks[candidates[j].ID]
+		}
+		return candidates[i].ID < candidates[j].ID
+	})
 }
 
 func sortByID(b []store.Book) {
