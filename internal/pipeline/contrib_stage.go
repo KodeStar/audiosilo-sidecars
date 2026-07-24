@@ -72,10 +72,6 @@ const (
 const (
 	contribDir       = "contrib"
 	coreProposalName = "core_proposal.json"
-	// contribSourceRef is the sources[] ref stamped on the sidecars at contribution
-	// time so the provenance names this tool. Matched on type+ref so a re-run is
-	// idempotent (append only when absent).
-	contribSourceRef = "audiosilo-sidecars"
 	// coreProvenanceLine is the honest, short Sources line the prefilled core
 	// proposal carries (the folder scan is the origin of the factual fields).
 	coreProvenanceLine = "audiosilo-sidecars folder scan (embedded tags)"
@@ -131,16 +127,18 @@ func (e *Executor) contribute(ctx context.Context, book store.Book, r scheduler.
 	}
 
 	// 3. Reconcile the durable sidecar files: rewrite "work" to the resolved slug and
-	// stamp the contribution source, canonicalized in place, so what ships matches disk.
+	// stamp the source audiobook edition, canonicalized in place, so what ships can be
+	// audited against the recording used for extraction.
+	sourceRef := e.contributionSourceRef(ctx, book, slug)
 	var artifacts []contribArtifact
 	if haveChars {
-		if err := reconcileSidecar(charsPath, slug); err != nil {
+		if err := reconcileSidecar(charsPath, slug, sourceRef); err != nil {
 			return scheduler.StageResult{}, fmt.Errorf("contributing: reconcile %s: %w", charactersFileName, err)
 		}
 		artifacts = append(artifacts, contribArtifact{kind: store.ContribKindCharacters, path: charsPath})
 	}
 	if haveRecaps {
-		if err := reconcileSidecar(recapsPath, slug); err != nil {
+		if err := reconcileSidecar(recapsPath, slug, sourceRef); err != nil {
 			return scheduler.StageResult{}, fmt.Errorf("contributing: reconcile %s: %w", recapsFileName, err)
 		}
 		artifacts = append(artifacts, contribArtifact{kind: store.ContribKindRecaps, path: recapsPath})
@@ -646,17 +644,17 @@ func (e *Executor) contribModeOrDefault() string {
 	return e.contribMode
 }
 
-// reconcileSidecar rewrites a sidecar file's "work" to slug, ensures the contribution
-// source is present, and canonicalizes it in place (atomic write). It fails on a
-// malformed sidecar (contribution runs after validating, so the files are well-formed).
-func reconcileSidecar(path, slug string) error {
+// reconcileSidecar rewrites a sidecar file's "work" to slug, replaces the
+// staging-only bare community source with the source audiobook edition, and
+// canonicalizes it in place (atomic write).
+func reconcileSidecar(path, slug, sourceRef string) error {
 	if filepath.Base(path) == charactersFileName {
 		var c model.Characters
 		if err := decodeSidecarFile(path, &c); err != nil {
 			return err
 		}
 		c.Work = slug
-		c.Sources = ensureContribSource(c.Sources)
+		c.Sources = contributionSources(sourceRef)
 		return writeCanonicalJSON(path, c)
 	}
 	var r model.Recaps
@@ -664,19 +662,99 @@ func reconcileSidecar(path, slug string) error {
 		return err
 	}
 	r.Work = slug
-	r.Sources = ensureContribSource(r.Sources)
+	r.Sources = contributionSources(sourceRef)
 	return writeCanonicalJSON(path, r)
 }
 
-// ensureContribSource appends {"type":"community","ref":"audiosilo-sidecars"} to
-// sources unless an identical entry is already present (matched on type+ref).
-func ensureContribSource(sources []model.Source) []model.Source {
-	for _, s := range sources {
-		if s.Type == sourceTypeCommunity && s.Ref == contribSourceRef {
-			return sources
+// contributionSources returns the one community provenance entry permitted by the
+// sidecar contract. The ref names the actual audiobook edition, not this tool.
+func contributionSources(sourceRef string) []model.Source {
+	return []model.Source{{Type: sourceTypeCommunity, Ref: sourceRef}}
+}
+
+// contributionSourceRef identifies the audiobook edition used for extraction. A
+// locally captured ASIN/ISBN is strongest. Otherwise the resolved work's recordings
+// are matched against local narrator/runtime evidence; only a tie-free match is used.
+func (e *Executor) contributionSourceRef(ctx context.Context, book store.Book, slug string) string {
+	cov, covErr := e.metaCoverageForWork(ctx, slug)
+	if asin := strings.TrimSpace(book.ASIN); asin != "" {
+		for _, rec := range cov.Recordings {
+			for _, candidate := range rec.ASINs {
+				if strings.EqualFold(strings.TrimSpace(candidate.ASIN), asin) && strings.TrimSpace(candidate.Region) != "" {
+					return "audible:" + strings.ToLower(strings.TrimSpace(candidate.Region)) + ":" + asin
+				}
+			}
+		}
+		return "audible:" + asin
+	}
+	if isbn := strings.TrimSpace(book.ISBN); isbn != "" {
+		return "isbn:" + isbn
+	}
+	if covErr == nil {
+		if rec := bestRecordingRef(book, cov.Recordings); rec != nil {
+			for _, region := range []string{"us", "uk", "au", "ca"} {
+				for _, asin := range rec.ASINs {
+					if strings.EqualFold(asin.Region, region) && strings.TrimSpace(asin.ASIN) != "" {
+						return "audible:" + strings.ToLower(asin.Region) + ":" + strings.TrimSpace(asin.ASIN)
+					}
+				}
+			}
+			if len(rec.ASINs) > 0 && strings.TrimSpace(rec.ASINs[0].ASIN) != "" {
+				return "audible:" + strings.TrimSpace(rec.ASINs[0].ASIN)
+			}
+			if len(rec.ISBNs) > 0 && strings.TrimSpace(rec.ISBNs[0]) != "" {
+				return "isbn:" + strings.TrimSpace(rec.ISBNs[0])
+			}
+			if rec.ID != "" {
+				return "audiosilo-meta:recording:" + slug + "/" + rec.ID
+			}
 		}
 	}
-	return append(sources, model.Source{Type: sourceTypeCommunity, Ref: contribSourceRef})
+	return "audiosilo-meta:work:" + slug
+}
+
+func bestRecordingRef(book store.Book, recordings []metaops.RecordingRef) *metaops.RecordingRef {
+	if len(recordings) == 1 {
+		return &recordings[0]
+	}
+	wantNarrators := make(map[string]bool, len(book.Narrators))
+	for _, narrator := range book.Narrators {
+		wantNarrators[normaliseName(narrator)] = true
+	}
+	best, bestScore := -1, -1
+	for i := range recordings {
+		score := 0
+		for _, narrator := range recordings[i].Narrators {
+			if wantNarrators[normaliseName(narrator)] {
+				score += 10
+			}
+		}
+		if book.DurationSec > 0 && recordings[i].RuntimeMin > 0 {
+			delta := math.Abs(book.DurationSec/60 - float64(recordings[i].RuntimeMin))
+			if delta <= math.Max(5, float64(recordings[i].RuntimeMin)*0.02) {
+				score += 5
+			}
+		}
+		if score > bestScore {
+			best, bestScore = i, score
+		} else if score == bestScore {
+			best = -1
+		}
+	}
+	if best < 0 || bestScore <= 0 {
+		return nil
+	}
+	return &recordings[best]
+}
+
+func normaliseName(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // writeCanonicalJSON marshals v, canonicalizes it (metafmt-equivalent), and atomically

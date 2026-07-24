@@ -214,9 +214,10 @@ type fakeMeta struct {
 }
 
 type metaWorkFixture struct {
-	title     string
-	hasChars  bool
-	hasRecaps bool
+	title      string
+	hasChars   bool
+	hasRecaps  bool
+	recordings []map[string]any
 }
 
 func newFakeMeta(t *testing.T, lookups map[string]string, works map[string]metaWorkFixture) *fakeMeta {
@@ -252,6 +253,9 @@ func (m *fakeMeta) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out := map[string]any{"title": wf.title}
+		if len(wf.recordings) > 0 {
+			out["recordings"] = wf.recordings
+		}
 		if wf.hasChars {
 			out["characters"] = []map[string]string{{"id": "x"}}
 		}
@@ -362,10 +366,18 @@ func TestContributeIssueHappyPath(t *testing.T) {
 	db := openContribDB(t)
 	gh := newFakeGitHub(t)
 	meta := newFakeMeta(t, nil, map[string]metaWorkFixture{
-		"reacher-01": {title: "Killing Floor"}, // no sidecars yet
+		"reacher-01": {
+			title: "Killing Floor",
+			recordings: []map[string]any{{
+				"id":          "jeff-harding-2015",
+				"runtime_min": 530,
+				"narrators":   []map[string]string{{"name": "Jeff Harding"}},
+				"asin":        []map[string]string{{"region": "us", "asin": "B012345678"}},
+			}},
+		}, // no sidecars yet
 	})
 
-	b := contribBook(t, db, store.NewBook{WorkID: "reacher-01"}, baseChars("placeholder"), baseRecaps("placeholder"))
+	b := contribBook(t, db, store.NewBook{WorkID: "reacher-01", ASIN: "B012345678"}, baseChars("placeholder"), baseRecaps("placeholder"))
 	cfg := contribConfig(t, db, contribModeIssue, gh.srv.URL, meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
 	exe := NewExecutor(cfg)
 
@@ -392,8 +404,11 @@ func TestContributeIssueHappyPath(t *testing.T) {
 		if !strings.Contains(string(raw), `"work": "reacher-01"`) {
 			t.Errorf("%s: work not rewritten to slug:\n%s", name, raw)
 		}
-		if !strings.Contains(string(raw), contribSourceRef) {
-			t.Errorf("%s: contribution source not stamped", name)
+		if !strings.Contains(string(raw), `"ref": "audible:us:B012345678"`) {
+			t.Errorf("%s: audiobook-edition source not stamped:\n%s", name, raw)
+		}
+		if strings.Count(string(raw), `"type": "community"`) != 1 {
+			t.Errorf("%s: contribution should carry exactly one community source:\n%s", name, raw)
 		}
 		if f, _ := canonical.Format(raw); !bytes.Equal(raw, f) {
 			t.Errorf("%s: not canonical on disk", name)
@@ -427,6 +442,20 @@ func TestContributeIssueHappyPath(t *testing.T) {
 		if r.Status != store.ContribStatusSubmitted || r.URL == "" || r.Note != "" {
 			t.Errorf("%s row = %+v, want submitted with url and no note", k, r)
 		}
+	}
+}
+
+func TestBestRecordingRef(t *testing.T) {
+	recordings := []metaops.RecordingRef{
+		{ID: "other", Narrators: []string{"Other Narrator"}, RuntimeMin: 400},
+		{ID: "match", Narrators: []string{"Jeff Harding"}, RuntimeMin: 530},
+	}
+	got := bestRecordingRef(store.Book{Narrators: []string{"Jeff Harding"}, DurationSec: 530 * 60}, recordings)
+	if got == nil || got.ID != "match" {
+		t.Fatalf("best recording = %+v, want match", got)
+	}
+	if got := bestRecordingRef(store.Book{}, recordings); got != nil {
+		t.Fatalf("ambiguous recording = %+v, want nil", got)
 	}
 }
 
