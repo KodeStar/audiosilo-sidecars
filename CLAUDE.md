@@ -805,9 +805,12 @@ Milestones from the workspace plan; each is shippable.
 - **M7 (done):** **contribution**. The `contributing` stage is real: it reconciles
   the sidecars' workSlug placeholder to the real meta work slug (books.work_id ->
   asin/isbn lookup; NEVER a fuzzy auto-adopt - wrong-work attachment is a spoiler
-  hazard), rewrites the files' `work` field + appends the
-  {type:"community",ref:"audiosilo-sidecars"} provenance source + re-canonicalizes
-  in place, skips upstream-covered dimensions (already_covered rows), then submits
+  hazard), rewrites the files' `work` field + replaces the staging source with one
+  community provenance entry identifying the source audiobook edition (local
+  ASIN/ISBN first, else narrator+runtime matched against the resolved work's
+  recordings, with a work ref only when edition evidence is unavailable) +
+  re-canonicalizes in place, skips upstream-covered dimensions (already_covered
+  rows), then submits
   per contribution.mode: **issue** (default - prefilled add-characters/add-recaps
   intake issues rendered to metaissue's exact form-markdown contract, secret-gist
   fallback for >60k bodies, label verification with a maintainer-hint note when

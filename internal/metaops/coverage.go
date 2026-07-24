@@ -75,6 +75,25 @@ type Coverage struct {
 	// sidecar (so it does not need contributing).
 	HasCharacters bool `json:"has_characters"`
 	HasRecaps     bool `json:"has_recaps"`
+	// Recordings carries the resolved work's audiobook editions for internal
+	// contribution provenance. It is deliberately omitted from scan/API JSON.
+	Recordings []RecordingRef `json:"-"`
+}
+
+// RecordingRef is the public metadata needed to identify the audiobook edition
+// behind a sidecar extraction.
+type RecordingRef struct {
+	ID         string
+	Narrators  []string
+	RuntimeMin int
+	ASINs      []RegionASIN
+	ISBNs      []string
+}
+
+// RegionASIN identifies one Audible regional listing for a recording.
+type RegionASIN struct {
+	Region string
+	ASIN   string
 }
 
 // BookIdentity is the resolution input for CoverageFor: the identifiers plus the
@@ -156,10 +175,11 @@ type lookupVal struct {
 }
 
 type workVal struct {
-	title    string
-	series   *SeriesRef
-	hasChars bool
-	hasRecap bool
+	title      string
+	series     *SeriesRef
+	recordings []RecordingRef
+	hasChars   bool
+	hasRecap   bool
 }
 
 // searchVal is a cached fuzzy-match verdict (including a negative one), keyed on
@@ -293,6 +313,7 @@ func (c *Client) CoverageForWork(ctx context.Context, workID string) (Coverage, 
 		Available: true, Known: true, WorkID: workID,
 		MatchedBy: "manual", WorkTitle: v.title, Series: cloneSeriesRef(v.series),
 		HasCharacters: v.hasChars, HasRecaps: v.hasRecap,
+		Recordings: cloneRecordingRefs(v.recordings),
 	}, nil
 }
 
@@ -323,6 +344,7 @@ func (c *Client) workCoverage(ctx context.Context, workID, matchedBy, workTitle 
 		cov.HasCharacters = v.hasChars
 		cov.HasRecaps = v.hasRecap
 		cov.Series = cloneSeriesRef(v.series)
+		cov.Recordings = cloneRecordingRefs(v.recordings)
 	}
 	return cov
 }
@@ -333,6 +355,17 @@ func cloneSeriesRef(s *SeriesRef) *SeriesRef {
 	}
 	copy := *s
 	return &copy
+}
+
+func cloneRecordingRefs(in []RecordingRef) []RecordingRef {
+	out := make([]RecordingRef, len(in))
+	for i := range in {
+		out[i] = in[i]
+		out[i].Narrators = append([]string(nil), in[i].Narrators...)
+		out[i].ASINs = append([]RegionASIN(nil), in[i].ASINs...)
+		out[i].ISBNs = append([]string(nil), in[i].ISBNs...)
+	}
+	return out
 }
 
 // getJSON performs a GET and decodes JSON into v. It returns (found=false) for a
@@ -404,6 +437,15 @@ func (c *Client) workDetail(ctx context.Context, workID string) (v workVal, foun
 		Series     []SeriesRef       `json:"series"`
 		Characters []json.RawMessage `json:"characters"`
 		Recaps     []json.RawMessage `json:"recaps"`
+		Recordings []struct {
+			ID        string `json:"id"`
+			Narrators []struct {
+				Name string `json:"name"`
+			} `json:"narrators"`
+			RuntimeMin int          `json:"runtime_min"`
+			ASINs      []RegionASIN `json:"asin"`
+			ISBNs      []string     `json:"isbn"`
+		} `json:"recordings"`
 	}
 	f, okc := c.getJSON(ctx, "/api/v1/works/"+url.PathEscape(workID), &res)
 	if !okc {
@@ -415,6 +457,13 @@ func (c *Client) workDetail(ctx context.Context, workID string) (v workVal, foun
 	v = workVal{title: res.Title, hasChars: len(res.Characters) > 0, hasRecap: len(res.Recaps) > 0}
 	if len(res.Series) > 0 {
 		v.series = cloneSeriesRef(&res.Series[0])
+	}
+	for _, rec := range res.Recordings {
+		r := RecordingRef{ID: rec.ID, RuntimeMin: rec.RuntimeMin, ASINs: rec.ASINs, ISBNs: rec.ISBNs}
+		for _, narrator := range rec.Narrators {
+			r.Narrators = append(r.Narrators, narrator.Name)
+		}
+		v.recordings = append(v.recordings, r)
 	}
 	c.works.put(workID, v)
 	return v, true, true
