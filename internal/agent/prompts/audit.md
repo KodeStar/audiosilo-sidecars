@@ -64,6 +64,32 @@ Verified names ledger:
 
 {{.VerifiedLedger}}
 {{end}}
+## Severity rubric (apply strictly)
+
+Stay adversarial, but grade each finding by consequence, not by tone. BLOCKER is
+reserved for a defect that makes the sidecars unsafe or wrong to publish, and is
+ONLY one of these four classes:
+
+- (a) A SPOILER LEAK: content visible before its `reveal`/`through` gate that
+  discloses a later-chapter twist, identity, ability, death, or outcome.
+- (b) A FACTUAL CONTRADICTION with the staged fact notes: a claim the facts
+  actively contradict (not merely a claim you would phrase differently).
+- (c) A POSITION OUTSIDE the logical chapter range (a `reveal`/`through`/position
+  below 0 or above {{.ChapterCount}}, or a coverage demand past an excluded edge
+  file that the facts do not support).
+- (d) A VERBATIM or LICENSING violation: source text copied beyond fair use, or a
+  wrong `license`/`sources` value.
+
+Everything else is FIX or NIT, never BLOCKER: a missing or thin card for a
+secondary character, a minor coverage gap, awkward or hedgy phrasing, a weak
+suggestion, neutral-voice or style slips. Use FIX when the sidecars should be
+corrected before publishing and NIT when it is a small polish you merely note.
+
+This is a RE-AUDIT: earlier rounds already audited these files. Content that was
+present UNCHANGED in a previously audited round must NOT be newly escalated to
+BLOCKER now unless it genuinely falls in one of the four classes above - do not
+raise the severity of an item just because the loop has run several rounds.
+
 ## Output (only under out/)
 
 `out/audit.json` with exactly this shape:

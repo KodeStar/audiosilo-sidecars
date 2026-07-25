@@ -208,7 +208,7 @@ func TestTailClipUpgradeClearsLegacyLayersBeforeFailedRetry(t *testing.T) {
 	verdicts := map[int]repair.TailVerdict{2: legacy}
 	exe := NewExecutor(Config{})
 	cut := func(context.Context, string, string, float64, float64) error { return nil }
-	res, err := exe.clipChapter(context.Background(), ASRSetup{}, cut, store.Book{ID: 1, WorkDir: work}, 2, verdicts, "tail-clip",
+	res, err := exe.clipChapter(context.Background(), scheduler.StageReport{}, ASRSetup{}, cut, store.Book{ID: 1, WorkDir: work}, 2, verdicts, "tail-clip",
 		repair.ClipSpliceRequest{ChapterEnd: 10},
 		func(_ context.Context, req repair.ClipSpliceRequest) (repair.ClipResult, error) {
 			for _, dir := range []string{transcript.RepairedDir, spelling.CorrectedDir} {

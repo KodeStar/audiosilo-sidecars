@@ -13,13 +13,21 @@ import (
 )
 
 // auditAcceptMaxFix is the largest FIX count the auditing stage will ACCEPT-AND-FINISH
-// on rather than keep looping. A large book's adversarial audit samples ~1 genuinely
-// new small defect per pass, so the fix==0 pass bar is unreachable; once the fix
-// trajectory is small and non-growing, one or two residual FIX items are cheaper to
-// apply-and-ship than to keep paying ~$6 per audit+fix round chasing zero. Calibrated
-// to the real book-3 evidence (fix trajectory 4 -> 1 -> 1 -> 2, blocker 0), which
-// converged and should have accepted at round 2 instead of parking.
-const auditAcceptMaxFix = 2
+// on rather than keep looping. A large book's adversarial audit is a FRESH sample each
+// round that surfaces ~1-3 genuinely new small defects, so the fix==0 pass bar is
+// unreachable; once the fix trajectory is small and within a slack of its best prior
+// round, a few residual FIX items are cheaper to apply-and-ship than to keep paying ~$6
+// per audit+fix round chasing zero. Raised from 2 to 3 with the window-tolerant
+// acceptance (acceptTrajectory) after three real books re-parked fix_loop_exhausted on
+// oscillating trajectories whose late rounds carried three small FIX findings.
+const auditAcceptMaxFix = 3
+
+// auditAcceptActionableSlack is how far above the SMALLEST actionable count (blocker+fix)
+// any prior round reached the current round may sit and still be judged "not growing". A
+// fresh adversarial audit oscillates - a later round can surface a finding or two more
+// than a lower earlier round - so a strict vs-previous-round comparison could never latch
+// on a converged-but-jittery trajectory. Two absorbs that sampling jitter.
+const auditAcceptActionableSlack = 2
 
 // auditRound is one entry in audit_rounds.json: the per-round finding tally the
 // acceptance decision and the park trajectory message read. Appended once per broad
@@ -115,17 +123,23 @@ func removeAuditTrajectory(workDir string) {
 // (apply this round's FIX items in one last fixing pass, then pass on re-entry) instead
 // of continuing the loop toward the park. Every clause must hold:
 //   - blocker == 0 and validation is clean: a BLOCKER or a mechanically-fixable
-//     validation error is never accepted over (those are real, fixable defects).
+//     validation error is never accepted over (those are real, fixable defects). A
+//     BLOCKER in the CURRENT round always blocks acceptance, regardless of trajectory.
 //   - round >= 2: at least one full fix round already ran and was re-audited, so we are
 //     judging a trajectory, not a first look.
 //   - 0 < fix <= auditAcceptMaxFix: fix==0 is a normal pass (handled elsewhere); more
 //     than the cap is too much residual to auto-ship.
-//   - prevOK and fix <= prevBlocker+prevFix: the actionable count is not growing.
-//     A BLOCKER becoming a FIX is progress, not the misleading "fix 0 -> 1"
-//     regression that used to reject a one-item tail.
+//   - havePrior and blocker+fix <= minPriorActionable + auditAcceptActionableSlack: the
+//     current actionable count is within a small slack of the SMALLEST actionable count
+//     any prior round reached - not merely the immediately preceding round. A fresh
+//     adversarial audit oscillates (a late round can surface a finding or two more than a
+//     lower earlier round), so a strict vs-previous test could never latch on a
+//     converged-but-jittery trajectory; the window absorbs that jitter while a genuinely
+//     growing count (each round well above the best prior) still never accepts. A BLOCKER
+//     becoming a FIX is still progress under this test (a lower actionable count).
 //   - fixesDone < MaxFixAttempts: the budget still allows the ONE final fixing round the
 //     acceptance path needs to apply this round's items.
-func acceptTrajectory(round, blocker, fix, prevBlocker, prevFix int, prevOK bool, fixesDone int, valClean bool, maxFix int) bool {
+func acceptTrajectory(round, blocker, fix, minPriorActionable int, havePrior bool, fixesDone int, valClean bool, maxFix int) bool {
 	if blocker != 0 || !valClean {
 		return false
 	}
@@ -135,10 +149,28 @@ func acceptTrajectory(round, blocker, fix, prevBlocker, prevFix int, prevOK bool
 	if fix <= 0 || fix > auditAcceptMaxFix {
 		return false
 	}
-	if !prevOK || fix > prevBlocker+prevFix {
+	if !havePrior || blocker+fix > minPriorActionable+auditAcceptActionableSlack {
 		return false
 	}
 	return fixesDone < maxFix
+}
+
+// minActionable returns the smallest actionable count (blocker+fix) across all recorded
+// audit rounds and whether there was at least one. Acceptance judges the current round
+// against the best (lowest) any prior round reached, so a converged trajectory that
+// jitters up by a finding or two in a later adversarial sample still latches (see
+// acceptTrajectory).
+func minActionable(rounds []auditRound) (int, bool) {
+	if len(rounds) == 0 {
+		return 0, false
+	}
+	best := rounds[0].Blocker + rounds[0].Fix
+	for _, r := range rounds[1:] {
+		if a := r.Blocker + r.Fix; a < best {
+			best = a
+		}
+	}
+	return best, true
 }
 
 // fixTrajectory renders the history's FIX counts as "4 -> 1 -> 2" for a message.

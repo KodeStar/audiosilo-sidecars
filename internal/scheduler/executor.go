@@ -32,12 +32,20 @@ type ProgressFunc func(done, total int)
 //     and the agent liveness heartbeat ("still running (6m elapsed)"). It is a real
 //     signal, not decoration - the heartbeat fires only while an agent subprocess is
 //     genuinely running.
+//   - Heartbeat records a liveness-only touch on the open stage run (its heartbeat
+//     timestamp, WITHOUT bumping progress) so the supervisor's stale-heartbeat detector
+//     does not kill a healthy stage that is mid-unit with no progress to report - a
+//     single pathologically slow ASR chapter (a whisper decode running many times its
+//     audio length) otherwise freezes the heartbeat between chapters. Unlike Note it
+//     carries no message; it is the same seam the agent subprocess heartbeat uses
+//     (store.TouchOpenStageRun with progress=false).
 //
-// Either field may be nil (a stage guards each call); the zero StageReport is a valid
+// Any field may be nil (a stage guards each call); the zero StageReport is a valid
 // no-op reporter for tests.
 type StageReport struct {
-	Progress ProgressFunc
-	Note     func(msg string)
+	Progress  ProgressFunc
+	Note      func(msg string)
+	Heartbeat func()
 }
 
 // RateSample is a stage's own report of how much work it did in ONE run, used to update

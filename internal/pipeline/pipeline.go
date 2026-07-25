@@ -610,7 +610,7 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, r scheduler.St
 		if !fsutil.IsFile(flac) {
 			return scheduler.StageResult{}, fmt.Errorf("asr: chapter %d FLAC missing (%s); split must run first", ch.Chapter, flac)
 		}
-		empty, err := e.transcribeChapter(ctx, setup, flac, rawDir, rawPath, ch.Chapter)
+		empty, err := e.transcribeChapter(ctx, r, setup, flac, rawDir, rawPath, ch.Chapter)
 		if err != nil {
 			return scheduler.StageResult{}, err
 		}
@@ -659,12 +659,17 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, r scheduler.St
 // segments it deletes the raw and retries ONCE; if it is still empty it accepts it
 // (returning empty=true so the caller records the chapter in provenance) rather than
 // looping forever. A genuine transcription/completeness error is returned as-is.
-func (e *Executor) transcribeChapter(ctx context.Context, setup ASRSetup, flac, rawDir, rawPath string, chapter int) (empty bool, err error) {
+func (e *Executor) transcribeChapter(ctx context.Context, r scheduler.StageReport, setup ASRSetup, flac, rawDir, rawPath string, chapter int) (empty bool, err error) {
 	// InitialPrompt is intentionally empty in M3a: verified spellings come from the
 	// spelling stage (M4). Seeding a guess would make a wrong spelling recur.
 	for attempt := range 2 {
 		job := asr.Job{Audio: flac, OutDir: rawDir, Chapter: chapter, Language: setup.Language}
-		if terr := setup.Backend.Transcribe(ctx, job); terr != nil {
+		// A pathologically slow chapter (a decode running many times its audio length) has no
+		// progress to report mid-chapter, so keep the heartbeat fresh while the backend runs.
+		terr := transcribeWithHeartbeat(ctx, r, "asr", chapter, func() error {
+			return setup.Backend.Transcribe(ctx, job)
+		})
+		if terr != nil {
 			if ctx.Err() != nil {
 				return false, ctx.Err() // killed by cancellation, not a real failure
 			}

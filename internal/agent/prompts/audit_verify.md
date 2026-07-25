@@ -28,6 +28,9 @@ the right spoiler boundary. Also confirm the correction did not introduce a new
 spoiler or unsupported claim in that same entry.
 
 Write `out/audit.json` in the normal audit shape. Set `pass` to true only if every
-prior FIX is resolved. Emit a FIX or BLOCKER for each unresolved item with the current
-text, evidence, and concrete correction. NITs may be reported but do not block pass.
-Use fresh words and hyphens only.
+prior FIX is resolved. Emit a finding for each unresolved item with the current text,
+evidence, and concrete correction. Grade it BLOCKER ONLY when it falls in one of the
+four blocker classes - (a) a spoiler leak, (b) a factual contradiction with the fact
+notes, (c) a position outside the logical chapter range, (d) a verbatim or licensing
+violation; otherwise grade an unresolved item FIX. NITs may be reported but do not
+block pass. Use fresh words and hyphens only.

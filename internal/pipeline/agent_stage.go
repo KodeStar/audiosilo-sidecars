@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
@@ -496,6 +497,62 @@ func humanDuration(d time.Duration) string {
 	h := int(d / time.Hour)
 	m := int((d % time.Hour) / time.Minute)
 	return fmt.Sprintf("%dh%dm", h, m)
+}
+
+// asrHeartbeatInterval is how often a long single-chapter transcription touches the open
+// stage run's heartbeat while the backend churns. The supervisor's stale-heartbeat detector
+// (supervisor.stale_heartbeat_minutes) kills a run whose heartbeat has frozen; the ASR/
+// retranscribe stages otherwise bump the heartbeat only BETWEEN chapters (a progress report),
+// so a single pathologically slow chapter (a whisper decode running many times its audio
+// length) has no heartbeat mid-chapter and the healthy run is killed and retried forever. This
+// ticker keeps a live-but-slow chapter's heartbeat fresh. It matches the agent subprocess
+// heartbeat cadence (internal/agent/exec.go). A var so tests can shorten it.
+var asrHeartbeatInterval = 60 * time.Second
+
+// asrHeartbeatNoteEvery is how many heartbeat ticks between operator-visible "still
+// transcribing" notes (every third tick, ~3 min): enough for the durable log to show liveness
+// without a line every minute.
+const asrHeartbeatNoteEvery = 3
+
+// transcribeWithHeartbeat runs one chapter's backend transcription (fn) while a ticker keeps
+// the open stage run's heartbeat fresh, so the supervisor's stale-heartbeat detector does not
+// mistake a healthy but pathologically slow chapter for a stalled run and kill it. Every
+// asrHeartbeatInterval it calls r.Heartbeat (a heartbeat-only stage-run touch) and, every
+// asrHeartbeatNoteEvery ticks, drops a stage note naming the chapter and elapsed time. The
+// ticker stops the moment fn returns and never fires once ctx is cancelled (a clean pause/
+// shutdown teardown selects ctx.Done() and returns), so a cancelled stage emits no trailing
+// heartbeat. label is the stage word ("asr" / "retranscribing").
+func transcribeWithHeartbeat(ctx context.Context, r scheduler.StageReport, label string, chapter int, fn func() error) error {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(asrHeartbeatInterval)
+		defer ticker.Stop()
+		start := time.Now()
+		ticks := 0
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				ticks++
+				if r.Heartbeat != nil {
+					r.Heartbeat()
+				}
+				if ticks%asrHeartbeatNoteEvery == 0 && r.Note != nil {
+					r.Note(fmt.Sprintf("%s: chapter %d still transcribing (%s elapsed)", label, chapter, humanDuration(time.Since(start))))
+				}
+			}
+		}
+	}()
+	err := fn()
+	close(done)
+	wg.Wait()
+	return err
 }
 
 // countNoun renders a count with a naively pluralized noun for a human note:
@@ -1709,7 +1766,7 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 		oc := repairOutcome{Chapter: entry.Chapter, Action: string(entry.Action), Round: round}
 		switch entry.Action {
 		case qa.ActionRetranscribe:
-			ok, rerr := e.retranscribeChapter(ctx, setup, book, durations[entry.Chapter], entry.Chapter)
+			ok, rerr := e.retranscribeChapter(ctx, r, setup, book, durations[entry.Chapter], entry.Chapter)
 			if rerr != nil {
 				return scheduler.StageResult{}, rerr
 			}
@@ -1727,7 +1784,7 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 				oc.Outcome, oc.ClipStartSec = "unlocatable", entry.ClipStartSec
 				break
 			}
-			res, rerr := e.tailClipChapter(ctx, setup, cut, book, durations[entry.Chapter], entry.Chapter, entry.ClipStartSec, verdicts)
+			res, rerr := e.tailClipChapter(ctx, r, setup, cut, book, durations[entry.Chapter], entry.Chapter, entry.ClipStartSec, verdicts)
 			if rerr != nil {
 				return scheduler.StageResult{}, rerr
 			}
@@ -1739,7 +1796,7 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 				oc.Outcome, oc.ClipStartSec, oc.ClipEndSec = "unlocatable", entry.ClipStartSec, entry.ClipEndSec
 				break
 			}
-			res, rerr := e.midClipChapter(ctx, setup, cut, book, durations[entry.Chapter], entry.Chapter, entry.ClipStartSec, entry.ClipEndSec, verdicts)
+			res, rerr := e.midClipChapter(ctx, r, setup, cut, book, durations[entry.Chapter], entry.Chapter, entry.ClipStartSec, entry.ClipEndSec, verdicts)
 			if rerr != nil {
 				return scheduler.StageResult{}, rerr
 			}
@@ -1931,7 +1988,7 @@ func ensureRetranscribeDecodeParams(workDir, tag string) error {
 // 0444), re-derives the json/text layers, and drops the chapter's stale
 // repaired/corrected files (correcting re-runs fully). On keep it leaves everything.
 // It returns whether the fresh run was adopted.
-func (e *Executor) retranscribeChapter(ctx context.Context, setup ASRSetup, book store.Book, durationSec float64, chapter int) (bool, error) {
+func (e *Executor) retranscribeChapter(ctx context.Context, r scheduler.StageReport, setup ASRSetup, book store.Book, durationSec float64, chapter int) (bool, error) {
 	flac := filepath.Join(book.WorkDir, audio.ChaptersDir, audio.ChapterFileName(chapter))
 	if !fsutil.IsFile(flac) {
 		return false, fmt.Errorf("retranscribing: chapter %d FLAC missing (%s); split must run first", chapter, flac)
@@ -1953,7 +2010,12 @@ func (e *Executor) retranscribeChapter(ctx context.Context, setup ASRSetup, book
 		// decode params - context-conditioning drives the deterministic repetition
 		// collapse we are here to fix, so an identical-params retry would just replay it.
 		job := asr.Job{Audio: flac, OutDir: freshDir, Chapter: chapter, Language: setup.Language, NoContext: true}
-		if terr := setup.Backend.Transcribe(ctx, job); terr != nil {
+		// A full-chapter re-transcription is as slow as the original decode, so keep the
+		// heartbeat fresh while it runs (no mid-chapter progress to report).
+		terr := transcribeWithHeartbeat(ctx, r, "retranscribing", chapter, func() error {
+			return setup.Backend.Transcribe(ctx, job)
+		})
+		if terr != nil {
 			if ctx.Err() != nil {
 				return false, ctx.Err()
 			}
@@ -2017,7 +2079,7 @@ func (e *Executor) retranscribeChapter(ctx context.Context, setup ASRSetup, book
 // wrapped error text. It returns the full repair.ClipResult so the caller can distinguish a
 // splice, a re-degeneration, a known-failed skip, and the tail unlocatable no-op (which it
 // buckets as clips_unlocatable and re-queues asking for a clip_start_sec).
-func (e *Executor) clipChapter(ctx context.Context, setup ASRSetup, cut repair.ClipCutter, book store.Book, chapter int, verdicts map[int]repair.TailVerdict, label string, req repair.ClipSpliceRequest, splice func(context.Context, repair.ClipSpliceRequest) (repair.ClipResult, error)) (repair.ClipResult, error) {
+func (e *Executor) clipChapter(ctx context.Context, r scheduler.StageReport, setup ASRSetup, cut repair.ClipCutter, book store.Book, chapter int, verdicts map[int]repair.TailVerdict, label string, req repair.ClipSpliceRequest, splice func(context.Context, repair.ClipSpliceRequest) (repair.ClipResult, error)) (repair.ClipResult, error) {
 	decodeTag := retranscribeDecodeTag
 	verdict, verdictExists := verdicts[chapter]
 	versionCurrent := clipMidVerdictCurrent(verdict, verdictExists)
@@ -2040,7 +2102,12 @@ func (e *Executor) clipChapter(ctx context.Context, setup ASRSetup, cut repair.C
 		// The backend names the raw from the audio stem (asr.RawOutputName), so the read
 		// derives from clipPath (t/m NNN...flac), not chNNN.
 		job := asr.Job{Audio: clipPath, OutDir: outDir, Chapter: chapter, Language: setup.Language, NoContext: true}
-		if terr := setup.Backend.Transcribe(ctx, job); terr != nil {
+		// A clip re-transcription can still churn (a short window that decodes slowly), so
+		// keep the heartbeat fresh while it runs.
+		terr := transcribeWithHeartbeat(ctx, r, "retranscribing", chapter, func() error {
+			return setup.Backend.Transcribe(ctx, job)
+		})
+		if terr != nil {
 			return nil, terr
 		}
 		return os.ReadFile(filepath.Join(outDir, asr.RawOutputName(clipPath))) //nolint:gosec // path derives from the book's work dir
@@ -2073,8 +2140,8 @@ func (e *Executor) clipChapter(ctx context.Context, setup ASRSetup, cut repair.C
 // degenerated. startOverrideSec, when > 0, is the agent-supplied window start (from the
 // plan entry's clip_start_sec) that relocates a window whose derived cut kept re-
 // degenerating; 0 derives as usual.
-func (e *Executor) tailClipChapter(ctx context.Context, setup ASRSetup, cut repair.ClipCutter, book store.Book, chapterEnd float64, chapter int, startOverrideSec float64, verdicts map[int]repair.TailVerdict) (repair.ClipResult, error) {
-	return e.clipChapter(ctx, setup, cut, book, chapter, verdicts, "tail-clip",
+func (e *Executor) tailClipChapter(ctx context.Context, r scheduler.StageReport, setup ASRSetup, cut repair.ClipCutter, book store.Book, chapterEnd float64, chapter int, startOverrideSec float64, verdicts map[int]repair.TailVerdict) (repair.ClipResult, error) {
+	return e.clipChapter(ctx, r, setup, cut, book, chapter, verdicts, "tail-clip",
 		repair.ClipSpliceRequest{ChapterEnd: chapterEnd, StartOverrideSec: startOverrideSec},
 		repair.ClipAndSplice)
 }
@@ -2084,7 +2151,7 @@ func (e *Executor) tailClipChapter(ctx context.Context, setup ASRSetup, cut repa
 // health-check, splice between the intact head and tail unless the clip re-degenerated. The
 // window comes from the plan entry's clip_start_sec/clip_end_sec (Validate guarantees
 // start>0 and end>start). chapterEnd rides on the request for parity with the tail path.
-func (e *Executor) midClipChapter(ctx context.Context, setup ASRSetup, cut repair.ClipCutter, book store.Book, chapterEnd float64, chapter int, startSec, endSec float64, verdicts map[int]repair.TailVerdict) (repair.ClipResult, error) {
+func (e *Executor) midClipChapter(ctx context.Context, r scheduler.StageReport, setup ASRSetup, cut repair.ClipCutter, book store.Book, chapterEnd float64, chapter int, startSec, endSec float64, verdicts map[int]repair.TailVerdict) (repair.ClipResult, error) {
 	// Clamp an over-long agent window to the chapter end: an endSec past EOF would leave an
 	// empty tail (no segment starts after it) and silently turn the interior splice into a
 	// tail-to-EOF one, discarding real narration the agent meant to keep. ChapterEnd > 0
@@ -2093,7 +2160,7 @@ func (e *Executor) midClipChapter(ctx context.Context, setup ASRSetup, cut repai
 	if chapterEnd > 0 && endSec > chapterEnd {
 		endSec = chapterEnd
 	}
-	return e.clipChapter(ctx, setup, cut, book, chapter, verdicts, "mid-clip",
+	return e.clipChapter(ctx, r, setup, cut, book, chapter, verdicts, "mid-clip",
 		repair.ClipSpliceRequest{ChapterEnd: chapterEnd, StartOverrideSec: startSec, EndOverrideSec: endSec},
 		repair.ClipAndSpliceWindow)
 }

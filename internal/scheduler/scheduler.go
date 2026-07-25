@@ -774,6 +774,13 @@ func (s *Scheduler) execute(ctx context.Context, b store.Book, stage state.State
 				"book_id": b.ID, "stage": string(stage), "msg": msg,
 			})
 		},
+		// Heartbeat bumps the open stage run's heartbeat WITHOUT touching progress - the
+		// same seam the agent subprocess heartbeat uses (progress=false). A long-running
+		// ASR chapter ticks it every minute so the supervisor's stale-heartbeat detector
+		// does not kill a healthy but slow decode mid-chapter.
+		Heartbeat: func() {
+			_ = s.db.TouchOpenStageRun(ctx, b.ID, string(stage), false)
+		},
 	}
 	return s.exec.Execute(ctx, b, stage, r)
 }

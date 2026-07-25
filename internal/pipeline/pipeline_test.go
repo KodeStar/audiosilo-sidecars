@@ -602,6 +602,85 @@ func TestASRStageTranscribeFailureFails(t *testing.T) {
 	}
 }
 
+// TestASRStageHeartbeatDuringSlowChapter asserts a long single-chapter transcription
+// keeps emitting liveness heartbeats while the backend runs - so the supervisor's stale-
+// heartbeat detector does not kill a healthy but pathologically slow decode mid-chapter -
+// and, every few ticks, a "still transcribing" note naming the chapter. The ticker must
+// also stop the moment the transcription returns (no trailing heartbeat).
+func TestASRStageHeartbeatDuringSlowChapter(t *testing.T) {
+	prev := asrHeartbeatInterval
+	asrHeartbeatInterval = 5 * time.Millisecond
+	defer func() { asrHeartbeatInterval = prev }()
+
+	work := t.TempDir()
+	writeManifest(t, work, 1)
+	seedFLACs(t, work, 1)
+
+	fake := newFakeBackend()
+	release := make(chan struct{})
+	fake.block = release // Transcribe waits until we release it, simulating a slow chapter.
+
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+
+	var mu sync.Mutex
+	heartbeats := 0
+	var notes []string
+	report := scheduler.StageReport{
+		Heartbeat: func() { mu.Lock(); heartbeats++; mu.Unlock() },
+		Note:      func(msg string) { mu.Lock(); notes = append(notes, msg); mu.Unlock() },
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.ASR, report)
+		done <- err
+	}()
+
+	// Wait until several heartbeats AND at least one note have fired while the chapter is
+	// still "transcribing", then release the backend so the stage completes.
+	deadline := time.After(5 * time.Second)
+	for {
+		mu.Lock()
+		hb, nn := heartbeats, len(notes)
+		mu.Unlock()
+		if hb >= 4 && nn >= 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for heartbeats/notes (heartbeats=%d notes=%d)", hb, nn)
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("asr stage: %v", err)
+	}
+
+	// The ticker stops when the transcription returns: no heartbeat after completion.
+	mu.Lock()
+	afterDone := heartbeats
+	mu.Unlock()
+	time.Sleep(20 * asrHeartbeatInterval)
+	mu.Lock()
+	defer mu.Unlock()
+	if heartbeats != afterDone {
+		t.Errorf("heartbeat fired after the transcription returned: %d -> %d", afterDone, heartbeats)
+	}
+	if heartbeats < 4 {
+		t.Errorf("heartbeats = %d, want >= 4 during a slow chapter", heartbeats)
+	}
+	foundNote := false
+	for _, n := range notes {
+		if strings.Contains(n, "still transcribing") && strings.Contains(n, "chapter 1") {
+			foundNote = true
+		}
+	}
+	if !foundNote {
+		t.Errorf("no 'still transcribing' note naming chapter 1; notes=%v", notes)
+	}
+}
+
 // TestStagesParkWhenMediaToolsMissing asserts inspect (no ffprobe) and split (no
 // ffmpeg) PARK needs_attention with the media-tools message, rather than
 // hard-failing, since a missing tool is a human-fixable startup precondition.

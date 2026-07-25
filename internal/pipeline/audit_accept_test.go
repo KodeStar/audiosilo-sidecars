@@ -18,31 +18,44 @@ import (
 
 func TestAcceptTrajectory(t *testing.T) {
 	const maxFix = state.MaxFixAttempts // 3
+	// prior holds the rounds BEFORE the current one; minActionable derives the window
+	// floor from them exactly as the stage does, so each case exercises the real
+	// prior-round -> minPriorActionable derivation as well as the predicate.
 	cases := []struct {
-		name                 string
-		round, blocker, fix  int
-		prevBlocker, prevFix int
-		prevOK               bool
-		fixesDone            int
-		valClean             bool
-		want                 bool
+		name                string
+		prior               []auditRound
+		round, blocker, fix int
+		fixesDone           int
+		valClean            bool
+		want                bool
 	}{
-		// The converging book-3 case: round 2, fix 1 <= prev 4, budget left -> accept.
-		{"converging", 2, 0, 1, 0, 4, true, 1, true, true},
-		{"flat-trajectory", 3, 0, 2, 0, 2, true, 2, true, true},
-		{"blocker-downgraded-to-fix", 2, 0, 1, 1, 0, true, 1, true, true},
-		{"blocker-never-accepts", 2, 1, 1, 0, 4, true, 1, true, false},
-		{"unclean-validation-never-accepts", 2, 0, 1, 0, 4, true, 1, false, false},
-		{"first-round-too-early", 1, 0, 1, 0, 0, false, 0, true, false},
-		{"fix-zero-is-a-pass-not-accept", 2, 0, 0, 0, 1, true, 1, true, false},
-		{"fix-over-cap", 2, 0, 3, 0, 4, true, 1, true, false},
-		{"growing-trajectory", 2, 0, 2, 0, 1, true, 1, true, false},
-		{"budget-exhausted", 4, 0, 1, 0, 1, true, maxFix, true, false},
-		{"no-previous-round", 2, 0, 1, 0, 0, false, 1, true, false},
+		// The converging book-3 case: round 2, fix 1 well within min(4)+2, budget left.
+		{"converging", []auditRound{{Blocker: 0, Fix: 4}}, 2, 0, 1, 1, true, true},
+		{"flat-trajectory", []auditRound{{Fix: 2}, {Fix: 2}}, 3, 0, 2, 2, true, true},
+		// One BLOCKER becoming one FIX lowers the actionable count - still progress.
+		{"blocker-downgraded-to-fix", []auditRound{{Blocker: 1, Fix: 0}}, 2, 0, 1, 1, true, true},
+		// Real book B: (0,1)(1,0)(3,2)(0,1) then round 5 (0,3). min prior actionable is 1
+		// (the (0,1) rounds), so fix 3 <= 1+2 accepts - the oscillation the strict
+		// vs-previous test could not latch.
+		{"book-B-oscillating-accepts", []auditRound{{Fix: 1}, {Blocker: 1}, {Blocker: 3, Fix: 2}, {Fix: 1}}, 5, 0, 3, 2, true, true},
+		// Real book A round 5 (b1,f1): a current blocker always blocks acceptance.
+		{"book-A-blocker-round-5", []auditRound{{Blocker: 2}, {Fix: 6}, {Fix: 5}, {Blocker: 1, Fix: 1}}, 5, 1, 1, 2, true, false},
+		// Real book C round 5 (b3,f1): three current blockers block acceptance.
+		{"book-C-blockers-round-5", []auditRound{{Fix: 2}, {Fix: 3}, {Blocker: 1}, {Fix: 3}}, 5, 3, 1, 2, true, false},
+		// Monotonically growing fix (0,1)(0,3) then round 3 (0,5): 5 > min(1)+2 (and over cap).
+		{"growing-trajectory", []auditRound{{Fix: 1}, {Fix: 3}}, 3, 0, 5, 2, true, false},
+		{"blocker-never-accepts", []auditRound{{Fix: 4}}, 2, 1, 1, 1, true, false},
+		{"unclean-validation-never-accepts", []auditRound{{Fix: 4}}, 2, 0, 1, 1, false, false},
+		{"first-round-too-early", nil, 1, 0, 1, 0, true, false},
+		{"fix-zero-is-a-pass-not-accept", []auditRound{{Fix: 1}}, 2, 0, 0, 1, true, false},
+		{"fix-over-cap", []auditRound{{Fix: 4}}, 2, 0, 4, 1, true, false},
+		{"budget-exhausted", []auditRound{{Fix: 1}}, 4, 0, 1, maxFix, true, false},
+		{"no-previous-round", nil, 2, 0, 1, 1, true, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := acceptTrajectory(c.round, c.blocker, c.fix, c.prevBlocker, c.prevFix, c.prevOK, c.fixesDone, c.valClean, maxFix)
+			minPrior, havePrior := minActionable(c.prior)
+			got := acceptTrajectory(c.round, c.blocker, c.fix, minPrior, havePrior, c.fixesDone, c.valClean, maxFix)
 			if got != c.want {
 				t.Errorf("acceptTrajectory = %v, want %v", got, c.want)
 			}
@@ -349,9 +362,10 @@ func TestAuditGrowingFixParksWithTrajectory(t *testing.T) {
 		case string(state.Synthesizing), string(state.Fixing):
 			writeOutSidecars(t, req, "book")
 		case string(state.Auditing):
-			// A growing FIX count each round (1, 2, 3, ...) - never a non-growing
-			// trajectory, so acceptTrajectory always refuses and the loop hits the cap.
-			findings := make([]AuditFinding, attempt)
+			// A fast-growing FIX count each round (2, 4, 6, ...) - every round past the
+			// first is above auditAcceptMaxFix AND above its best prior round plus the
+			// slack, so acceptTrajectory always refuses and the loop hits the cap.
+			findings := make([]AuditFinding, attempt*2)
 			for i := range findings {
 				findings[i] = AuditFinding{Severity: SeverityFix, Locus: "f"}
 			}
@@ -366,7 +380,7 @@ func TestAuditGrowingFixParksWithTrajectory(t *testing.T) {
 	if final.State != string(state.Auditing) {
 		t.Fatalf("parked at %q, want auditing", final.State)
 	}
-	if !strings.Contains(final.Error, "did not converge") || !strings.Contains(final.Error, "fix counts 1 -> 2 -> 3") {
+	if !strings.Contains(final.Error, "did not converge") || !strings.Contains(final.Error, "fix counts 2 -> 4 -> 6") {
 		t.Errorf("park reason = %q, want the growing fix-count trajectory", final.Error)
 	}
 	assertSuccesses(t, db, book.ID, string(state.Fixing), state.MaxFixAttempts)

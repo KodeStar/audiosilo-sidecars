@@ -187,10 +187,25 @@ func (s *Scheduler) supervisorPark(ctx context.Context, bookID int64, code state
 	if state.IsTerminal(state.State(b.State)) {
 		return "", ErrInvalidOp
 	}
-	if err := s.db.SetBookStatus(ctx, bookID, string(state.StatusNeedsAttention), reason, string(code)); err != nil {
+	// If the book is ALREADY parked with a typed code, PRESERVE that code (and its
+	// scheduled retry_at): the escalation updates only the operator-facing message, never
+	// the machine-readable park class. Rewriting a wrapped park to supervisor_escalated (or
+	// supervisor_budget) would strip the underlying code's readmit semantics - a Retry on a
+	// real fix_loop_exhausted park would take the plain readmit branch (no auditing/fixing
+	// supersede, no audit_rounds/audit_accepted wipe), re-enter the audit stage with an
+	// exhausted round history, and re-park instantly. Both readmit and supervisor.Decide
+	// already switch on the underlying code, so preserving it routes them to the right
+	// branch (supervisor_escalated's ask-model/retry branch simply stops being reachable for
+	// a wrapped park - that is the intent). The supervisor code is applied only when parking
+	// a book that was not already parked.
+	effectiveCode, retryAt := code, ""
+	if b.Status == string(state.StatusNeedsAttention) && b.ParkCode != "" {
+		effectiveCode, retryAt = state.ParkCode(b.ParkCode), b.RetryAt
+	}
+	if err := s.db.SetBookStatusRetry(ctx, bookID, string(state.StatusNeedsAttention), reason, string(effectiveCode), retryAt); err != nil {
 		return "", err
 	}
 	s.cancelInflight(bookID)
-	s.publishState(bookID, b.State, string(state.StatusNeedsAttention), reason, string(code), "")
+	s.publishState(bookID, b.State, string(state.StatusNeedsAttention), reason, string(effectiveCode), retryAt)
 	return "book parked and escalated", nil
 }
