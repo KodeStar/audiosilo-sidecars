@@ -225,7 +225,8 @@ internal/
             preparation with input digests; fresh per-run work trees and databases;
             stage-specific model/effort routes; the real fact/synthesis/audit/fix
             pipeline; independent holdout audits; hard-gated aggregate/Pareto reports;
-            and read-only historical telemetry over a caller-supplied DB snapshot.
+            accepted-reference judge calibration; and read-only historical telemetry
+            over a caller-supplied DB snapshot.
             Transcript corpora and generated results must remain outside the repo.
   repair/   M5: the mechanical tail-clip + adoption machinery (ports the historical
             tail_clip_check/adjudicate_tails/build_repairs): ClipAndSplice (locate the

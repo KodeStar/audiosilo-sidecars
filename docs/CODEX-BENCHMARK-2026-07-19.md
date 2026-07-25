@@ -1,7 +1,11 @@
 # Codex sidecar benchmark: initial findings
 
-Date: 2026-07-19
+Started: 2026-07-19
+
+Updated: 2026-07-20
+
 Codex CLI: 0.144.5
+
 Corpus digest: recorded in the private prepared suite
 
 ## Decision so far
@@ -102,6 +106,62 @@ chunk needed a full retry, the Sol loop used all three fixes, and two later Sol
 calls hit rate limits before retrying. Because Luna has no configured price, the
 route still has no defensible dollar total. The result is excluded from the
 Pareto frontier because the holdout did not pass.
+
+## Paired route screen
+
+Four medium-effort routes have now run on the same case. All completed and passed
+mechanical validation; none passed the strict fresh Sol/high holdout, so none is
+eligible for the Pareto frontier.
+
+| Route | Holdout | Wall min* | Input / output | Cost proxy | Audit / fix |
+|---|---:|---:|---:|---:|---:|
+| Luna all | 3 BLOCKER, 3 FIX | 38.3 | 7.87M / 116k | unknown | 4 / 3 |
+| Luna → Sol | 0 BLOCKER, 2 FIX | 47.8 | 7.93M / 132k | unknown | 4 / 3 |
+| Terra → Sol | **0 BLOCKER, 1 FIX** | 42.7 | **7.01M / 107k** | **$31.70** | 4 / 3 |
+| Sol all | 1 BLOCKER, 0 FIX | 39.8 | 9.67M / 127k | $56.53 | 3 / 2 |
+
+`*` Wall time is contaminated by production agents, rate limiting, and other
+machine work; it is included for transparency but not used as clean model latency.
+
+Terra → Sol is the provisional sweet spot among the routes tested: it has the
+best holdout outcome, lowest measured token usage, lowest known cost proxy, and
+fewer validation repairs than Luna → Sol. It is not yet a deployable benchmark
+winner because the holdout still requested one minor-character card. Sol-only is
+strong evidence against “use the biggest model everywhere”: it cost about 78%
+more than Terra → Sol and still leaked a future project name in a reveal-5 card.
+
+Raising the Terra/Sol tail from medium to high did not close the gap. The high
+profile consumed 6.71M input and 124k output tokens ($31.26 configured proxy) in
+41.4 contaminated wall minutes, then failed to converge after all three fixes.
+Its fourth audit still contained two FIX findings, so no holdout was run. Earlier
+rounds also caught reveal-timing blockers introduced during the loop. Higher
+reasoning effort therefore increased audit sensitivity and output usage without
+producing a stable accepted artifact.
+
+The evidence now points to the audit/fix convergence policy and character-coverage
+contract as the bottleneck. Terra → Sol at medium remains the provisional sweet
+spot, but “provisional” matters: it is the closest failed route, not a profile that
+passed every quality gate. Before changing production routing, calibrate the
+holdout against accepted references, improve convergence, and repeat the medium
+route across the full corpus. Do not spend more on low-effort testing until a
+medium or high profile can pass the semantic gate.
+
+## Holdout calibration
+
+A fresh Sol/high audit of the accepted production reference also failed, with two
+FIX findings. Both were deterministic reference drift: `characters.json` and
+`recaps.json` contain an extra `{type: community, ref: audiosilo-sidecars}` source,
+while the current contract requires exactly `[{"type":"community"}]`. The current
+validator enforces that rule, but the frozen reference and its copied validation
+report predate the enforcement.
+
+This does not erase the candidates' findings: the Terra/Sol miss was a semantic
+character omission, and the Sol-only miss was a reveal-timing spoiler. It does
+show why judge calibration is required and why accepted references must be
+revalidated when contracts change. Refresh the corpus reference after correcting
+the stale source arrays, then run both Sol and Claude holdouts on Monday. Until
+then, name/recap overlap remains a stability diagnostic and holdout severity is
+more informative than a raw pass percentage.
 
 ## Historical production evidence
 

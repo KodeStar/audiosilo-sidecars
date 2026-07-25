@@ -50,6 +50,21 @@ Quality is deliberately layered:
    holdout findings. The harness does not collapse quality, dollars, and seconds
    into a subjective weighted number; it reports the Pareto frontier.
 
+Calibrate every judge against the accepted reference before interpreting a narrow
+holdout miss. Keep calibration separate from generation results:
+
+```sh
+go run ./cmd/audiosilo-bench calibrate \
+  --suite ~/.audiosilo-bench/corpus-v1/suite.yaml \
+  --matrix benchmarks/codex-matrix.yaml \
+  --results ~/.audiosilo-bench/calibration-codex \
+  --profile terra_sol_medium_f3 --case short-series-opener
+```
+
+If the accepted reference fails, inspect the finding and either correct the
+reference/contract or report the judge's measured false-positive baseline. Never
+silently weaken a candidate's hard gate to make its score look better.
+
 ## Private corpus setup
 
 Never commit the suite. It contains transcripts and fact notes. Put the spec and
@@ -127,7 +142,13 @@ medium, and high, and includes one Luna-low extraction probe. Do not mix its
 results into the route block: first choose a viable route, then choose the lowest
 effort that preserves every hard gate.
 
-## Claude comparison on Monday
+## Claude comparison
+
+The initial Claude screen was executed on 2026-07-24/25. See
+[`CLAUDE-BENCHMARK-2026-07-24.md`](CLAUDE-BENCHMARK-2026-07-24.md) for the
+results, measured spend, judge disagreement, and the targeted follow-up hybrid.
+No profile passed every hard gate, so the commands below remain the rerun
+procedure after the audit protocol is corrected.
 
 Use the same corpus and seed. The cross-provider matrix has Haiku-only,
 Haiku/Opus, Sonnet-only, Sonnet/Opus, and Opus-only generation profiles plus both

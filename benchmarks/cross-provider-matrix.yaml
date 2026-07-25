@@ -94,3 +94,19 @@ profiles:
       fixing: opus
     efforts: *all_medium
     judges: *cross_judges
+
+  # Follow-up hybrid prompted by the first cross-provider screen: Sonnet was
+  # reliable at fact extraction and strict audit JSON, while Opus produced the
+  # strongest synthesis and successful semantic repairs. Keeping Sonnet on
+  # auditing avoids the repeated extra-field drift seen in Opus audit output.
+  - id: claude_sonnet_opus_sonnet_audit_opus_fix_cross_judged
+    backend: claude
+    max_agents_per_book: 3
+    models:
+      spelling_research: sonnet
+      fact_pass: sonnet
+      synthesizing: opus
+      auditing: sonnet
+      fixing: opus
+    efforts: *all_medium
+    judges: *cross_judges

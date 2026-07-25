@@ -228,6 +228,10 @@ func runOne(ctx context.Context, opts RunOptions, matrix Matrix, profile Profile
 			return result, err
 		}
 		if status == state.StatusNeedsAttention {
+			// Validation precedes every audit. Preserve the final mechanical score
+			// even though semantic convergence is a hard failure, so the aggregate
+			// does not mislabel a clean-but-nonconverged run as unvalidated.
+			result.Quality = Score(workDir, filepath.Join(suiteBase, filepath.FromSlash(c.Reference)))
 			populateResult(ctx, db, book.ID, &result)
 			return result, fmt.Errorf("audit did not converge after %d fix rounds", fixAttempts)
 		}

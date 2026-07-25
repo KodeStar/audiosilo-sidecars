@@ -22,27 +22,30 @@ type AggregateReport struct {
 }
 
 type ProfileAggregate struct {
-	Profile              string  `json:"profile"`
-	Runs                 int     `json:"runs"`
-	Completed            int     `json:"completed"`
-	ValidationPassed     int     `json:"validation_passed"`
-	HoldoutRuns          int     `json:"holdout_runs"`
-	HoldoutPassed        int     `json:"holdout_passed"`
-	MeanWallSeconds      float64 `json:"mean_wall_seconds"`
-	MedianWallSeconds    float64 `json:"median_wall_seconds"`
-	MeanAgentSeconds     float64 `json:"mean_agent_seconds"`
-	MedianAgentSeconds   float64 `json:"median_agent_seconds"`
-	MeanInputTokens      float64 `json:"mean_input_tokens"`
-	MeanOutputTokens     float64 `json:"mean_output_tokens"`
-	MeanCacheReadTokens  float64 `json:"mean_cache_read_tokens"`
-	MeanEstimatedCostUSD float64 `json:"mean_estimated_api_cost_usd"`
-	CostEstimateComplete bool    `json:"cost_estimate_complete"`
-	MeanCharacterRecall  float64 `json:"mean_character_name_recall"`
-	MeanRecapJaccard     float64 `json:"mean_recap_point_jaccard"`
-	MeanAuditRounds      float64 `json:"mean_audit_rounds"`
-	MeanFixRounds        float64 `json:"mean_fix_rounds"`
-	ValidationFailures   int     `json:"validation_failed_invocations"`
-	InvocationFailures   int     `json:"failed_invocations"`
+	Profile               string  `json:"profile"`
+	Runs                  int     `json:"runs"`
+	Completed             int     `json:"completed"`
+	ValidationPassed      int     `json:"validation_passed"`
+	HoldoutRuns           int     `json:"holdout_runs"`
+	HoldoutPassed         int     `json:"holdout_passed"`
+	MeanWallSeconds       float64 `json:"mean_wall_seconds"`
+	MedianWallSeconds     float64 `json:"median_wall_seconds"`
+	MeanAgentSeconds      float64 `json:"mean_agent_seconds"`
+	MedianAgentSeconds    float64 `json:"median_agent_seconds"`
+	MeanInputTokens       float64 `json:"mean_input_tokens"`
+	MeanOutputTokens      float64 `json:"mean_output_tokens"`
+	MeanCacheReadTokens   float64 `json:"mean_cache_read_tokens"`
+	MeanReportedCostUSD   float64 `json:"mean_provider_reported_cost_usd"`
+	ReportedCostComplete  bool    `json:"provider_reported_cost_complete"`
+	ReportedCostAvailable bool    `json:"provider_reported_cost_available"`
+	MeanEstimatedCostUSD  float64 `json:"mean_estimated_api_cost_usd"`
+	CostEstimateComplete  bool    `json:"cost_estimate_complete"`
+	MeanCharacterRecall   float64 `json:"mean_character_name_recall"`
+	MeanRecapJaccard      float64 `json:"mean_recap_point_jaccard"`
+	MeanAuditRounds       float64 `json:"mean_audit_rounds"`
+	MeanFixRounds         float64 `json:"mean_fix_rounds"`
+	ValidationFailures    int     `json:"validation_failed_invocations"`
+	InvocationFailures    int     `json:"failed_invocations"`
 }
 
 func BuildReport(resultsRoot string, now time.Time) (AggregateReport, error) {
@@ -82,7 +85,7 @@ func BuildReport(resultsRoot string, now time.Time) (AggregateReport, error) {
 	}
 	sort.Strings(ids)
 	report := AggregateReport{Version: schemaVersion, Generated: now.UTC().Format(time.RFC3339),
-		MethodNote: "Quality gates are primary. Reference-name and recap-point overlap are stability diagnostics, not semantic correctness scores. Cost is an API-equivalent estimate only when every model has an explicit configured rate."}
+		MethodNote: "Quality gates are primary. Reference-name and recap-point overlap are stability diagnostics, not semantic correctness scores. Provider-reported generation cost is shown separately from the versioned API-equivalent estimate; holdout-judge spend is excluded from both."}
 	for _, id := range ids {
 		report.Profiles = append(report.Profiles, aggregate(id, byProfile[id]))
 	}
@@ -91,8 +94,8 @@ func BuildReport(resultsRoot string, now time.Time) (AggregateReport, error) {
 }
 
 func aggregate(id string, runs []RunResult) ProfileAggregate {
-	a := ProfileAggregate{Profile: id, Runs: len(runs), CostEstimateComplete: true}
-	var wall, input, output, cache, cost, charRecall, recap, audits, fixes float64
+	a := ProfileAggregate{Profile: id, Runs: len(runs), ReportedCostComplete: true, CostEstimateComplete: true}
+	var wall, input, output, cache, reportedCost, estimatedCost, charRecall, recap, audits, fixes float64
 	wallSamples := make([]float64, 0, len(runs))
 	agentSamples := make([]float64, 0, len(runs))
 	for _, r := range runs {
@@ -120,8 +123,14 @@ func aggregate(id string, runs []RunResult) ProfileAggregate {
 			output += float64(v.OutputTokens)
 			cache += float64(v.CacheReadTokens)
 			runAgentSeconds += elapsed(v.StartedAt, v.CompletedAt)
+			if v.CostReported {
+				reportedCost += v.CostUSD
+				a.ReportedCostAvailable = true
+			} else if v.InputTokens+v.OutputTokens+v.CacheReadTokens > 0 {
+				a.ReportedCostComplete = false
+			}
 			if v.EstimatedAPICostUSD != nil {
-				cost += *v.EstimatedAPICostUSD
+				estimatedCost += *v.EstimatedAPICostUSD
 			} else if v.InputTokens+v.OutputTokens+v.CacheReadTokens > 0 {
 				a.CostEstimateComplete = false
 			}
@@ -144,7 +153,11 @@ func aggregate(id string, runs []RunResult) ProfileAggregate {
 	a.MeanInputTokens = input / n
 	a.MeanOutputTokens = output / n
 	a.MeanCacheReadTokens = cache / n
-	a.MeanEstimatedCostUSD = cost / n
+	a.MeanReportedCostUSD = reportedCost / n
+	if !a.ReportedCostAvailable {
+		a.ReportedCostComplete = false
+	}
+	a.MeanEstimatedCostUSD = estimatedCost / n
 	a.MeanCharacterRecall = charRecall / n
 	a.MeanRecapJaccard = recap / n
 	a.MeanAuditRounds = audits / n
@@ -218,15 +231,19 @@ func WriteReport(root string, report AggregateReport) error {
 	var b strings.Builder
 	b.WriteString("# Sidecar agent benchmark\n\n")
 	b.WriteString("Quality gates are pass/fail. Name recall and recap-point overlap measure stability against the accepted reference, not factual correctness. Holdout audits are fresh sessions and should use a different provider when available.\n\n")
-	b.WriteString("| Profile | Complete | Validation | Holdout | Wall min mean/median | Agent min mean/median | Input M | Output k | Cost proxy | Character recall | Recap overlap | Audit rounds | Fix rounds |\n")
-	b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	b.WriteString("| Profile | Complete | Validation | Holdout | Wall min mean/median | Agent min mean/median | Input M | Output k | Reported gen cost | API proxy | Character recall | Recap overlap | Audit rounds | Fix rounds |\n")
+	b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, p := range report.Profiles {
-		cost := "unknown"
-		if p.CostEstimateComplete {
-			cost = fmt.Sprintf("$%.2f", p.MeanEstimatedCostUSD)
+		reportedCost := "unknown"
+		if p.ReportedCostAvailable && p.ReportedCostComplete {
+			reportedCost = fmt.Sprintf("$%.2f", p.MeanReportedCostUSD)
 		}
-		fmt.Fprintf(&b, "| %s | %d/%d | %d/%d | %d/%d | %.1f / %.1f | %.1f / %.1f | %.2f | %.0f | %s | %.0f%% | %.0f%% | %.2f | %.2f |\n",
-			p.Profile, p.Completed, p.Runs, p.ValidationPassed, p.Runs, p.HoldoutPassed, p.HoldoutRuns, p.MeanWallSeconds/60, p.MedianWallSeconds/60, p.MeanAgentSeconds/60, p.MedianAgentSeconds/60, p.MeanInputTokens/1e6, p.MeanOutputTokens/1e3, cost, p.MeanCharacterRecall*100, p.MeanRecapJaccard*100, p.MeanAuditRounds, p.MeanFixRounds)
+		estimatedCost := "unknown"
+		if p.CostEstimateComplete {
+			estimatedCost = fmt.Sprintf("$%.2f", p.MeanEstimatedCostUSD)
+		}
+		fmt.Fprintf(&b, "| %s | %d/%d | %d/%d | %d/%d | %.1f / %.1f | %.1f / %.1f | %.2f | %.0f | %s | %s | %.0f%% | %.0f%% | %.2f | %.2f |\n",
+			p.Profile, p.Completed, p.Runs, p.ValidationPassed, p.Runs, p.HoldoutPassed, p.HoldoutRuns, p.MeanWallSeconds/60, p.MedianWallSeconds/60, p.MeanAgentSeconds/60, p.MedianAgentSeconds/60, p.MeanInputTokens/1e6, p.MeanOutputTokens/1e3, reportedCost, estimatedCost, p.MeanCharacterRecall*100, p.MeanRecapJaccard*100, p.MeanAuditRounds, p.MeanFixRounds)
 	}
 	if len(report.Pareto) == 0 {
 		b.WriteString("\nPareto frontier: none; no measured profile passed every hard gate.\n")

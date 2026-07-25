@@ -82,6 +82,29 @@ func run(ctx context.Context, args []string) error {
 		}
 		fmt.Printf("wrote %s and %s\n", filepath.Join(*results, "report.json"), filepath.Join(*results, "report.md"))
 		return nil
+	case "calibrate":
+		fs := flag.NewFlagSet("calibrate", flag.ContinueOnError)
+		suite := fs.String("suite", "", "prepared suite.yaml")
+		matrix := fs.String("matrix", "benchmarks/codex-matrix.yaml", "profile matrix YAML")
+		results := fs.String("results", "", "new private calibration results directory")
+		profile := fs.String("profile", "", "one profile whose holdout judges are used")
+		caseID := fs.String("case", "", "one case whose accepted reference is judged")
+		timeout := fs.Duration("timeout", 60*time.Minute, "per judge invocation timeout")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		result, err := benchmark.Calibrate(ctx, benchmark.RunOptions{SuitePath: *suite, MatrixPath: *matrix, ResultsDir: *results, ProfileID: *profile, CaseID: *caseID, Timeout: *timeout, Out: os.Stdout})
+		if err != nil {
+			return err
+		}
+		passed := 0
+		for _, holdout := range result.Holdouts {
+			if holdout.Passed {
+				passed++
+			}
+		}
+		fmt.Printf("accepted reference passed %d/%d holdout judges\n", passed, len(result.Holdouts))
+		return nil
 	case "history":
 		fs := flag.NewFlagSet("history", flag.ContinueOnError)
 		db := fs.String("db", "", "sidecars.db SNAPSHOT (never the live daemon DB)")
@@ -120,5 +143,6 @@ Commands:
   prepare --spec SPEC.yaml --out PRIVATE_SUITE_DIR
   run --suite PRIVATE_SUITE_DIR/suite.yaml --matrix MATRIX.yaml --results DIR [--profile ID] [--case ID] [--repeat N]
   report --results DIR
+  calibrate --suite PRIVATE_SUITE_DIR/suite.yaml --matrix MATRIX.yaml --results NEW_DIR --profile ID --case ID
   history --db SNAPSHOT.db --out DIR`)
 }

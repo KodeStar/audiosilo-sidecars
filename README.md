@@ -74,8 +74,9 @@ for compatibility, supported stages, timing, liveness, cost, and safe testing.
 
 Model-routing research uses the private, provider-neutral `audiosilo-bench`
 harness. It replays the real post-ASR pipeline without copying source audio or raw
-ASR into the repository; see [Agent pipeline benchmarking](docs/BENCHMARKING.md)
-and the [initial Codex findings](docs/CODEX-BENCHMARK-2026-07-19.md).
+ASR into the repository; see [Agent pipeline benchmarking](docs/BENCHMARKING.md),
+the [initial Codex findings](docs/CODEX-BENCHMARK-2026-07-19.md), and the
+[initial Claude findings](docs/CLAUDE-BENCHMARK-2026-07-24.md).
 
 ### Frontend dev loop
 

@@ -15,6 +15,12 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
 
+func TestCalibrateRequiresExplicitSingleCase(t *testing.T) {
+	if _, err := Calibrate(context.Background(), RunOptions{ResultsDir: t.TempDir(), ProfileID: "all", CaseID: "case"}); err == nil || !strings.Contains(err.Error(), "explicit profile and case") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 type benchmarkRunner struct {
 	id       string
 	requests []agent.Request
@@ -138,8 +144,28 @@ func TestBuildReportMarksUnknownCostAndFindsProfiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(report.Profiles) != 1 || report.Profiles[0].CostEstimateComplete || len(report.Pareto) != 0 {
+	if len(report.Profiles) != 1 || report.Profiles[0].CostEstimateComplete || report.Profiles[0].ReportedCostAvailable || report.Profiles[0].ReportedCostComplete || len(report.Pareto) != 0 {
 		t.Fatalf("report=%+v", report)
+	}
+}
+
+func TestBuildReportSeparatesReportedAndEstimatedCost(t *testing.T) {
+	root := t.TempDir()
+	estimated := 1.25
+	r := RunResult{Version: 1, Profile: "claude", Case: "c", Repeat: 1, Completed: true, WallSeconds: 60}
+	r.Invocations = []store.AgentInvocation{{
+		Status: "success", InputTokens: 10, CostUSD: 2.5, CostReported: true,
+		EstimatedAPICostUSD: &estimated, StartedAt: "2026-01-01T00:00:00Z", CompletedAt: "2026-01-01T00:00:01Z",
+	}}
+	raw, _ := json.Marshal(r)
+	writeTestFile(t, root, "claude/c/r01/result.json", string(raw))
+	report, err := BuildReport(root, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := report.Profiles[0]
+	if !p.ReportedCostAvailable || !p.ReportedCostComplete || p.MeanReportedCostUSD != 2.5 || !p.CostEstimateComplete || p.MeanEstimatedCostUSD != estimated {
+		t.Fatalf("profile=%+v", p)
 	}
 }
 
