@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
-	"github.com/kodestar/audiosilo-sidecars/internal/audio"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
@@ -17,6 +16,7 @@ import (
 type auditPromptData struct {
 	Title          string
 	ChapterCount   int
+	EdgeNote       string
 	IsSeriesOpener bool
 	VerifiedLedger string
 }
@@ -27,6 +27,7 @@ type auditPromptData struct {
 type auditVerifyPromptData struct {
 	Title        string
 	ChapterCount int
+	EdgeNote     string
 	Round        int
 }
 
@@ -66,10 +67,11 @@ func (e *Executor) audit(ctx context.Context, book store.Book, r scheduler.Stage
 		}
 	}
 
-	manifest, seriesOpener, ledger, err := e.sidecarStageInputs(ctx, book)
+	class, seriesOpener, ledger, err := e.sidecarStageInputs(ctx, book)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("auditing: %w", err)
 	}
+	noteEdgeExclusions(r, class)
 
 	st, err := agent.New(book.WorkDir, string(state.Auditing), e.stageAttempt(ctx, book, state.Auditing))
 	if err != nil {
@@ -92,7 +94,8 @@ func (e *Executor) audit(ctx context.Context, book store.Book, r scheduler.Stage
 	}
 	data := auditPromptData{
 		Title:          book.Title,
-		ChapterCount:   manifest.ChapterCount,
+		ChapterCount:   class.LogicalCount,
+		EdgeNote:       class.EdgeNote,
 		IsSeriesOpener: seriesOpener,
 		VerifiedLedger: ledger,
 	}
@@ -187,9 +190,9 @@ func (e *Executor) auditReentryAccept(ctx context.Context, book store.Book, r sc
 		_ = os.Remove(auditAcceptedPath(book.WorkDir))
 		return scheduler.StageResult{}, false, nil
 	}
-	manifest, err := audio.ReadManifest(book.WorkDir)
+	class, err := classifyBookEdges(book.WorkDir)
 	if err != nil {
-		return scheduler.StageResult{}, false, fmt.Errorf("auditing: verification read manifest: %w", err)
+		return scheduler.StageResult{}, false, fmt.Errorf("auditing: verification classify edges: %w", err)
 	}
 	st, err := agent.New(book.WorkDir, string(state.Auditing)+"-verify", e.stageAttempt(ctx, book, state.Auditing))
 	if err != nil {
@@ -211,7 +214,7 @@ func (e *Executor) auditReentryAccept(ctx context.Context, book store.Book, r sc
 		return nil
 	}
 	usage, err := e.runAgent(ctx, book, state.Auditing, r, st, "audit_verify.md", auditVerifyPromptData{
-		Title: book.Title, ChapterCount: manifest.ChapterCount, Round: acc.Round,
+		Title: book.Title, ChapterCount: class.LogicalCount, EdgeNote: class.EdgeNote, Round: acc.Round,
 	}, false, validate)
 	if err != nil {
 		return scheduler.StageResult{}, true, err

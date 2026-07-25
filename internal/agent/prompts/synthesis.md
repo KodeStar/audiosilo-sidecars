@@ -1,6 +1,11 @@
 You are the synthesis stage of the extraction pipeline. Author the CC BY-SA
 sidecars for "{{.Title}}" by {{.Authors}}{{if .Series}} ({{.Series}} book {{.SeriesPos}}){{end}},
 a work of {{.ChapterCount}} logical chapters.
+{{if .EdgeNote}}
+Note on this book's structure: {{.EdgeNote}} The final recap runs through the
+last logical story chapter ({{.ChapterCount}}), not the file count; never carry a
+position past chapter {{.ChapterCount}}.
+{{end}}
 
 ## The load-bearing boundary
 

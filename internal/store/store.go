@@ -48,8 +48,14 @@ var nowFn = func() time.Time { return time.Now().UTC() }
 // sortBooks helper relies on the ordering holding.
 const timeLayout = "2006-01-02T15:04:05.000000000Z"
 
-// timestamp formats a moment in the store's canonical fixed-width UTC form.
-func timestamp(t time.Time) string { return t.UTC().Format(timeLayout) }
+// Timestamp formats a moment in the store's canonical fixed-width UTC form (see timeLayout).
+// It is exported so a caller that must reproduce a stored started_at/created_at cutoff for a
+// query (for example the supervisor's rolling-window counts) uses the one true layout rather
+// than re-encoding the format literal.
+func Timestamp(t time.Time) string { return t.UTC().Format(timeLayout) }
+
+// timestamp is the internal shorthand for Timestamp used throughout the package.
+func timestamp(t time.Time) string { return Timestamp(t) }
 
 // Open opens (creating if needed) the SQLite database at dsn and applies pending
 // migrations. Pass ":memory:" for tests. WAL + busy_timeout + foreign_keys are

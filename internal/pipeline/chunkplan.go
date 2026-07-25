@@ -116,7 +116,7 @@ func computeChunkPlan(workDir string) (chunkPlan, error) {
 	}
 	chs := make([]chapterWords, 0, len(m.Chapters))
 	for _, ch := range m.Chapters {
-		w, werr := chapterWordCount(workDir, ch.Chapter)
+		w, _, werr := chapterWordCount(workDir, ch.Chapter)
 		if werr != nil {
 			return chunkPlan{}, fmt.Errorf("chunk plan: count chapter %d words: %w", ch.Chapter, werr)
 		}
@@ -128,20 +128,22 @@ func computeChunkPlan(workDir string) (chunkPlan, error) {
 	return planChunks(chs), nil
 }
 
-// chapterWordCount returns a chapter's word count from its corrected-source text,
-// preferring transcripts-repaired/<ch>.txt over transcripts-text/<ch>.txt via the
-// shared transcript.ChapterTextPath resolver (the same preference spelling.Apply
-// applies). A chapter with no text counts as zero words.
-func chapterWordCount(workDir string, chapter int) (int, error) {
+// chapterWordCount returns a chapter's word count from its corrected-source text and
+// whether a readable transcript exists for it, preferring transcripts-repaired/<ch>.txt
+// over transcripts-text/<ch>.txt via the shared transcript.ChapterTextPath resolver (the
+// same preference spelling.Apply applies). A chapter with no transcript path is
+// (0, false); the edge classifier reads presence to treat a missing transcript as
+// narrative, while chunk planning ignores it and counts a missing chapter as zero words.
+func chapterWordCount(workDir string, chapter int) (words int, present bool, err error) {
 	p, ok := transcript.ChapterTextPath(workDir, chapter)
 	if !ok {
-		return 0, nil
+		return 0, false, nil
 	}
 	b, err := os.ReadFile(p) //nolint:gosec // path derives from the book's work dir
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	return len(strings.Fields(string(b))), nil
+	return len(strings.Fields(string(b))), true, nil
 }
 
 // writeChunkPlan persists the plan to <workDir>/chunk_plan.json (pretty JSON,

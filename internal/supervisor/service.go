@@ -19,6 +19,47 @@ import (
 
 var ErrModelDisabled = errors.New("model-assisted supervision is disabled")
 
+// autoRecoveryWindow bounds the durable cross-Kind auto-recovery cap: a book gets at
+// most MaxAttempts automatic supervisor auto-recovery actions within this rolling window
+// before automatic re-admission stops and operator review is required.
+const autoRecoveryWindow = 24 * time.Hour
+
+// capAutoRecovery consults the durable cross-Kind auto-recovery cap for a would-be automatic
+// recovery ACTION on a book, and is the ONE cap check shared by the deterministic and the
+// model-assisted lanes. It queries the store ONLY when the cap could actually bind (the cap is
+// configured, automatic actions are on, the incident is unprotected, and the action is one of the
+// counted auto-recovery actions); otherwise it is a no-op (0, false, nil) with no query. When
+// capped is true the caller must convert the action to park_escalate + approval-required and
+// append autoRecoveryCapEvidence, identically in both lanes. It returns the recovery count so the
+// caller can build the evidence line.
+func (s *Service) capAutoRecovery(ctx context.Context, bookID int64, action Action, protected bool) (recoveries int, capped bool, err error) {
+	if s.policy.MaxAttempts <= 0 || !s.policy.AutomaticActions || protected || !isAutoRecoveryAction(action) {
+		return 0, false, nil
+	}
+	n, qerr := s.db.CountAutoRecoveriesSince(ctx, bookID, time.Now().Add(-autoRecoveryWindow))
+	if qerr != nil {
+		return 0, false, qerr
+	}
+	return n, n >= s.policy.MaxAttempts, nil
+}
+
+// autoRecoveryCapEvidence renders the cap-escalation evidence line appended when the durable
+// auto-recovery cap binds. The window text derives from autoRecoveryWindow so it can never drift
+// from the const the cap actually uses.
+func autoRecoveryCapEvidence(recoveries int) string {
+	return fmt.Sprintf("auto-recovery cap: %d automatic recovery actions in %s; human review required",
+		recoveries, autoRecoveryWindowText())
+}
+
+// autoRecoveryWindowText renders autoRecoveryWindow compactly ("24h" for a whole number of
+// hours, else time.Duration's own form) for the cap evidence line.
+func autoRecoveryWindowText() string {
+	if h := autoRecoveryWindow.Hours(); h == float64(int64(h)) {
+		return fmt.Sprintf("%dh", int64(h))
+	}
+	return autoRecoveryWindow.String()
+}
+
 type Runtime struct {
 	ActiveBooks        map[int64]bool `json:"active_books"`
 	AgentActive        int            `json:"agent_active"`
@@ -256,7 +297,23 @@ func (s *Service) handleIncident(ctx context.Context, trigger string, i Incident
 	if err != nil {
 		return err
 	}
-	d := Decide(i, attempts, s.policy)
+	d := Decide(i, attempts, 0, s.policy)
+	// Durable cross-Kind auto-recovery cap. The per-family attempt count above can be
+	// defeated by Kind alternation (parked_recovery vs unclassified/backend_unavailable)
+	// or any residual fingerprint drift, so a book must additionally never be automatically
+	// recovered (retry/readmit/supersede_rerun/requeue/fallback_backend) more than MaxAttempts
+	// times within the rolling window. capAutoRecovery is the ONE cap check shared with the
+	// model-assisted lane; it queries only when the cap could bind. Decide owns the cap-to-park
+	// conversion (via capsAutoRecovery, same predicate), so re-deciding with the observed count
+	// escalates a capped action; the evidence is appended here when the cap binds.
+	recoveries, capped, capErr := s.capAutoRecovery(ctx, i.BookID, d.Action, i.Protected)
+	if capErr != nil {
+		return capErr
+	}
+	if capped {
+		i.Evidence = append(i.Evidence, autoRecoveryCapEvidence(recoveries))
+	}
+	d = Decide(i, attempts, recoveries, s.policy)
 	evidence, _ := json.Marshal(i.Evidence)
 	bookID := i.BookID
 	var stageRunID *int64
@@ -339,7 +396,7 @@ func (s *Service) runModel(ctx context.Context, r *store.SupervisorRun, i Incide
 	providerSeen, providerComplete := false, true
 	estimateSeen, estimateComplete := false, true
 	maxCalls := s.cfg.MaxModelCalls
-	usedCalls, countErr := s.db.SupervisorInvocationCountSince(ctx, time.Now().Add(-time.Hour).UTC().Format("2006-01-02T15:04:05.000000000Z"))
+	usedCalls, countErr := s.db.SupervisorInvocationCountSince(ctx, time.Now().Add(-time.Hour))
 	if countErr != nil {
 		r.State = "failed"
 		r.ActionOutcome = countErr.Error()
@@ -418,6 +475,30 @@ func (s *Service) runModel(ctx context.Context, r *store.SupervisorRun, i Incide
 		automatic = s.cfg.AutomaticActions && s.cfg.ModelAutomaticActions && !r.ApprovalRequired
 	}
 	r.Automatic = automatic
+	// The model lane obeys the SAME durable auto-recovery cap as the deterministic lane: a
+	// capped book that routed here (supervisor_escalated -> ask_model) must not resume the
+	// ping-pong through a model-recommended retry/readmit/supersede_rerun/requeue/fallback.
+	// When the cap binds, escalate for operator review instead of applying (mirroring the
+	// deterministic park_escalate + approval + cap evidence).
+	if automatic {
+		recoveries, capped, capErr := s.capAutoRecovery(ctx, i.BookID, decision.RecommendedAction, i.Protected)
+		if capErr != nil {
+			r.State = "failed"
+			r.ActionOutcome = capErr.Error()
+			return s.finishRun(ctx, *r)
+		}
+		if capped {
+			decision.Evidence = append(decision.Evidence, autoRecoveryCapEvidence(recoveries))
+			ev, _ := json.Marshal(decision.Evidence)
+			r.Evidence = ev
+			r.SelectedAction = string(ActionParkEscalate)
+			r.Automatic = false
+			r.ApprovalRequired = true
+			r.State = "approval_required"
+			r.ActionOutcome = "auto-recovery cap reached; operator review required"
+			return s.finishRun(ctx, *r)
+		}
+	}
 	if automatic && s.hooks.Apply != nil {
 		outcome, aerr := s.hooks.Apply(ctx, decision.RecommendedAction, i)
 		if aerr != nil {
@@ -462,7 +543,7 @@ func accumulateUsage(dst *agent.Usage, u agent.Usage, first bool) {
 }
 
 func (s *Service) modelBudgetAllows(ctx context.Context, batch string, book *int64) (bool, string) {
-	count, err := s.db.SupervisorInvocationCountSince(ctx, time.Now().Add(-time.Hour).UTC().Format("2006-01-02T15:04:05.000000000Z"))
+	count, err := s.db.SupervisorInvocationCountSince(ctx, time.Now().Add(-time.Hour))
 	if err != nil {
 		return false, err.Error()
 	}

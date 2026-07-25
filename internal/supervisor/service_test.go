@@ -3,8 +3,10 @@ package supervisor
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,8 +14,18 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/config"
 	"github.com/kodestar/audiosilo-sidecars/internal/pricing"
+	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
+
+func failedRunMetrics(t *testing.T, errMsg string) json.RawMessage {
+	t.Helper()
+	m, err := json.Marshal(map[string]string{"error": errMsg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
 
 type fixedModel struct {
 	decision ModelDecision
@@ -50,6 +62,270 @@ func supervisorDB(t *testing.T) *store.DB {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+// TestParkedRecoveryFingerprintIgnoresRewrittenBookError proves change 1: the
+// parked-recovery fingerprint is derived from the stable underlying stage-run error,
+// not from book.Error (which every supervisor escalation rewrites). Two snapshots that
+// differ ONLY in book.Error must fingerprint identically; a genuinely different
+// underlying failure must fingerprint differently.
+func TestParkedRecoveryFingerprintIgnoresRewrittenBookError(t *testing.T) {
+	no := false
+	underlying := "ffmpeg: Invalid data found when processing input"
+	runs := func(errMsg string) []store.StageRun {
+		return []store.StageRun{{ID: 7, Stage: "retranscribing", FinishedAt: "2026-07-19T09:50:07Z", Ok: &no, Metrics: failedRunMetrics(t, errMsg)}}
+	}
+	book := func(bookError string) store.Book {
+		return store.Book{ID: 1, State: "retranscribing", Status: string(state.StatusNeedsAttention), Error: bookError, ParkCode: string(state.ParkQANoConverge)}
+	}
+	find := func(b store.Book, r []store.StageRun) Incident {
+		for _, i := range Classify(Snapshot{Book: b, Runs: r}, Policy{MaxAttempts: 3}) {
+			if i.Kind == IncidentParkedRecovery {
+				return i
+			}
+		}
+		t.Fatalf("no parked_recovery incident for %+v", b)
+		return Incident{}
+	}
+	genuine := find(book("stage failed: "+underlying), runs(underlying))
+	// A later recovery cycle: park_escalate rewrote book.Error to nested supervisor prose,
+	// but the underlying stage-run error is byte-for-byte identical.
+	rewritten := find(book("supervisor: parked book requires a bounded recovery plan: park code qa_no_converge; stage failed: "+underlying), runs(underlying))
+	if genuine.Fingerprint == "" || genuine.Fingerprint != rewritten.Fingerprint {
+		t.Fatalf("fingerprint drifted with a rewritten book.Error: %q vs %q", genuine.Fingerprint, rewritten.Fingerprint)
+	}
+	other := find(book("stage failed: other"), runs("ffmpeg: No such file or directory"))
+	if other.Fingerprint == genuine.Fingerprint {
+		t.Fatalf("a distinct underlying error collapsed into the same fingerprint")
+	}
+}
+
+// TestPingPongRecoveryEscalatesByCapAndStopsRetrying reproduces the production incident:
+// a deterministically-failing stage, alternating park/readmit cycles, with book.Error
+// rewritten each escalation by the supervisor message builder. With the fix, the book is
+// automatically retried at most MaxAttempts times, then escalates for operator review and
+// stops retrying.
+func TestPingPongRecoveryEscalatesByCapAndStopsRetrying(t *testing.T) {
+	ctx := context.Background()
+	db := supervisorDB(t)
+	_ = db.EnsureBatch(ctx, "pingpong", time.Now())
+	b, _ := db.CreateBook(ctx, store.NewBook{BatchID: "pingpong", SourcePath: "/pp", WorkDir: t.TempDir(), Title: "PingPong", State: "retranscribing"})
+	underlying := "ffmpeg: deterministic conversion failure"
+	metrics := failedRunMetrics(t, underlying)
+	first, _ := db.StartStageRun(ctx, b.ID, "retranscribing", 1)
+	_ = db.FinishStageRun(ctx, first, false, metrics)
+	_ = db.SetBookStatus(ctx, b.ID, string(state.StatusNeedsAttention), underlying, string(state.ParkQANoConverge))
+
+	cfg := config.Default().Supervisor
+	cfg.AutomaticActions = true
+	cfg.MaxAttempts = 3
+	cfg.StaleMinutes, cfg.NoProgressMinutes, cfg.MaxStageMinutes = 999, 999, 999
+
+	var mu sync.Mutex
+	var applied []Action
+	attempt := 1
+	s := New(db, cfg, pricing.Table{Version: "test"}, nil, Hooks{
+		Runtime: func([]store.Book) Runtime { return Runtime{ActiveBooks: map[int64]bool{}} },
+		Apply: func(_ context.Context, a Action, i Incident) (string, error) {
+			mu.Lock()
+			applied = append(applied, a)
+			mu.Unlock()
+			switch a {
+			case ActionRetry, ActionReadmit:
+				// Readmit: the stage runs and fails identically; the pipeline leaves the
+				// failed run and a failed book (genuine underlying error preserved).
+				attempt++
+				id, _ := db.StartStageRun(ctx, i.BookID, "retranscribing", attempt)
+				_ = db.FinishStageRun(ctx, id, false, metrics)
+				_ = db.SetBookStatus(ctx, i.BookID, string(state.StatusFailed), underlying, "")
+			case ActionParkEscalate:
+				// Reproduce supervisorPark: nested supervisor prose becomes the new
+				// book.Error and the park code becomes supervisor_escalated.
+				detail := i.Diagnosis
+				if len(i.Evidence) > 0 {
+					detail += ": " + strings.Join(i.Evidence, "; ")
+				}
+				_ = db.SetBookStatus(ctx, i.BookID, string(state.StatusNeedsAttention), "supervisor: "+detail, string(state.ParkSupervisorEscalated))
+			}
+			return "simulated", nil
+		},
+	})
+	for n := 0; n < 16; n++ {
+		s.check(ctx, "pingpong")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	retries := 0
+	for _, a := range applied {
+		if a == ActionRetry || a == ActionReadmit {
+			retries++
+		}
+	}
+	if retries != cfg.MaxAttempts {
+		t.Fatalf("applied %d automatic retries, want the cap of %d; actions=%v", retries, cfg.MaxAttempts, applied)
+	}
+	if len(applied) == 0 || applied[len(applied)-1] != ActionParkEscalate {
+		t.Fatalf("recovery loop did not terminate in escalation; actions=%v", applied)
+	}
+	runs, err := db.RecentSupervisorRuns(ctx, "pingpong", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capped := false
+	for _, r := range runs {
+		if r.SelectedAction == string(ActionParkEscalate) && r.ApprovalRequired && strings.Contains(string(r.Evidence), "auto-recovery cap") {
+			capped = true
+		}
+	}
+	if !capped {
+		t.Fatalf("no cap-triggered escalation with approval recorded; runs=%d", len(runs))
+	}
+	got, _ := db.GetBook(ctx, b.ID)
+	if got.Status != string(state.StatusNeedsAttention) {
+		t.Fatalf("book not left parked for review: status=%q park=%q", got.Status, got.ParkCode)
+	}
+}
+
+// seedAutoRecovery records a completed automatic retry supervisor run for a book under a
+// distinct incident key, so the cross-Kind cap can be exercised without relying on the
+// per-family attempt count.
+func seedAutoRecovery(t *testing.T, db *store.DB, batch string, bookID int64, key, startedAt string) {
+	t.Helper()
+	bid := bookID
+	if _, err := db.StartSupervisorRun(context.Background(), store.SupervisorRun{IncidentKey: key, BatchID: batch, BookID: &bid,
+		Trigger: "seed", Diagnosis: "prior recovery", Evidence: json.RawMessage(`[]`), SelectedAction: "retry",
+		Automatic: true, State: "completed", StartedAt: startedAt}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCrossKindAutoRecoveryCapForcesEscalation proves change 2: recoveries recorded under
+// DIFFERENT kinds/fingerprints for the same book still count toward the per-book cap, so a
+// fresh incident escalates instead of retrying once the cap is reached.
+func TestCrossKindAutoRecoveryCapForcesEscalation(t *testing.T) {
+	ctx := context.Background()
+	db := supervisorDB(t)
+	_ = db.EnsureBatch(ctx, "crosskind", time.Now())
+	b, _ := db.CreateBook(ctx, store.NewBook{BatchID: "crosskind", SourcePath: "/ck", WorkDir: t.TempDir(), Title: "CrossKind", State: "retranscribing"})
+	now := time.Now().UTC()
+	for n := 0; n < 3; n++ {
+		key := fmt.Sprintf("kind-%d/%d/retranscribing/%d/fp-%d", n, b.ID, n, n)
+		seedAutoRecovery(t, db, "crosskind", b.ID, key, store.Timestamp(now.Add(-time.Duration(n+1)*time.Minute)))
+	}
+	id, _ := db.StartStageRun(ctx, b.ID, "retranscribing", 1)
+	_ = db.FinishStageRun(ctx, id, false, failedRunMetrics(t, "ffmpeg: deterministic conversion failure"))
+	_ = db.SetBookStatus(ctx, b.ID, string(state.StatusNeedsAttention), "ffmpeg: deterministic conversion failure", string(state.ParkQANoConverge))
+
+	cfg := config.Default().Supervisor
+	cfg.AutomaticActions = true
+	cfg.MaxAttempts = 3
+	cfg.StaleMinutes, cfg.NoProgressMinutes, cfg.MaxStageMinutes = 999, 999, 999
+	var applied []Action
+	s := New(db, cfg, pricing.Table{Version: "test"}, nil, Hooks{
+		Runtime: func([]store.Book) Runtime { return Runtime{ActiveBooks: map[int64]bool{}} },
+		Apply: func(_ context.Context, a Action, _ Incident) (string, error) {
+			applied = append(applied, a)
+			return "simulated", nil
+		},
+	})
+	s.check(ctx, "crosskind")
+	if len(applied) != 1 || applied[0] != ActionParkEscalate {
+		t.Fatalf("cross-Kind cap did not force escalation; actions=%v", applied)
+	}
+}
+
+// TestAgedRecoveriesDoNotConsumeTheAutoRecoveryCap proves the window boundary: recoveries
+// older than the rolling window do not count, so a distinct failure after a human
+// intervention (and enough elapsed time) still receives a fresh automatic attempt.
+func TestAgedRecoveriesDoNotConsumeTheAutoRecoveryCap(t *testing.T) {
+	ctx := context.Background()
+	db := supervisorDB(t)
+	_ = db.EnsureBatch(ctx, "aged", time.Now())
+	b, _ := db.CreateBook(ctx, store.NewBook{BatchID: "aged", SourcePath: "/aged", WorkDir: t.TempDir(), Title: "Aged", State: "retranscribing"})
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	for n := 0; n < 3; n++ {
+		key := fmt.Sprintf("kind-%d/%d/retranscribing/%d/fp-%d", n, b.ID, n, n)
+		seedAutoRecovery(t, db, "aged", b.ID, key, store.Timestamp(old.Add(-time.Duration(n)*time.Minute)))
+	}
+	id, _ := db.StartStageRun(ctx, b.ID, "retranscribing", 1)
+	_ = db.FinishStageRun(ctx, id, false, failedRunMetrics(t, "ffmpeg: a genuinely new failure"))
+	_ = db.SetBookStatus(ctx, b.ID, string(state.StatusNeedsAttention), "ffmpeg: a genuinely new failure", string(state.ParkQANoConverge))
+
+	cfg := config.Default().Supervisor
+	cfg.AutomaticActions = true
+	cfg.MaxAttempts = 3
+	cfg.StaleMinutes, cfg.NoProgressMinutes, cfg.MaxStageMinutes = 999, 999, 999
+	var applied []Action
+	s := New(db, cfg, pricing.Table{Version: "test"}, nil, Hooks{
+		Runtime: func([]store.Book) Runtime { return Runtime{ActiveBooks: map[int64]bool{}} },
+		Apply: func(_ context.Context, a Action, _ Incident) (string, error) {
+			applied = append(applied, a)
+			return "simulated", nil
+		},
+	})
+	s.check(ctx, "aged")
+	if len(applied) != 1 || applied[0] != ActionRetry {
+		t.Fatalf("aged recoveries should not consume the cap; actions=%v", applied)
+	}
+}
+
+// TestModelLaneRecoveryObeysAutoRecoveryCap proves Fix 2: a book that routed to the MODEL lane
+// (supervisor_escalated -> ask_model) whose durable auto-recovery cap is already exhausted must
+// NOT resume the ping-pong when the model recommends a retry - the model-recommended recovery is
+// refused and recorded as the same cap escalation (park_escalate + approval + cap evidence) the
+// deterministic lane produces, so the model lane cannot smuggle a capped book back into recovery.
+func TestModelLaneRecoveryObeysAutoRecoveryCap(t *testing.T) {
+	ctx := context.Background()
+	db := supervisorDB(t)
+	_ = db.EnsureBatch(ctx, "modelcap", time.Now())
+	b, _ := db.CreateBook(ctx, store.NewBook{BatchID: "modelcap", SourcePath: "/mc", WorkDir: t.TempDir(), Title: "ModelCap", State: "retranscribing"})
+	// Exhaust the cap with prior automatic recoveries under distinct incident keys.
+	now := time.Now().UTC()
+	for n := 0; n < 3; n++ {
+		key := fmt.Sprintf("kind-%d/%d/retranscribing/%d/fp-%d", n, b.ID, n, n)
+		seedAutoRecovery(t, db, "modelcap", b.ID, key, store.Timestamp(now.Add(-time.Duration(n+1)*time.Minute)))
+	}
+	// Park the book supervisor_escalated so the parked-recovery incident routes to the model lane.
+	id, _ := db.StartStageRun(ctx, b.ID, "retranscribing", 1)
+	_ = db.FinishStageRun(ctx, id, false, failedRunMetrics(t, "ffmpeg: deterministic conversion failure"))
+	_ = db.SetBookStatus(ctx, b.ID, string(state.StatusNeedsAttention), "supervisor: prior", string(state.ParkSupervisorEscalated))
+
+	cfg := config.Default().Supervisor
+	cfg.AutomaticActions, cfg.ModelAssisted, cfg.ModelAutomaticActions = true, true, true
+	cfg.MaxAttempts = 3
+	cfg.StaleMinutes, cfg.NoProgressMinutes, cfg.MaxStageMinutes = 999, 999, 999
+	m := &fixedModel{decision: ModelDecision{Diagnosis: "just retry it", Confidence: .8, Evidence: []string{"bounded"}, RecommendedAction: ActionRetry, SuggestedRetryLimit: 1}, usage: agent.Usage{Model: "supervisor-test", CostReported: true}}
+	var applied []Action
+	s := New(db, cfg, pricing.Table{Version: "test"}, m, Hooks{
+		Runtime: func([]store.Book) Runtime { return Runtime{ActiveBooks: map[int64]bool{}} },
+		Apply: func(_ context.Context, a Action, _ Incident) (string, error) {
+			applied = append(applied, a)
+			return "simulated", nil
+		},
+	})
+	s.check(ctx, "modelcap")
+
+	if len(applied) != 0 {
+		t.Fatalf("a capped model-recommended recovery was applied; actions=%v", applied)
+	}
+	if m.calls != 1 {
+		t.Fatalf("model consulted %d times, want exactly 1", m.calls)
+	}
+	runs, err := db.RecentSupervisorRuns(ctx, "modelcap", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capped := false
+	for _, r := range runs {
+		if r.Decision == "model_assisted" && r.SelectedAction == string(ActionParkEscalate) && r.ApprovalRequired &&
+			!r.Automatic && strings.Contains(string(r.Evidence), "auto-recovery cap") {
+			capped = true
+		}
+	}
+	if !capped {
+		t.Fatalf("model lane did not record the cap escalation; runs=%+v", runs)
+	}
 }
 
 func TestSimulatedMultiBookRecoveryAndEscalation(t *testing.T) {
@@ -349,7 +625,7 @@ func TestUnavailableModelKeepsDeterministicEscalation(t *testing.T) {
 	cfg := config.Default().Supervisor
 	cfg.ModelAssisted = true
 	s := New(supervisorDB(t), cfg, pricing.Table{Version: "test"}, nil, Hooks{})
-	decision := Decide(Incident{Kind: IncidentNoProgress}, 1, s.policy)
+	decision := Decide(Incident{Kind: IncidentNoProgress}, 1, 0, s.policy)
 	if decision.Action != ActionParkEscalate || !decision.ApprovalRequired || decision.Automatic {
 		t.Fatalf("unavailable model suppressed deterministic escalation: %+v", decision)
 	}

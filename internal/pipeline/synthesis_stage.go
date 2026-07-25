@@ -10,7 +10,6 @@ import (
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/agent/prompts"
-	"github.com/kodestar/audiosilo-sidecars/internal/audio"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
@@ -24,6 +23,7 @@ type synthesisPromptData struct {
 	Series         string
 	SeriesPos      string
 	ChapterCount   int
+	EdgeNote       string
 	WorkSlug       string
 	IsSeriesOpener bool
 	VerifiedLedger string
@@ -40,10 +40,11 @@ func (e *Executor) synthesize(ctx context.Context, book store.Book, r scheduler.
 	if r.Progress != nil {
 		r.Progress(0, 1)
 	}
-	manifest, seriesOpener, ledger, err := e.sidecarStageInputs(ctx, book)
+	class, seriesOpener, ledger, err := e.sidecarStageInputs(ctx, book)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("synthesizing: %w", err)
 	}
+	noteEdgeExclusions(r, class)
 
 	st, err := agent.New(book.WorkDir, string(state.Synthesizing), e.stageAttempt(ctx, book, state.Synthesizing))
 	if err != nil {
@@ -64,7 +65,7 @@ func (e *Executor) synthesize(ctx context.Context, book store.Book, r scheduler.
 	// tally needs no post-harvest reload (harvest is a straight copy of these files).
 	var cards, recaps, warnings int
 	validate := func(_ agent.Result, s *agent.Staging) error {
-		chars, recs, warns, verr := loadOutSidecars(s.OutDir(), manifest.ChapterCount, seriesOpener)
+		chars, recs, warns, verr := loadOutSidecars(s.OutDir(), class.LogicalCount, seriesOpener)
 		if verr != nil {
 			return verr
 		}
@@ -76,7 +77,8 @@ func (e *Executor) synthesize(ctx context.Context, book store.Book, r scheduler.
 		Authors:        authors(book),
 		Series:         book.Series,
 		SeriesPos:      book.SeriesPos,
-		ChapterCount:   manifest.ChapterCount,
+		ChapterCount:   class.LogicalCount,
+		EdgeNote:       class.EdgeNote,
 		WorkSlug:       workSlug(book),
 		IsSeriesOpener: seriesOpener,
 		VerifiedLedger: ledger,
@@ -103,25 +105,28 @@ func (e *Executor) synthesize(ctx context.Context, book store.Book, r scheduler.
 	return result, nil
 }
 
-// sidecarStageInputs resolves the inputs the sidecar stages share: the manifest (for
-// ChapterCount), whether the book opens its series (the chapter-0 recap rule), and the
-// verified-spelling ledger table for the prompts. validating uses only the manifest +
-// opener and ignores the ledger. Errors are unprefixed; each stage wraps with its own
-// name.
-func (e *Executor) sidecarStageInputs(ctx context.Context, book store.Book) (audio.Manifest, bool, string, error) {
-	manifest, err := audio.ReadManifest(book.WorkDir)
+// sidecarStageInputs resolves the inputs the sidecar stages share: the edge-chapter
+// classification (the LOGICAL story-chapter count + the EdgeNote for a files-style book
+// with a non-narrative intro/credits file, else the raw count and an empty note; it reads
+// the manifest itself), whether the book opens its series (the chapter-0 recap rule), and
+// the verified-spelling ledger table for the prompts. validating uses only the
+// classification + opener and ignores the ledger. The manifest is deliberately not
+// returned so no consumer can reach its raw ChapterCount past the logical count. Errors
+// are unprefixed; each stage wraps with its own name.
+func (e *Executor) sidecarStageInputs(ctx context.Context, book store.Book) (edgeClassification, bool, string, error) {
+	class, err := classifyBookEdges(book.WorkDir)
 	if err != nil {
-		return audio.Manifest{}, false, "", fmt.Errorf("read manifest (inspect must run first): %w", err)
+		return edgeClassification{}, false, "", err
 	}
 	seriesOpener, err := e.isSeriesOpener(ctx, book)
 	if err != nil {
-		return audio.Manifest{}, false, "", fmt.Errorf("series predecessor lookup: %w", err)
+		return edgeClassification{}, false, "", fmt.Errorf("series predecessor lookup: %w", err)
 	}
 	ledger, err := verifiedLedgerTable(book.WorkDir)
 	if err != nil {
-		return audio.Manifest{}, false, "", fmt.Errorf("verified ledger: %w", err)
+		return edgeClassification{}, false, "", fmt.Errorf("verified ledger: %w", err)
 	}
-	return manifest, seriesOpener, ledger, nil
+	return class, seriesOpener, ledger, nil
 }
 
 // authoringName is the vendored authoring contract staged into every notes-only /

@@ -237,7 +237,16 @@ internal/
             re-transcription (full-chapter AND clip) runs NoContext (asr.Job.NoContext)
             so a context-conditioned repetition collapse cannot replay identically.
             ClipSpliceRequest.StartOverrideSec accepts an agent-supplied window start
-            (0 = derive as before, byte-identical); the cut clip file is keyed on
+            (0 = derive as before, byte-identical). Clip windows are CHAPTER-RELATIVE
+            seconds and bounded by qa.ClipStartInRange (the shared floor predicate,
+            qa.ClipStartFloorSec): the plan validator rejects an out-of-range value at
+            authoring time with retry feedback, the retranscribe dispatch skips it as
+            clips_unlocatable BEFORE any cut or destructive prep (with an
+            action-appropriate "out of range" note), and the repair layer is defense in
+            depth - the located path IGNORES an out-of-range override (keeps the derived
+            start), the directed and MID paths no-op. This closed the live incident where
+            an absolute source-file timestamp cut a negative-length clip and hard-failed
+            the book forever. The cut clip file is keyed on
             chapter+effective window start (t%03d-<start>.flac), so a relocated window
             forces a fresh cut instead of reusing the prior window's audio. A window whose
             clip_start already carries a CLIP-REDEGENERATED verdict (within ~1s) UNDER THE
@@ -273,9 +282,11 @@ internal/
             like the MID path (no rotation-adjudication), writing a TAIL-REPAIRED
             verdict (ClipEnd 0, so auto-accept/known-failed behave like a located tail);
             a degenerate override past chend-1 is the Unlocatable no-op, never an error.
-            ClipResult.Unlocatable() distinguishes the true no-op (no loop AND no
-            override), which the stage buckets as clips_unlocatable + a note naming the
-            chapters so the adjudicator knows to supply clip_start_sec next round.
+            ClipResult.Unlocatable() reports a no-op: the true tail no-op (no loop AND no
+            override), a MID window whose start is out of range for the chapter, or a
+            dispatch-level out-of-range rejection - all bucketed as clips_unlocatable +
+            a note (naming the missing window, or the out-of-range value and the
+            chapter-relative rule) so the adjudicator can correct the plan next round.
   pipeline/ composite scheduler.Executor: routes inspecting -> audio.Inspect,
             splitting -> audio.Split, asr -> the per-chapter internal/asr loop
             (resumable: skip complete raws, delete+retry malformed, freeze each raw
@@ -295,7 +306,23 @@ internal/
             the staging (synthesizing/auditing dirs hold NO transcripts, independent
             fact_pass chunk and QA partition dirs hold only their own chapter range and spoiler-bounded
             spelling sheet, and a separate notes-only assembly writes the compact final
-            knowledge sheet). Fact chunks and QA chapter partitions run concurrently
+            knowledge sheet). LOGICAL CHAPTER UNIVERSE (edgechapters.go): the manifest
+            counts every audio FILE as a chapter, but an Audible "This is Audible"
+            intro or publisher-credits outro file is not a story chapter - counting
+            them deadlocked the audit loop on two real books (the auditor demanded
+            recaps through phantom chapters the fixing stage could never satisfy,
+            burning $200+). classifyBookEdges (content-driven, any manifest style)
+            probes the first/last 8 chapters' transcript word counts (< 120 words AND
+            < 180s duration at the edges only; probe-saturation and all-small books
+            degrade to no exclusions) and derives the LOGICAL story-chapter count +
+            stage notes. Synthesis/audit/audit-verify/fix prompts and the mechanical
+            validateSidecars position cap use the logical count (sidecarStageInputs
+            deliberately does not expose the raw manifest); the fact-pass CHUNK keeps
+            file-numbered `## Chapter N` headings (matching staged transcripts + the
+            chunk validator - never renumber), and the ASSEMBLE step is the ONE
+            file->spoken renumbering boundary (its note renders the concrete offset
+            mapping). Exclusions always surface as a stage note. Fact chunks and QA
+            chapter partitions run concurrently
             behind the same executor-wide invocation semaphore. New capacity uses
             queue_concurrency * max_agents_per_book; legacy concurrency remains a
             non-multiplied global cap. Spelling reference_files are restricted to the
@@ -336,7 +363,10 @@ internal/
             multi-loop is covered ONLY by a recorded MID window (never a tail window); a mid
             window with an untimed hit is conservatively NOT covered; (3) plan
             clip_start_sec/clip_end_sec (per tail_clip/mid_clip entry) feeds the repair
-            known-failed skip above. wph outliers, within-segment hits, non-end-fade runs, a
+            known-failed skip above, and (*qa.Plan).Validate(rep, durations) bounds every
+            clip window against its chapter's manifest duration (chapter-relative
+            seconds; an at-or-past-duration value is rejected with retry feedback naming
+            the chapter, value, and duration - adjudicate.md states the timebase). wph outliers, within-segment hits, non-end-fade runs, a
             MID-CHAPTER multi-loop NOT covered by a mid window, and spans that straddle
             mid-chapter into the tail still always disqualify a chapter from residual-only.
             The repair re-transcription is decode-tagged
@@ -470,6 +500,20 @@ internal/
             only, so an unconfigured daemon parks once instead of churning). retry_at
             rides bookView and the book.state SSE frame (the web patch clears it when
             absent); pre-migration parks (retry_at '') never auto-readmit.
+  supervisor/ the health-tick babysitter (config supervisor.*): classifies incidents
+            over book/stage-run snapshots (deterministic classifiers + optional
+            model-assisted lane), decides bounded recovery actions, and applies them
+            through the scheduler seam. Two invariants are load-bearing (both fixed
+            after a live 5,867-cycle park/readmit ping-pong): (1) the parked-recovery
+            FINGERPRINT is stationary - derived from park code + stage + the latest
+            non-superseded stage-run error, never from book.Error, which every
+            park_escalate rewrites (state.SupervisorMessagePrefix prose is stripped);
+            (2) a durable cross-Kind AUTO-RECOVERY CAP: at most MaxAttempts automatic
+            retry/readmit/supersede_rerun/requeue/fallback_backend actions per book
+            per rolling 24h (store.CountAutoRecoveriesSince; terminate_requeue is
+            deliberately excluded as restart hygiene), enforced on BOTH the
+            deterministic and the model-assisted lanes - past the cap the decision
+            converts to park_escalate + approval_required (human review).
   metaops/  meta.audiosilo.app client (coverage/lookup, capped 1h TTL caches,
             graceful degrade) + async folder-scan job manager over audiosilo-meta
             pkg/scan + the library_roots PathAllowed check. Coverage resolves
@@ -556,7 +600,8 @@ events, config, store, scheduler, metaops}`; `scheduler -> {store, state, eta, e
 scheduler - never the reverse);
 `pipeline -> {audio, asr, transcript, qa, spelling, agent, repair, toolfetch, scratch,
 secrets, fsutil, store, state, scheduler}`; `agent`/`repair` are leaf helpers (no
-scheduler/store deps; `repair -> qa` for the shared Python-compat gram/repr helpers);
+scheduler/store deps; `repair -> qa` for the shared Python-compat gram/repr helpers
+and the shared clip-floor predicate `qa.ClipStartInRange`/`qa.ClipStartFloorSec`);
 `state` is pure. Handlers marshal DTOs and call into the injected packages; they
 hold no logic (state transitions live in `state`, dispatch in `scheduler`).
 

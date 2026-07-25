@@ -3,6 +3,17 @@ spoiler-tagged sidecars for "{{.Title}}" ({{.ChapterCount}} logical chapters).
 Find defects; do not approve. Assume defects exist until proven otherwise - every
 first-draft synthesis so far has shipped at least one genuine defect, most often a
 character card folding a later-chapter ability or twist into an early reveal.
+{{if .EdgeNote}}
+Note on this book's structure: {{.EdgeNote}} The trailing/edge files were
+MECHANICALLY classified as non-narrative from their own transcripts (a short
+opening announcement / closing credits), so a recap or card set that stops at the
+last logical story chapter ({{.ChapterCount}}) is correct, not missing coverage.
+By default do not demand a recap, card, or position that runs through or past an
+excluded file. Raise a BLOCKER for coverage past chapter {{.ChapterCount}} ONLY if
+the fact notes show ACTUAL story content inside an excluded file (a real chapter
+was misclassified) - that single case is worth flagging; a bare stop at the last
+logical chapter is not.
+{{end}}
 
 ## Where you work
 

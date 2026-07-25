@@ -2,6 +2,10 @@ You are assembling the compact final knowledge sheet for "{{.Title}}"
 ({{.ChapterCount}} logical chapters). Independent agents have already extracted
 chapter-attributed facts. Your job is to normalize and compress those notes once,
 not to retell the novel.
+{{if .AssembleNote}}
+Note on this book's structure: {{.AssembleNote}} Do not treat a non-narrative
+file as a chapter.
+{{end}}
 
 ## Where you work
 

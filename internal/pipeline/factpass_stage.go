@@ -43,21 +43,26 @@ var factsHeadingRe = regexp.MustCompile(`(?m)^##\s+Chapter\s+(\d+)\b`)
 func factsChunkName(from, to int) string { return fmt.Sprintf("facts-ch%d-%d.md", from, to) }
 
 // factPassPromptData feeds factpass.md. Field names MUST match the template (rendered
-// with missingkey=error).
+// with missingkey=error). ChunkNote is the fact-pass CHUNK edge note (file-numbered headings;
+// spoken numbers only in fact text), NOT the generic EdgeNote - a chunk keys its headings to
+// audio-file numbers, so it must never be told to renumber to spoken chapters.
 type factPassPromptData struct {
 	Title         string
 	From          int
 	To            int
 	HasInherited  bool
+	ChunkNote     string
 	SpellingSheet string
 }
 
 // factAssemblePromptData feeds factpass_assemble.md after every independent chunk
-// has completed.
+// has completed. AssembleNote is the fact-pass ASSEMBLE edge note - the ONE renumbering
+// boundary, carrying the concrete file->spoken mapping when there is a leading exclusion.
 type factAssemblePromptData struct {
 	Title         string
 	HasInherited  bool
 	ChapterCount  int
+	AssembleNote  string
 	SpellingSheet string
 }
 
@@ -75,6 +80,14 @@ func (e *Executor) factPass(ctx context.Context, book store.Book, r scheduler.St
 	if len(plan.Chunks) == 0 {
 		return scheduler.StageResult{}, fmt.Errorf("fact_pass: chunk plan has no chunks")
 	}
+	// Classify the book's edge chapters (a non-narrative intro/credits file on a
+	// files-style book) so the chunk agents get the EdgeNote and the assembler the
+	// LOGICAL story-chapter count. A normal book yields an empty note and the raw count.
+	class, err := classifyBookEdges(book.WorkDir)
+	if err != nil {
+		return scheduler.StageResult{}, fmt.Errorf("fact_pass: %w", err)
+	}
+	noteEdgeExclusions(r, class)
 	if r.Note != nil {
 		r.Note(fmt.Sprintf("fact pass over %s", countNoun(len(plan.Chunks), "chunk")))
 	}
@@ -108,7 +121,7 @@ func (e *Executor) factPass(ctx context.Context, book store.Book, r scheduler.St
 		go func() {
 			defer wg.Done()
 			for idx := range jobs {
-				usage, chunkReview, chunkErr := e.factPassChunk(ctx, book, r, plan, idx, hasCarryover, pred)
+				usage, chunkReview, chunkErr := e.factPassChunk(ctx, book, r, plan, idx, hasCarryover, pred, class)
 				workerSeconds[workerID] += usage.Seconds
 				mu.Lock()
 				usageTotal.add(usage.Usage)
@@ -160,7 +173,7 @@ sendJobs:
 	// compact facts (never transcripts), runs once, and is resumable on re-entry.
 	assembledThisRun := false
 	if !fsutil.IsFile(filepath.Join(book.WorkDir, factsDir, knowledgeFinalName)) {
-		usage, aerr := e.assembleFacts(ctx, book, r, plan, hasCarryover, pred)
+		usage, aerr := e.assembleFacts(ctx, book, r, plan, hasCarryover, pred, class)
 		usageTotal.add(usage.Usage)
 		usageTotal.Invocations += usage.Invocations
 		usageTotal.Seconds += usage.Seconds
@@ -200,7 +213,7 @@ sendJobs:
 // factPassChunk stages and runs one independent chunk. The staged dir contains ONLY
 // that range's corrected chapters, its spelling sheet, and optionally the previous
 // BOOK's compact final knowledge. It never receives a prior current-book chunk.
-func (e *Executor) factPassChunk(ctx context.Context, book store.Book, r scheduler.StageReport, plan chunkPlan, idx int, hasCarryover bool, pred *store.Book) (agentUsage, int, error) {
+func (e *Executor) factPassChunk(ctx context.Context, book store.Book, r scheduler.StageReport, plan chunkPlan, idx int, hasCarryover bool, pred *store.Book, class edgeClassification) (agentUsage, int, error) {
 	chunk := plan.Chunks[idx]
 
 	st, err := agent.New(book.WorkDir, fmt.Sprintf("%s-c%02d", state.FactPass, idx+1), e.stageAttempt(ctx, book, state.FactPass))
@@ -249,6 +262,7 @@ func (e *Executor) factPassChunk(ctx context.Context, book store.Book, r schedul
 		From:          chunk.From,
 		To:            chunk.To,
 		HasInherited:  hasInherited,
+		ChunkNote:     class.ChunkNote,
 		SpellingSheet: sheet,
 	}
 	// Capture the NEEDS AUDIO REVIEW count from the successful attempt's facts file so
@@ -300,7 +314,7 @@ func validateFactPassChunk(outDir string, from, to int) (int, error) {
 
 // assembleFacts builds one compact book-level knowledge sheet after all independent
 // chunk facts have been harvested. This is the only current-book aggregation call.
-func (e *Executor) assembleFacts(ctx context.Context, book store.Book, r scheduler.StageReport, plan chunkPlan, hasCarryover bool, pred *store.Book) (agentUsage, error) {
+func (e *Executor) assembleFacts(ctx context.Context, book store.Book, r scheduler.StageReport, plan chunkPlan, hasCarryover bool, pred *store.Book, class edgeClassification) (agentUsage, error) {
 	st, err := agent.New(book.WorkDir, string(state.FactPass)+"-assemble", e.stageAttempt(ctx, book, state.FactPass))
 	if err != nil {
 		return agentUsage{}, err
@@ -325,7 +339,6 @@ func (e *Executor) assembleFacts(ctx context.Context, book store.Book, r schedul
 			return agentUsage{}, fmt.Errorf("fact_pass: stage inherited knowledge for assembly: %w", err)
 		}
 	}
-	chapterCount := plan.Chunks[len(plan.Chunks)-1].To
 	validate := func(_ agent.Result, s *agent.Staging) error {
 		data, rerr := readNonEmptyFile(filepath.Join(s.OutDir(), knowledgeFinalName))
 		if rerr != nil {
@@ -334,7 +347,7 @@ func (e *Executor) assembleFacts(ctx context.Context, book store.Book, r schedul
 		return requireSections(string(data), knowledgeFinalName, "ROSTER", "REVEALS", "THREADS", "ENDING")
 	}
 	usage, err := e.runAgent(ctx, book, state.FactPass, r, st, "factpass_assemble.md", factAssemblePromptData{
-		Title: book.Title, HasInherited: hasInherited, ChapterCount: chapterCount, SpellingSheet: finalSpellingSheet,
+		Title: book.Title, HasInherited: hasInherited, ChapterCount: class.LogicalCount, AssembleNote: class.AssembleNote, SpellingSheet: finalSpellingSheet,
 	}, false, validate)
 	if err != nil {
 		return usage, err

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // SupervisorRun is one deterministic incident/decision or bounded model invocation.
@@ -206,10 +207,34 @@ func (db *DB) CountSupervisorIncidentFamily(ctx context.Context, kind string, bo
 	return n, err
 }
 
-func (db *DB) SupervisorInvocationCountSince(ctx context.Context, since string) (int, error) {
+// CountAutoRecoveriesSince counts COMPLETED automatic auto-recovery supervisor actions for one
+// book since the given time. The store formats the cutoff in its canonical fixed-width UTC form
+// (so the lexical started_at comparison is chronological), owning the timestamp layout rather
+// than making callers reproduce it. It is the blunt, cross-Kind, cross-fingerprint auto-recovery
+// cap: regardless of how each incident is classified or fingerprinted, a book may only be
+// automatically recovered a bounded number of times within the caller's rolling window before
+// human review is forced. The counted action set mirrors supervisor.autoRecoveryActions:
+// retry/readmit/supersede_rerun/requeue/fallback_backend - every action that re-admits or
+// re-runs paid work. 'terminate_requeue' is deliberately EXCLUDED (orphaned-process hygiene; a
+// daemon restart legitimately fires several in a day, so counting them would park healthy books
+// after restarts). Manual (non-automatic) retries and non-recovery actions are excluded.
+func (db *DB) CountAutoRecoveriesSince(ctx context.Context, bookID int64, since time.Time) (int, error) {
 	var n int
 	err := db.sql.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(model_calls),0) FROM supervisor_runs WHERE started_at>=?`, since).Scan(&n)
+		`SELECT COUNT(*) FROM supervisor_runs
+		 WHERE book_id=? AND automatic=1 AND state='completed'
+		   AND selected_action IN ('retry','readmit','supersede_rerun','requeue','fallback_backend')
+		   AND started_at>=?`, bookID, timestamp(since)).Scan(&n)
+	return n, err
+}
+
+// SupervisorInvocationCountSince sums model_calls across supervisor runs started since the given
+// time. It takes a time.Time (formatted via the store's canonical layout) like its sibling
+// CountAutoRecoveriesSince, so callers never reproduce the timestamp format.
+func (db *DB) SupervisorInvocationCountSince(ctx context.Context, since time.Time) (int, error) {
+	var n int
+	err := db.sql.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(model_calls),0) FROM supervisor_runs WHERE started_at>=?`, timestamp(since)).Scan(&n)
 	return n, err
 }
 

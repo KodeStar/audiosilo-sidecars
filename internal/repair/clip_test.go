@@ -936,3 +936,75 @@ func readFile(t *testing.T, path string) string {
 	}
 	return string(b)
 }
+
+// TestClipAndSplice_OverEndOverrideIgnoredUsesDerivedStart is the located-path defense in
+// depth for the production incident: a StartOverrideSec past the chapter end (an absolute
+// source-file timestamp mistaken for a chapter-relative one) is IGNORED, so the trustworthy
+// mechanical locator's derived window drives the cut and a locatable repair is NOT turned
+// into a no-op or a hard ffmpeg failure. The over-end override must produce the SAME cut as
+// no override at all.
+func TestClipAndSplice_OverEndOverrideIgnoredUsesDerivedStart(t *testing.T) {
+	// Baseline: no override -> the mechanical locator derives the window start.
+	base := &recordingCut{}
+	if _, err := ClipAndSplice(context.Background(), ClipSpliceRequest{
+		WorkDir: t.TempDir(), Chapter: 4, Transcript: locatedTranscript(), ChapterEnd: 200,
+		Cut: base.cut, Transcribe: fakeTranscribe("he walked to the door and left the room quietly"),
+	}); err != nil {
+		t.Fatalf("baseline ClipAndSplice: %v", err)
+	}
+	// An out-of-range override (past the chapter end) must be ignored, keeping the derived start.
+	rc := &recordingCut{}
+	res, err := ClipAndSplice(context.Background(), ClipSpliceRequest{
+		WorkDir: t.TempDir(), Chapter: 4, Transcript: locatedTranscript(), ChapterEnd: 200,
+		Cut: rc.cut, Transcribe: fakeTranscribe("he walked to the door and left the room quietly"),
+		StartOverrideSec: 250, // > ChapterEnd: an absolute-timestamp mistake
+	})
+	if err != nil {
+		t.Fatalf("ClipAndSplice with an over-end override should not error: %v", err)
+	}
+	if !res.Located {
+		t.Error("expected the located run to still drive the repair (not a no-op)")
+	}
+	if len(base.starts) != 1 || len(rc.starts) != 1 {
+		t.Fatalf("cut counts: baseline %d, override %d - want exactly one each", len(base.starts), len(rc.starts))
+	}
+	if rc.starts[0] == 250 {
+		t.Errorf("the garbage over-end override (250) was used as the cut start")
+	}
+	if rc.starts[0] != base.starts[0] {
+		t.Errorf("over-end override changed the cut window: got %.1f, want the derived %.1f", rc.starts[0], base.starts[0])
+	}
+}
+
+// TestClipAndSpliceWindow_OverEndStartNoOp is the mid-path defense in depth: a mid_clip
+// window start at or past the chapter end degrades to an unlocatable no-op (zero result, no
+// error, nothing cut or transcribed) instead of the hard ffmpeg failure a zero/negative-
+// length cut would produce. The stage then buckets it as clips_unlocatable and re-queues.
+func TestClipAndSpliceWindow_OverEndStartNoOp(t *testing.T) {
+	dir := t.TempDir()
+	rc := &recordingCut{}
+	rt := &recordingTranscribe{}
+	res, err := ClipAndSpliceWindow(context.Background(), ClipSpliceRequest{
+		WorkDir:          dir,
+		Chapter:          4,
+		Transcript:       midSegTranscript(4),
+		ChapterEnd:       40.0,
+		Cut:              rc.cut,
+		Transcribe:       rt.fn,
+		StartOverrideSec: 40.0, // == chend: >= chend-1, out of range
+		EndOverrideSec:   45.0,
+		DecodeTag:        "nocontext-v1",
+	})
+	if err != nil {
+		t.Fatalf("an out-of-range mid window must not error: %v", err)
+	}
+	if !res.Unlocatable() {
+		t.Errorf("expected Unlocatable() true for an out-of-range mid window, got %+v", res)
+	}
+	if len(rc.starts) != 0 || rt.calls != 0 {
+		t.Errorf("out-of-range mid window cut/transcribed (cut %d, transcribe %d), want 0/0", len(rc.starts), rt.calls)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("expected no artifacts written, got %d entries", len(entries))
+	}
+}

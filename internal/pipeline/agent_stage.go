@@ -841,6 +841,27 @@ func writeRepairOutcomes(workDir string, outcomes map[int]repairOutcome) error {
 	return fsutil.WriteFileAtomic(filepath.Join(workDir, repairOutcomesName), append(out, '\n'), 0o644)
 }
 
+// clipWindowOutOfRange is the retranscribe DISPATCH pre-check: it reports whether a clip plan
+// entry's supplied clip_start_sec is out of range for its chapter (at or past duration -
+// qa.ClipStartFloorSec) and returns the action-named rejection note. It runs BEFORE any repair
+// call so an out-of-range window never reaches the repair layer, where the destructive stale-
+// layer cleanup (removeChapterDerived) runs BEFORE the repair's own no-op guard - so a bad
+// number would silently drop a stale-verdict chapter's derived text - and where the shared
+// unlocatable bucketing would emit a tail-worded locator-miss note for a mid entry. A tail_clip
+// clip_start_sec of 0 means "derive from the transcript" and is never out of range; an unknown
+// (<= 0) chapter duration cannot bound the window (qa.ClipStartInRange). The repair layer keeps
+// its own guards as defense in depth for a value that still slips through a persisted plan.
+func clipWindowOutOfRange(entry qa.PlanEntry, duration float64) (string, bool) {
+	if entry.Action == qa.ActionTailClip && entry.ClipStartSec == 0 {
+		return "", false
+	}
+	if qa.ClipStartInRange(entry.ClipStartSec, duration) {
+		return "", false
+	}
+	return fmt.Sprintf("%s clip_start_sec %.1f is out of range for chapter %d (%.1fs) - clip seconds are chapter-relative; supply an in-range value",
+		entry.Action, entry.ClipStartSec, entry.Chapter, duration), true
+}
+
 // clipOutcomeString maps a clip repair's ClipResult to its repair_outcomes.json outcome
 // string. It mirrors recordClipOutcome's bucketing (spliced / skipped_known_failed /
 // unlocatable / else redegenerated) so the durable record and the metrics counters agree.
@@ -1100,6 +1121,30 @@ func (e *Executor) qaAdjudicate(ctx context.Context, book store.Book, r schedule
 	return result, nil
 }
 
+// chapterDurations folds a chapter list into a chapter -> duration (seconds) map, the
+// bound each clip window is validated against ((*qa.Plan).Validate). It is shared by the
+// three sites that build one (the whole manifest, a partition's bounded subset, and the
+// retranscribe pass).
+func chapterDurations(chs []audio.Chapter) map[int]float64 {
+	durations := make(map[int]float64, len(chs))
+	for _, ch := range chs {
+		durations[ch.Chapter] = ch.Duration
+	}
+	return durations
+}
+
+// manifestDurations reads the book's manifest and returns a chapter -> duration (seconds)
+// map for bounding clip windows in plan validation. An unreadable/absent manifest degrades
+// to nil, which (*qa.Plan).Validate treats as "no bound check" - defensive, never fatal
+// here (the stages that truly need the manifest fail loudly on their own read).
+func manifestDurations(workDir string) map[int]float64 {
+	manifest, err := audio.ReadManifest(workDir)
+	if err != nil {
+		return nil
+	}
+	return chapterDurations(manifest.Chapters)
+}
+
 // runQAAdjudicateAgent stages the report + flagged transcripts, runs the agent, and
 // returns the MERGED plan (the daemon's auto-accept entries plus the agent's
 // dispositions for the remaining chapters) validated against the report. The merge is
@@ -1162,7 +1207,10 @@ func (e *Executor) runQAAdjudicateAgent(ctx context.Context, book store.Book, r 
 	}
 	merged.Notes = strings.Join(notes, "\n")
 	sort.Slice(merged.Entries, func(i, j int) bool { return merged.Entries[i].Chapter < merged.Entries[j].Chapter })
-	if err := merged.Validate(rep); err != nil {
+	// Bound each clip window against its chapter's own duration; a nil map (unreadable
+	// manifest) skips the bound check, and the partition below hard-errors if it is absent.
+	durations := manifestDurations(book.WorkDir)
+	if err := merged.Validate(rep, durations); err != nil {
 		return nil, total, fmt.Errorf("qa_adjudicating: validate merged plan: %w", err)
 	}
 	return merged, total, nil
@@ -1205,6 +1253,11 @@ func (e *Executor) runQAAdjudicatePartition(ctx context.Context, book store.Book
 	}
 	manifest.Chapters = boundedChapters
 	manifest.ChapterCount = len(boundedChapters)
+	// Per-chapter durations for this partition, used to bound each clip window in plan
+	// validation (a clip_start_sec/clip_end_sec must stay under its chapter's length). The
+	// bounded set covers exactly the chapters this worker may disposition, so it is complete
+	// for the entries the closure below validates.
+	durations := chapterDurations(manifest.Chapters)
 	manifestData, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return nil, agentUsage{}, err
@@ -1283,7 +1336,7 @@ func (e *Executor) runQAAdjudicatePartition(ctx context.Context, book store.Book
 		if perr != nil {
 			return perr
 		}
-		if verr := p.Validate(filtered); verr != nil {
+		if verr := p.Validate(filtered, durations); verr != nil {
 			return verr
 		}
 		fragment = p
@@ -1505,10 +1558,7 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("retranscribing: read manifest: %w", err)
 	}
-	durations := make(map[int]float64, len(manifest.Chapters))
-	for _, ch := range manifest.Chapters {
-		durations[ch.Chapter] = ch.Duration
-	}
+	durations := chapterDurations(manifest.Chapters)
 
 	setup, err := e.readyASR(ctx)
 	if err != nil {
@@ -1595,12 +1645,21 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 	// repeat below the 6-gram reach) AND that carried no clip_start_sec, so the round did no
 	// work on them - the stage Note asks the adjudicator to supply clip_start_sec.
 	var unlocatableChapters []int
+	// rejectedClipNotes holds the action-named "out of range" note for each clip entry whose
+	// supplied clip_start_sec the dispatch pre-check (clipWindowOutOfRange) rejected before any
+	// cut or destructive stale-layer cleanup. It is distinct from a tail-locator miss above (a
+	// chapter-relative window the agent still has to supply): here the agent DID supply a
+	// window, but out of range. Each note is emitted verbatim so the log names the offending
+	// action + value.
+	var rejectedClipNotes []string
 	// recordClipOutcome buckets a clip repair's ClipResult into the shared counters. Both the
 	// tail and mid clip actions feed it, so a mid splice reuses the SAME buckets as a tail
 	// splice - an interior repair counts as progress for the stall signal below. An unlocatable
-	// no-op (only the tail path can produce it) is bucketed separately from a re-degeneration:
-	// it did no ASR at all (misleadingly counting it as clips_redegenerated hid why the round
-	// stalled). wasDone excludes a resumed free outcome from the rate-sample tallies.
+	// no-op (the tail locator finding no loop, or - via recordRejectedClip below, before any
+	// repair call - the dispatch pre-check rejecting an out-of-range tail/mid window) is
+	// bucketed separately from a re-degeneration: it did no ASR at all (misleadingly counting it
+	// as clips_redegenerated hid why the round stalled). wasDone excludes a resumed free outcome
+	// from the rate-sample tallies.
 	recordClipOutcome := func(res repair.ClipResult, wasDone bool) {
 		switch {
 		case res.Spliced:
@@ -1619,6 +1678,17 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 		default:
 			redegen++
 		}
+	}
+	// recordRejectedClip buckets a dispatch-rejected out-of-range clip window (no repair call
+	// ran) as an unlocatable no-op with its own action-named note, so a bad clip_start_sec never
+	// reaches the repair layer (which would destructively drop the chapter's derived layers
+	// before its own guard no-ops) and never borrows the tail-worded locator-miss note.
+	recordRejectedClip := func(wasDone bool, msg string) {
+		unlocatable++
+		if !wasDone {
+			unlocatableNew++
+		}
+		rejectedClipNotes = append(rejectedClipNotes, msg)
 	}
 	for _, entry := range plan.Entries {
 		if err := ctx.Err(); err != nil {
@@ -1652,6 +1722,11 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 				oc.Outcome = "kept"
 			}
 		case qa.ActionTailClip:
+			if msg, bad := clipWindowOutOfRange(entry, durations[entry.Chapter]); bad {
+				recordRejectedClip(wasDone, msg)
+				oc.Outcome, oc.ClipStartSec = "unlocatable", entry.ClipStartSec
+				break
+			}
 			res, rerr := e.tailClipChapter(ctx, setup, cut, book, durations[entry.Chapter], entry.Chapter, entry.ClipStartSec, verdicts)
 			if rerr != nil {
 				return scheduler.StageResult{}, rerr
@@ -1659,6 +1734,11 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 			recordClipOutcome(res, wasDone)
 			oc.Outcome, oc.ClipStartSec = clipOutcomeString(res), entry.ClipStartSec
 		case qa.ActionMidClip:
+			if msg, bad := clipWindowOutOfRange(entry, durations[entry.Chapter]); bad {
+				recordRejectedClip(wasDone, msg)
+				oc.Outcome, oc.ClipStartSec, oc.ClipEndSec = "unlocatable", entry.ClipStartSec, entry.ClipEndSec
+				break
+			}
 			res, rerr := e.midClipChapter(ctx, setup, cut, book, durations[entry.Chapter], entry.Chapter, entry.ClipStartSec, entry.ClipEndSec, verdicts)
 			if rerr != nil {
 				return scheduler.StageResult{}, rerr
@@ -1700,6 +1780,15 @@ func (e *Executor) retranscribe(ctx context.Context, book store.Book, r schedule
 			noun = "chapter"
 		}
 		r.Note(fmt.Sprintf("tail-clip could not locate a loop in %s %s - the adjudicator must supply clip_start_sec", noun, intsCSV(unlocatableChapters)))
+	}
+
+	// Visibility: name each clip entry the dispatch pre-check rejected as out of range (its
+	// clip_start_sec at or past the chapter duration - the absolute-timestamp mistake), so the
+	// adjudicator re-queues with a chapter-relative value. Each note already names its action.
+	if r.Note != nil {
+		for _, msg := range rejectedClipNotes {
+			r.Note(msg)
+		}
 	}
 
 	// Convergence signal for qaAdjudicate: a repair round that neither spliced nor adopted

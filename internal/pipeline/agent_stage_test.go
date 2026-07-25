@@ -622,7 +622,7 @@ func TestQAAdjudicateReopensLegacyAutoAcceptedTailRepair(t *testing.T) {
 			Chapter:      2,
 			Action:       qa.ActionTailClip,
 			Reason:       "replace the legacy short-window splice with a context-expanded decode",
-			ClipStartSec: 5,
+			ClipStartSec: 0.5, // in range for the 2s markerChapters fixture (< duration-1)
 		}}})
 		return agent.Result{}, nil
 	}

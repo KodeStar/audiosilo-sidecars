@@ -334,6 +334,144 @@ func TestRetranscribeMidClipClampsEndToChapter(t *testing.T) {
 	}
 }
 
+// TestRetranscribeMidClipOverRangeStartNoOp is the production-incident defense in depth at
+// the stage level: a persisted qa_plan.json whose clip_start_sec is an out-of-range value
+// (an absolute source-file timestamp past the chapter duration) must NOT cut a negative-
+// length clip and hard-FAIL the stage. It degrades to an unlocatable no-op - nothing is cut
+// or transcribed, no repaired file is written - recorded under clips_unlocatable so the next
+// adjudication round is asked to re-supply a chapter-relative window.
+func TestRetranscribeMidClipOverRangeStartNoOp(t *testing.T) {
+	work := t.TempDir()
+	tr, dur := midSegLoopTranscript(2) // dur = 40
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: dur, ChapterCount: 1, Chapters: []audio.Chapter{{Chapter: 2, Start: 0, End: dur, Duration: dur}}})
+	seedNormalized(t, work, tr)
+	seedFLACs(t, work, 2)
+	// clip_start_sec of 50 is past the 40s chapter duration - the absolute-timestamp mistake.
+	seedPlan(t, work, qa.PlanEntry{Chapter: 2, Action: qa.ActionMidClip, Reason: "interior loop", ClipStartSec: 50, ClipEndSec: 60})
+
+	fake := newFakeBackend()
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	cutCalls := 0
+	exe.clipCutter = func(_ context.Context, _, dstFlac string, _, _ float64) error {
+		cutCalls++
+		return os.WriteFile(dstFlac, []byte("clip"), 0o644) //nolint:gosec // test artifact
+	}
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, scheduler.StageReport{})
+	if err != nil {
+		t.Fatalf("an out-of-range clip window must not fail the stage: %v", err)
+	}
+	assertRetranscribeMetrics(t, res.Metrics, map[string]int{"clips_unlocatable": 1, "clips_spliced": 0, "clips_redegenerated": 0})
+	if cutCalls != 0 || fake.count(2) != 0 {
+		t.Errorf("out-of-range window cut/transcribed (cut %d, transcribe %d), want 0/0", cutCalls, fake.count(2))
+	}
+	if _, err := os.Stat(filepath.Join(work, transcript.RepairedDir, transcript.TextName(2))); !os.IsNotExist(err) {
+		t.Errorf("an out-of-range no-op must not write a repaired file, stat err = %v", err)
+	}
+}
+
+// seedStaleRepairedLayer writes a repaired-layer file plus a stale (non-current)
+// CLIP-REDEGENERATED verdict for the chapter, the exact durable state clipChapter's
+// removeChapterDerived would destroy on entry (verdict exists but is not current). A dispatch
+// rejection must never reach that cleanup, so the repaired file must survive the stage.
+func seedStaleRepairedLayer(t *testing.T, work string, chapter int) {
+	t.Helper()
+	if err := transcript.WriteText(filepath.Join(work, transcript.RepairedDir), chapter, "stale repaired"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repair.MergeTailVerdict(work, repair.TailVerdict{Chapter: chapter, Verdict: repair.VerdictClipRedegenerated, DecodeTag: "legacy"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// assertOutOfRangeRejection asserts a dispatch out-of-range rejection's shared shape: no cut, no
+// ASR, the stale repaired layer survives, clips_unlocatable bucketing, and a note naming the
+// given action + "out of range" without borrowing the tail-locator-miss wording.
+func assertOutOfRangeRejection(t *testing.T, res scheduler.StageResult, work, action string, cutCalls, transcribeCalls, chapter int, notes []string) {
+	t.Helper()
+	assertRetranscribeMetrics(t, res.Metrics, map[string]int{"clips_unlocatable": 1, "clips_spliced": 0, "clips_redegenerated": 0})
+	if cutCalls != 0 || transcribeCalls != 0 {
+		t.Errorf("out-of-range window cut/transcribed (cut %d, transcribe %d), want 0/0", cutCalls, transcribeCalls)
+	}
+	if !fileExistsT(filepath.Join(work, transcript.RepairedDir, transcript.TextName(chapter))) {
+		t.Error("dispatch rejection destroyed the chapter's repaired layer (removeChapterDerived ran before the repair no-op)")
+	}
+	foundAction, foundLocator := false, false
+	for _, n := range notes {
+		if strings.Contains(n, action) && strings.Contains(n, "out of range") {
+			foundAction = true
+		}
+		if strings.Contains(n, "could not locate a loop") {
+			foundLocator = true
+		}
+	}
+	if !foundAction {
+		t.Errorf("missing the %q out-of-range note; got %v", action, notes)
+	}
+	if foundLocator {
+		t.Errorf("out-of-range rejection borrowed the tail-locator-miss note; got %v", notes)
+	}
+}
+
+// TestRetranscribeTailClipOutOfRangeRejectedAtDispatch is Fix 4 (tail): a tail_clip entry whose
+// clip_start_sec is past the chapter duration is rejected at the DISPATCH layer, BEFORE any cut
+// or the destructive removeChapterDerived, so a stale-verdict chapter's repaired layer survives.
+// It is bucketed clips_unlocatable and the note names the tail_clip action + "out of range".
+func TestRetranscribeTailClipOutOfRangeRejectedAtDispatch(t *testing.T) {
+	work := t.TempDir()
+	const dur = 40.0
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: dur, ChapterCount: 1, Chapters: []audio.Chapter{{Chapter: 2, Start: 0, End: dur, Duration: dur}}})
+	seedNormalized(t, work, oneWordTranscript(2))
+	seedFLACs(t, work, 2)
+	seedStaleRepairedLayer(t, work, 2)
+	// clip_start_sec 50 is past the 40s chapter - the absolute-timestamp mistake.
+	seedPlan(t, work, qa.PlanEntry{Chapter: 2, Action: qa.ActionTailClip, Reason: "directed", ClipStartSec: 50})
+
+	var notes []string
+	rep := scheduler.StageReport{Note: func(m string) { notes = append(notes, m) }}
+	fake := newFakeBackend()
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	cutCalls := 0
+	exe.clipCutter = func(_ context.Context, _, dstFlac string, _, _ float64) error {
+		cutCalls++
+		return os.WriteFile(dstFlac, []byte("clip"), 0o644) //nolint:gosec // test artifact
+	}
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, rep)
+	if err != nil {
+		t.Fatalf("an out-of-range clip window must not fail the stage: %v", err)
+	}
+	assertOutOfRangeRejection(t, res, work, "tail_clip", cutCalls, fake.count(2), 2, notes)
+}
+
+// TestRetranscribeMidClipOutOfRangeRejectedAtDispatch is Fix 4 (mid): the mid_clip counterpart -
+// an out-of-range mid_clip clip_start_sec is rejected at dispatch (no cut, stale repaired layer
+// survives) and the note names the mid_clip action + "out of range", NOT the tail-worded note the
+// shared bucketing used to emit for a mid entry.
+func TestRetranscribeMidClipOutOfRangeRejectedAtDispatch(t *testing.T) {
+	work := t.TempDir()
+	const dur = 40.0
+	writeManifestStruct(t, work, audio.Manifest{Source: "/x", Style: audio.StyleMarkers, Duration: dur, ChapterCount: 1, Chapters: []audio.Chapter{{Chapter: 2, Start: 0, End: dur, Duration: dur}}})
+	seedNormalized(t, work, oneWordTranscript(2))
+	seedFLACs(t, work, 2)
+	seedStaleRepairedLayer(t, work, 2)
+	// clip_start_sec 50 past the 40s chapter; the end is irrelevant once the start is rejected.
+	seedPlan(t, work, qa.PlanEntry{Chapter: 2, Action: qa.ActionMidClip, Reason: "interior loop", ClipStartSec: 50, ClipEndSec: 60})
+
+	var notes []string
+	rep := scheduler.StageReport{Note: func(m string) { notes = append(notes, m) }}
+	fake := newFakeBackend()
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	cutCalls := 0
+	exe.clipCutter = func(_ context.Context, _, dstFlac string, _, _ float64) error {
+		cutCalls++
+		return os.WriteFile(dstFlac, []byte("clip"), 0o644) //nolint:gosec // test artifact
+	}
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Retranscribing, rep)
+	if err != nil {
+		t.Fatalf("an out-of-range mid clip window must not fail the stage: %v", err)
+	}
+	assertOutOfRangeRejection(t, res, work, "mid_clip", cutCalls, fake.count(2), 2, notes)
+}
+
 // TestRetranscribeMidClipStallMarkerClearedOnProgress: a mid splice makes progress
 // (spliced > 0), so it clears any stale stall marker - a mid repair converges the QA loop
 // exactly like a tail splice.

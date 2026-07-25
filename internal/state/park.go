@@ -49,6 +49,13 @@ const (
 	ParkSupervisorBudget    ParkCode = "supervisor_budget"
 )
 
+// SupervisorMessagePrefix labels a book.Error the supervisor rewrote on a park_escalate
+// ("supervisor: <diagnosis/evidence>"). The scheduler prepends it when building the park
+// message; the supervisor's parked-recovery fingerprint strips it so re-hashed escalation
+// prose never leaks back into the stationary fingerprint. One const, two packages
+// (internal/scheduler + internal/supervisor), instead of a duplicated literal in each.
+const SupervisorMessagePrefix = "supervisor: "
+
 // IsParkedWith reports whether a book carrying the given status/park code is parked
 // (needs_attention) with a park code among want. It centralizes the
 // "status == needs_attention && park code in {...}" test the api's park-gated handlers

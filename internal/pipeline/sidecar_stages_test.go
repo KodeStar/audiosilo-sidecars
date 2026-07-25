@@ -46,11 +46,16 @@ func seedFacts(t *testing.T, work string) {
 }
 
 // seedTranscriptsText writes a few non-overlapping transcript text files so the
-// validating stage's ngram check has a clean source layer.
+// validating stage's ngram check has a clean source layer. Each line is padded past
+// the edge-chapter narrative threshold with distinct filler so the edge classifier
+// treats every seeded chapter as a real (narrative) chapter - a real story chapter is
+// thousands of words, and the filler cannot form an 8-word overlap with any sidecar
+// prose. The caller's exact content stays contiguous at the front of the chapter.
 func seedTranscriptsText(t *testing.T, work string, lines ...string) {
 	t.Helper()
+	filler := strings.Repeat(" filler", nonNarrativeWordThreshold+20)
 	for i, line := range lines {
-		if err := transcript.WriteText(filepath.Join(work, transcript.TextDir), i+1, line); err != nil {
+		if err := transcript.WriteText(filepath.Join(work, transcript.TextDir), i+1, line+filler); err != nil {
 			t.Fatal(err)
 		}
 	}

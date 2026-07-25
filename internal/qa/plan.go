@@ -122,13 +122,52 @@ func LoadPlan(workDir string) (*Plan, error) {
 	return &p, nil
 }
 
+// ClipStartFloorSec is how far below a chapter's duration a clip_start_sec must stay:
+// a value at or past (duration - this) leaves no room for at least a ~1s window, so the
+// repair layer would cut a zero/negative-length clip. It is exported because internal/repair
+// applies the SAME floor in its defense-in-depth guards (StartOverrideSec vs
+// ChapterEnd-ClipStartFloorSec), so validation and repair share one constant instead of
+// each re-encoding 1.0.
+const ClipStartFloorSec = 1.0
+
+// ClipStartInRange reports whether a clip window start (seconds RELATIVE to the start of a
+// chapter's audio) leaves room for at least a ~ClipStartFloorSec window inside a chapter of
+// the given duration. It is the ONE shared predicate the plan validator, the three
+// internal/repair/clip.go defense-in-depth guards, and the retranscribe dispatch pre-check
+// all use, so the boundary operator is normalized in exactly one place. Semantics:
+//   - an unknown (<= 0) duration cannot bound the window, so any start is in range;
+//   - otherwise a start is in range only when start < duration - ClipStartFloorSec, i.e. a
+//     start at or past (duration - ClipStartFloorSec) is REJECTED (out of range) - the value
+//     that would cut a zero/negative-length clip and hard-fail ffmpeg.
+func ClipStartInRange(start, duration float64) bool {
+	if duration <= 0 {
+		return true
+	}
+	return start < duration-ClipStartFloorSec
+}
+
+// clipEndToleranceSec is the slack a mid_clip's clip_end_sec may exceed the manifest
+// duration by. Agents read segment end times that can round a fraction past the chapter
+// duration, so a near-end window is legitimate; only a value well past the end (the
+// absolute-timestamp mistake) is rejected.
+const clipEndToleranceSec = 2.0
+
 // Validate checks the plan against the QA report: every chapter that REQUIRES a
 // disposition (the retranscribe queue, every tail-rate hit, every repeated run, and every
 // mid-chapter multi-loop) has exactly one entry; no entry names a chapter the sweep
 // did not flag at all; every action is valid and every reason non-empty. The
 // informational low-confidence stats never require an entry. A repeated end fade does
 // require adjudication, but may still legitimately receive an "accept" after verification.
-func (p *Plan) Validate(rep *Report) error {
+//
+// durations maps a chapter number to its audio length in seconds (from the manifest); it
+// bounds a clip window to that chapter's own timeline. clip_start_sec / clip_end_sec are
+// seconds RELATIVE to the start of that chapter's audio, never an absolute source-file or
+// whole-book timestamp, so a value at or past the chapter duration is out of range and is
+// rejected here (the retry feedback tells the agent to use a chapter-relative value). A
+// missing or zero duration for a chapter skips the bound check defensively. The error text
+// is the agent's retry feedback, so it names the chapter, the offending value, and the
+// chapter duration.
+func (p *Plan) Validate(rep *Report, durations map[int]float64) error {
 	if rep == nil {
 		return errors.New("qa plan: nil report")
 	}
@@ -169,6 +208,27 @@ func (p *Plan) Validate(rep *Report) error {
 				return fmt.Errorf("qa plan: chapter %d mid_clip clip_end_sec %.1f must be greater than clip_start_sec %.1f", e.Chapter, e.ClipEndSec, e.ClipStartSec)
 			}
 		}
+		// Clip windows are chapter-relative, so reject a value at or past the chapter's own
+		// duration (the live incident: an absolute source-file timestamp of 1752 supplied for
+		// a 1720.296s chapter, which cut a negative-length clip -> a hard ffmpeg failure). Only
+		// a tail_clip or mid_clip carries clip seconds; a missing/zero duration skips the check.
+		if dur, ok := durations[e.Chapter]; ok && dur > 0 {
+			switch e.Action {
+			case ActionTailClip:
+				// A tail_clip clip_start_sec of 0 means "derive the window" - only a supplied
+				// (> 0) value is bounded, so an omitted start never trips the check.
+				if e.ClipStartSec > 0 && !ClipStartInRange(e.ClipStartSec, dur) {
+					return outOfRangeClipErr(e.Chapter, "tail_clip", "clip_start_sec", e.ClipStartSec, dur)
+				}
+			case ActionMidClip:
+				if !ClipStartInRange(e.ClipStartSec, dur) {
+					return outOfRangeClipErr(e.Chapter, "mid_clip", "clip_start_sec", e.ClipStartSec, dur)
+				}
+				if e.ClipEndSec > dur+clipEndToleranceSec {
+					return outOfRangeClipErr(e.Chapter, "mid_clip", "clip_end_sec", e.ClipEndSec, dur)
+				}
+			}
+		}
 		if !allowed[e.Chapter] {
 			return fmt.Errorf("qa plan: chapter %d has an entry but the QA sweep flagged nothing for it", e.Chapter)
 		}
@@ -196,6 +256,14 @@ func (p *Plan) Validate(rep *Report) error {
 		return fmt.Errorf("qa plan: chapter %d is flagged for disposition but has no plan entry", missing[0])
 	}
 	return nil
+}
+
+// outOfRangeClipErr builds the agent retry feedback for a clip window value that exceeds
+// the chapter's own duration. It names the chapter, the offending field and value, and the
+// chapter duration, and states the chapter-relative rule so the agent corrects the mistake
+// rather than repeating the absolute-timestamp form.
+func outOfRangeClipErr(chapter int, action, field string, value, duration float64) error {
+	return fmt.Errorf("qa plan: chapter %d %s %s %.1f is out of range for a %.1fs chapter - clip seconds are relative to the start of that chapter's audio, never an absolute source-file or whole-book timestamp", chapter, action, field, value, duration)
 }
 
 // FlaggedChapters is the sorted set of chapters that REQUIRE a disposition - the same

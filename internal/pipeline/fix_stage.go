@@ -15,6 +15,7 @@ import (
 type fixPromptData struct {
 	Title          string
 	ChapterCount   int
+	EdgeNote       string
 	VerifiedLedger string
 }
 
@@ -27,10 +28,11 @@ func (e *Executor) fixSidecars(ctx context.Context, book store.Book, r scheduler
 	if r.Progress != nil {
 		r.Progress(0, 1)
 	}
-	manifest, seriesOpener, ledger, err := e.sidecarStageInputs(ctx, book)
+	class, seriesOpener, ledger, err := e.sidecarStageInputs(ctx, book)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("fixing: %w", err)
 	}
+	noteEdgeExclusions(r, class)
 
 	st, err := agent.New(book.WorkDir, string(state.Fixing), e.stageAttempt(ctx, book, state.Fixing))
 	if err != nil {
@@ -41,12 +43,13 @@ func (e *Executor) fixSidecars(ctx context.Context, book store.Book, r scheduler
 	}
 
 	validate := func(_ agent.Result, s *agent.Staging) error {
-		_, _, _, verr := loadOutSidecars(s.OutDir(), manifest.ChapterCount, seriesOpener)
+		_, _, _, verr := loadOutSidecars(s.OutDir(), class.LogicalCount, seriesOpener)
 		return verr
 	}
 	data := fixPromptData{
 		Title:          book.Title,
-		ChapterCount:   manifest.ChapterCount,
+		ChapterCount:   class.LogicalCount,
+		EdgeNote:       class.EdgeNote,
 		VerifiedLedger: ledger,
 	}
 	usage, err := e.runAgent(ctx, book, state.Fixing, r, st, "fix.md", data, false, validate)

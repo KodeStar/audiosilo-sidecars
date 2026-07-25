@@ -67,7 +67,7 @@ func TestSupervisorPersistenceAndBatchCostAggregation(t *testing.T) {
 	if _, err := db.StartSupervisorRun(ctx, SupervisorRun{BatchID: batch.ID, Trigger: "unknown", Diagnosis: "unknown-cost call", Evidence: json.RawMessage(`[]`), SelectedAction: "observe", State: "failed", Model: "unpriced", Backend: "codex", ModelCalls: 2}); err != nil {
 		t.Fatal(err)
 	}
-	if calls, err := db.SupervisorInvocationCountSince(ctx, timestamp(time.Now().Add(-time.Hour))); err != nil || calls != 2 {
+	if calls, err := db.SupervisorInvocationCountSince(ctx, time.Now().Add(-time.Hour)); err != nil || calls != 2 {
 		t.Fatalf("model calls=%d err=%v", calls, err)
 	}
 	costs, err := db.BatchCosts(ctx, batch.ID)
@@ -90,6 +90,67 @@ func TestSupervisorPersistenceAndBatchCostAggregation(t *testing.T) {
 	runs, err := db.ListStageRuns(ctx, b.ID)
 	if err != nil || len(runs) != 2 || !runs[1].Superseded {
 		t.Fatalf("runs=%+v err=%v", runs, err)
+	}
+}
+
+func TestCountAutoRecoveriesSinceCountsOnlyCompletedAutomaticRecoveriesInWindow(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	batch, err := db.CreateBatch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := db.CreateBook(ctx, NewBook{BatchID: batch.ID, SourcePath: "/book", WorkDir: t.TempDir(), Title: "Book"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := db.CreateBook(ctx, NewBook{BatchID: batch.ID, SourcePath: "/other", WorkDir: t.TempDir(), Title: "Other"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bid, oid := b.ID, other.ID
+	now := time.Now().UTC()
+	insert := func(bookID int64, action, state string, automatic bool, at time.Time) {
+		if _, err := db.StartSupervisorRun(ctx, SupervisorRun{BatchID: batch.ID, BookID: &bookID, Trigger: "t",
+			Diagnosis: "d", Evidence: json.RawMessage(`[]`), SelectedAction: action, Automatic: automatic,
+			State: state, StartedAt: timestamp(at)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// In-window completed automatic recoveries under EVERY counted action count: the cap
+	// covers retry/readmit AND the paid re-run actions supersede_rerun/requeue/fallback_backend.
+	insert(bid, "retry", "completed", true, now.Add(-time.Hour))
+	insert(bid, "readmit", "completed", true, now.Add(-2*time.Hour))
+	insert(bid, "supersede_rerun", "completed", true, now.Add(-30*time.Minute))
+	insert(bid, "requeue", "completed", true, now.Add(-40*time.Minute))
+	insert(bid, "fallback_backend", "completed", true, now.Add(-50*time.Minute))
+	// Excluded: non-automatic (manual), non-completed, non-recovery action, terminate_requeue
+	// (orphaned-process hygiene, deliberately uncounted), another book, and one aged out.
+	insert(bid, "retry", "completed", false, now.Add(-time.Minute))
+	insert(bid, "readmit", "approval_required", true, now.Add(-time.Minute))
+	insert(bid, "park_escalate", "completed", true, now.Add(-time.Minute))
+	insert(bid, "terminate_requeue", "completed", true, now.Add(-time.Minute))
+	insert(oid, "retry", "completed", true, now.Add(-time.Minute))
+	insert(bid, "retry", "completed", true, now.Add(-48*time.Hour))
+
+	n, err := db.CountAutoRecoveriesSince(ctx, bid, now.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 {
+		t.Fatalf("in-window automatic recoveries = %d, want 5 (retry/readmit/supersede_rerun/requeue/fallback_backend)", n)
+	}
+	// A tighter 90-minute window drops only the -2h readmit; the other four remain.
+	n, err = db.CountAutoRecoveriesSince(ctx, bid, now.Add(-90*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 4 {
+		t.Fatalf("tighter-window recoveries = %d, want 4", n)
 	}
 }
 

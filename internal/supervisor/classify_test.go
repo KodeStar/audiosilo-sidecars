@@ -187,41 +187,41 @@ func TestFailedQARunsDoNotCreateConvergenceIncident(t *testing.T) {
 
 func TestDecisionRetryEscalationAndApprovalLimits(t *testing.T) {
 	p := Policy{MaxAttempts: 3, AutomaticActions: true, AllowBackendFailover: false}
-	d := Decide(Incident{Kind: IncidentMissingProcess}, 2, p)
+	d := Decide(Incident{Kind: IncidentMissingProcess}, 2, 0, p)
 	if d.Action != ActionTerminateRequeue || !d.Automatic {
 		t.Fatalf("decision=%+v", d)
 	}
-	d = Decide(Incident{Kind: IncidentMissingProcess}, 3, p)
+	d = Decide(Incident{Kind: IncidentMissingProcess}, 3, 0, p)
 	if d.Action != ActionParkEscalate || !d.ApprovalRequired || !d.Automatic {
 		t.Fatalf("limit decision=%+v", d)
 	}
-	d = Decide(Incident{Kind: IncidentArtifactInvalid, Stage: "contributing"}, 0, p)
+	d = Decide(Incident{Kind: IncidentArtifactInvalid, Stage: "contributing"}, 0, 0, p)
 	if d.Action != ActionParkEscalate || !d.ApprovalRequired {
 		t.Fatalf("publishing decision=%+v", d)
 	}
-	d = Decide(Incident{Kind: IncidentArtifactInvalid, Stage: "validating", Protected: true}, 0, p)
+	d = Decide(Incident{Kind: IncidentArtifactInvalid, Stage: "validating", Protected: true}, 0, 0, p)
 	if d.Action != ActionParkEscalate || d.Automatic || !d.ApprovalRequired {
 		t.Fatalf("protected output decision=%+v", d)
 	}
-	d = Decide(Incident{Kind: IncidentBackendUnavailable}, 0, p)
+	d = Decide(Incident{Kind: IncidentBackendUnavailable}, 0, 0, p)
 	if d.Action != ActionParkEscalate {
 		t.Fatalf("backend=%+v", d)
 	}
 	p.AllowBackendFailover = true
-	d = Decide(Incident{Kind: IncidentBackendUnavailable}, 0, p)
+	d = Decide(Incident{Kind: IncidentBackendUnavailable}, 0, 0, p)
 	if d.Action != ActionFallbackBackend || !d.Automatic {
 		t.Fatalf("fallback=%+v", d)
 	}
-	d = Decide(Incident{Kind: IncidentNoProgress}, 0, p)
+	d = Decide(Incident{Kind: IncidentNoProgress}, 0, 0, p)
 	if d.Action != ActionParkEscalate || d.Automatic || !d.ApprovalRequired {
 		t.Fatalf("ambiguous no-progress=%+v", d)
 	}
-	d = Decide(Incident{Kind: IncidentDurationLimit}, 0, p)
+	d = Decide(Incident{Kind: IncidentDurationLimit}, 0, 0, p)
 	if d.Action != ActionStopBudget || !d.Automatic {
 		t.Fatalf("duration containment=%+v", d)
 	}
 	for _, kind := range []IncidentKind{IncidentNonConvergingQA, IncidentNonConvergingAudit} {
-		d = Decide(Incident{Kind: kind}, 0, p)
+		d = Decide(Incident{Kind: kind}, 0, 0, p)
 		if d.Action != ActionObserve || d.Automatic || d.ApprovalRequired {
 			t.Fatalf("bounded pipeline loop %s was interrupted: %+v", kind, d)
 		}
@@ -231,26 +231,26 @@ func TestDecisionRetryEscalationAndApprovalLimits(t *testing.T) {
 func TestParkedRecoveryGetsBoundedAutomaticPlan(t *testing.T) {
 	p := Policy{MaxAttempts: 3, AutomaticActions: true, ModelAssisted: true}
 	i := Incident{Kind: IncidentParkedRecovery, ParkCode: string(state.ParkFixLoopExhausted)}
-	d := Decide(i, 0, p)
+	d := Decide(i, 0, 0, p)
 	if d.Action != ActionRetry || !d.Automatic {
 		t.Fatalf("first fix-loop recovery = %+v, want automatic retry", d)
 	}
-	d = Decide(i, 3, p)
+	d = Decide(i, 3, 0, p)
 	if d.Action != ActionParkEscalate || !d.ApprovalRequired {
 		t.Fatalf("exhausted recovery = %+v, want bounded escalation", d)
 	}
 
 	i.ParkCode = string(state.ParkSupervisorEscalated)
-	d = Decide(i, 0, p)
+	d = Decide(i, 0, 0, p)
 	if d.Action != ActionAskModel || d.Automatic {
 		t.Fatalf("ambiguous parked recovery = %+v, want bounded model diagnosis", d)
 	}
-	d = Decide(i, 3, p)
+	d = Decide(i, 3, 0, p)
 	if d.Action != ActionParkEscalate || !d.ApprovalRequired {
 		t.Fatalf("exhausted model recovery = %+v, want bounded escalation", d)
 	}
 	i.ParkCode = string(state.ParkBudgetExceeded)
-	d = Decide(i, 0, p)
+	d = Decide(i, 0, 0, p)
 	if d.Action != ActionObserve || !d.ApprovalRequired {
 		t.Fatalf("book budget park = %+v, want protected observation", d)
 	}

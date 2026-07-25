@@ -3,6 +3,10 @@ You are the focused semantic verification pass for the sidecars of "{{.Title}}"
 {{.Round}} and a fixer was instructed to apply its remaining FIX findings. Verify
 that those exact corrections are now genuinely present. Do not start a fresh audit
 or search for unrelated stylistic improvements.
+{{if .EdgeNote}}
+Note on this book's structure: {{.EdgeNote}} A stop at the last logical story
+chapter ({{.ChapterCount}}) is correct; do not fault it.
+{{end}}
 
 ## Where you work
 

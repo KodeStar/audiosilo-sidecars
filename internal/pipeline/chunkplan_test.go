@@ -97,14 +97,14 @@ func TestChapterWordCountPrefersRepaired(t *testing.T) {
 	if err := transcript.WriteText(filepath.Join(work, transcript.TextDir), 2, "alpha beta"); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := chapterWordCount(work, 1); err != nil || n != 6 {
-		t.Errorf("chapter 1 words = %d (%v), want 6 (repaired preferred)", n, err)
+	if n, present, err := chapterWordCount(work, 1); err != nil || n != 6 || !present {
+		t.Errorf("chapter 1 words = %d present=%v (%v), want 6 present (repaired preferred)", n, present, err)
 	}
-	if n, err := chapterWordCount(work, 2); err != nil || n != 2 {
-		t.Errorf("chapter 2 words = %d (%v), want 2", n, err)
+	if n, present, err := chapterWordCount(work, 2); err != nil || n != 2 || !present {
+		t.Errorf("chapter 2 words = %d present=%v (%v), want 2 present", n, present, err)
 	}
-	if n, err := chapterWordCount(work, 3); err != nil || n != 0 {
-		t.Errorf("absent chapter 3 words = %d (%v), want 0", n, err)
+	if n, present, err := chapterWordCount(work, 3); err != nil || n != 0 || present {
+		t.Errorf("absent chapter 3 words = %d present=%v (%v), want 0 absent", n, present, err)
 	}
 }
 

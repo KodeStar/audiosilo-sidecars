@@ -101,7 +101,10 @@ web access.
   where the real narration ends and the loop starts, and give a timestamp for a
   DIFFERENT (usually narrower) window. Omit it only for a long, clearly-located loop
   the stage can find on its own; for short repeats do NOT leave the derivation to the
-  stage.
+  stage. `clip_start_sec` is measured in seconds from the START of THAT chapter's own
+  audio (chapter-relative) and MUST be less than the chapter's `duration` in
+  `manifest.json` - NEVER an absolute whole-book or source-file timestamp. The plan
+  validator rejects an out-of-range value and asks you to re-supply a chapter-relative one.
 - `mid_clip` - the corruption is a MID-CHAPTER loop: an interior repeated span with
   REAL narration resuming AFTER it (the classic "...the two of the two of the two
   [x80] the pixie queen was still hovering..."). tail_clip cannot reach an interior
@@ -110,7 +113,11 @@ web access.
   intact head (before the loop) and tail (after it). Supply BOTH `"clip_start_sec"`
   and `"clip_end_sec"` (seconds from the chapter start) bounding the looping span: use
   the cross-segment finding's "(A-Bs)" time range plus the transcript to locate where
-  the loop STARTS and where real narration RESUMES. Use mid_clip ONLY for a bounded
+  the loop STARTS and where real narration RESUMES. Both `clip_start_sec` and
+  `clip_end_sec` are seconds from the START of THAT chapter's own audio (chapter-relative)
+  and MUST fall within the chapter's `duration` in `manifest.json` - NEVER an absolute
+  whole-book or source-file timestamp. The plan validator rejects an out-of-range
+  window. Use mid_clip ONLY for a bounded
   interior loop with intact content after it; use `retranscribe` for pervasive or
   whole-chapter degeneration, `tail_clip` for a loop that runs to the chapter end.
   Bound the window GENEROUSLY - make it cover the WHOLE loop with a little margin on

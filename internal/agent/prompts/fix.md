@@ -1,6 +1,12 @@
 You are the fix stage of the extraction pipeline. An independent auditor found
 defects in the CC BY-SA sidecars for "{{.Title}}" ({{.ChapterCount}} logical
 chapters). Correct them and re-emit complete sidecar files.
+{{if .EdgeNote}}
+Note on this book's structure: {{.EdgeNote}} Keep every position in the range 0 to
+{{.ChapterCount}}; the final recap ends at chapter {{.ChapterCount}}. If a finding
+demands a recap or position running through a non-narrative file, that finding is
+mistaken - leave the correct stop at chapter {{.ChapterCount}} in place.
+{{end}}
 
 ## Where you work
 

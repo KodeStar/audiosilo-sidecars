@@ -209,10 +209,16 @@ func classifyParked(book store.Book, runs []store.StageRun) (Incident, bool) {
 	if book.Status != string(state.StatusNeedsAttention) || book.ParkCode == "" {
 		return Incident{}, false
 	}
+	// One reverse walk over the current stage's runs: take the latest NON-SUPERSEDED run so the
+	// incident's StageRunID and its fingerprint derive from the SAME run. Previously the id walk
+	// ignored Superseded while the fingerprint's error walk filtered it, so a superseded retry
+	// could identify the incident while an older run supplied the error text.
 	var stageRunID int64
+	var stageErr string
 	for idx := len(runs) - 1; idx >= 0; idx-- {
-		if runs[idx].Stage == book.State {
+		if runs[idx].Stage == book.State && !runs[idx].Superseded {
 			stageRunID = runs[idx].ID
+			stageErr = stageRunError(runs[idx])
 			break
 		}
 	}
@@ -223,9 +229,37 @@ func classifyParked(book store.Book, runs []store.StageRun) (Incident, bool) {
 	return Incident{
 		Kind: IncidentParkedRecovery, BookID: book.ID, BatchID: book.BatchID,
 		Stage: book.State, StageRunID: stageRunID, ParkCode: book.ParkCode,
-		Fingerprint: ErrorFingerprint(book.ParkCode + " " + book.Error),
+		Fingerprint: parkedRecoveryFingerprint(book, stageErr),
 		Diagnosis:   "parked book requires a bounded recovery plan", Evidence: evidence,
 	}, true
+}
+
+// parkedRecoveryFingerprint derives a STATIONARY fingerprint for a parked-recovery
+// incident. book.Error must never contribute: every supervisor park_escalate rewrites
+// it to "supervisor: <diagnosis>: <evidence>", nesting a re-truncated copy of the
+// previous error, so hashing it produced a fresh fingerprint each recovery cycle and
+// the family-attempt cap never bound (the incident ping-ponged indefinitely). Instead
+// hash stable material only: the park code + current stage, plus the underlying failed
+// stage-run error for that stage when one exists (the genuine ffmpeg/agent text, which the
+// supervisor never rewrites). classifyParked supplies that error from the SAME non-superseded
+// run it takes the StageRunID from. A supervisor message prefix on the error is stripped so no
+// escalation prose can leak back in.
+func parkedRecoveryFingerprint(book store.Book, underlyingErr string) string {
+	source := book.ParkCode + " " + book.State
+	if underlying := stripSupervisorPrefix(underlyingErr); underlying != "" {
+		source += " " + underlying
+	}
+	return ErrorFingerprint(source)
+}
+
+// stripSupervisorPrefix removes a leading supervisor message prefix (state.SupervisorMessagePrefix,
+// e.g. "supervisor: <text>") so a re-hashed escalation message never contaminates the stationary
+// parked-recovery fingerprint. It trims the colon form (prefix without its trailing space) so it
+// tolerates a prefix written with or without the space.
+func stripSupervisorPrefix(message string) string {
+	trimmed := strings.TrimSpace(message)
+	trimmed = strings.TrimPrefix(trimmed, strings.TrimSpace(state.SupervisorMessagePrefix))
+	return strings.TrimSpace(trimmed)
 }
 
 func comparableCost(r store.StageRun) (float64, string, bool) {
@@ -356,7 +390,37 @@ func dedupeIncidents(in []Incident) []Incident {
 	return out
 }
 
-func Decide(i Incident, attempts int, p Policy) Decision {
+// autoRecoveryActions is the set of AUTOMATIC recovery actions the durable cross-Kind cap
+// counts and gates: each re-admits or re-runs paid work, so an unbounded cycle of any of them
+// (not just retry/readmit) burns budget on a book that will not converge. terminate_requeue is
+// deliberately EXCLUDED: it is orphaned-process hygiene (a daemon restart legitimately fires
+// several in a day to clean up dead workers), so counting it would park healthy books after
+// every restart. The store's CountAutoRecoveriesSince SQL IN clause mirrors this exact set.
+var autoRecoveryActions = map[Action]bool{
+	ActionRetry: true, ActionReadmit: true, ActionSupersedeRerun: true,
+	ActionRequeue: true, ActionFallbackBackend: true,
+}
+
+// isAutoRecoveryAction reports whether an action is one the durable auto-recovery cap counts
+// and gates. It is the ONE definition shared by capsAutoRecovery and the service's pre-gate.
+func isAutoRecoveryAction(a Action) bool { return autoRecoveryActions[a] }
+
+// capsAutoRecovery reports whether the durable cross-Kind auto-recovery cap binds for a
+// tentative decision d: a would-be automatic auto-recovery action (isAutoRecoveryAction) for a
+// book that has already had at least MaxAttempts such actions in the caller's rolling window
+// (recentAutoRecoveries, supplied by the service). The per-family attempt count can be
+// defeated by Kind alternation or fingerprint drift, so this blunt count is the backstop.
+// When it binds, Decide converts the action to park_escalate + approval-required and lets
+// its normal Automatic formula recompute (park_escalate stays automatic containment;
+// re-admission stops). It is checked before Automatic is computed, so it gates on the
+// would-be-automatic condition (p.AutomaticActions && !i.Protected) directly.
+func capsAutoRecovery(d Decision, recentAutoRecoveries int, i Incident, p Policy) bool {
+	return p.MaxAttempts > 0 && recentAutoRecoveries >= p.MaxAttempts &&
+		isAutoRecoveryAction(d.Action) &&
+		p.AutomaticActions && !i.Protected
+}
+
+func Decide(i Incident, attempts, recentAutoRecoveries int, p Policy) Decision {
 	d := Decision{Incident: i, Action: ActionObserve, RetryLimit: p.MaxAttempts, TerminationLimit: 1}
 	if i.Kind == IncidentParkedRecovery {
 		switch state.ParkCode(i.ParkCode) {
@@ -389,6 +453,10 @@ func Decide(i Incident, attempts int, p Policy) Decision {
 			d.ApprovalRequired = true
 		}
 		if attempts >= p.MaxAttempts && d.Action != ActionObserve {
+			d.Action = ActionParkEscalate
+			d.ApprovalRequired = true
+		}
+		if capsAutoRecovery(d, recentAutoRecoveries, i, p) {
 			d.Action = ActionParkEscalate
 			d.ApprovalRequired = true
 		}
@@ -444,6 +512,10 @@ func Decide(i Incident, attempts int, p Policy) Decision {
 		}
 	}
 	if attempts >= p.MaxAttempts && (d.Action == ActionRetry || d.Action == ActionReadmit || d.Action == ActionRequeue || d.Action == ActionTerminateRequeue || d.Action == ActionSupersedeRerun) {
+		d.Action = ActionParkEscalate
+		d.ApprovalRequired = true
+	}
+	if capsAutoRecovery(d, recentAutoRecoveries, i, p) {
 		d.Action = ActionParkEscalate
 		d.ApprovalRequired = true
 	}

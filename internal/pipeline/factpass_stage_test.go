@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
+	"github.com/kodestar/audiosilo-sidecars/internal/audio"
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/spelling"
@@ -33,6 +34,20 @@ func writeOutRaw(t *testing.T, req agent.Request, rel, content string) {
 func seedFactPassInputs(t *testing.T, work string, chunks []chunkRange) chunkPlan {
 	t.Helper()
 	plan := chunkPlan{Chunks: chunks}
+	// fact_pass reads the manifest to classify edge chapters; seed a markers manifest
+	// spanning every chunk chapter (markers => the edge classifier returns the raw
+	// count with no exclusions, matching a real inspected book).
+	maxCh := 0
+	for _, c := range chunks {
+		if c.To > maxCh {
+			maxCh = c.To
+		}
+	}
+	m := audio.Manifest{Source: "/x/book.m4b", Style: audio.StyleMarkers, ChapterCount: maxCh}
+	for k := 1; k <= maxCh; k++ {
+		m.Chapters = append(m.Chapters, audio.Chapter{Chapter: k, Start: float64(k - 1), End: float64(k), Duration: 1})
+	}
+	writeManifestStruct(t, work, m)
 	for _, c := range chunks {
 		plan.ChunkEnds = append(plan.ChunkEnds, c.To)
 		// the chunk's spelling sheet

@@ -3,6 +3,9 @@ You are extracting compact, chapter-attributed facts from the audiobook
 stage will combine your notes with independently extracted chunks. Preserve the
 important story evidence, but do not write narrative prose or a cumulative book
 summary.
+{{if .ChunkNote}}
+Note on this book's structure: {{.ChunkNote}}
+{{end}}
 
 ## Where you work
 

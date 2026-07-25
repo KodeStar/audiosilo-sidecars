@@ -114,7 +114,10 @@ type ClipResult struct {
 // recorded (the ClipResult is zero). It is distinct from a re-degeneration (Verdict set), a
 // known-failed skip (SkippedKnownFailed), and any splice (Spliced). The retranscribing stage
 // buckets it as clips_unlocatable and asks the adjudicator to supply a clip_start_sec so the
-// window can be relocated. It is never true for a MID clip (ClipAndSpliceWindow always cuts).
+// window can be relocated. A MID clip is normally always cut, but ClipAndSpliceWindow ALSO
+// returns this zero result (no cut) when the agent's window start is out of range for the
+// chapter (>= ChapterEnd-1) - a bad number degrades to the same unlocatable no-op instead of
+// a hard ffmpeg failure.
 func (r ClipResult) Unlocatable() bool {
 	return !r.Located && !r.Spliced && !r.SkippedKnownFailed && r.Verdict == ""
 }
@@ -153,7 +156,15 @@ func ClipAndSplice(ctx context.Context, req ClipSpliceRequest) (ClipResult, erro
 	// straddles an arbitrary timestamp. Decode may start earlier still to provide a full
 	// 30-second ending window; only fresh words at/after clipStart are adopted.
 	snapped := ClipWindow(req.Transcript, run)
-	if req.StartOverrideSec > 0 {
+	// Honor an agent-supplied override ONLY when it fits the chapter: an out-of-range value
+	// (e.g. an absolute source-file timestamp past the chapter end) would cut a zero/negative-
+	// length window and hard-FAIL the book. The located run is trustworthy, so ignore garbage
+	// and keep the derived start rather than turning a locatable repair into a no-op. A
+	// ChapterEnd <= 0 (unknown duration) applies the override, since the bound is unknown
+	// (qa.ClipStartInRange treats it as in range). The plan validator and the retranscribe
+	// dispatch pre-check reject such values earlier (the SAME qa.ClipStartInRange predicate);
+	// this is defense in depth for a value that slipped through in a persisted plan.
+	if req.StartOverrideSec > 0 && qa.ClipStartInRange(req.StartOverrideSec, req.ChapterEnd) {
 		snapped = req.StartOverrideSec
 	}
 	clipStart, decodeStart := tailStarts(req.Transcript, snapped, req.ChapterEnd)
@@ -241,11 +252,11 @@ func clipAndSpliceDirected(ctx context.Context, req ClipSpliceRequest) (ClipResu
 	// Degenerate-window guard: a bogus agent clip_start_sec at (or past) the chapter end
 	// would cut a zero/negative-length window - `chend - override + 2` collapses to <= 2s
 	// of nothing, so ffmpeg would produce an empty/failed clip and hard-FAIL the book.
-	// Treat "no room for at least a ~1s window" (override > chend - 1) as an unlocatable
-	// no-op instead: nothing is cut, and the stage's clips_unlocatable bucket + note + the
-	// next adjudication round handle re-supplying a sane window. This keeps a single bad
-	// number from failing a book the pipeline can still recover.
-	if req.StartOverrideSec > req.ChapterEnd-1 {
+	// Treat "no room for at least a ~1s window" (out of range per qa.ClipStartInRange) as an
+	// unlocatable no-op instead: nothing is cut, and the stage's clips_unlocatable bucket +
+	// note + the next adjudication round handle re-supplying a sane window. This keeps a
+	// single bad number from failing a book the pipeline can still recover.
+	if !qa.ClipStartInRange(req.StartOverrideSec, req.ChapterEnd) {
 		return res, nil
 	}
 	clipStart, decodeStart := tailStarts(req.Transcript, req.StartOverrideSec, req.ChapterEnd)
@@ -311,6 +322,19 @@ func clipAndSpliceDirected(ctx context.Context, req ClipSpliceRequest) (ClipResu
 // cut/transcribe calls.
 func ClipAndSpliceWindow(ctx context.Context, req ClipSpliceRequest) (ClipResult, error) {
 	res := ClipResult{Chapter: req.Chapter}
+	// Out-of-range guard (BEFORE the window-shape check and the cut): a start at or past the
+	// chapter end (e.g. an absolute source-file timestamp the adjudicator supplied instead of
+	// a chapter-relative one) leaves no room for a valid interior window and would cut a zero/
+	// negative-length clip - a hard ffmpeg FAIL repeated every round. Degrade to an unlocatable
+	// no-op (zero result, no error), exactly like the tail directed path: the stage buckets it
+	// in clips_unlocatable + a note so the next adjudication round re-supplies a sane window,
+	// rather than failing a recoverable book on one bad number. ChapterEnd <= 0 (unknown
+	// duration) cannot bound it, so qa.ClipStartInRange returns true and we fall through to the
+	// window-shape check. The predicate is the SAME one the plan validator and the dispatch
+	// pre-check enforce.
+	if !qa.ClipStartInRange(req.StartOverrideSec, req.ChapterEnd) {
+		return res, nil
+	}
 	if req.StartOverrideSec <= 0 || req.EndOverrideSec <= req.StartOverrideSec {
 		return res, fmt.Errorf("mid-clip ch%03d: invalid window [%g, %g]", req.Chapter, req.StartOverrideSec, req.EndOverrideSec)
 	}

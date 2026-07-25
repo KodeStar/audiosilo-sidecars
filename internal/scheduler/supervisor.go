@@ -88,7 +88,7 @@ func (s *Scheduler) SupervisorApply(ctx context.Context, action string, bookID i
 	case "park_escalate":
 		message := "supervisor parked this book for operator review"
 		if len(detail) > 0 && detail[0] != "" {
-			message = "supervisor: " + detail[0]
+			message = state.SupervisorMessagePrefix + detail[0]
 		}
 		return s.supervisorPark(ctx, bookID, state.ParkSupervisorEscalated, message)
 	case "reallocate":

@@ -44,6 +44,13 @@ func baseReport() *Report {
 	}
 }
 
+// baseDurations gives every flagged chapter a generous audio length so the clip-window
+// bound check in Validate never rejects the in-range values the other cases use (they go
+// up to ~1205s). The out-of-range cases pass their own tight durations map.
+func baseDurations() map[int]float64 {
+	return map[int]float64{2: 2000, 3: 2000, 5: 2000, 8: 2000, 9: 2000}
+}
+
 func fullPlan() *Plan {
 	return &Plan{Entries: []PlanEntry{
 		{Chapter: 2, Action: ActionRetranscribe, Reason: "wph outlier + tail rate"},
@@ -54,13 +61,13 @@ func fullPlan() *Plan {
 }
 
 func TestPlanValidate_Valid(t *testing.T) {
-	if err := fullPlan().Validate(baseReport()); err != nil {
+	if err := fullPlan().Validate(baseReport(), baseDurations()); err != nil {
 		t.Fatalf("expected valid, got %v", err)
 	}
 	// An extra accept for an allowed-but-not-required chapter (cross-segment ch9) is OK.
 	p := fullPlan()
 	p.Entries = append(p.Entries, PlanEntry{Chapter: 9, Action: ActionAccept, Reason: "prose repeat, fine"})
-	if err := p.Validate(baseReport()); err != nil {
+	if err := p.Validate(baseReport(), baseDurations()); err != nil {
 		t.Fatalf("expected valid with allowed extra, got %v", err)
 	}
 }
@@ -68,7 +75,7 @@ func TestPlanValidate_Valid(t *testing.T) {
 func TestPlanValidate_MissingRequired(t *testing.T) {
 	p := fullPlan()
 	p.Entries = append(p.Entries[:2], p.Entries[3]) // drop only the ch8 entry
-	err := p.Validate(baseReport())
+	err := p.Validate(baseReport(), baseDurations())
 	if err == nil || !strings.Contains(err.Error(), "chapter 8") {
 		t.Fatalf("expected missing-ch8 error, got %v", err)
 	}
@@ -77,7 +84,7 @@ func TestPlanValidate_MissingRequired(t *testing.T) {
 func TestPlanValidate_EntryForUnflagged(t *testing.T) {
 	p := fullPlan()
 	p.Entries = append(p.Entries, PlanEntry{Chapter: 99, Action: ActionAccept, Reason: "why"})
-	err := p.Validate(baseReport())
+	err := p.Validate(baseReport(), baseDurations())
 	if err == nil || !strings.Contains(err.Error(), "chapter 99") {
 		t.Fatalf("expected unflagged-ch99 error, got %v", err)
 	}
@@ -86,7 +93,7 @@ func TestPlanValidate_EntryForUnflagged(t *testing.T) {
 func TestPlanValidate_DuplicateEntry(t *testing.T) {
 	p := fullPlan()
 	p.Entries = append(p.Entries, PlanEntry{Chapter: 2, Action: ActionAccept, Reason: "dup"})
-	err := p.Validate(baseReport())
+	err := p.Validate(baseReport(), baseDurations())
 	if err == nil || !strings.Contains(err.Error(), "expected exactly one") {
 		t.Fatalf("expected duplicate error, got %v", err)
 	}
@@ -95,7 +102,7 @@ func TestPlanValidate_DuplicateEntry(t *testing.T) {
 func TestPlanValidate_EmptyReason(t *testing.T) {
 	p := fullPlan()
 	p.Entries[0].Reason = "  "
-	err := p.Validate(baseReport())
+	err := p.Validate(baseReport(), baseDurations())
 	if err == nil || !strings.Contains(err.Error(), "empty reason") {
 		t.Fatalf("expected empty-reason error, got %v", err)
 	}
@@ -104,7 +111,7 @@ func TestPlanValidate_EmptyReason(t *testing.T) {
 func TestPlanValidate_InvalidAction(t *testing.T) {
 	p := fullPlan()
 	p.Entries[0].Action = "delete"
-	err := p.Validate(baseReport())
+	err := p.Validate(baseReport(), baseDurations())
 	if err == nil || !strings.Contains(err.Error(), "invalid action") {
 		t.Fatalf("expected invalid-action error, got %v", err)
 	}
@@ -115,7 +122,7 @@ func TestPlanValidate_InvalidAction(t *testing.T) {
 func TestPlanValidate_ClipStartSecValid(t *testing.T) {
 	p := fullPlan()
 	p.Entries[1].ClipStartSec = 1180.5 // chapter 5 is the tail_clip entry
-	if err := p.Validate(baseReport()); err != nil {
+	if err := p.Validate(baseReport(), baseDurations()); err != nil {
 		t.Fatalf("expected valid clip_start_sec on a tail_clip entry, got %v", err)
 	}
 }
@@ -124,7 +131,7 @@ func TestPlanValidate_ClipStartSecValid(t *testing.T) {
 func TestPlanValidate_ClipStartSecNegative(t *testing.T) {
 	p := fullPlan()
 	p.Entries[1].ClipStartSec = -3
-	err := p.Validate(baseReport())
+	err := p.Validate(baseReport(), baseDurations())
 	if err == nil || !strings.Contains(err.Error(), "negative clip_start_sec") {
 		t.Fatalf("expected negative-clip_start_sec error, got %v", err)
 	}
@@ -135,7 +142,7 @@ func TestPlanValidate_ClipStartSecNegative(t *testing.T) {
 func TestPlanValidate_ClipStartSecOnNonTailClip(t *testing.T) {
 	p := fullPlan()
 	p.Entries[0].ClipStartSec = 100 // chapter 2 is the retranscribe entry
-	err := p.Validate(baseReport())
+	err := p.Validate(baseReport(), baseDurations())
 	if err == nil || !strings.Contains(err.Error(), "clip_start_sec on a") {
 		t.Fatalf("expected clip_start_sec-on-non-tail_clip error, got %v", err)
 	}
@@ -147,7 +154,7 @@ func TestPlanValidate_ClipStartSecOnNonTailClip(t *testing.T) {
 func TestPlanValidate_MidClipValid(t *testing.T) {
 	p := fullPlan()
 	p.Entries[1] = PlanEntry{Chapter: 5, Action: ActionMidClip, Reason: "interior loop", ClipStartSec: 1180, ClipEndSec: 1205}
-	if err := p.Validate(baseReport()); err != nil {
+	if err := p.Validate(baseReport(), baseDurations()); err != nil {
 		t.Fatalf("expected a valid mid_clip entry, got %v", err)
 	}
 }
@@ -157,7 +164,7 @@ func TestPlanValidate_MidClipValid(t *testing.T) {
 func TestPlanValidate_MidClipMissingEnd(t *testing.T) {
 	p := fullPlan()
 	p.Entries[1] = PlanEntry{Chapter: 5, Action: ActionMidClip, Reason: "interior loop", ClipStartSec: 1180}
-	err := p.Validate(baseReport())
+	err := p.Validate(baseReport(), baseDurations())
 	if err == nil || !strings.Contains(err.Error(), "clip_end_sec") {
 		t.Fatalf("expected a missing-clip_end_sec error, got %v", err)
 	}
@@ -168,7 +175,7 @@ func TestPlanValidate_MidClipMissingEnd(t *testing.T) {
 func TestPlanValidate_MidClipEndNotAfterStart(t *testing.T) {
 	p := fullPlan()
 	p.Entries[1] = PlanEntry{Chapter: 5, Action: ActionMidClip, Reason: "interior loop", ClipStartSec: 1200, ClipEndSec: 1180}
-	err := p.Validate(baseReport())
+	err := p.Validate(baseReport(), baseDurations())
 	if err == nil || !strings.Contains(err.Error(), "must be greater than clip_start_sec") {
 		t.Fatalf("expected an end<=start error, got %v", err)
 	}
@@ -179,7 +186,7 @@ func TestPlanValidate_MidClipEndNotAfterStart(t *testing.T) {
 func TestPlanValidate_MidClipMissingStart(t *testing.T) {
 	p := fullPlan()
 	p.Entries[1] = PlanEntry{Chapter: 5, Action: ActionMidClip, Reason: "interior loop", ClipEndSec: 1200}
-	err := p.Validate(baseReport())
+	err := p.Validate(baseReport(), baseDurations())
 	if err == nil || !strings.Contains(err.Error(), "no clip_start_sec > 0") {
 		t.Fatalf("expected a missing-clip_start_sec error, got %v", err)
 	}
@@ -190,7 +197,7 @@ func TestPlanValidate_MidClipMissingStart(t *testing.T) {
 func TestPlanValidate_MidClipNegativeEnd(t *testing.T) {
 	p := fullPlan()
 	p.Entries[1] = PlanEntry{Chapter: 5, Action: ActionMidClip, Reason: "interior loop", ClipStartSec: 1180, ClipEndSec: -5}
-	err := p.Validate(baseReport())
+	err := p.Validate(baseReport(), baseDurations())
 	if err == nil || !strings.Contains(err.Error(), "negative clip_end_sec") {
 		t.Fatalf("expected a negative-clip_end_sec error, got %v", err)
 	}
@@ -201,7 +208,7 @@ func TestPlanValidate_MidClipNegativeEnd(t *testing.T) {
 func TestPlanValidate_ClipEndSecOnNonMidClip(t *testing.T) {
 	p := fullPlan()
 	p.Entries[1].ClipEndSec = 1200 // chapter 5 is the tail_clip entry
-	err := p.Validate(baseReport())
+	err := p.Validate(baseReport(), baseDurations())
 	if err == nil || !strings.Contains(err.Error(), "clip_end_sec on a") {
 		t.Fatalf("expected a clip_end_sec-on-non-mid_clip error, got %v", err)
 	}
@@ -212,14 +219,123 @@ func TestPlanValidate_ClipEndSecOnNonMidClip(t *testing.T) {
 func TestPlanValidate_ClipStartSecOnMidClip(t *testing.T) {
 	p := fullPlan()
 	p.Entries[1] = PlanEntry{Chapter: 5, Action: ActionMidClip, Reason: "interior loop", ClipStartSec: 1180, ClipEndSec: 1205}
-	if err := p.Validate(baseReport()); err != nil {
+	if err := p.Validate(baseReport(), baseDurations()); err != nil {
 		t.Fatalf("expected clip_start_sec allowed on a mid_clip, got %v", err)
 	}
 }
 
 func TestPlanValidate_NilReport(t *testing.T) {
-	if err := fullPlan().Validate(nil); err == nil {
+	if err := fullPlan().Validate(nil, nil); err == nil {
 		t.Fatal("expected error for nil report")
+	}
+}
+
+// TestPlanValidate_TailClipInRangeDuration: a tail_clip clip_start_sec comfortably below
+// the chapter duration is accepted when a durations map is supplied.
+func TestPlanValidate_TailClipInRangeDuration(t *testing.T) {
+	p := fullPlan()
+	p.Entries[1].ClipStartSec = 1700 // chapter 5 is the tail_clip entry
+	durs := map[int]float64{2: 2000, 3: 2000, 5: 1720.296, 8: 2000, 9: 2000}
+	if err := p.Validate(baseReport(), durs); err != nil {
+		t.Fatalf("expected an in-range tail_clip to validate, got %v", err)
+	}
+}
+
+// TestPlanValidate_TailClipOverDuration reproduces the production incident: a tail_clip
+// clip_start_sec of 1752 (an absolute source-file timestamp) supplied for a 1720.296s
+// chapter is rejected, and the error names the chapter and the duration.
+func TestPlanValidate_TailClipOverDuration(t *testing.T) {
+	p := fullPlan()
+	p.Entries[1].ClipStartSec = 1752 // chapter 5 is the tail_clip entry
+	durs := map[int]float64{2: 2000, 3: 2000, 5: 1720.296, 8: 2000, 9: 2000}
+	err := p.Validate(baseReport(), durs)
+	if err == nil {
+		t.Fatal("expected an out-of-range tail_clip clip_start_sec to be rejected")
+	}
+	for _, want := range []string{"chapter 5", "1752", "1720.3", "out of range"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+// TestPlanValidate_MidClipStartOverDuration: a mid_clip whose clip_start_sec is at/past
+// the chapter duration is rejected.
+func TestPlanValidate_MidClipStartOverDuration(t *testing.T) {
+	p := fullPlan()
+	p.Entries[1] = PlanEntry{Chapter: 5, Action: ActionMidClip, Reason: "interior loop", ClipStartSec: 1730, ClipEndSec: 1740}
+	durs := map[int]float64{2: 2000, 3: 2000, 5: 1720.296, 8: 2000, 9: 2000}
+	err := p.Validate(baseReport(), durs)
+	if err == nil || !strings.Contains(err.Error(), "clip_start_sec") || !strings.Contains(err.Error(), "out of range") {
+		t.Fatalf("expected an out-of-range mid_clip clip_start_sec error, got %v", err)
+	}
+}
+
+// TestPlanValidate_MidClipEndOverDuration: a mid_clip whose clip_end_sec runs well past
+// the chapter duration (beyond the small tolerance) is rejected.
+func TestPlanValidate_MidClipEndOverDuration(t *testing.T) {
+	p := fullPlan()
+	p.Entries[1] = PlanEntry{Chapter: 5, Action: ActionMidClip, Reason: "interior loop", ClipStartSec: 1700, ClipEndSec: 1752}
+	durs := map[int]float64{2: 2000, 3: 2000, 5: 1720.296, 8: 2000, 9: 2000}
+	err := p.Validate(baseReport(), durs)
+	if err == nil || !strings.Contains(err.Error(), "clip_end_sec") || !strings.Contains(err.Error(), "out of range") {
+		t.Fatalf("expected an out-of-range mid_clip clip_end_sec error, got %v", err)
+	}
+}
+
+// TestPlanValidate_MidClipEndWithinTolerance: a mid_clip clip_end_sec a fraction past the
+// manifest duration (segment end times can round slightly past it) is accepted.
+func TestPlanValidate_MidClipEndWithinTolerance(t *testing.T) {
+	p := fullPlan()
+	p.Entries[1] = PlanEntry{Chapter: 5, Action: ActionMidClip, Reason: "interior loop", ClipStartSec: 1700, ClipEndSec: 1721}
+	durs := map[int]float64{2: 2000, 3: 2000, 5: 1720.296, 8: 2000, 9: 2000}
+	if err := p.Validate(baseReport(), durs); err != nil {
+		t.Fatalf("expected a near-end mid_clip window within tolerance to validate, got %v", err)
+	}
+}
+
+// TestPlanValidate_MissingDurationSkipsBound: a chapter absent from the durations map (or
+// with a zero duration) skips the bound check, so an otherwise-valid plan validates even
+// with a large clip_start_sec - the guard is defensive, never a hard requirement.
+func TestPlanValidate_MissingDurationSkipsBound(t *testing.T) {
+	p := fullPlan()
+	p.Entries[1].ClipStartSec = 99999 // chapter 5 tail_clip, absurd value
+	// durations omits chapter 5 entirely, and gives chapter 5's peers zero.
+	durs := map[int]float64{2: 0}
+	if err := p.Validate(baseReport(), durs); err != nil {
+		t.Fatalf("expected a missing duration to skip the bound check, got %v", err)
+	}
+	// An explicit zero duration for the chapter likewise skips the check.
+	if err := p.Validate(baseReport(), map[int]float64{5: 0}); err != nil {
+		t.Fatalf("expected a zero duration to skip the bound check, got %v", err)
+	}
+}
+
+// TestClipStartInRange pins the shared clip-window predicate's boundary and zero-duration
+// semantics: reject at or past (duration - ClipStartFloorSec); an unknown (<= 0) duration is
+// always in range. The validator, the three internal/repair guards, and the retranscribe
+// dispatch pre-check all key on this.
+func TestClipStartInRange(t *testing.T) {
+	const floor = ClipStartFloorSec
+	cases := []struct {
+		name        string
+		start, dur  float64
+		wantInRange bool
+	}{
+		{"well inside", 10, 40, true},
+		{"just below boundary", 40 - floor - 0.1, 40, true},
+		{"exactly at boundary is rejected", 40 - floor, 40, false},
+		{"past the end", 50, 40, false},
+		{"zero duration is unbounded", 9999, 0, true},
+		{"negative duration is unbounded", 9999, -1, true},
+		{"zero start in a real chapter", 0, 40, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClipStartInRange(tc.start, tc.dur); got != tc.wantInRange {
+				t.Errorf("ClipStartInRange(%.2f, %.2f) = %v, want %v", tc.start, tc.dur, got, tc.wantInRange)
+			}
+		})
 	}
 }
 
