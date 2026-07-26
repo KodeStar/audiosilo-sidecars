@@ -774,12 +774,18 @@ func (s *Scheduler) execute(ctx context.Context, b store.Book, stage state.State
 				"book_id": b.ID, "stage": string(stage), "msg": msg,
 			})
 		},
-		// Heartbeat bumps the open stage run's heartbeat WITHOUT touching progress - the
-		// same seam the agent subprocess heartbeat uses (progress=false). A long-running
-		// ASR chapter ticks it every minute so the supervisor's stale-heartbeat detector
-		// does not kill a healthy but slow decode mid-chapter.
+		// Heartbeat bumps the open stage run's heartbeat AND progress timestamp. This
+		// closure is consumed ONLY by the ASR/retranscribing heartbeat ticker
+		// (transcribeWithHeartbeat); those stages have no mid-chapter incremental output,
+		// so a live decode subprocess tick IS genuine progress - advancing progress_at (not
+		// just heartbeat_at) keeps the supervisor's no_progress detector from killing a
+		// healthy but pathologically slow chapter (a whisper decode running many times its
+		// audio length) whose progress_at would otherwise freeze until the chapter
+		// completes. The agent-subprocess heartbeat (agent.Request.Heartbeat in
+		// runAgent) stays liveness-only (progress=false) so a stuck agent loop still trips
+		// no_progress.
 		Heartbeat: func() {
-			_ = s.db.TouchOpenStageRun(ctx, b.ID, string(stage), false)
+			_ = s.db.TouchOpenStageRun(ctx, b.ID, string(stage), true)
 		},
 	}
 	return s.exec.Execute(ctx, b, stage, r)

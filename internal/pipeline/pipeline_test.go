@@ -30,13 +30,17 @@ import (
 // to observe/block a chapter (for cancel/resume tests). It never touches a real
 // model or the network.
 type fakeBackend struct {
-	mu            sync.Mutex
-	transcribed   map[int]int  // chapter -> transcribe count
-	noContext     map[int]bool // chapter -> whether the last Job for it set NoContext
-	before        func(chapter int)
-	block         chan struct{} // when non-nil, Transcribe waits on it (or ctx)
-	transcribeErr error         // when non-nil, Transcribe returns it (a real failure)
-	ensureErr     error         // when non-nil, EnsureReady returns it (an environment precondition)
+	mu          sync.Mutex
+	transcribed map[int]int  // chapter -> transcribe count
+	noContext   map[int]bool // chapter -> whether the last Job for it set NoContext
+	before      func(chapter int)
+	block       chan struct{} // when non-nil, Transcribe waits on it (or ctx)
+	// blockFirst, when > 0, makes the first that-many Transcribe calls block on ctx and
+	// return ctx.Err() (simulating a decode that runs until its deadline fires), after
+	// which calls proceed normally. It drives the per-chapter decode-timeout tests.
+	blockFirst    int
+	transcribeErr error // when non-nil, Transcribe returns it (a real failure)
+	ensureErr     error // when non-nil, EnsureReady returns it (an environment precondition)
 	// emptyMode scripts per-chapter empty output across attempts: "" normal (always
 	// non-empty), "once" empty on the first attempt then non-empty, "always" empty on
 	// every attempt. An empty attempt writes a valid-but-segmentless raw transcript.
@@ -58,6 +62,16 @@ func (f *fakeBackend) EnsureReady(context.Context) error { return f.ensureErr }
 func (f *fakeBackend) Transcribe(ctx context.Context, job asr.Job) error {
 	if f.before != nil {
 		f.before(job.Chapter)
+	}
+	f.mu.Lock()
+	blockThis := f.blockFirst > 0
+	if blockThis {
+		f.blockFirst--
+	}
+	f.mu.Unlock()
+	if blockThis {
+		<-ctx.Done() // run until the (per-chapter deadline) context fires
+		return ctx.Err()
 	}
 	if f.block != nil {
 		select {
@@ -679,6 +693,147 @@ func TestASRStageHeartbeatDuringSlowChapter(t *testing.T) {
 	if !foundNote {
 		t.Errorf("no 'still transcribing' note naming chapter 1; notes=%v", notes)
 	}
+}
+
+// TestASRChapterDecodeBound covers the pure per-chapter decode-bound helper: the floor
+// dominates a short chapter (and a zero/negative/unknown duration), the multiple dominates
+// a long one.
+func TestASRChapterDecodeBound(t *testing.T) {
+	if got := asrChapterDecodeBound(60); got != asrChapterDecodeFloor {
+		t.Errorf("bound(60s) = %v, want floor %v (floor dominates a short chapter)", got, asrChapterDecodeFloor)
+	}
+	if want := 3 * 3600 * time.Second; asrChapterDecodeBound(3600) != want {
+		t.Errorf("bound(3600s) = %v, want %v (multiple dominates a long chapter)", asrChapterDecodeBound(3600), want)
+	}
+	if got := asrChapterDecodeBound(0); got != asrChapterDecodeFloor {
+		t.Errorf("bound(0) = %v, want floor %v (unknown duration -> floor)", got, asrChapterDecodeFloor)
+	}
+	if got := asrChapterDecodeBound(-5); got != asrChapterDecodeFloor {
+		t.Errorf("bound(-5) = %v, want floor %v (negative duration -> floor)", got, asrChapterDecodeFloor)
+	}
+}
+
+// shortDecodeBound sets a tiny per-chapter decode floor for the timeout tests and returns a
+// restore func (deferred so the defaults survive across tests). audioDuration 0 in the
+// callers keeps the multiple term non-positive, so the bound is exactly this floor.
+func shortDecodeBound(t *testing.T) func() {
+	t.Helper()
+	prevFloor, prevMul := asrChapterDecodeFloor, asrChapterDecodeMultiple
+	asrChapterDecodeFloor = 50 * time.Millisecond
+	asrChapterDecodeMultiple = 3.0
+	return func() { asrChapterDecodeFloor, asrChapterDecodeMultiple = prevFloor, prevMul }
+}
+
+// decodeTimeoutExec builds an executor + fake around a fresh raw dir for the direct
+// transcribeChapter timeout tests, returning the executor, fake, and the chapter's rawPath.
+func decodeTimeoutExec(t *testing.T, fake *fakeBackend) (*Executor, string) {
+	t.Helper()
+	work := t.TempDir()
+	rawDir := filepath.Join(work, transcript.RawDir)
+	if err := os.MkdirAll(rawDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	exe := NewExecutor(Config{DataDir: t.TempDir(), ASR: fakeASR(fake), Fallback: scheduler.NewStubExecutor(0, 0)})
+	return exe, rawDir
+}
+
+// TestTranscribeChapterDecodeTimeoutRetriesNoContext: a first (context-conditioned) decode
+// that blows past the per-chapter bound is retried ONCE with NoContext, and the successful
+// retry produces the transcript. It asserts the retry Job carried NoContext=true.
+func TestTranscribeChapterDecodeTimeoutRetriesNoContext(t *testing.T) {
+	defer shortDecodeBound(t)()
+
+	fake := newFakeBackend()
+	fake.blockFirst = 1 // the first attempt runs until its deadline; the second succeeds
+	var attempts int
+	fake.before = func(int) { attempts++ }
+
+	exe, rawDir := decodeTimeoutExec(t, fake)
+	rawPath := filepath.Join(rawDir, transcript.RawName(1))
+	empty, err := exe.transcribeChapter(context.Background(), scheduler.StageReport{}, fakeASR(fake), audio.ChapterFileName(1), rawDir, rawPath, 1, 0)
+	if err != nil {
+		t.Fatalf("transcribeChapter after a NoContext retry: %v", err)
+	}
+	if empty {
+		t.Error("empty=true, want a real transcript after the retry")
+	}
+	if attempts != 2 {
+		t.Errorf("attempts = %d, want 2 (timeout then NoContext retry)", attempts)
+	}
+	if !fake.sawNoContext(1) {
+		t.Error("the retry Job did not set NoContext (a repetition collapse must not be retried identically)")
+	}
+	if !rawComplete(rawPath) {
+		t.Error("no complete raw transcript after the successful retry")
+	}
+}
+
+// TestTranscribeChapterDecodeTimeoutParks: when the NoContext retry ALSO exceeds the bound,
+// the chapter parks with ParkASRDecodeTimeout (a human-only park - not auto-readmitted).
+func TestTranscribeChapterDecodeTimeoutParks(t *testing.T) {
+	defer shortDecodeBound(t)()
+
+	fake := newFakeBackend()
+	fake.blockFirst = 5 // every attempt runs until its deadline
+	var attempts int
+	fake.before = func(int) { attempts++ }
+
+	exe, rawDir := decodeTimeoutExec(t, fake)
+	rawPath := filepath.Join(rawDir, transcript.RawName(1))
+	_, err := exe.transcribeChapter(context.Background(), scheduler.StageReport{}, fakeASR(fake), audio.ChapterFileName(1), rawDir, rawPath, 1, 0)
+	var pe *scheduler.ParkError
+	if !errors.As(err, &pe) {
+		t.Fatalf("error = %v, want a ParkError (decode timeout after the NoContext retry)", err)
+	}
+	if pe.Code != state.ParkASRDecodeTimeout {
+		t.Errorf("park code = %q, want %q", pe.Code, state.ParkASRDecodeTimeout)
+	}
+	if !pe.RetryAfter.IsZero() {
+		t.Error("ParkASRDecodeTimeout must be human-only (no auto-readmit RetryAfter)")
+	}
+	if attempts != 2 {
+		t.Errorf("attempts = %d, want 2 (the decode is retried exactly once)", attempts)
+	}
+}
+
+// TestTranscribeChapterFastAndEmpty: a normal fast decode succeeds in ONE attempt with
+// context-conditioning on, and an always-empty decode still gets ONE retry then is accepted
+// (empty=true) - the timeout retry never disturbs the pre-existing empty-transcript handling.
+func TestTranscribeChapterFastAndEmpty(t *testing.T) {
+	defer shortDecodeBound(t)()
+
+	t.Run("fast decode succeeds without a retry", func(t *testing.T) {
+		fake := newFakeBackend()
+		exe, rawDir := decodeTimeoutExec(t, fake)
+		rawPath := filepath.Join(rawDir, transcript.RawName(1))
+		empty, err := exe.transcribeChapter(context.Background(), scheduler.StageReport{}, fakeASR(fake), audio.ChapterFileName(1), rawDir, rawPath, 1, 0)
+		if err != nil || empty {
+			t.Fatalf("transcribeChapter = (empty=%v, %v), want (false, nil)", empty, err)
+		}
+		if got := fake.count(1); got != 1 {
+			t.Errorf("attempts = %d, want 1 (no retry on a clean fast decode)", got)
+		}
+		if fake.sawNoContext(1) {
+			t.Error("the first-pass decode must keep context-conditioning ON")
+		}
+	})
+
+	t.Run("empty decode gets one retry then is accepted", func(t *testing.T) {
+		fake := newFakeBackend()
+		fake.emptyMode = "always"
+		exe, rawDir := decodeTimeoutExec(t, fake)
+		rawPath := filepath.Join(rawDir, transcript.RawName(1))
+		empty, err := exe.transcribeChapter(context.Background(), scheduler.StageReport{}, fakeASR(fake), audio.ChapterFileName(1), rawDir, rawPath, 1, 0)
+		if err != nil {
+			t.Fatalf("transcribeChapter: %v", err)
+		}
+		if !empty {
+			t.Error("empty=false, want an accepted empty transcript")
+		}
+		if got := fake.count(1); got != 2 {
+			t.Errorf("attempts = %d, want 2 (one empty retry, then accept)", got)
+		}
+	})
 }
 
 // TestStagesParkWhenMediaToolsMissing asserts inspect (no ffprobe) and split (no

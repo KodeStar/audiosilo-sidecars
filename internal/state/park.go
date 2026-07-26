@@ -27,6 +27,12 @@ const (
 	ParkManifestChanged          ParkCode = "manifest_changed"
 	ParkFixLoopExhausted         ParkCode = "fix_loop_exhausted"
 
+	// ParkASRDecodeTimeout: a chapter's whisper decode exceeded its per-chapter time bound
+	// even after a NoContext retry (a repetition-collapse decode running many times the audio
+	// length). Human-only: inspect the chapter audio, then Retry. Not auto-readmitted (an
+	// immediate retry would just time out again).
+	ParkASRDecodeTimeout ParkCode = "asr_decode_timeout"
+
 	// ParkContribUnavailable: the contributing stage runs in issue/pr mode but no
 	// GitHub credential is available (no PAT in secrets, no `gh auth token`). The user
 	// adds a PAT in Settings or runs `gh auth login`, then Retry.

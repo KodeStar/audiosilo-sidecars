@@ -610,7 +610,7 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, r scheduler.St
 		if !fsutil.IsFile(flac) {
 			return scheduler.StageResult{}, fmt.Errorf("asr: chapter %d FLAC missing (%s); split must run first", ch.Chapter, flac)
 		}
-		empty, err := e.transcribeChapter(ctx, r, setup, flac, rawDir, rawPath, ch.Chapter)
+		empty, err := e.transcribeChapter(ctx, r, setup, flac, rawDir, rawPath, ch.Chapter, ch.Duration)
 		if err != nil {
 			return scheduler.StageResult{}, err
 		}
@@ -653,25 +653,88 @@ func (e *Executor) asrStage(ctx context.Context, book store.Book, r scheduler.St
 	return result, nil
 }
 
-// transcribeChapter runs the backend for one chapter and guards against an empty
-// transcript - a known ASR failure mode (a silent/near-silent decode) that still
-// passes the structural Complete check. If the normalized transcript has zero
-// segments it deletes the raw and retries ONCE; if it is still empty it accepts it
-// (returning empty=true so the caller records the chapter in provenance) rather than
-// looping forever. A genuine transcription/completeness error is returned as-is.
-func (e *Executor) transcribeChapter(ctx context.Context, r scheduler.StageReport, setup ASRSetup, flac, rawDir, rawPath string, chapter int) (empty bool, err error) {
-	// InitialPrompt is intentionally empty in M3a: verified spellings come from the
-	// spelling stage (M4). Seeding a guess would make a wrong spelling recur.
-	for attempt := range 2 {
-		job := asr.Job{Audio: flac, OutDir: rawDir, Chapter: chapter, Language: setup.Language}
-		// A pathologically slow chapter (a decode running many times its audio length) has no
-		// progress to report mid-chapter, so keep the heartbeat fresh while the backend runs.
-		terr := transcribeWithHeartbeat(ctx, r, "asr", chapter, func() error {
-			return setup.Backend.Transcribe(ctx, job)
+// asrChapterDecodeFloor / asrChapterDecodeMultiple bound a single chapter's decode.
+// A whisper repetition-collapse decode can run many times the audio length; past this
+// bound the decode is killed and retried ONCE with NoContext (context-conditioning off,
+// which usually breaks a deterministic collapse), and if that also exceeds the bound the
+// book parks. Bound = max(floor, multiple x audio-duration). Vars so tests can shorten them.
+var asrChapterDecodeFloor = 10 * time.Minute
+var asrChapterDecodeMultiple = 3.0
+
+// asrChapterDecodeBound returns the per-chapter decode deadline for a chapter of the given
+// audio duration: max(floor, multiple x duration). A zero/negative/unknown duration yields
+// the floor (the multiple term is non-positive, so the floor dominates).
+func asrChapterDecodeBound(audioDurationSec float64) time.Duration {
+	return max(asrChapterDecodeFloor, time.Duration(asrChapterDecodeMultiple*audioDurationSec*float64(time.Second)))
+}
+
+// asrDecodeTimeoutMsg is the needs_attention reason a chapter parks with when its whisper
+// decode blew past the per-chapter time bound even after the NoContext retry - a likely
+// repetition-collapse decode running many times the audio length. It names the chapter and
+// the bound and points a human at the fix (inspect the chapter audio, then Retry), mirroring
+// the tone of the other park messages.
+func asrDecodeTimeoutMsg(chapter int, bound time.Duration) string {
+	return fmt.Sprintf("asr: chapter %d exceeded its %s decode time bound even after a no-context retry - the chapter audio may be pathological (a repetition-collapse decode); inspect it, then Retry", chapter, humanDuration(bound))
+}
+
+// transcribeChapter runs the backend for one chapter under a per-chapter decode deadline and
+// guards against two known ASR failure modes.
+//
+//   - A pathologically slow decode (a whisper repetition collapse running many times the
+//     audio length): each decode runs under a deadline of asrChapterDecodeBound(audioDuration).
+//     A first (context-conditioned) decode that times out is retried ONCE with NoContext
+//     (which usually breaks a deterministic collapse); if the NoContext decode ALSO times out
+//     the book parks (ParkASRDecodeTimeout) rather than running for hours. A parent-context
+//     cancel (a clean pause/shutdown) is distinguished from a child decode timeout and
+//     returned unchanged.
+//   - An empty transcript (a silent/near-silent decode) that still passes the structural
+//     Complete check: a zero-segment result is retried ONCE, then accepted (returning
+//     empty=true so the caller records the chapter in provenance) rather than looping forever.
+//
+// The two retries are independent: an empty NoContext decode still gets its one empty-retry.
+// Every decode attempt starts from a clean rawPath. A genuine transcription/completeness
+// error is returned as-is.
+func (e *Executor) transcribeChapter(ctx context.Context, r scheduler.StageReport, setup ASRSetup, flac, rawDir, rawPath string, chapter int, audioDuration float64) (empty bool, err error) {
+	bound := asrChapterDecodeBound(audioDuration)
+	// noContext escalates on a decode timeout (context-conditioning drives the collapse we
+	// are here to break); emptyRetried tracks the one allowed empty-transcript retry. Both
+	// are independent one-shot state, so the two failure modes compose cleanly.
+	noContext := false
+	emptyRetried := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, err // clean pause/cancel/shutdown before a fresh attempt
+		}
+		_ = os.Remove(rawPath) // every attempt starts from a clean raw (partial/empty/timed-out output)
+		// InitialPrompt is intentionally empty: verified spellings come from the spelling
+		// stage. Seeding a guess would make a wrong spelling recur.
+		job := asr.Job{Audio: flac, OutDir: rawDir, Chapter: chapter, Language: setup.Language, NoContext: noContext}
+		// Bound this decode: a repetition-collapse decode would otherwise run for hours. A
+		// slow chapter has no mid-chapter progress to report, so the heartbeat ticker keeps
+		// the supervisor's stale-heartbeat/no_progress detectors from killing a healthy decode
+		// within the bound.
+		dctx, cancel := context.WithTimeout(ctx, bound)
+		terr := transcribeWithHeartbeat(dctx, r, "asr", chapter, func() error {
+			return setup.Backend.Transcribe(dctx, job)
 		})
+		cancel()
 		if terr != nil {
 			if ctx.Err() != nil {
-				return false, ctx.Err() // killed by cancellation, not a real failure
+				return false, ctx.Err() // PARENT cancelled: a clean pause/shutdown, not a failure
+			}
+			if dctx.Err() == context.DeadlineExceeded {
+				// The CHILD deadline fired while the parent is alive: a decode timeout.
+				if !noContext {
+					e.log.Warn("asr: chapter decode exceeded its time bound; retrying without context-conditioning",
+						"chapter", chapter, "bound", bound)
+					if r.Note != nil {
+						r.Note(fmt.Sprintf("asr: chapter %d exceeded its %s decode bound; retrying without context-conditioning", chapter, humanDuration(bound)))
+					}
+					noContext = true
+					continue
+				}
+				// Already NoContext and it timed out AGAIN: stop and park for a human.
+				return false, scheduler.ParkWithCode(state.ParkASRDecodeTimeout, asrDecodeTimeoutMsg(chapter, bound))
 			}
 			return false, fmt.Errorf("asr: transcribe chapter %d: %w", chapter, terr)
 		}
@@ -685,13 +748,13 @@ func (e *Executor) transcribeChapter(ctx context.Context, r scheduler.StageRepor
 		if !isEmpty {
 			return false, nil
 		}
-		if attempt == 0 {
-			_ = os.Remove(rawPath) // one retry - a transient empty decode
+		if !emptyRetried {
+			emptyRetried = true // one retry - a transient empty decode
 			continue
 		}
+		e.log.Warn("asr: chapter produced an empty transcript; accepting", "chapter", chapter)
+		return true, nil
 	}
-	e.log.Warn("asr: chapter produced an empty transcript; accepting", "chapter", chapter)
-	return true, nil
 }
 
 // deriveChapterLayers derives a chapter's normalized JSON + plain-text layers from its

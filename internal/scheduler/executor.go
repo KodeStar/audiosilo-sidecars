@@ -32,13 +32,17 @@ type ProgressFunc func(done, total int)
 //     and the agent liveness heartbeat ("still running (6m elapsed)"). It is a real
 //     signal, not decoration - the heartbeat fires only while an agent subprocess is
 //     genuinely running.
-//   - Heartbeat records a liveness-only touch on the open stage run (its heartbeat
-//     timestamp, WITHOUT bumping progress) so the supervisor's stale-heartbeat detector
-//     does not kill a healthy stage that is mid-unit with no progress to report - a
-//     single pathologically slow ASR chapter (a whisper decode running many times its
-//     audio length) otherwise freezes the heartbeat between chapters. Unlike Note it
-//     carries no message; it is the same seam the agent subprocess heartbeat uses
-//     (store.TouchOpenStageRun with progress=false).
+//   - Heartbeat records a live-decode touch on the open stage run so neither the
+//     supervisor's stale-heartbeat detector NOR its no_progress detector kills a healthy
+//     stage that is mid-unit with no incremental output - a single pathologically slow
+//     ASR chapter (a whisper decode running many times its audio length) otherwise
+//     freezes both the heartbeat and progress_at between chapters. It is consumed only by
+//     the ASR/retranscribing ticker (transcribeWithHeartbeat), whose stages produce no
+//     mid-chapter output, so a live decode subprocess tick IS genuine progress: the
+//     scheduler's closure bumps BOTH heartbeat_at and progress_at (store.TouchOpenStageRun
+//     with progress=true). Unlike Note it carries no message. (The agent subprocess
+//     heartbeat is a separate, liveness-only seam - progress=false - so a stuck agent loop
+//     still trips no_progress.)
 //
 // Any field may be nil (a stage guards each call); the zero StageReport is a valid
 // no-op reporter for tests.

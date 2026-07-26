@@ -21,6 +21,8 @@ const PARK_HINTS: Record<string, string> = {
     'A spelling correction failed its safety gates. Inspect corrections.json, then Retry.',
   media_tools_unavailable: 'ffmpeg/ffprobe are missing. Fix tool paths (Settings), then Retry.',
   asr_unavailable: 'No ASR backend is available. Install/configure one (Settings), then Retry.',
+  asr_decode_timeout:
+    "A chapter's transcription exceeded its time limit even after a retry. Inspect the chapter audio, then Retry.",
   manifest_changed:
     'The audio changed on disk since transcription. Retry re-runs from the new manifest.',
   fix_loop_exhausted:

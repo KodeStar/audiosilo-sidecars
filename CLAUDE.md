@@ -291,7 +291,14 @@ internal/
   pipeline/ composite scheduler.Executor: routes inspecting -> audio.Inspect,
             splitting -> audio.Split, asr -> the per-chapter internal/asr loop
             (resumable: skip complete raws, delete+retry malformed, freeze each raw
-            0444, write asr.json provenance, account scratch), sanitizing ->
+            0444, write asr.json provenance, account scratch; each chapter decode is
+            bounded by asrChapterDecodeBound = max(10min, 3x audio duration) - a
+            whisper repetition-collapse decode that blows past it is killed and retried
+            ONCE with NoContext, and a second timeout parks asr_decode_timeout rather
+            than running for hours; the ASR/retranscribe heartbeat ticker advances BOTH
+            heartbeat_at AND progress_at, since those stages have no mid-chapter output,
+            so a live-but-slow decode trips neither the supervisor's stale-heartbeat nor
+            its no_progress detector), sanitizing ->
             internal/transcript normalization, qa_sweep -> the internal/qa sweep
             (writes both reports, branches on Report.Clean()). M5 made EVERY remaining
             stage real: markers_normalizing/qa_adjudicating/spelling_research/fact_pass/
@@ -450,7 +457,8 @@ internal/
   state/    per-book pipeline state machine: table-driven states/lanes/transitions,
             CanStart/NextState guards, the audit fix-loop cap. Pure, no I/O. M6 added
             ParkCode (typed park reasons - M7 added contrib_unavailable, core_needed,
-            core_pending; the reliability round added budget_exceeded, so 14 now),
+            core_pending; the reliability round added budget_exceeded; the ASR
+            decode-timeout hotfix added asr_decode_timeout, so 15 now),
             MainlineNext (the optimistic mainline
             successor the ETA engine walks - the table's Next ordering is load-bearing:
             conditional/loop target first, mainline continuation LAST),

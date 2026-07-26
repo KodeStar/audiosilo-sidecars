@@ -500,13 +500,17 @@ func humanDuration(d time.Duration) string {
 }
 
 // asrHeartbeatInterval is how often a long single-chapter transcription touches the open
-// stage run's heartbeat while the backend churns. The supervisor's stale-heartbeat detector
-// (supervisor.stale_heartbeat_minutes) kills a run whose heartbeat has frozen; the ASR/
-// retranscribe stages otherwise bump the heartbeat only BETWEEN chapters (a progress report),
-// so a single pathologically slow chapter (a whisper decode running many times its audio
-// length) has no heartbeat mid-chapter and the healthy run is killed and retried forever. This
-// ticker keeps a live-but-slow chapter's heartbeat fresh. It matches the agent subprocess
-// heartbeat cadence (internal/agent/exec.go). A var so tests can shorten it.
+// stage run while the backend churns. TWO supervisor detectors would otherwise kill a
+// healthy but pathologically slow chapter (a whisper decode running many times its audio
+// length): the stale-heartbeat detector (supervisor.stale_heartbeat_minutes) kills a run
+// whose heartbeat has frozen, and the no_progress detector (supervisor.no_progress_minutes)
+// kills a run whose progress_at has frozen. The ASR/retranscribe stages otherwise touch both
+// only BETWEEN chapters (a progress report), so a single slow chapter freezes both mid-chapter.
+// This ticker calls r.Heartbeat, whose scheduler closure bumps BOTH heartbeat_at AND
+// progress_at (a live decode subprocess tick is genuine progress for these no-mid-output
+// stages - see execute in internal/scheduler), so neither detector kills a live-but-slow
+// chapter. It matches the agent subprocess heartbeat cadence (internal/agent/exec.go). A var
+// so tests can shorten it.
 var asrHeartbeatInterval = 60 * time.Second
 
 // asrHeartbeatNoteEvery is how many heartbeat ticks between operator-visible "still
@@ -515,10 +519,12 @@ var asrHeartbeatInterval = 60 * time.Second
 const asrHeartbeatNoteEvery = 3
 
 // transcribeWithHeartbeat runs one chapter's backend transcription (fn) while a ticker keeps
-// the open stage run's heartbeat fresh, so the supervisor's stale-heartbeat detector does not
-// mistake a healthy but pathologically slow chapter for a stalled run and kill it. Every
-// asrHeartbeatInterval it calls r.Heartbeat (a heartbeat-only stage-run touch) and, every
-// asrHeartbeatNoteEvery ticks, drops a stage note naming the chapter and elapsed time. The
+// the open stage run fresh, so neither the supervisor's stale-heartbeat detector NOR its
+// no_progress detector mistakes a healthy but pathologically slow chapter for a stalled run
+// and kills it. Every asrHeartbeatInterval it calls r.Heartbeat (whose scheduler closure
+// advances BOTH heartbeat_at and progress_at, since a live decode subprocess tick is genuine
+// progress for these no-mid-output stages) and, every asrHeartbeatNoteEvery ticks, drops a
+// stage note naming the chapter and elapsed time. The
 // ticker stops the moment fn returns and never fires once ctx is cancelled (a clean pause/
 // shutdown teardown selects ctx.Done() and returns), so a cancelled stage emits no trailing
 // heartbeat. label is the stage word ("asr" / "retranscribing").

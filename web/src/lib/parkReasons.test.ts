@@ -12,6 +12,7 @@ describe('parkHint', () => {
       'spelling_gate_failure',
       'media_tools_unavailable',
       'asr_unavailable',
+      'asr_decode_timeout',
       'manifest_changed',
       'fix_loop_exhausted',
       'contrib_unavailable',
