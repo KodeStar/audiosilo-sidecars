@@ -109,8 +109,10 @@ raise the severity of an item just because the loop has run several rounds.
 }
 ```
 
-Severity is one of BLOCKER, FIX, or NIT. State explicitly (as a NIT-free note in
-`findings` reasons, or by leaving a category out) when a category is clean. Set
+Severity is one of BLOCKER, FIX, or NIT. `out/audit.json` carries EXACTLY the two
+top-level fields shown above (`pass` and `findings`) and nothing else - never add
+counts, summaries, a `nit` field, or any other top-level key; a clean category
+simply has no entries in `findings`. Set
 `pass` to true ONLY when there is not a single BLOCKER or FIX finding AND the
 validation report carries no `errors` (warnings alone do not block); otherwise
 `pass` is false. Write every field in your
