@@ -626,12 +626,23 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, r sche
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("markers_normalizing: read manifest (inspect must run first): %w", err)
 	}
-	// Upgrade recovery: an older parser may have written an empty marker draft even
-	// though probe.json contains a fully explicit chapter sequence. Reparse with the
-	// current deterministic rules before paying an agent to reconstruct it. When the
-	// result is contiguous, this stage is complete without any model invocation.
+	// Upgrade recovery: an older parser may have written a draft that the CURRENT
+	// deterministic rules can resolve outright, so reparse probe.json before paying an
+	// agent to reconstruct it. When the result is contiguous, this stage is complete
+	// with no model invocation.
+	//
+	// The gate is "the draft is not contiguous", not "the draft is empty". A total
+	// dialect miss empties the manifest, but a PARTIAL miss (mixed marker styles,
+	// where the old parser understood some titles and dropped others) leaves a
+	// non-contiguous draft that an upgraded parser handles just as deterministically -
+	// and that case used to pay for an agent round the empty case got for free. An
+	// already-contiguous draft is never touched, which is what keeps an agent-harvested
+	// manifest safe: validateMarkersManifest only accepts a contiguous one, so this can
+	// never overwrite the agent's work with a re-derived draft. The reparse is adopted
+	// only when it comes back contiguous; otherwise the refreshed draft (never worse
+	// than the old one - same probe.json, newer rules) goes on to the agent as before.
 	var markers audio.MarkerStats
-	if draft.Style == audio.StyleMarkers && len(draft.Chapters) == 0 {
+	if draft.Style == audio.StyleMarkers && !audio.Contiguous(draft.Chapters) {
 		started := time.Now()
 		rebuilt, stats, reparseErr := audio.ReparseMarkerManifest(book.WorkDir, draft)
 		if reparseErr != nil {

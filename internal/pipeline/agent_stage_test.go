@@ -1367,3 +1367,100 @@ func TestMarkersPromptExplainsVocabularyGap(t *testing.T) {
 		t.Error("the vocabulary-gap section must not render when markers WERE recognized")
 	}
 }
+
+// TestMarkersNormalizePartialLegacyDraftReparsesProbeWithoutAgent covers the case the
+// empty-draft gate used to miss: an older parser understood SOME of a book's marker
+// titles and dropped the rest, leaving a non-contiguous draft. The current parser
+// resolves the whole table deterministically, so this must recover for free too -
+// previously it fell straight through to a paid agent round.
+func TestMarkersNormalizePartialLegacyDraftReparsesProbeWithoutAgent(t *testing.T) {
+	work := t.TempDir()
+	// Every marker parses under the current rules (1..3, contiguous).
+	probe := `{
+		"format":{"duration":"30.000","tags":{"title":"Mixed"}},
+		"chapters":[
+			{"start_time":"0.000","end_time":"10.000","tags":{"title":"Chapter 1: Opening"}},
+			{"start_time":"10.000","end_time":"20.000","tags":{"title":"002"}},
+			{"start_time":"20.000","end_time":"30.000","tags":{"title":"3. Closing"}}
+		]
+	}`
+	if err := os.WriteFile(filepath.Join(work, audio.ProbeName), []byte(probe), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+	// The stale draft an older parser left: it understood 1 and 3 but not the bare
+	// "002", so the chapters are non-contiguous rather than absent.
+	writeManifestStruct(t, work, audio.Manifest{
+		Source: "/books/mixed.m4b", Title: "Mixed", Style: audio.StyleMarkers, Duration: 30,
+		ChapterCount: 2,
+		Chapters: []audio.Chapter{
+			{Chapter: 1, Title: "Opening", MarkerTitle: "Chapter 1: Opening", Start: 0, End: 10, Duration: 10},
+			{Chapter: 3, Title: "Closing", MarkerTitle: "3. Closing", Start: 20, End: 30, Duration: 10},
+		},
+	})
+
+	fake := newFakeRunner()
+	fake.act = func(_ *fakeRunner, _ agent.Request, _ int) (agent.Result, error) {
+		t.Fatal("a deterministically resolvable partial draft must not invoke an agent")
+		return agent.Result{}, nil
+	}
+	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Mixed", WorkDir: work}, state.MarkersNormalizing, scheduler.StageReport{})
+	if err != nil {
+		t.Fatalf("markers_normalize: %v", err)
+	}
+	if fake.count(string(state.MarkersNormalizing)) != 0 {
+		t.Fatalf("agent ran %d times, want zero", fake.count(string(state.MarkersNormalizing)))
+	}
+	m, err := audio.ReadManifest(work)
+	if err != nil || !audio.Contiguous(m.Chapters) || m.ChapterCount != 3 {
+		t.Fatalf("recovered manifest = %+v err=%v, want a contiguous 3-chapter map", m, err)
+	}
+	var metrics map[string]any
+	if err := json.Unmarshal(res.Metrics, &metrics); err != nil || metrics["deterministic_reparse"] != true {
+		t.Fatalf("metrics = %s err=%v", res.Metrics, err)
+	}
+}
+
+// TestMarkersNormalizeNeverOverwritesAContiguousDraft pins the safety property the
+// widened gate rests on: a contiguous manifest is never re-derived from probe.json.
+// validateMarkersManifest accepts only contiguous agent output, so this is what stops
+// a re-run of the stage from throwing away a mapping the agent already produced -
+// here, one that deliberately EXCLUDES the credits markers probe.json still lists.
+func TestMarkersNormalizeNeverOverwritesAContiguousDraft(t *testing.T) {
+	work := t.TempDir()
+	probe := `{
+		"format":{"duration":"40.000","tags":{"title":"Kept"}},
+		"chapters":[
+			{"start_time":"0.000","end_time":"10.000","tags":{"title":"001"}},
+			{"start_time":"10.000","end_time":"20.000","tags":{"title":"002"}},
+			{"start_time":"20.000","end_time":"30.000","tags":{"title":"003"}},
+			{"start_time":"30.000","end_time":"40.000","tags":{"title":"004"}}
+		]
+	}`
+	if err := os.WriteFile(filepath.Join(work, audio.ProbeName), []byte(probe), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+	// An agent-quality mapping: credits dropped, the two real chapters renumbered.
+	// A blind reparse of probe.json would replace this with a 4-chapter map.
+	agentMap := audio.Manifest{
+		Source: "/books/kept.m4b", Title: "Kept", Style: audio.StyleMarkers, Duration: 40,
+		ChapterCount: 2,
+		Chapters: []audio.Chapter{
+			{Chapter: 1, MarkerTitle: "002", Start: 10, End: 20, Duration: 10},
+			{Chapter: 2, MarkerTitle: "003", Start: 20, End: 30, Duration: 10},
+		},
+	}
+	writeManifestStruct(t, work, agentMap)
+
+	fake := newFakeRunner()
+	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
+	_, _ = exe.Execute(context.Background(), store.Book{ID: 1, Title: "Kept", WorkDir: work}, state.MarkersNormalizing, scheduler.StageReport{})
+
+	m, err := audio.ReadManifest(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.ChapterCount != 2 || len(m.Chapters) != 2 || m.Chapters[0].MarkerTitle != "002" {
+		t.Fatalf("contiguous draft was re-derived from probe.json: %+v", m)
+	}
+}

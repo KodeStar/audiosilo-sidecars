@@ -146,6 +146,13 @@ func ReparseMarkerManifest(workDir string, draft Manifest) (Manifest, MarkerStat
 	if draft.Title != "" {
 		m.Title = draft.Title
 	}
+	// The probe is authoritative for duration when it states one, but a probe.json
+	// without a parseable format.duration must not ZERO a duration the draft already
+	// knew. markers_normalizing bounds the agent's corrected intervals against this
+	// value, so a zeroed duration rejects every correct mapping the agent can produce.
+	if m.Duration == 0 {
+		m.Duration = draft.Duration
+	}
 	if err := WriteManifest(workDir, m); err != nil {
 		return Manifest{}, MarkerStats{}, err
 	}

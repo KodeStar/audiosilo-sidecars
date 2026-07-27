@@ -242,6 +242,34 @@ func TestMarkerStatsSeparatesVocabularyGapFromMarkerless(t *testing.T) {
 	}
 }
 
+// TestReparseKeepsDraftDurationWhenProbeOmitsIt guards a sharp edge: the
+// markers_normalizing stage bounds the agent's corrected chapter intervals against the
+// draft's Duration, so a reparse that zeroed it would reject every correct mapping the
+// agent could produce. The probe still wins whenever it states a duration.
+func TestReparseKeepsDraftDurationWhenProbeOmitsIt(t *testing.T) {
+	work := t.TempDir()
+	writeProbe(t, work, `{"chapters":[{"start_time":"0.000","end_time":"10.000","tags":{"title":"001"}}]}`)
+
+	m, _, err := ReparseMarkerManifest(work, Manifest{Style: StyleMarkers, Duration: 42})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Duration != 42 {
+		t.Errorf("duration = %v, want the draft's 42 preserved when the probe states none", m.Duration)
+	}
+
+	// A probe that DOES state a duration still wins.
+	work2 := t.TempDir()
+	writeProbe(t, work2, `{"format":{"duration":"99.000"},"chapters":[{"start_time":"0.000","end_time":"10.000","tags":{"title":"001"}}]}`)
+	m2, _, err := ReparseMarkerManifest(work2, Manifest{Style: StyleMarkers, Duration: 42})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m2.Duration != 99 {
+		t.Errorf("duration = %v, want the probe's 99 to win", m2.Duration)
+	}
+}
+
 func TestManifestRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	m := Manifest{
