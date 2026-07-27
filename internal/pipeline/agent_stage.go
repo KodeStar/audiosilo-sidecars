@@ -638,12 +638,13 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, r sche
 	// and that case used to pay for an agent round the empty case got for free. An
 	// already-contiguous draft is never touched, which is what keeps an agent-harvested
 	// manifest safe: validateMarkersManifest only accepts a contiguous one, so this can
-	// never overwrite the agent's work with a re-derived draft. The reparse is adopted
-	// only when it comes back contiguous; otherwise the refreshed draft (never worse
-	// than the old one - same probe.json, newer rules) goes on to the agent as before.
+	// never overwrite the agent's work with a re-derived draft. The stage COMPLETES on the
+	// reparse only when it comes back contiguous; the refreshed draft itself is written to
+	// manifest.json either way (never worse than the old one - same probe.json, newer
+	// rules), which is deliberate: the agent path stages manifest.json from the work dir,
+	// so it must see the refreshed draft rather than the stale one.
 	var markers audio.MarkerStats
 	if draft.Style == audio.StyleMarkers && !audio.Contiguous(draft.Chapters) {
-		started := time.Now()
 		rebuilt, stats, reparseErr := audio.ReparseMarkerManifest(book.WorkDir, draft)
 		if reparseErr != nil {
 			return scheduler.StageResult{}, fmt.Errorf("markers_normalizing: deterministic probe reparse: %w", reparseErr)
@@ -660,9 +661,16 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, r sche
 			if r.Progress != nil {
 				r.Progress(1, 1)
 			}
+			// NO RateSample. This path is a sub-millisecond in-memory re-derivation, while
+			// the stage's real cost is the agent round below (seed 180s/book). Feeding it
+			// to the EWMA (alpha 0.3) would drag the learned markers_normalizing rate
+			// toward zero with every recovered book - 180 -> 126 -> 88 -> ... - and then
+			// under-predict every book that DOES need the agent. Same rule as the repair
+			// stage's free known-failed skip: a free run observes nothing.
 			result := scheduler.StageResult{Metrics: metrics(map[string]any{
 				"chapter_count": draft.ChapterCount, "deterministic_reparse": true,
-			}), RateSample: rateSample(1, time.Since(started).Seconds())}
+				"markers_seen": markers.Seen,
+			})}
 			if err := scheduler.WriteSentinel(book.WorkDir, string(state.MarkersNormalizing), result); err != nil {
 				return scheduler.StageResult{}, err
 			}
@@ -737,6 +745,17 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, r sche
 
 	if err := agent.Harvest(st, []agent.HarvestSpec{{From: audio.ManifestName, To: audio.ManifestName}}); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("markers_normalizing: harvest manifest: %w", err)
+	}
+	// Re-point the book's gauges at the HARVESTED map, exactly as the deterministic
+	// branch above does. Normalization exists to drop credits/sample markers, so the
+	// harvested chapter count is routinely lower than the draft count inspect recorded -
+	// leaving books.chapters stale makes the ETA engine size every per-chapter stage
+	// (splitting/asr/...) off the wrong total, and a stale duration_sec is what
+	// contrib matches against the upstream work's recordings. Best-effort bookkeeping;
+	// a failure never fails the stage.
+	if final, ferr := audio.ReadManifest(book.WorkDir); ferr == nil && e.db != nil {
+		_ = e.db.SetBookChapters(context.WithoutCancel(ctx), book.ID, final.ChapterCount)
+		_ = e.db.SetBookDuration(context.WithoutCancel(ctx), book.ID, final.Duration)
 	}
 	if r.Progress != nil {
 		r.Progress(1, 1)

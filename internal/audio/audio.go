@@ -65,11 +65,13 @@ type Chapter struct {
 //     NOT an unfixable book - but it used to look identical to the case above in the
 //     logs, so each new dialect had to be rediscovered from a parked book.
 //
-// A StyleFiles book has no markers to parse; its chapters are synthesized one per
-// file, so Seen and Recognized are both the file count and NoneRecognized is false.
+// A StyleFiles book has no marker table to parse at all (its chapters are synthesized
+// one per file, and its probe.json is a per-file duration summary), so both counts stay
+// 0 and NoneRecognized is false - reporting its file count as markers would fabricate
+// the very signal these stats exist to make trustworthy.
 type MarkerStats struct {
-	Seen       int  // embedded markers present in probe.json
-	Recognized int  // markers chapterFromMarker understood (== Manifest.ChapterCount)
+	Seen       int  // embedded markers present in probe.json (0 for a StyleFiles book)
+	Recognized int  // markers chapterFromMarker understood (== Manifest.ChapterCount for StyleMarkers)
 	Contiguous bool // the recognized chapters form a gapless 0/1-based run
 }
 

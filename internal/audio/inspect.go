@@ -240,9 +240,13 @@ func inspectFiles(ctx context.Context, files []string, workDir, ffprobePath stri
 	if err := WriteManifest(workDir, m); err != nil {
 		return Manifest{}, MarkerStats{}, err
 	}
-	// A files-style book parses no markers - its chapters ARE its files - so Seen and
-	// Recognized both count the files and NoneRecognized() stays false.
-	return m, MarkerStats{Seen: len(files), Recognized: len(files), Contiguous: true}, nil
+	// A files-style book parses no markers - its chapters ARE its files, and its
+	// probe.json is a per-file duration summary with no marker table at all. Report
+	// Seen/Recognized as 0 rather than the file count: the whole point of Seen is to make
+	// an unread marker dialect visible in the metrics, so reporting a marker count for a
+	// book that has none would poison exactly that signal. NoneRecognized() stays false
+	// (it needs Seen > 0), which is the correct verdict here.
+	return m, MarkerStats{Contiguous: true}, nil
 }
 
 // fileProbeSummary is the probe.json written for a multi-file book (there is no

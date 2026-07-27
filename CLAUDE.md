@@ -153,7 +153,19 @@ internal/
             two were indistinguishable in the metrics for three dialects running, so
             inspect now records markers_seen and notes the condition, and markers.md
             tells the agent to read probe.json and map an announced numbering the
-            parser missed rather than decline.
+            parser missed WITHOUT narrowing the other decline criteria (an order it can
+            read is not by itself a reason to proceed - a marker holding several
+            chapters still parks). A StyleFiles book reports Seen/Recognized 0 (its
+            probe.json holds no marker table at all), so markers_seen never fabricates a
+            dialect signal. The deterministic reparse records NO RateSample - it is a
+            sub-millisecond re-derivation of a stage whose real cost is the agent round
+            it skipped, so observing it would collapse the markers_normalizing EWMA (the
+            same rule as repair's free known-failed skip). KNOWN TRADEOFF: because a
+            fully-numbered bare-number table now parses contiguously, such a book skips
+            markers_normalizing entirely, so an INTERIOR non-chapter marker (a publisher
+            "Summary of Book N-1" mid-book) is no longer excluded by anyone -
+            classifyEdgeChapters gates only leading/trailing runs - and shifts every
+            later chapter's spoiler position by one. Edge credits stay covered.
   asr/      the ASR backend abstraction (M3a/M3b): Backend{ID,Detect,EnsureReady,
             Transcribe} over a normalized Job (audio/outDir/chapter/prompt/language),
             producing RAW per-chapter output byte-for-byte. Two backends behind

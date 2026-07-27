@@ -66,7 +66,10 @@ So read those titles before concluding anything:
   publisher "Summary of Book N-1" recap sitting mid-book. That still needs your
   judgment.
 
-Decline only when the titles genuinely do not state an order.
+So a numbering you can read is not, by itself, a reason to decline. Every other
+reason to decline still stands, unchanged: if the titles do not state an order, or
+one marker holds several chapters, or the labels are ambiguous, say so in the
+verdict and do NOT guess.
 {{end}}
 ## Output (only under out/)
 

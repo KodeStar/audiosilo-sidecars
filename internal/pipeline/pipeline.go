@@ -446,7 +446,8 @@ func (e *Executor) inspect(ctx context.Context, book store.Book, r scheduler.Sta
 	// every new marker dialect had to be rediscovered by hand from a parked book.
 	if markers.NoneRecognized() && r.Note != nil {
 		r.Note(fmt.Sprintf(
-			"%s present, none in a recognized format - the draft manifest is empty; see chapterFromMarker",
+			"%s present, but none in a chapter-marker format this build recognizes - "+
+				"the draft manifest is empty and marker normalization will try to map them",
 			countNoun(markers.Seen, "embedded chapter marker")))
 	}
 	// Record the manifest chapter count so the ETA engine has a real per-book total

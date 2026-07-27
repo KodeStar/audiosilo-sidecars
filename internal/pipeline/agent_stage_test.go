@@ -1345,7 +1345,7 @@ func TestMarkersPromptExplainsVocabularyGap(t *testing.T) {
 		"recognized NONE",
 		"64 markers",
 		"probe.json",
-		"Decline only when the titles genuinely do not state an order.",
+		"not, by itself, a reason to decline",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("gap prompt missing %q", want)
@@ -1355,6 +1355,13 @@ func TestMarkersPromptExplainsVocabularyGap(t *testing.T) {
 	// read announced numbers, it does not license numbering by position.
 	if !strings.Contains(got, "NEVER infer chapter numbers merely from the marker count") {
 		t.Error("gap prompt dropped the infer-from-count prohibition")
+	}
+	// ...and it must not NARROW the decline criteria the Output section lists. A book
+	// whose bare-number titles state a clean order can still be undeliverable (one
+	// marker holding several chapters), and the section must not read as "an order you
+	// can see means map it anyway".
+	if !strings.Contains(got, "one marker holds several chapters") {
+		t.Error("gap prompt narrowed the decline criteria: the other not-confident cases must stay stated")
 	}
 
 	ambiguous := base
@@ -1384,9 +1391,7 @@ func TestMarkersNormalizePartialLegacyDraftReparsesProbeWithoutAgent(t *testing.
 			{"start_time":"20.000","end_time":"30.000","tags":{"title":"3. Closing"}}
 		]
 	}`
-	if err := os.WriteFile(filepath.Join(work, audio.ProbeName), []byte(probe), 0o644); err != nil { //nolint:gosec // test artifact
-		t.Fatal(err)
-	}
+	writeProbeJSON(t, work, probe)
 	// The stale draft an older parser left: it understood 1 and 3 but not the bare
 	// "002", so the chapters are non-contiguous rather than absent.
 	writeManifestStruct(t, work, audio.Manifest{
@@ -1419,6 +1424,94 @@ func TestMarkersNormalizePartialLegacyDraftReparsesProbeWithoutAgent(t *testing.
 	if err := json.Unmarshal(res.Metrics, &metrics); err != nil || metrics["deterministic_reparse"] != true {
 		t.Fatalf("metrics = %s err=%v", res.Metrics, err)
 	}
+	// The free path must observe NO rate. It is a sub-millisecond in-memory
+	// re-derivation, while the stage's real cost is the agent round it skipped (seed
+	// 180s/book); folding it into the EWMA would drag the learned markers_normalizing
+	// rate toward zero with every recovered book and then under-predict every book that
+	// genuinely needs the agent.
+	if res.RateSample != nil {
+		t.Errorf("deterministic reparse recorded RateSample %+v; want none (a free run observes nothing)", res.RateSample)
+	}
+}
+
+// writeProbeJSON drops a probe.json fixture into a book's work dir.
+func writeProbeJSON(t *testing.T, workDir, probeJSON string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(workDir, audio.ProbeName), []byte(probeJSON), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+}
+
+// TestMarkersNormalizeRepointsBookGaugesAfterHarvest pins that the AGENT path updates
+// books.chapters/duration_sec just like the deterministic branch does. Normalization
+// exists to drop credits/bonus markers, so the harvested count is routinely lower than
+// the draft count inspect recorded - a stale gauge makes the ETA engine size every
+// per-chapter stage off the wrong total and feeds contrib the wrong runtime.
+func TestMarkersNormalizeRepointsBookGaugesAfterHarvest(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	work := filepath.Join(dir, "work")
+	if err := os.MkdirAll(work, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	writeProbeJSON(t, work, `{
+		"format":{"duration":"40.000","tags":{"title":"Kept"}},
+		"chapters":[
+			{"start_time":"0.000","end_time":"10.000","tags":{"title":"Opening Credits"}},
+			{"start_time":"10.000","end_time":"20.000","tags":{"title":"Chapter 1"}},
+			{"start_time":"20.000","end_time":"30.000","tags":{"title":"Chapter 2"}},
+			{"start_time":"30.000","end_time":"40.000","tags":{"title":"Chapter 7"}}
+		]
+	}`)
+	// A draft the deterministic reparse cannot resolve (1,2,7 - a gap), so the agent runs.
+	src := filepath.Join(dir, "kept.m4b")
+	writeManifestStruct(t, work, audio.Manifest{
+		Source: src, Title: "Kept", Style: audio.StyleMarkers, Duration: 40, ChapterCount: 3,
+		Chapters: []audio.Chapter{
+			{Chapter: 1, Start: 10, End: 20, Duration: 10},
+			{Chapter: 2, Start: 20, End: 30, Duration: 10},
+			{Chapter: 7, Start: 30, End: 40, Duration: 10},
+		},
+	})
+
+	book, err := db.CreateBook(ctx, store.NewBook{SourcePath: src, WorkDir: work, Title: "Kept"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The stale gauge inspect left behind.
+	if err := db.SetBookChapters(ctx, book.ID, 3); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := newFakeRunner()
+	fake.act = func(_ *fakeRunner, req agent.Request, _ int) (agent.Result, error) {
+		writeOut(t, req, "verdict.json", markerVerdict{Confident: true, Reason: "bonus track excluded"})
+		writeOut(t, req, audio.ManifestName, audio.Manifest{
+			Source: src, Title: "Kept", Style: audio.StyleMarkers, Duration: 40, ChapterCount: 2,
+			Chapters: []audio.Chapter{
+				{Chapter: 1, Start: 10, End: 20, Duration: 10},
+				{Chapter: 2, Start: 20, End: 30, Duration: 10},
+			},
+		})
+		return agent.Result{Usage: agent.Usage{Model: "sonnet", Input: 10, Output: 5}}, nil
+	}
+	cfg := withAgentConfig(t.TempDir(), fake)
+	cfg.DB = db
+	if _, err := NewExecutor(cfg).Execute(ctx, book, state.MarkersNormalizing, scheduler.StageReport{}); err != nil {
+		t.Fatalf("markers_normalize: %v", err)
+	}
+
+	got, err := db.GetBook(ctx, book.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Chapters != 2 {
+		t.Errorf("books.chapters = %d after the agent excluded a marker, want the harvested 2", got.Chapters)
+	}
+	if got.DurationSec != 40 {
+		t.Errorf("books.duration_sec = %v, want the harvested 40", got.DurationSec)
+	}
 }
 
 // TestMarkersNormalizeNeverOverwritesAContiguousDraft pins the safety property the
@@ -1437,9 +1530,7 @@ func TestMarkersNormalizeNeverOverwritesAContiguousDraft(t *testing.T) {
 			{"start_time":"30.000","end_time":"40.000","tags":{"title":"004"}}
 		]
 	}`
-	if err := os.WriteFile(filepath.Join(work, audio.ProbeName), []byte(probe), 0o644); err != nil { //nolint:gosec // test artifact
-		t.Fatal(err)
-	}
+	writeProbeJSON(t, work, probe)
 	// An agent-quality mapping: credits dropped, the two real chapters renumbered.
 	// A blind reparse of probe.json would replace this with a 4-chapter map.
 	agentMap := audio.Manifest{
