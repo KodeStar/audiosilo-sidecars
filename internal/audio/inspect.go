@@ -85,17 +85,18 @@ func audioFilesIn(dir string) ([]string, error) {
 }
 
 // Inspect probes a book's source audio, writes probe.json + a manifest.json into
-// workDir, and reports whether the chapter markers are contiguous. A non-contiguous
-// marker set still writes manifest.json - as a DRAFT the M5 markers_normalizing stage
-// corrects - but returns markersContiguous=false so the state machine routes there
-// first. A multi-file book is always contiguous (chapters are synthesized 1..N).
-func Inspect(ctx context.Context, sourcePath, workDir, ffprobePath string) (Manifest, bool, error) {
+// workDir, and reports what the marker parser saw (MarkerStats, whose Contiguous
+// drives routing). A non-contiguous marker set still writes manifest.json - as a
+// DRAFT the M5 markers_normalizing stage corrects - but returns Contiguous=false so
+// the state machine routes there first. A multi-file book is always contiguous
+// (chapters are synthesized 1..N).
+func Inspect(ctx context.Context, sourcePath, workDir, ffprobePath string) (Manifest, MarkerStats, error) {
 	if err := os.MkdirAll(workDir, 0o750); err != nil {
-		return Manifest{}, false, err
+		return Manifest{}, MarkerStats{}, err
 	}
 	src, err := ResolveSource(sourcePath)
 	if err != nil {
-		return Manifest{}, false, err
+		return Manifest{}, MarkerStats{}, err
 	}
 	if src.Style == StyleFiles {
 		return inspectFiles(ctx, src.Files, workDir, ffprobePath)
@@ -105,23 +106,23 @@ func Inspect(ctx context.Context, sourcePath, workDir, ffprobePath string) (Mani
 
 // inspectMarkers probes a single chaptered file and builds a marker-derived
 // manifest.
-func inspectMarkers(ctx context.Context, bookFile, workDir, ffprobePath string) (Manifest, bool, error) {
+func inspectMarkers(ctx context.Context, bookFile, workDir, ffprobePath string) (Manifest, MarkerStats, error) {
 	if ffprobePath == "" {
-		return Manifest{}, false, errors.New("ffprobe unavailable; cannot read chapter markers")
+		return Manifest{}, MarkerStats{}, errors.New("ffprobe unavailable; cannot read chapter markers")
 	}
 	raw, meta, err := probeFile(ctx, bookFile, ffprobePath, true)
 	if err != nil {
-		return Manifest{}, false, fmt.Errorf("ffprobe %s: %w", bookFile, err)
+		return Manifest{}, MarkerStats{}, fmt.Errorf("ffprobe %s: %w", bookFile, err)
 	}
 	if err := fsutil.WriteFileAtomic(filepath.Join(workDir, ProbeName), raw, 0o644); err != nil {
-		return Manifest{}, false, err
+		return Manifest{}, MarkerStats{}, err
 	}
 
-	m, contig := markerManifestFromProbe(bookFile, meta)
+	m, stats := markerManifestFromProbe(bookFile, meta)
 	if err := WriteManifest(workDir, m); err != nil {
-		return Manifest{}, false, err
+		return Manifest{}, MarkerStats{}, err
 	}
-	return m, contig, nil
+	return m, stats, nil
 }
 
 // ReparseMarkerManifest rebuilds an already-inspected marker manifest from its
@@ -129,29 +130,29 @@ func inspectMarkers(ctx context.Context, bookFile, workDir, ffprobePath string) 
 // path for books inspected by an older parser that discarded a now-supported
 // marker style: marker normalization can recover deterministically without another
 // ffprobe call or an agent guessing a manifest schema.
-func ReparseMarkerManifest(workDir string, draft Manifest) (Manifest, bool, error) {
+func ReparseMarkerManifest(workDir string, draft Manifest) (Manifest, MarkerStats, error) {
 	if draft.Style != StyleMarkers {
-		return Manifest{}, false, fmt.Errorf("cannot reparse non-marker manifest style %q", draft.Style)
+		return Manifest{}, MarkerStats{}, fmt.Errorf("cannot reparse non-marker manifest style %q", draft.Style)
 	}
 	raw, err := os.ReadFile(filepath.Join(workDir, ProbeName)) //nolint:gosec // workDir is the book's managed scratch directory
 	if err != nil {
-		return Manifest{}, false, fmt.Errorf("read %s: %w", ProbeName, err)
+		return Manifest{}, MarkerStats{}, fmt.Errorf("read %s: %w", ProbeName, err)
 	}
 	var meta probeMeta
 	if err := json.Unmarshal(raw, &meta); err != nil {
-		return Manifest{}, false, fmt.Errorf("parse %s: %w", ProbeName, err)
+		return Manifest{}, MarkerStats{}, fmt.Errorf("parse %s: %w", ProbeName, err)
 	}
-	m, contig := markerManifestFromProbe(draft.Source, meta)
+	m, stats := markerManifestFromProbe(draft.Source, meta)
 	if draft.Title != "" {
 		m.Title = draft.Title
 	}
 	if err := WriteManifest(workDir, m); err != nil {
-		return Manifest{}, false, err
+		return Manifest{}, MarkerStats{}, err
 	}
-	return m, contig, nil
+	return m, stats, nil
 }
 
-func markerManifestFromProbe(source string, meta probeMeta) (Manifest, bool) {
+func markerManifestFromProbe(source string, meta probeMeta) (Manifest, MarkerStats) {
 	var chapters []Chapter
 	for _, ch := range meta.Chapters {
 		num, title, ok := chapterFromMarker(ch.Tags["title"])
@@ -171,7 +172,6 @@ func markerManifestFromProbe(source string, meta probeMeta) (Manifest, bool) {
 	// the markers_normalizing agent stage reads and corrects (renumber/exclude/retitle).
 	// contiguous() is still the routing decision - when it is false the state machine
 	// sends the book to markers_normalizing before split, which never runs on a draft.
-	contig := contiguous(chapters)
 	m := Manifest{
 		Source:       source,
 		Title:        meta.Format.Tags["title"],
@@ -180,13 +180,20 @@ func markerManifestFromProbe(source string, meta probeMeta) (Manifest, bool) {
 		ChapterCount: len(chapters),
 		Chapters:     chapters,
 	}
-	return m, contig
+	// Seen counts the RAW markers, so a table written in an unknown dialect (every
+	// marker dropped above) stays distinguishable from a genuinely markerless file.
+	stats := MarkerStats{
+		Seen:       len(meta.Chapters),
+		Recognized: len(chapters),
+		Contiguous: contiguous(chapters),
+	}
+	return m, stats
 }
 
 // inspectFiles builds a synthesized-chapter manifest for a multi-file book: one
 // chapter per file in name order, with cumulative offsets from each file's probed
 // duration (best-effort; a missing/failing ffprobe leaves durations 0).
-func inspectFiles(ctx context.Context, files []string, workDir, ffprobePath string) (Manifest, bool, error) {
+func inspectFiles(ctx context.Context, files []string, workDir, ffprobePath string) (Manifest, MarkerStats, error) {
 	var (
 		chapters []Chapter
 		offset   float64
@@ -211,10 +218,10 @@ func inspectFiles(ctx context.Context, files []string, workDir, ffprobePath stri
 	}
 	rawSummary, err := json.MarshalIndent(summary, "", "  ")
 	if err != nil {
-		return Manifest{}, false, err
+		return Manifest{}, MarkerStats{}, err
 	}
 	if err := fsutil.WriteFileAtomic(filepath.Join(workDir, ProbeName), append(rawSummary, '\n'), 0o644); err != nil {
-		return Manifest{}, false, err
+		return Manifest{}, MarkerStats{}, err
 	}
 	m := Manifest{
 		Source:       filepath.Dir(files[0]),
@@ -224,9 +231,11 @@ func inspectFiles(ctx context.Context, files []string, workDir, ffprobePath stri
 		Chapters:     chapters,
 	}
 	if err := WriteManifest(workDir, m); err != nil {
-		return Manifest{}, false, err
+		return Manifest{}, MarkerStats{}, err
 	}
-	return m, true, nil
+	// A files-style book parses no markers - its chapters ARE its files - so Seen and
+	// Recognized both count the files and NoneRecognized() stays false.
+	return m, MarkerStats{Seen: len(files), Recognized: len(files), Contiguous: true}, nil
 }
 
 // fileProbeSummary is the probe.json written for a multi-file book (there is no

@@ -362,7 +362,7 @@ func (e *Executor) ensureTools() (ffmpeg, ffprobe string) {
 func (e *Executor) Execute(ctx context.Context, book store.Book, stage state.State, r scheduler.StageReport) (scheduler.StageResult, error) {
 	switch stage {
 	case state.Inspecting:
-		return e.inspect(ctx, book)
+		return e.inspect(ctx, book, r)
 	case state.MarkersNormalizing:
 		return e.markersNormalize(ctx, book, r)
 	case state.Splitting:
@@ -429,16 +429,25 @@ type asrProvenance struct {
 // inspect probes the book's source audio, writes probe.json + manifest.json, and
 // records whether the chapter markers are contiguous (drives the
 // markers_normalizing skip). It writes the stage sentinel as its final action.
-func (e *Executor) inspect(ctx context.Context, book store.Book) (scheduler.StageResult, error) {
+func (e *Executor) inspect(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
 	_, ffprobe := e.ensureTools()
 	if ffprobe == "" {
 		return scheduler.StageResult{}, scheduler.ParkWithCode(state.ParkMediaToolsUnavailable, MediaToolsUnavailableMsg)
 	}
 	// Time only the productive body (after the tool-availability check) for the rate.
 	start := time.Now()
-	manifest, contiguous, err := audio.Inspect(ctx, book.SourcePath, book.WorkDir, ffprobe)
+	manifest, markers, err := audio.Inspect(ctx, book.SourcePath, book.WorkDir, ffprobe)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("inspect: %w", err)
+	}
+	// Name the vocabulary gap out loud. An empty manifest from a file that HAS a full
+	// marker table is a one-line parser gap with a free deterministic recovery, but in
+	// the log it used to be indistinguishable from a genuinely markerless file - so
+	// every new marker dialect had to be rediscovered by hand from a parked book.
+	if markers.NoneRecognized() && r.Note != nil {
+		r.Note(fmt.Sprintf(
+			"%s present, none in a recognized format - the draft manifest is empty; see chapterFromMarker",
+			countNoun(markers.Seen, "embedded chapter marker")))
 	}
 	// Record the manifest chapter count so the ETA engine has a real per-book total
 	// for the per-chapter stages instead of its default. Best-effort bookkeeping (nil
@@ -448,12 +457,13 @@ func (e *Executor) inspect(ctx context.Context, book store.Book) (scheduler.Stag
 		_ = e.db.SetBookDuration(context.WithoutCancel(ctx), book.ID, manifest.Duration)
 	}
 	result := scheduler.StageResult{
-		MarkersContiguous: contiguous,
+		MarkersContiguous: markers.Contiguous,
 		Metrics: metrics(map[string]any{
 			"style":         manifest.Style,
 			"chapter_count": manifest.ChapterCount,
 			"duration_sec":  manifest.Duration,
-			"contiguous":    contiguous,
+			"contiguous":    markers.Contiguous,
+			"markers_seen":  markers.Seen,
 		}),
 		RateSample: rateSample(1, time.Since(start).Seconds()),
 	}

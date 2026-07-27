@@ -625,12 +625,12 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, r sche
 	// result is contiguous, this stage is complete without any model invocation.
 	if draft.Style == audio.StyleMarkers && len(draft.Chapters) == 0 {
 		started := time.Now()
-		rebuilt, contiguous, reparseErr := audio.ReparseMarkerManifest(book.WorkDir, draft)
+		rebuilt, markers, reparseErr := audio.ReparseMarkerManifest(book.WorkDir, draft)
 		if reparseErr != nil {
 			return scheduler.StageResult{}, fmt.Errorf("markers_normalizing: deterministic probe reparse: %w", reparseErr)
 		}
 		draft = rebuilt
-		if contiguous {
+		if markers.Contiguous {
 			if e.db != nil {
 				_ = e.db.SetBookChapters(context.WithoutCancel(ctx), book.ID, draft.ChapterCount)
 				_ = e.db.SetBookDuration(context.WithoutCancel(ctx), book.ID, draft.Duration)

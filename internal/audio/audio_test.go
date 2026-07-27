@@ -109,12 +109,12 @@ func TestReparseMarkerManifestRecoversColonBeforeNumber(t *testing.T) {
 	writeProbe(t, work, probe)
 	draft := Manifest{Source: "/books/mageling.m4b", Title: "Mageling", Style: StyleMarkers, Duration: 180}
 
-	m, contiguous, err := ReparseMarkerManifest(work, draft)
+	m, markers, err := ReparseMarkerManifest(work, draft)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contiguous || m.ChapterCount != 2 || len(m.Chapters) != 2 {
-		t.Fatalf("reparsed manifest = %+v contiguous=%v, want two contiguous chapters", m, contiguous)
+	if !markers.Contiguous || m.ChapterCount != 2 || len(m.Chapters) != 2 {
+		t.Fatalf("reparsed manifest = %+v contiguous=%v, want two contiguous chapters", m, markers.Contiguous)
 	}
 	if m.Chapters[0].Chapter != 1 || m.Chapters[0].Title != "New Beginnings" || m.Chapters[1].Chapter != 2 {
 		t.Fatalf("reparsed chapters = %+v", m.Chapters)
@@ -145,11 +145,11 @@ func TestReparseMarkerManifestRecoversBareNumberMarkers(t *testing.T) {
 	// The empty draft inspect actually wrote for these books.
 	draft := Manifest{Source: "/books/Inflame.m4b", Title: "Inflame", Style: StyleMarkers, Duration: 40}
 
-	m, contiguous, err := ReparseMarkerManifest(work, draft)
+	m, markers, err := ReparseMarkerManifest(work, draft)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contiguous {
+	if !markers.Contiguous {
 		t.Fatalf("bare-number markers must reparse contiguously, got manifest %+v", m)
 	}
 	if m.ChapterCount != 3 || len(m.Chapters) != 3 {
@@ -181,12 +181,64 @@ func TestBareNumberMarkersStillGatedByContiguity(t *testing.T) {
 		]
 	}`
 	writeProbe(t, work, probe)
-	_, contiguous, err := ReparseMarkerManifest(work, Manifest{Style: StyleMarkers, Duration: 40})
+	_, markers, err := ReparseMarkerManifest(work, Manifest{Style: StyleMarkers, Duration: 40})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if contiguous {
+	if markers.Contiguous {
 		t.Fatal("a gappy bare-number marker set must NOT be reported contiguous")
+	}
+	// The markers WERE understood - they just do not form a run. That is the
+	// vocabulary-gap condition's opposite, and the two must stay distinguishable.
+	if markers.NoneRecognized() || markers.Recognized != 3 || markers.Seen != 3 {
+		t.Errorf("gappy set = %+v, want 3 seen / 3 recognized and not a vocabulary gap", markers)
+	}
+}
+
+// TestMarkerStatsSeparatesVocabularyGapFromMarkerless pins the distinction the stats
+// exist for: BOTH cases yield an empty manifest, but one is an unfixable book and the
+// other is a parser gap with a free deterministic recovery. Before this they were
+// indistinguishable in the metrics, so each new marker dialect had to be rediscovered
+// from a parked book.
+func TestMarkerStatsSeparatesVocabularyGapFromMarkerless(t *testing.T) {
+	cases := []struct {
+		name           string
+		chapters       string
+		wantSeen       int
+		wantRecognized int
+		wantGap        bool
+	}{
+		{
+			name:     "unknown dialect - a full table we cannot read",
+			chapters: `{"start_time":"0.000","end_time":"10.000","tags":{"title":"Track A"}},{"start_time":"10.000","end_time":"20.000","tags":{"title":"Track B"}}`,
+			wantSeen: 2, wantRecognized: 0, wantGap: true,
+		},
+		{
+			name:     "genuinely markerless",
+			chapters: ``,
+			wantSeen: 0, wantRecognized: 0, wantGap: false,
+		},
+		{
+			name:     "understood",
+			chapters: `{"start_time":"0.000","end_time":"10.000","tags":{"title":"001"}}`,
+			wantSeen: 1, wantRecognized: 1, wantGap: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			work := t.TempDir()
+			writeProbe(t, work, `{"format":{"duration":"20.000"},"chapters":[`+c.chapters+`]}`)
+			_, markers, err := ReparseMarkerManifest(work, Manifest{Style: StyleMarkers, Duration: 20})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if markers.Seen != c.wantSeen || markers.Recognized != c.wantRecognized {
+				t.Errorf("stats = %+v, want seen=%d recognized=%d", markers, c.wantSeen, c.wantRecognized)
+			}
+			if got := markers.NoneRecognized(); got != c.wantGap {
+				t.Errorf("NoneRecognized() = %v, want %v (stats %+v)", got, c.wantGap, markers)
+			}
+		})
 	}
 }
 
@@ -347,11 +399,11 @@ func TestInspectAndSplitMarkers(t *testing.T) {
 		[]string{"Chapter 1: One", "Chapter 2. Two", "Chapter 3 - Three"}, 3)
 	work := filepath.Join(dir, "work")
 
-	m, contig, err := Inspect(context.Background(), book, work, ffprobe)
+	m, markers, err := Inspect(context.Background(), book, work, ffprobe)
 	if err != nil {
 		t.Fatalf("Inspect: %v", err)
 	}
-	if !contig {
+	if !markers.Contiguous {
 		t.Fatal("markers should be contiguous")
 	}
 	if m.Style != StyleMarkers || m.ChapterCount != 3 {
@@ -387,11 +439,11 @@ func TestInspectWordNumberedMarkersExcludesExtras(t *testing.T) {
 		[]string{"Opening Credits", "Chapter One – Arrival", "Chapter Two — Departure", "Bloopers", "End Credits"}, 2)
 	work := filepath.Join(dir, "work")
 
-	m, contig, err := Inspect(context.Background(), book, work, ffprobe)
+	m, markers, err := Inspect(context.Background(), book, work, ffprobe)
 	if err != nil {
 		t.Fatalf("Inspect: %v", err)
 	}
-	if !contig {
+	if !markers.Contiguous {
 		t.Fatal("word-numbered chapter markers should be contiguous")
 	}
 	if m.ChapterCount != 2 || len(m.Chapters) != 2 {
@@ -463,11 +515,11 @@ func TestInspectMultiFileStyle(t *testing.T) {
 		}
 	}
 	work := filepath.Join(dir, "work")
-	m, contig, err := Inspect(context.Background(), bookDir, work, ffprobe)
+	m, markers, err := Inspect(context.Background(), bookDir, work, ffprobe)
 	if err != nil {
 		t.Fatalf("Inspect: %v", err)
 	}
-	if !contig || m.Style != StyleFiles || m.ChapterCount != 2 {
+	if !markers.Contiguous || m.Style != StyleFiles || m.ChapterCount != 2 {
 		t.Fatalf("multi-file manifest = %+v, want 2 files-style chapters", m)
 	}
 	if m.Chapters[0].FilePath == "" || m.Chapters[1].Chapter != 2 {
@@ -493,11 +545,11 @@ func TestInspectNonContiguousWritesDraftManifest(t *testing.T) {
 	book := genChapteredM4B(t, ffmpeg, dir,
 		[]string{"Chapter 1", "Chapter 2", "Chapter 4"}, 2)
 	work := filepath.Join(dir, "work")
-	m, contig, err := Inspect(context.Background(), book, work, ffprobe)
+	m, markers, err := Inspect(context.Background(), book, work, ffprobe)
 	if err != nil {
 		t.Fatalf("Inspect: %v", err)
 	}
-	if contig {
+	if markers.Contiguous {
 		t.Error("gap markers should not be contiguous")
 	}
 	// The draft manifest is written (non-contiguous chapters preserved as-seen).
@@ -510,6 +562,38 @@ func TestInspectNonContiguousWritesDraftManifest(t *testing.T) {
 	// probe.json is still written (the record of what we saw).
 	if _, err := os.Stat(filepath.Join(work, ProbeName)); err != nil {
 		t.Errorf("probe.json should be written even when non-contiguous: %v", err)
+	}
+}
+
+// TestInspectReportsUnrecognizedMarkerDialect drives the real ffprobe path for the
+// condition that made three books look unfixable: the file HAS a complete marker
+// table, the parser understands none of it, and the manifest comes out empty. Inspect
+// must report that as a vocabulary gap (Seen > 0, Recognized == 0) rather than as a
+// markerless file, which is what the inspecting stage's note keys on.
+func TestInspectReportsUnrecognizedMarkerDialect(t *testing.T) {
+	ffmpeg, ffprobe := requireFFmpeg(t)
+	dir := t.TempDir()
+	book := genChapteredM4B(t, ffmpeg, dir,
+		[]string{"Track A", "Track B", "Track C"}, 2)
+	work := filepath.Join(dir, "work")
+
+	m, markers, err := Inspect(context.Background(), book, work, ffprobe)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if !markers.NoneRecognized() {
+		t.Fatalf("stats = %+v, want the vocabulary-gap condition (markers seen, none recognized)", markers)
+	}
+	if markers.Seen != 3 || markers.Recognized != 0 || markers.Contiguous {
+		t.Errorf("stats = %+v, want seen=3 recognized=0 contiguous=false", markers)
+	}
+	if m.ChapterCount != 0 || len(m.Chapters) != 0 {
+		t.Errorf("manifest = %+v, want an empty draft", m)
+	}
+	// probe.json still holds every marker, which is what makes the recovery free once
+	// the parser learns the dialect.
+	if _, err := os.Stat(filepath.Join(work, ProbeName)); err != nil {
+		t.Errorf("probe.json should be written even when no marker parses: %v", err)
 	}
 }
 

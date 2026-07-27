@@ -54,6 +54,29 @@ type Chapter struct {
 	FilePath    string  `json:"file_path,omitempty"`
 }
 
+// MarkerStats reports what the marker parser SAW versus what it understood, so a
+// caller can tell the two very different empty-manifest causes apart:
+//
+//   - Seen == 0: the file carries no embedded chapter markers at all. Nothing to
+//     parse; only a human (or a per-file split) can chapter this book.
+//   - Seen > 0 && Recognized == 0: the file carries a full marker table written in a
+//     dialect chapterFromMarker does not know. That is a one-line vocabulary gap with
+//     a free deterministic recovery (ReparseMarkerManifest after a parser upgrade),
+//     NOT an unfixable book - but it used to look identical to the case above in the
+//     logs, so each new dialect had to be rediscovered from a parked book.
+//
+// A StyleFiles book has no markers to parse; its chapters are synthesized one per
+// file, so Seen and Recognized are both the file count and NoneRecognized is false.
+type MarkerStats struct {
+	Seen       int  // embedded markers present in probe.json
+	Recognized int  // markers chapterFromMarker understood (== Manifest.ChapterCount)
+	Contiguous bool // the recognized chapters form a gapless 0/1-based run
+}
+
+// NoneRecognized reports the vocabulary-gap condition: markers were present and the
+// parser understood none of them.
+func (s MarkerStats) NoneRecognized() bool { return s.Seen > 0 && s.Recognized == 0 }
+
 // Manifest is the normalized inspect output: the audio source, its title/duration,
 // the chapter split style, and the ordered chapters.
 type Manifest struct {
