@@ -42,6 +42,32 @@ Map the raw recording markers to the work's LOGICAL chapters:
   manifest, and preserve the recording layout Style. You may only renumber,
   exclude, and retitle - never move, retime, or invent an interval.
 
+{{if .NoneRecognized}}
+## Why the draft is empty (read this first)
+
+The mechanical parser recognized NONE of this recording's {{.MarkersSeen}} markers,
+which is the only reason the draft manifest above has no chapters. That is a gap in
+the parser's vocabulary, NOT a verdict that the markers are unusable. `probe.json`
+still holds every marker with its title, start and end, and it is authoritative.
+
+So read those titles before concluding anything:
+
+- If they carry a complete, self-consistent numbering the parser simply does not
+  know - every title a plain number ("001".."064"), or "Track 07", or Roman
+  numerals - then the titles DO state the announced numbering. Map them
+  confidently. This is not numbering by position: the number is written in the
+  title, which is exactly what the rule above asks you to read.
+- Credits are the one thing you do NOT need to identify to proceed. When a marker
+  is LABELLED as credits, exclude it as described above. When credits are
+  unlabelled and indistinguishable from a chapter (every title is just a number),
+  map them like any other marker: a short non-narrative file at the START or END of
+  the book is dropped later by a content-driven check that reads the transcripts.
+- What that check will NOT catch is an INTERIOR non-chapter marker, such as a
+  publisher "Summary of Book N-1" recap sitting mid-book. That still needs your
+  judgment.
+
+Decline only when the titles genuinely do not state an order.
+{{end}}
 ## Output (only under out/)
 
 1. `out/verdict.json` (ALWAYS) with exactly this shape:

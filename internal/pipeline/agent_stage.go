@@ -598,6 +598,13 @@ type markersPromptData struct {
 	Style        string
 	Duration     float64
 	ChapterCount int
+	// MarkersSeen is the raw marker count in probe.json and NoneRecognized reports
+	// that the parser understood none of them. Together they tell the agent WHY the
+	// draft is empty: a vocabulary gap it can read straight from probe.json, not a
+	// recording whose markers are unusable. Without this the agent could only
+	// conclude the markers were hopeless and decline (which is what it did).
+	MarkersSeen    int
+	NoneRecognized bool
 }
 
 // markerVerdict is the agent's confidence signal (out/verdict.json): a not-confident
@@ -623,13 +630,14 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, r sche
 	// though probe.json contains a fully explicit chapter sequence. Reparse with the
 	// current deterministic rules before paying an agent to reconstruct it. When the
 	// result is contiguous, this stage is complete without any model invocation.
+	var markers audio.MarkerStats
 	if draft.Style == audio.StyleMarkers && len(draft.Chapters) == 0 {
 		started := time.Now()
-		rebuilt, markers, reparseErr := audio.ReparseMarkerManifest(book.WorkDir, draft)
+		rebuilt, stats, reparseErr := audio.ReparseMarkerManifest(book.WorkDir, draft)
 		if reparseErr != nil {
 			return scheduler.StageResult{}, fmt.Errorf("markers_normalizing: deterministic probe reparse: %w", reparseErr)
 		}
-		draft = rebuilt
+		draft, markers = rebuilt, stats
 		if markers.Contiguous {
 			if e.db != nil {
 				_ = e.db.SetBookChapters(context.WithoutCancel(ctx), book.ID, draft.ChapterCount)
@@ -686,13 +694,15 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, r sche
 		return validateMarkersManifest(s.OutDir(), draft, inputPaths)
 	}
 	data := markersPromptData{
-		Title:        book.Title,
-		Authors:      authors(book),
-		Series:       book.Series,
-		SeriesPos:    book.SeriesPos,
-		Style:        draft.Style,
-		Duration:     draft.Duration,
-		ChapterCount: draft.ChapterCount,
+		Title:          book.Title,
+		Authors:        authors(book),
+		Series:         book.Series,
+		SeriesPos:      book.SeriesPos,
+		Style:          draft.Style,
+		Duration:       draft.Duration,
+		ChapterCount:   draft.ChapterCount,
+		MarkersSeen:    markers.Seen,
+		NoneRecognized: markers.NoneRecognized(),
 	}
 	usage, err := e.runAgent(ctx, book, state.MarkersNormalizing, r, st, "markers.md", data, false, validate)
 	if err != nil {

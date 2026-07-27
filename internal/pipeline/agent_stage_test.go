@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
+	"github.com/kodestar/audiosilo-sidecars/internal/agent/prompts"
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
 	"github.com/kodestar/audiosilo-sidecars/internal/qa"
 	"github.com/kodestar/audiosilo-sidecars/internal/repair"
@@ -1319,5 +1320,50 @@ func assertUsageMetrics(t *testing.T, raw json.RawMessage, model string, in, out
 	}
 	if m.Usage.Invocations < 1 {
 		t.Errorf("usage invocations = %d, want >= 1", m.Usage.Invocations)
+	}
+}
+
+// TestMarkersPromptExplainsVocabularyGap pins both branches of markers.md's
+// empty-draft section. The stage renders with missingkey=error, so a field rename
+// would fail loudly - but a template whose {{if}} never fires fails SILENTLY, and the
+// whole point of this section is to reach the agent on exactly the books that used to
+// park. So assert it appears when the parser recognized nothing and stays out of the
+// way otherwise.
+func TestMarkersPromptExplainsVocabularyGap(t *testing.T) {
+	base := markersPromptData{
+		Title: "Inflame", Authors: "Dakota Krout", Style: "markers",
+		Duration: 48295, ChapterCount: 0,
+	}
+
+	gap := base
+	gap.MarkersSeen, gap.NoneRecognized = 64, true
+	got, err := prompts.Render("markers.md", gap)
+	if err != nil {
+		t.Fatalf("render (gap): %v", err)
+	}
+	for _, want := range []string{
+		"recognized NONE",
+		"64 markers",
+		"probe.json",
+		"Decline only when the titles genuinely do not state an order.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("gap prompt missing %q", want)
+		}
+	}
+	// The existing rules must survive alongside it - the new section explains how to
+	// read announced numbers, it does not license numbering by position.
+	if !strings.Contains(got, "NEVER infer chapter numbers merely from the marker count") {
+		t.Error("gap prompt dropped the infer-from-count prohibition")
+	}
+
+	ambiguous := base
+	ambiguous.MarkersSeen, ambiguous.NoneRecognized = 12, false
+	got, err = prompts.Render("markers.md", ambiguous)
+	if err != nil {
+		t.Fatalf("render (ambiguous): %v", err)
+	}
+	if strings.Contains(got, "recognized NONE") {
+		t.Error("the vocabulary-gap section must not render when markers WERE recognized")
 	}
 }
