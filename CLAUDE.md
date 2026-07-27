@@ -141,9 +141,19 @@ internal/
             per-chapter progress, ctx-cancel clean). Pure/tool-driven, no scheduler deps.
             chapterFromMarker's vocabulary covers "Chapter N[: Title]" (digits or
             spelled-out), "N. Title", and bare-number tables ("001".."064"); an
-            unrecognized dialect drops every marker, and the resulting EMPTY draft is
-            what markers_normalizing's deterministic ReparseMarkerManifest exists to
-            recover after a parser upgrade. contiguous() gates routing either way.
+            unrecognized dialect drops those markers, and the resulting empty or
+            non-contiguous draft is what markers_normalizing's deterministic
+            ReparseMarkerManifest recovers for free after a parser upgrade (gated on
+            the draft being non-contiguous, so it never re-derives over an
+            agent-harvested map; it preserves the draft's Title AND Duration, since
+            the stage bounds the agent's intervals against that duration).
+            contiguous() gates routing either way. Inspect/Reparse return MarkerStats
+            {Seen,Recognized,Contiguous}: Seen>0 with Recognized==0 is a parser
+            vocabulary gap (free deterministic recovery), NOT a markerless file - the
+            two were indistinguishable in the metrics for three dialects running, so
+            inspect now records markers_seen and notes the condition, and markers.md
+            tells the agent to read probe.json and map an announced numbering the
+            parser missed rather than decline.
   asr/      the ASR backend abstraction (M3a/M3b): Backend{ID,Detect,EnsureReady,
             Transcribe} over a normalized Job (audio/outDir/chapter/prompt/language),
             producing RAW per-chapter output byte-for-byte. Two backends behind
