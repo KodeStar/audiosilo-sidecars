@@ -79,14 +79,23 @@ func IsAudio(name string) bool {
 
 // Marker regexes ported verbatim from audio_extract.py's chapter_from_marker: the
 // marker style varies per book, so accept "Chapter N", "Chapter N: Title",
-// "Chapter N. Title", "Chapter N - Title" (hyphen), and the bare "N. Title" form.
-// Credits ("Opening Credits" / "End Credits") match none and are excluded.
+// "Chapter N. Title", "Chapter N - Title" (hyphen), and a leading number with an
+// optional ". Title" tail ("1. Troll Hunt" or a bare "001"). Credits ("Opening
+// Credits" / "End Credits") match none and are excluded.
 var (
 	// Some Audible-style M4Bs use "Chapter: 1 – Title": a separator appears
 	// between the word Chapter and its number, and a Unicode dash separates the
 	// title. Accept that alongside the older "Chapter 1: Title" forms.
 	reChapterMarker = regexp.MustCompile(`(?i)^Chapter(?:\s*:\s*|\s+)(\d+)(?:\s*[.:\-–—]\s*(.*))?$`)
-	reNumberDot     = regexp.MustCompile(`^(\d+)\.\s*(.*)$`)
+	// The ". Title" tail is OPTIONAL because many M4Bs label markers with nothing but
+	// a zero-padded track number ("001".."064") - titleless, but a fully explicit
+	// sequence. Requiring the dot discarded every such marker, leaving an EMPTY draft
+	// manifest that markers_normalizing could only park on. A bare number is trusted
+	// no more than "N." already was: contiguous() still routes a gappy set to the
+	// agent, and a numbered credits marker is dropped downstream by the
+	// content-driven classifyBookEdges, never here. Do NOT reduce the tail to
+	// `\.?\s*(.*)` - that also swallows "1a" and "1 Some Title" as chapter 1.
+	reNumberMarker = regexp.MustCompile(`^(\d+)(?:\.\s*(.*))?$`)
 )
 
 var chapterNumberWords = map[string]int{
@@ -123,7 +132,9 @@ func chapterFromMarker(title string) (num int, chapterTitle string, ok bool) {
 			return n, suffix, true
 		}
 	}
-	if m := reNumberDot.FindStringSubmatch(t); m != nil {
+	// A leading number, with or without a ". Title" tail. Atoi still guards the
+	// range: the pattern proves the digits, not that they fit an int.
+	if m := reNumberMarker.FindStringSubmatch(t); m != nil {
 		n, err := strconv.Atoi(m[1])
 		if err != nil {
 			return 0, "", false

@@ -38,9 +38,17 @@ func TestChapterFromMarker(t *testing.T) {
 		{"Chapter One Hundred and Two: Return", 102, "Return", true},
 		{"Chapter Forty Seven - The Gate", 47, "The Gate", true},
 		{"Chapter Seventy-One – Knowing the Risks", 71, "Knowing the Risks", true},
+		{"1", 1, "", true},                // bare number marker
+		{"001", 1, "", true},              // zero-padded bare number
+		{"064", 64, "", true},             // zero-padded, multi-digit
 		{"Opening Credits", 0, "", false}, // credits excluded
 		{"End Credits", 0, "", false},
 		{"Prologue", 0, "", false},
+		// The optional ". Title" tail must not decay into "digits then anything":
+		// a bare marker is digits ONLY, and a number must lead.
+		{"1a", 0, "", false},
+		{"1 Some Title", 0, "", false},
+		{"Disc 1 - 003", 0, "", false},
 	}
 	for _, c := range cases {
 		num, tit, ok := chapterFromMarker(c.in)
@@ -79,6 +87,14 @@ func TestContiguous(t *testing.T) {
 	}
 }
 
+// writeProbe drops a probe.json fixture into a work dir for the reparse tests.
+func writeProbe(t *testing.T, workDir, probeJSON string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(workDir, ProbeName), []byte(probeJSON), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+}
+
 func TestReparseMarkerManifestRecoversColonBeforeNumber(t *testing.T) {
 	work := t.TempDir()
 	probe := `{
@@ -90,9 +106,7 @@ func TestReparseMarkerManifestRecoversColonBeforeNumber(t *testing.T) {
 			{"start_time":"170.000","end_time":"180.000","tags":{"title":"End Credits"}}
 		]
 	}`
-	if err := os.WriteFile(filepath.Join(work, ProbeName), []byte(probe), 0o644); err != nil { //nolint:gosec // test artifact
-		t.Fatal(err)
-	}
+	writeProbe(t, work, probe)
 	draft := Manifest{Source: "/books/mageling.m4b", Title: "Mageling", Style: StyleMarkers, Duration: 180}
 
 	m, contiguous, err := ReparseMarkerManifest(work, draft)
@@ -108,6 +122,71 @@ func TestReparseMarkerManifestRecoversColonBeforeNumber(t *testing.T) {
 	stored, err := ReadManifest(work)
 	if err != nil || stored.ChapterCount != 2 {
 		t.Fatalf("stored manifest = %+v err=%v", stored, err)
+	}
+}
+
+// TestReparseMarkerManifestRecoversBareNumberMarkers replays the real incident: three
+// books whose M4B markers were nothing but zero-padded track numbers ("001".."064")
+// parsed to ZERO chapters, so inspect wrote an empty draft, the state machine routed
+// them to markers_normalizing, and the agent correctly declined to invent a mapping
+// from bare numbers. The sequence is fully explicit, so the deterministic reparse must
+// recover it titlelessly, with no agent invocation.
+func TestReparseMarkerManifestRecoversBareNumberMarkers(t *testing.T) {
+	work := t.TempDir()
+	probe := `{
+		"format":{"duration":"40.000","tags":{"title":"Inflame"}},
+		"chapters":[
+			{"start_time":"0.000","end_time":"10.000","tags":{"title":"001"}},
+			{"start_time":"10.000","end_time":"20.000","tags":{"title":"002"}},
+			{"start_time":"20.000","end_time":"30.000","tags":{"title":"003"}}
+		]
+	}`
+	writeProbe(t, work, probe)
+	// The empty draft inspect actually wrote for these books.
+	draft := Manifest{Source: "/books/Inflame.m4b", Title: "Inflame", Style: StyleMarkers, Duration: 40}
+
+	m, contiguous, err := ReparseMarkerManifest(work, draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contiguous {
+		t.Fatalf("bare-number markers must reparse contiguously, got manifest %+v", m)
+	}
+	if m.ChapterCount != 3 || len(m.Chapters) != 3 {
+		t.Fatalf("reparsed chapter count = %d (%d chapters), want 3", m.ChapterCount, len(m.Chapters))
+	}
+	if m.Chapters[0].Chapter != 1 || m.Chapters[2].Chapter != 3 {
+		t.Fatalf("reparsed numbering = %d..%d, want 1..3", m.Chapters[0].Chapter, m.Chapters[2].Chapter)
+	}
+	if m.Chapters[0].MarkerTitle != "001" || m.Chapters[0].Title != "" {
+		t.Errorf("first chapter = %+v, want marker_title 001 and no title", m.Chapters[0])
+	}
+	stored, err := ReadManifest(work)
+	if err != nil || stored.ChapterCount != 3 {
+		t.Fatalf("stored manifest = %+v err=%v", stored, err)
+	}
+}
+
+// TestBareNumberMarkersStillGatedByContiguity pins the guard the bare-number form does
+// NOT weaken: a gappy bare-number set is still non-contiguous, so it routes to the
+// markers_normalizing agent rather than being silently accepted.
+func TestBareNumberMarkersStillGatedByContiguity(t *testing.T) {
+	work := t.TempDir()
+	probe := `{
+		"format":{"duration":"40.000","tags":{"title":"Gappy"}},
+		"chapters":[
+			{"start_time":"0.000","end_time":"10.000","tags":{"title":"001"}},
+			{"start_time":"10.000","end_time":"20.000","tags":{"title":"002"}},
+			{"start_time":"20.000","end_time":"30.000","tags":{"title":"004"}}
+		]
+	}`
+	writeProbe(t, work, probe)
+	_, contiguous, err := ReparseMarkerManifest(work, Manifest{Style: StyleMarkers, Duration: 40})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contiguous {
+		t.Fatal("a gappy bare-number marker set must NOT be reported contiguous")
 	}
 }
 

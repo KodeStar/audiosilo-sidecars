@@ -139,6 +139,11 @@ internal/
             single-file marker books AND multi-file "files" books) and Split (ffmpeg
             each chapter -> mono/16k FLAC under chapters/, resumable via temp+rename,
             per-chapter progress, ctx-cancel clean). Pure/tool-driven, no scheduler deps.
+            chapterFromMarker's vocabulary covers "Chapter N[: Title]" (digits or
+            spelled-out), "N. Title", and bare-number tables ("001".."064"); an
+            unrecognized dialect drops every marker, and the resulting EMPTY draft is
+            what markers_normalizing's deterministic ReparseMarkerManifest exists to
+            recover after a parser upgrade. contiguous() gates routing either way.
   asr/      the ASR backend abstraction (M3a/M3b): Backend{ID,Detect,EnsureReady,
             Transcribe} over a normalized Job (audio/outDir/chapter/prompt/language),
             producing RAW per-chapter output byte-for-byte. Two backends behind
