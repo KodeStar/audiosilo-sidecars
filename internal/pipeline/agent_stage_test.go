@@ -148,9 +148,74 @@ func TestValidateMarkersManifestRejectsNumberAliasExplicitly(t *testing.T) {
 		t.Fatal(err)
 	}
 	draft := audio.Manifest{Source: "/x/book.m4b", Style: audio.StyleMarkers, Duration: 2}
-	err := validateMarkersManifest(out, draft, nil)
+	markers := []audio.Marker{{Title: "Chapter 1", Start: 0, End: 2}}
+	err := validateMarkersManifest(out, draft, nil, markers, 2, nil)
 	if err == nil || !strings.Contains(err.Error(), `unknown field "number"`) {
 		t.Fatalf("validation error = %v, want explicit unknown number field", err)
+	}
+}
+
+// TestValidateMarkersManifestRejectsUndeclaredNarration is the agent-side half of the
+// coverage contract. Nine books had an interlude dropped by an agent that WAS consulted
+// and answered confidently: the numbering contract it was checked against had nothing to
+// say about audio left out of the map. Now a drop has to be declared to be accepted.
+func TestValidateMarkersManifestRejectsUndeclaredNarration(t *testing.T) {
+	// A map that skips a 1000s interlude between chapters 2 and 3 - perfectly numbered.
+	write := func(t *testing.T) string {
+		t.Helper()
+		out := t.TempDir()
+		raw := `{
+			"source":"/x/book.m4b","style":"markers","duration":5000,"chapter_count":3,
+			"chapters":[
+				{"chapter":1,"start":20,"end":1000,"duration":980},
+				{"chapter":2,"start":1000,"end":2000,"duration":1000},
+				{"chapter":3,"start":3000,"end":4980,"duration":1980}]
+		}`
+		if err := os.WriteFile(filepath.Join(out, audio.ManifestName), []byte(raw), 0o644); err != nil { //nolint:gosec // test artifact
+			t.Fatal(err)
+		}
+		return out
+	}
+	draft := audio.Manifest{Source: "/x/book.m4b", Style: audio.StyleMarkers, Duration: 5000}
+	markers := []audio.Marker{
+		{Title: "Opening Credits", Start: 0, End: 20},
+		{Title: "Chapter 1", Start: 20, End: 1000},
+		{Title: "Chapter 2", Start: 1000, End: 2000},
+		{Title: "Interlude", Start: 2000, End: 3000},
+		{Title: "Chapter 3", Start: 3000, End: 4980},
+		{Title: "End Credits", Start: 4980, End: 5000},
+	}
+
+	err := validateMarkersManifest(write(t), draft, nil, markers, 5000, nil)
+	if err == nil {
+		t.Fatal("a map that silently drops a 1000s Interlude was accepted")
+	}
+	if !strings.Contains(err.Error(), "Interlude") {
+		t.Errorf("error = %v, want it to name the dropped Interlude so the retry can fix it", err)
+	}
+
+	// DECLARING the exclusion is what makes it acceptable - that is the whole mechanism,
+	// since a bundled preview of the NEXT book genuinely must be left out.
+	declared := []markerExclusion{{Title: "Interlude", Start: 2000, End: 3000, Reason: "preview of another book"}}
+	if err := validateMarkersManifest(write(t), draft, nil, markers, 5000, declared); err != nil {
+		t.Errorf("a declared exclusion was still rejected: %v", err)
+	}
+
+	// Credits at the edges never need declaring; they are ordinary non-chapter audio.
+	full := t.TempDir()
+	raw := `{
+		"source":"/x/book.m4b","style":"markers","duration":5000,"chapter_count":4,
+		"chapters":[
+			{"chapter":1,"start":20,"end":1000,"duration":980},
+			{"chapter":2,"start":1000,"end":2000,"duration":1000},
+			{"chapter":3,"start":2000,"end":3000,"duration":1000},
+			{"chapter":4,"start":3000,"end":4980,"duration":1980}]
+	}`
+	if err := os.WriteFile(filepath.Join(full, audio.ManifestName), []byte(raw), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+	if err := validateMarkersManifest(full, draft, nil, markers, 5000, nil); err != nil {
+		t.Errorf("a complete map was rejected over its 20s credits: %v", err)
 	}
 }
 
@@ -1351,16 +1416,11 @@ func TestMarkersPromptExplainsVocabularyGap(t *testing.T) {
 			t.Errorf("gap prompt missing %q", want)
 		}
 	}
-	// The existing rules must survive alongside it - the new section explains how to
-	// read announced numbers, it does not license numbering by position.
-	if !strings.Contains(got, "NEVER infer chapter numbers merely from the marker count") {
-		t.Error("gap prompt dropped the infer-from-count prohibition")
-	}
-	// ...and it must not NARROW the decline criteria the Output section lists. A book
-	// whose bare-number titles state a clean order can still be undeliverable (one
-	// marker holding several chapters), and the section must not read as "an order you
-	// can see means map it anyway".
-	if !strings.Contains(got, "one marker holds several chapters") {
+	// It must not NARROW the decline criteria the Output section lists. A book whose
+	// titles state a clean order can still be undeliverable (one marker holding several
+	// chapters), and the section must not read as "an order you can see means map it
+	// anyway".
+	if !strings.Contains(got, "holds several chapters") {
 		t.Error("gap prompt narrowed the decline criteria: the other not-confident cases must stay stated")
 	}
 
@@ -1372,6 +1432,53 @@ func TestMarkersPromptExplainsVocabularyGap(t *testing.T) {
 	}
 	if strings.Contains(got, "recognized NONE") {
 		t.Error("the vocabulary-gap section must not render when markers WERE recognized")
+	}
+}
+
+// TestMarkersPromptStatesTheCoverageContract pins the rules that stop a mapping from
+// losing narration, in BOTH renderings of the template. They are prompt-side halves of a
+// mechanical check - the validator rejects an undeclared hole - so a prompt that stopped
+// stating them would turn a clean run into a retry loop the agent cannot diagnose.
+//
+// The verdict's "excluded" key is pinned for the same reason audit.json's shape is: it is
+// read by a Go struct, and an agent that never learns the key can only fail validation.
+func TestMarkersPromptStatesTheCoverageContract(t *testing.T) {
+	base := markersPromptData{Title: "Garden of Sanctuary", Authors: "pirateaba", Style: "markers", Duration: 112389, ChapterCount: 19}
+	for _, gap := range []bool{true, false} {
+		data := base
+		data.NoneRecognized, data.MarkersSeen = gap, 25
+		got, err := prompts.Render("markers.md", data)
+		if err != nil {
+			t.Fatalf("render (gap=%v): %v", gap, err)
+		}
+		for _, want := range []string{
+			"Account for every second", // the coverage rule itself
+			"Interlude",                // named, because it is the shape that lost 61 hours
+			"When in doubt, INCLUDE",   // the tie-breaker, in the safe direction
+			`"excluded"`,               // the verdict key the Go reader parses
+			"bloopers or outtakes",     // the exclusions that must stay possible
+			"DIFFERENT",                // ...including a preview of another book
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("gap=%v: markers.md no longer states %q", gap, want)
+			}
+		}
+	}
+}
+
+// TestMarkerExclusionShapeMatchesPrompt pins the verdict JSON the prompt shows against the
+// struct that reads it, so the two cannot drift apart silently. audit_verify.md drifted
+// exactly this way and parked a finished book one cosmetic key from done.
+func TestMarkerExclusionShapeMatchesPrompt(t *testing.T) {
+	var v markerVerdict
+	sample := `{"confident":true,"reason":"r","excluded":[{"title":"End Credits","start":89962.4,"end":89998.1,"reason":"closing credits"}]}`
+	dec := json.NewDecoder(strings.NewReader(sample))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&v); err != nil {
+		t.Fatalf("the shape markers.md documents does not parse into markerVerdict: %v", err)
+	}
+	if len(v.Excluded) != 1 || v.Excluded[0].Title != "End Credits" || v.Excluded[0].End != 89998.1 {
+		t.Fatalf("decoded = %+v", v)
 	}
 }
 

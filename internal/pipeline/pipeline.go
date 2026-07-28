@@ -440,15 +440,30 @@ func (e *Executor) inspect(ctx context.Context, book store.Book, r scheduler.Sta
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("inspect: %w", err)
 	}
-	// Name the vocabulary gap out loud. An empty manifest from a file that HAS a full
-	// marker table is a one-line parser gap with a free deterministic recovery, but in
-	// the log it used to be indistinguishable from a genuinely markerless file - so
-	// every new marker dialect had to be rediscovered by hand from a parked book.
-	if markers.NoneRecognized() && r.Note != nil {
-		r.Note(fmt.Sprintf(
-			"%s present, but none in a chapter-marker format this build recognizes - "+
-				"the draft manifest is empty and marker normalization will try to map them",
-			countNoun(markers.Seen, "embedded chapter marker")))
+	if r.Note != nil {
+		// Name the vocabulary gap out loud. An empty manifest from a file that HAS a full
+		// marker table is a one-line parser gap with a free deterministic recovery, but in
+		// the log it used to be indistinguishable from a genuinely markerless file - so
+		// every new marker dialect had to be rediscovered by hand from a parked book.
+		if markers.NoneRecognized() {
+			r.Note(fmt.Sprintf(
+				"%s present, but none in a chapter-marker format this build recognizes - "+
+					"the draft manifest is empty and marker normalization will try to map them",
+				countNoun(markers.Seen, "embedded chapter marker")))
+		}
+		if markers.Positional {
+			r.Note(fmt.Sprintf(
+				"%s state no chapter numbers, but they tile the recording - numbered by marker order",
+				countNoun(markers.Seen, "embedded chapter marker")))
+		}
+		// Unmapped narration is the failure that used to be invisible: the numbering can
+		// look perfect while an unnumbered interlude, prologue or epilogue is dropped from
+		// the map entirely, never split and never transcribed. Name the spans and their
+		// marker titles so the reason a book routed to marker normalization is on the log.
+		if !markers.Complete {
+			r.Note("audio not covered by the draft chapter map, so marker normalization must map it: " +
+				audio.DescribeSpans(markers.Unmapped))
+		}
 	}
 	// Record the manifest chapter count so the ETA engine has a real per-book total
 	// for the per-chapter stages instead of its default. Best-effort bookkeeping (nil
@@ -457,14 +472,21 @@ func (e *Executor) inspect(ctx context.Context, book store.Book, r scheduler.Sta
 		_ = e.db.SetBookChapters(context.WithoutCancel(ctx), book.ID, manifest.ChapterCount)
 		_ = e.db.SetBookDuration(context.WithoutCancel(ctx), book.ID, manifest.Duration)
 	}
+	// MarkersContiguous is the persisted sentinel's routing flag; the verdict it carries
+	// is now Usable() - numbering AND coverage - because a map can number perfectly while
+	// losing hours of narration.
 	result := scheduler.StageResult{
-		MarkersContiguous: markers.Contiguous,
+		MarkersContiguous: markers.Usable(),
 		Metrics: metrics(map[string]any{
-			"style":         manifest.Style,
-			"chapter_count": manifest.ChapterCount,
-			"duration_sec":  manifest.Duration,
-			"contiguous":    markers.Contiguous,
-			"markers_seen":  markers.Seen,
+			"style":            manifest.Style,
+			"chapter_count":    manifest.ChapterCount,
+			"duration_sec":     manifest.Duration,
+			"contiguous":       markers.Contiguous,
+			"complete":         markers.Complete,
+			"positional":       markers.Positional,
+			"markers_seen":     markers.Seen,
+			"unmapped_spans":   len(markers.Unmapped),
+			"unmapped_summary": audio.DescribeSpans(markers.Unmapped),
 		}),
 		RateSample: rateSample(1, time.Since(start).Seconds()),
 	}

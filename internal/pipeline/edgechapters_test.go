@@ -483,6 +483,89 @@ func TestClassifyEdgeChaptersUsesNarratedNumbering(t *testing.T) {
 	}
 }
 
+// TestClassifyEdgeChaptersPositionsInteriorUnnumberedSections is the "Garden of Sanctuary"
+// (The Wandering Inn 15) shape, which a single offset cannot describe: unnumbered sections
+// sit BETWEEN numbered chapters, and chapter 10 is split across two files.
+//
+// The rule is round UP - an unnumbered section takes the number of the chapter it precedes -
+// because that is the direction that cannot leak. A listener who has finished chapter 10 has
+// necessarily heard the interlude before it; one who has only finished 9 has not, so gating
+// the interlude's material at 9 would disclose it early.
+func TestClassifyEdgeChaptersPositionsInteriorUnnumberedSections(t *testing.T) {
+	spoken := func(n int) string { return fmt.Sprintf("%d. The morning came slowly over the hills.", n) }
+	unnumbered := "The city of Pallass never truly slept, and Erin knew it."
+	// files 1-7 = chapters 1-7, 8 = Mini Stories, 9-10 = chapters 8-9, 11 = Interlude,
+	// 12-13 = chapter 10a/10b, 14-23 = chapters 11-20.
+	// 23 files is more than 2*edgeProbeDepth, so classifyBookEdges word-counts only files
+	// 1-8 and 16-23. The interior is UNPROBED - which is the realistic shape, and the one
+	// that matters: the announcements must still be read there, or the interlude at file 11
+	// is invisible to the numbering.
+	var chs []edgeChapter
+	add := func(file int, opening string) {
+		c := edgeChapter{Chapter: file, Opening: opening}
+		if file <= edgeProbeDepth || file > 23-edgeProbeDepth {
+			c.Words, c.HasTranscript, c.Probed, c.DurationSec = 5000, true, true, 5000
+		}
+		chs = append(chs, c)
+	}
+	for f := 1; f <= 7; f++ {
+		add(f, spoken(f))
+	}
+	add(8, unnumbered)
+	add(9, spoken(8))
+	add(10, spoken(9))
+	add(11, unnumbered)
+	add(12, spoken(10))
+	add(13, spoken(10))
+	for f := 14; f <= 23; f++ {
+		add(f, spoken(f-3))
+	}
+
+	got := classifyEdgeChapters(chs)
+	if got.LogicalCount != 20 {
+		t.Errorf("logical count = %d, want 20 - the book's own last chapter number, not its 23 audio files", got.LogicalCount)
+	}
+	if got.ConstantOffset() {
+		t.Error("ConstantOffset() = true, but files 1 and 14 sit at different shifts")
+	}
+	want := map[int]int{1: 1, 7: 7, 8: 8, 9: 8, 10: 9, 11: 10, 12: 10, 13: 10, 14: 11, 23: 20}
+	for file, wantPos := range want {
+		if pos, ok := got.PositionOf(file); !ok || pos != wantPos {
+			t.Errorf("PositionOf(file %d) = %d,%v; want %d", file, pos, ok, wantPos)
+		}
+	}
+	if len(got.FrontMatter) != 0 || len(got.EndMatter) != 0 {
+		t.Errorf("front=%v end=%v; every file here is inside the numbered range", got.FrontMatter, got.EndMatter)
+	}
+	// The assembly stage must be handed the mapping, not a formula it cannot satisfy.
+	for _, want := range []string{"do NOT shift", "audio files 1-8 hold chapters 1-8", "1-20"} {
+		if !strings.Contains(got.AssembleNote, want) {
+			t.Errorf("assemble note missing %q: %q", want, got.AssembleNote)
+		}
+	}
+}
+
+// TestNarratedNumberingIgnoresAStrayParse guards the believability rule. Only the
+// corroborated run is trusted outright; a lone opening that happens to parse as a number
+// must not renumber the book around it.
+func TestNarratedNumberingIgnoresAStrayParse(t *testing.T) {
+	var chs []edgeChapter
+	for f := 1; f <= 12; f++ {
+		opening := fmt.Sprintf("%d. Real narration follows here.", f)
+		if f == 9 {
+			opening = "Two. Words opened the door and he stepped through." // a stray parse
+		}
+		chs = append(chs, edgeChapter{Chapter: f, Words: 4000, HasTranscript: true, Probed: true, DurationSec: 3000, Opening: opening})
+	}
+	got := classifyEdgeChapters(chs)
+	if got.LogicalCount != 12 {
+		t.Errorf("logical count = %d, want 12; a stray 'Two.' in file 9 must not renumber the book", got.LogicalCount)
+	}
+	if pos, ok := got.PositionOf(9); !ok || pos != 9 {
+		t.Errorf("PositionOf(9) = %d,%v; want 9 - the stray announcement is discarded, not believed", pos, ok)
+	}
+}
+
 // With no announcements to read, the classifier keeps its previous positional behaviour
 // exactly - the overwhelming majority of books, whose prompts must render as before.
 func TestClassifyEdgeChaptersFallsBackWithoutAnnouncements(t *testing.T) {

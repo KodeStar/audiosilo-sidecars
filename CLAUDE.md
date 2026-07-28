@@ -139,33 +139,48 @@ internal/
             single-file marker books AND multi-file "files" books) and Split (ffmpeg
             each chapter -> mono/16k FLAC under chapters/, resumable via temp+rename,
             per-chapter progress, ctx-cancel clean). Pure/tool-driven, no scheduler deps.
-            chapterFromMarker's vocabulary covers "Chapter N[: Title]" (digits or
-            spelled-out), "N. Title", and bare-number tables ("001".."064"); an
-            unrecognized dialect drops those markers, and the resulting empty or
-            non-contiguous draft is what markers_normalizing's deterministic
-            ReparseMarkerManifest recovers for free after a parser upgrade (gated on
-            the draft being non-contiguous, so it never re-derives over an
-            agent-harvested map; it preserves the draft's Title AND Duration, since
-            the stage bounds the agent's intervals against that duration).
-            contiguous() gates routing either way. Inspect/Reparse return MarkerStats
-            {Seen,Recognized,Contiguous}: Seen>0 with Recognized==0 is a parser
-            vocabulary gap (free deterministic recovery), NOT a markerless file - the
-            two were indistinguishable in the metrics for three dialects running, so
-            inspect now records markers_seen and notes the condition, and markers.md
-            tells the agent to read probe.json and map an announced numbering the
-            parser missed WITHOUT narrowing the other decline criteria (an order it can
-            read is not by itself a reason to proceed - a marker holding several
-            chapters still parks). A StyleFiles book reports Seen/Recognized 0 (its
-            probe.json holds no marker table at all), so markers_seen never fabricates a
+            chapterFromMarker's vocabulary covers "Chapter N", with the title introduced
+            by punctuation, an underscore, or NOTHING BUT WHITESPACE ("Chapter 1
+            Suffering from Success", "Chapter 1 (Series Name)", "Chapter_1" - the literal
+            word "Chapter" is what makes a loose tail unambiguous), digits or
+            spelled-out, plus "N. Title" and bare-number tables ("001".."064", "-1-").
+            The tail still REQUIRES a separator, which is what keeps "Chapter 10a"
+            unrecognized: a split chapter announces one number twice and no contiguous
+            manifest can express that, so those books belong with the agent.
+            ROUTING IS MarkerStats.Usable() = Contiguous AND Complete, and both halves
+            are load-bearing. Contiguous is the numbering check. Complete is COVERAGE:
+            UnmappedSpans reports every run of recording time no chapter covers, with the
+            marker titles occupying it, and an interior run >= MaxInteriorGapSec (60s) or
+            an edge run >= MaxEdgeGapSec (180s) means narration was lost. Numbering alone
+            said nothing about it, so 27 books silently dropped 61 hours of Interludes,
+            Side Stories, Prologues and Epilogues - never split, never transcribed, no
+            park and no note, their sidecars written as though that audio did not exist.
+            The two thresholds are measured, not guessed: over the 294-book corpus
+            interior holes are bimodal (one 9s encoder artifact, then nothing until 211s,
+            above which all 173 are real narration), while the edges are where credits,
+            bloopers and retailer samples legitimately live. A title-only marker table
+            (no marker states any number) that TILES the recording is numbered by its own
+            time order - positionalChapters, MarkerStats.Positional - exactly as a
+            multi-file book is numbered by file order; refusing only for the single-file
+            case was an inconsistency, not a safety property. A GAPPY title-only table is
+            still not numbered: the hole is precisely what must reach a human.
+            ReparseMarkerManifest recovers a draft for free after a parser upgrade (gated
+            on the draft being non-contiguous, NOT on coverage - an agent-harvested map
+            legitimately has edge holes where it excluded credits, so widening the gate
+            would re-derive over the agent's work; it preserves the draft's Title AND
+            Duration, since the stage bounds the agent's intervals against that duration).
+            Inspect/Reparse return MarkerStats {Seen,Recognized,Contiguous,Positional,
+            Unmapped,Complete}: Seen>0 with Recognized==0 is a parser vocabulary gap, NOT
+            a markerless file - the two were indistinguishable in the metrics for three
+            dialects running. Recognized stays the honest PARSER count, so a positionally
+            numbered table reports Recognized 0 and Positional true rather than claiming a
+            dialect was understood. A StyleFiles book reports Seen/Recognized 0 (its
+            probe.json holds no marker table at all) and Complete true (its chapters are
+            laid end to end from each file's duration), so markers_seen never fabricates a
             dialect signal. The deterministic reparse records NO RateSample - it is a
             sub-millisecond re-derivation of a stage whose real cost is the agent round
             it skipped, so observing it would collapse the markers_normalizing EWMA (the
-            same rule as repair's free known-failed skip). KNOWN TRADEOFF: because a
-            fully-numbered bare-number table now parses contiguously, such a book skips
-            markers_normalizing entirely, so an INTERIOR non-chapter marker (a publisher
-            "Summary of Book N-1" mid-book) is no longer excluded by anyone -
-            classifyEdgeChapters gates only leading/trailing runs - and shifts every
-            later chapter's spoiler position by one. Edge credits stay covered.
+            same rule as repair's free known-failed skip).
   asr/      the ASR backend abstraction (M3a/M3b): Backend{ID,Detect,EnsureReady,
             Transcribe} over a normalized Job (audio/outDir/chapter/prompt/language),
             producing RAW per-chapter output byte-for-byte. Two backends behind
@@ -336,7 +351,21 @@ internal/
             M7 made contributing real (contrib_stage.go: slug reconcile -> skip-if-
             covered -> submit per contribution.mode, resume-idempotent via the
             contributions rows; export.go composes the download zip + core-proposal
-            JSON injected into api) - EVERY stage is now real. The load-bearing
+            JSON injected into api) - EVERY stage is now real.
+            markers_normalizing's manifest contract has a COVERAGE half alongside the
+            numbering one: validateMarkersManifest checks the corrected map against the
+            RAW marker table from probe.json (never the draft - the draft is exactly what
+            may have dropped a marker) and rejects any unmapped span the verdict did not
+            DECLARE in its `excluded` list (title/start/end/reason, surfaced as a stage
+            note). Nine books had interludes dropped by an agent that was consulted and
+            answered confidently, because numbering was all it was checked against.
+            Declaration rather than prohibition is deliberate: an omnibus file carrying a
+            preview or the whole NEXT book genuinely must leave audio out, so the rule is
+            that a drop must be stated, not that it is forbidden. markers.md correspondingly
+            tells the agent that an unnumbered narrative section (Interlude/Side Story/
+            Intermission/Prologue/Epilogue/"Chapter 10a") IS a chapter, that including it
+            shifts nothing (positions come from the narration later), and to INCLUDE when
+            in doubt. The load-bearing
             invariants live in
             the staging (synthesizing/auditing dirs hold NO transcripts, independent
             fact_pass chunk and QA partition dirs hold only their own chapter range and spoiler-bounded
@@ -350,7 +379,12 @@ internal/
             probes the first/last 8 chapters' transcript word counts (< 120 words AND
             < 180s duration at the edges only; probe-saturation and all-small books
             degrade to no exclusions) and derives the LOGICAL story-chapter count +
-            stage notes. Synthesis/audit/audit-verify/fix prompts and the mechanical
+            stage notes. It reads each chapter's OPENING for EVERY chapter, not just the
+            edges (256 bytes, unlike the whole-transcript word count) - the numbering
+            below is only as good as its coverage, and reading openings at the edges
+            alone left a long book's interior with no evidence, so any unnumbered
+            section in the middle had to be guessed around.
+            Synthesis/audit/audit-verify/fix prompts and the mechanical
             validateSidecars position cap use the logical count (sidecarStageInputs
             deliberately does not expose the raw manifest); the fact-pass CHUNK keeps
             file-numbered `## Chapter N` headings (matching staged transcripts + the
@@ -363,13 +397,32 @@ internal/
             opening "One more time" is rejected) and takes the offset from a run of
             >= minAnnouncementRun (3) CONSECUTIVE files announcing CONSECUTIVE numbers.
             Both conditions matter: one stray parse cannot shift a book, and files
-            repeating the same number (a stuck transcript) are not a numbering. Files
+            repeating the same number (a stuck transcript) are not a numbering. That run
+            is the ANCHOR - the only announcements trusted outright; the derivation then
+            extends outward, believing a further announcement only while it stays
+            monotone, so a stray parse outside the run is discarded rather than allowed to
+            renumber the book. Files
             before the first numbered chapter are FrontMatter (the meta schema's
             position 0 - an unnumbered Prologue is NOT chapter 1) and files past the
             last numbered one are EndMatter (an Epilogue/bloopers reel: outside the
             numbered range, its material belongs in the whole-book summaries, never a
             chapter-gated entry). With no agreeing run the classifier keeps the old
-            positional behaviour byte-identically. This was a real incident: a 64-file
+            positional behaviour byte-identically.
+            The result is a PER-FILE map (edgeClassification.Positions, read via
+            PositionOf), not one offset, because a single offset cannot describe a book
+            with unnumbered material in the MIDDLE - an Interlude between chapters 9 and
+            10, or a chapter split across "10a"/"10b". Such a file takes the number of the
+            chapter it PRECEDES: rounding UP is the direction that cannot leak, since
+            finishing chapter 10 implies having heard the interlude before it while
+            finishing 9 does not. Three cases must not be confused when filling the gaps:
+            a file that was read and announces nothing is unnumbered narrative (round up);
+            one that announced a number which was NOT believed is still a numbered chapter
+            (keep the shift); and one with no transcript at all is too (silence is not
+            evidence). Folding the last two in with the first collapsed a 59-chapter book
+            onto chapter 55. ConstantOffset() reports whether the map is a single shift,
+            so composeAssembleNote keeps its byte-identical "subtract N" sentence for the
+            common case and renders an explicit file->chapter run table only when it is
+            not - inventing a formula for a book that has none is the original error. This was a real incident: a 64-file
             book (Audible intro, unnumbered Prologue, chapters 1-59, Epilogue,
             bloopers, credits) counted as 62 logical chapters at offset 1, so EVERY
             reveal and recap gate sat a chapter early and the position cap allowed

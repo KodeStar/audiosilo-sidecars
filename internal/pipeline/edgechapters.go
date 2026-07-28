@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -72,12 +73,45 @@ type edgeClassification struct {
 	// schema's position 0. Both are empty unless deriveNarratedNumbering found the numbering.
 	FrontMatter []int
 	EndMatter   []int
-	// ChapterOffset is the derived file->chapter shift: audio file N holds spoken chapter
-	// N-ChapterOffset. It is len(ExcludedLeading) when the narration gave no usable evidence.
+	// ChapterOffset is the derived file->chapter shift at the START of the numbered range:
+	// audio file N holds spoken chapter N-ChapterOffset. It is len(ExcludedLeading) when the
+	// narration gave no usable evidence. It describes the WHOLE book only when Positions is
+	// a constant shift (see ConstantOffset) - a book carrying unnumbered interior sections
+	// has no single offset.
 	ChapterOffset int
-	EdgeNote      string
-	ChunkNote     string
-	AssembleNote  string
+	// Positions maps a manifest chapter number to the spoken story chapter it belongs to,
+	// for every retained file that has one. It is empty when the narration gave no usable
+	// evidence, in which case position IS the manifest number less ChapterOffset.
+	//
+	// It exists because a constant offset cannot express a book with unnumbered material
+	// in the MIDDLE. An interlude between chapters 9 and 10 belongs to chapter 10: rounding
+	// UP is what keeps a spoiler gated, since a listener who has finished chapter 10 has
+	// necessarily heard the interlude, while one who has only finished 9 has not.
+	Positions    map[int]int
+	EdgeNote     string
+	ChunkNote    string
+	AssembleNote string
+}
+
+// PositionOf returns the spoken story chapter a manifest chapter belongs to, and whether
+// it has one at all (end matter does not - it sits past the last numbered chapter).
+func (c edgeClassification) PositionOf(chapter int) (int, bool) {
+	if len(c.Positions) == 0 {
+		return chapter - c.ChapterOffset, true
+	}
+	p, ok := c.Positions[chapter]
+	return p, ok
+}
+
+// ConstantOffset reports whether every positioned chapter sits at the same shift, so the
+// mapping can be stated as one subtraction rather than as a table.
+func (c edgeClassification) ConstantOffset() bool {
+	for ch, pos := range c.Positions {
+		if ch-pos != c.ChapterOffset {
+			return false
+		}
+	}
+	return true
 }
 
 // classifyEdgeChapters classifies the maximal LEADING and TRAILING runs of non-narrative
@@ -127,31 +161,36 @@ func classifyEdgeChapters(chs []edgeChapter) edgeClassification {
 	logical := n - lead - trail
 	offset := lead
 	var frontMatter, endMatter []int
+	var positions map[int]int
 	// Prefer the numbering the narration actually announces over counting positions. Only a
 	// corroborated run overrides, and only when it leaves at least one numbered chapter.
-	if got, lastNumbered, ok := deriveNarratedNumbering(chs, lead, trail); ok && lastNumbered-got >= 1 {
-		offset = got
-		logical = lastNumbered - got
-		for i := lead; i < n-trail; i++ {
-			switch {
-			case chs[i].Chapter <= got:
-				frontMatter = append(frontMatter, chs[i].Chapter)
-			case chs[i].Chapter > lastNumbered:
-				endMatter = append(endMatter, chs[i].Chapter)
-			}
-		}
+	if num, ok := deriveNarratedNumbering(chs, lead, trail); ok && num.last >= 1 {
+		offset = num.offset
+		logical = num.last
+		frontMatter, endMatter, positions = num.frontMatter, num.endMatter, num.positions
 	}
-	return edgeClassification{
+	class := edgeClassification{
 		LogicalCount:     logical,
 		ExcludedLeading:  leading,
 		ExcludedTrailing: trailing,
 		FrontMatter:      frontMatter,
 		EndMatter:        endMatter,
 		ChapterOffset:    offset,
-		EdgeNote:         composeEdgeNote(logical, leading, trailing, frontMatter, endMatter),
-		ChunkNote:        composeChunkNote(leading, trailing),
-		AssembleNote:     composeAssembleNote(logical, leading, trailing, frontMatter, endMatter, offset),
+		Positions:        positions,
 	}
+	class.EdgeNote = composeEdgeNote(logical, leading, trailing, frontMatter, endMatter)
+	class.ChunkNote = composeChunkNote(leading, trailing)
+	class.AssembleNote = composeAssembleNote(class)
+	return class
+}
+
+// narratedNumbering is the file->chapter mapping read out of the narration.
+type narratedNumbering struct {
+	positions   map[int]int // manifest chapter number -> spoken story chapter
+	frontMatter []int
+	endMatter   []int
+	last        int // the highest spoken chapter number
+	offset      int // the shift at the first numbered file
 }
 
 // minAnnouncementRun is how many CONSECUTIVE audio files must announce consecutive chapter
@@ -163,8 +202,7 @@ const minAnnouncementRun = 3
 
 // deriveNarratedNumbering reads the chapter number the narration ANNOUNCES in each probed
 // retained file and derives the real file->chapter mapping from it, rather than assuming every
-// retained file is a numbered chapter. It returns the offset (audio file N holds chapter
-// N-offset) and the last file that is still a numbered chapter.
+// retained file is a numbered chapter.
 //
 // This exists because position among the retained files is NOT the chapter number whenever a
 // book carries unnumbered narrative sections. The live case: an Audible intro (file 1,
@@ -175,15 +213,23 @@ const minAnnouncementRun = 3
 // narration says "One."/"Two."/"Three." in files 3/4/5, which fixes the offset at 2, and
 // "Fifty-nine." in file 61, which fixes the numbered range at 59.
 //
-// It is pure (openings are carried on edgeChapter) and conservative in both directions: with
-// no agreeing run it reports ok=false and nothing changes, and it only shrinks the numbered
-// range when the TRAILING probe window positively identifies the last numbered file - a book
-// whose trailing openings simply do not parse keeps every retained file.
-func deriveNarratedNumbering(chs []edgeChapter, lead, trail int) (offset, lastNumbered int, ok bool) {
+// A single offset cannot describe a book with unnumbered material in the MIDDLE (an
+// Interlude between chapters 9 and 10, a chapter split into "10a" and "10b"), so the mapping
+// is per file. An unnumbered interior file takes the number of the NEXT announced chapter:
+// rounding up is the direction that cannot leak, because finishing that chapter implies
+// having heard the section, whereas the preceding chapter does not.
+//
+// It is pure (openings are carried on edgeChapter) and conservative: with no agreeing run it
+// reports ok=false and nothing changes, and an announcement is only believed when it is
+// consistent with the corroborated run, so one chapter opening "One more time" cannot shift a
+// book.
+func deriveNarratedNumbering(chs []edgeChapter, lead, trail int) (narratedNumbering, bool) {
 	n := len(chs)
 	announced := make(map[int]int, n) // index -> announced chapter number
 	for i := lead; i < n-trail; i++ {
-		if !chs[i].Probed || chs[i].Opening == "" {
+		// Deliberately NOT gated on Probed: an opening is read for every chapter (see
+		// classifyBookEdges), and the numbering is only as reliable as its coverage.
+		if chs[i].Opening == "" {
 			continue
 		}
 		if num, got := audio.SpokenChapterNumber(chs[i].Opening); got {
@@ -192,38 +238,95 @@ func deriveNarratedNumbering(chs []edgeChapter, lead, trail int) (offset, lastNu
 	}
 	// The longest run of consecutive files whose announcements also run consecutively. Both
 	// must hold: consecutive files announcing 7, 7, 7 (a stuck transcript) is not a numbering.
-	bestLen, bestOffset := 0, 0
-	runLen, runOffset := 0, 0
+	// That run is the ANCHOR - the only announcements trusted without corroboration.
+	bestLen, bestStart := 0, -1
+	runLen := 0
 	for i := lead; i < n-trail; i++ {
 		num, got := announced[i]
 		if !got {
 			runLen = 0
 			continue
 		}
-		thisOffset := chs[i].Chapter - num
-		if runLen > 0 && thisOffset == runOffset && announced[i-1] == num-1 {
+		if runLen > 0 && announced[i-1] == num-1 && chs[i].Chapter == chs[i-1].Chapter+1 {
 			runLen++
 		} else {
-			runLen, runOffset = 1, thisOffset
+			runLen = 1
 		}
 		if runLen > bestLen {
-			bestLen, bestOffset = runLen, runOffset
+			bestLen, bestStart = runLen, i-runLen+1
 		}
 	}
 	if bestLen < minAnnouncementRun {
-		return 0, 0, false
+		return narratedNumbering{}, false
 	}
-	// The last numbered file, sought only within the TRAILING probe window: outside it the
-	// openings were never read, so a leading-run match must not be mistaken for the end of the
-	// book. No match in that window means "cannot tell" - keep every retained file.
-	lastNumbered = chs[n-trail-1].Chapter
-	for i := n - trail - 1; i >= lead && i >= n-edgeProbeDepth; i-- {
-		if num, got := announced[i]; got && chs[i].Chapter-num == bestOffset {
-			lastNumbered = chs[i].Chapter
-			break
+
+	// Keep the anchor run, then extend outward, believing a further announcement only while
+	// it stays monotone with what is already established. A stray parse outside the run is
+	// dropped rather than allowed to renumber the book.
+	kept := make(map[int]int, n)
+	for i := bestStart; i < bestStart+bestLen; i++ {
+		kept[i] = announced[i]
+	}
+	first, last := bestStart, bestStart+bestLen-1
+	for i := last + 1; i < n-trail; i++ {
+		if num, got := announced[i]; got && num >= kept[last] {
+			kept[i], last = num, i
 		}
 	}
-	return bestOffset, lastNumbered, true
+	for i := first - 1; i >= lead; i-- {
+		if num, got := announced[i]; got && num <= kept[first] {
+			kept[i], first = num, i
+		}
+	}
+
+	// Every retained file now takes a position, and three cases must not be confused:
+	//
+	//   - Read, and announces nothing: genuinely unnumbered narrative, so it belongs to the
+	//     next announced chapter (rounding up, which cannot leak).
+	//   - Read, announced a number that was NOT believed: still a numbered chapter - it did
+	//     open with a number - so it keeps the shift in force.
+	//   - Not read at all (no transcript): silence is not evidence, so it keeps the shift too.
+	//
+	// Folding the last two in with the first collapsed a 59-chapter book onto chapter 55.
+	num := narratedNumbering{
+		positions: make(map[int]int, n),
+		last:      kept[last],
+		offset:    chs[first].Chapter - kept[first],
+	}
+	nextAnnounced := make(map[int]int, n)
+	for i, next := n-trail-1, 0; i >= lead; i-- {
+		if k, got := kept[i]; got {
+			next = k
+		}
+		nextAnnounced[i] = next
+	}
+	shift := chs[first].Chapter - kept[first]
+	for i := lead; i < n-trail; i++ {
+		if announcedHere, got := kept[i]; got {
+			shift = chs[i].Chapter - announcedHere
+			num.positions[chs[i].Chapter] = announcedHere
+			continue
+		}
+		_, parsed := announced[i]
+		switch {
+		// A file that ANNOUNCED a number which was not believed (it contradicted the
+		// corroborated run) is still a numbered chapter - it opened with a number - so it
+		// keeps the shift in force rather than being folded into its neighbour. Same for a
+		// file with no transcript to read at all: silence is not evidence of anything.
+		case parsed || chs[i].Opening == "":
+			num.positions[chs[i].Chapter] = chs[i].Chapter - shift
+		case i > last:
+			num.endMatter = append(num.endMatter, chs[i].Chapter)
+		case i < first:
+			num.frontMatter = append(num.frontMatter, chs[i].Chapter)
+			num.positions[chs[i].Chapter] = 0
+		// Read, and announced nothing: an unnumbered narrative section, which belongs to the
+		// chapter it precedes.
+		default:
+			num.positions[chs[i].Chapter] = nextAnnounced[i]
+		}
+	}
+	return num, true
 }
 
 // nonNarrative reports whether an edge chapter is a non-narrative intro/credits file: it must
@@ -368,11 +471,29 @@ func unnumberedPhrase(frontMatter, endMatter []int, logical int) string {
 	return joinSentences(parts...)
 }
 
-func composeAssembleNote(logical int, leading, trailing, frontMatter, endMatter []int, offset int) string {
-	if len(leading) == 0 && len(trailing) == 0 && len(frontMatter) == 0 && len(endMatter) == 0 {
+func composeAssembleNote(c edgeClassification) string {
+	logical, offset := c.LogicalCount, c.ChapterOffset
+	if len(c.ExcludedLeading) == 0 && len(c.ExcludedTrailing) == 0 &&
+		len(c.FrontMatter) == 0 && len(c.EndMatter) == 0 && c.ConstantOffset() {
 		return ""
 	}
-	prefix := joinSentences(edgeFilesPhrase(leading, trailing), unnumberedPhrase(frontMatter, endMatter, logical))
+	prefix := joinSentences(
+		edgeFilesPhrase(c.ExcludedLeading, c.ExcludedTrailing),
+		unnumberedPhrase(c.FrontMatter, c.EndMatter, logical))
+	// A book whose unnumbered material sits only at the ENDS shifts by one constant, so the
+	// mapping states as a single subtraction. One with unnumbered material in the MIDDLE (an
+	// interlude, a split "10a"/"10b") does not, and must be given the mapping explicitly -
+	// inventing a formula for it is exactly the error that put every gate a chapter out.
+	if !c.ConstantOffset() {
+		return joinSentences(prefix, fmt.Sprintf(
+			"This is the one renumbering boundary: the fact files' [chN] attributions are FILE"+
+				" numbers, and this book's audio files do NOT shift onto the spoken story chapters"+
+				" by a single constant, because it carries unnumbered sections between numbered"+
+				" chapters. The mapping is: %s. An unnumbered section belongs to the chapter it"+
+				" precedes, and two files of one chapter share that chapter's number. Write the"+
+				" final knowledge sheet keyed by SPOKEN story chapter numbers %s.",
+			describeFileRuns(c), logicalRangeText(logical)))
+	}
 	if offset == 0 {
 		return joinSentences(prefix, fmt.Sprintf(
 			"The fact files' [chN] attributions are already the spoken story-chapter numbers;"+
@@ -385,6 +506,44 @@ func composeAssembleNote(logical int, leading, trailing, frontMatter, endMatter 
 			" FILE numbers. Write the final knowledge sheet keyed by SPOKEN story chapter numbers"+
 			" %s, subtracting %d from each fact file's chapter number.",
 		offset, offset+1, offset+logical, logical, logicalRangeText(logical), offset))
+}
+
+// describeFileRuns renders a non-constant mapping compactly, by grouping consecutive files
+// that share one shift: "audio files 1-8 hold chapters 1-8; files 9-11 hold chapters 8-10".
+// Listing every file individually would run to hundreds of pairs on a real book.
+func describeFileRuns(c edgeClassification) string {
+	files := make([]int, 0, len(c.Positions))
+	for ch := range c.Positions {
+		files = append(files, ch)
+	}
+	sort.Ints(files)
+
+	var parts []string
+	flush := func(from, to int) {
+		fromPos, toPos := c.Positions[from], c.Positions[to]
+		noun := fmt.Sprintf("audio file %d", from)
+		if from != to {
+			noun = fmt.Sprintf("audio files %d-%d", from, to)
+		}
+		what := fmt.Sprintf("chapter %d", fromPos)
+		if fromPos != toPos {
+			what = fmt.Sprintf("chapters %d-%d", fromPos, toPos)
+		}
+		parts = append(parts, noun+" hold "+what)
+	}
+	runFrom := files[0]
+	for i := 1; i <= len(files); i++ {
+		contiguousRun := i < len(files) &&
+			files[i] == files[i-1]+1 &&
+			c.Positions[files[i]]-files[i] == c.Positions[files[i-1]]-files[i-1]
+		if !contiguousRun {
+			flush(runFrom, files[i-1])
+			if i < len(files) {
+				runFrom = files[i]
+			}
+		}
+	}
+	return strings.Join(parts, "; ")
 }
 
 // joinIntsAnd renders a small int list in prose: "1", "1 and 78", "1, 2 and 78".
@@ -442,19 +601,25 @@ func classifyBookEdges(workDir string) (edgeClassification, error) {
 	n := len(m.Chapters)
 	chs := make([]edgeChapter, 0, n)
 	for i, ch := range m.Chapters {
+		// The chapter's OPENING is read for EVERY chapter, not just the edges. Word counting
+		// reads a whole transcript, so it stays bounded to the edges where it is needed; an
+		// opening is 256 bytes, and the numbering derived from it is only as good as its
+		// coverage. Reading it at the edges alone left the entire interior of a long book
+		// unnumbered evidence-wise, so any unnumbered section in the middle had to be guessed
+		// around - and a book carrying interludes is exactly the shape that needs it.
+		opening, err := chapterOpening(workDir, ch.Chapter)
+		if err != nil {
+			return edgeClassification{}, fmt.Errorf("edge classify: read chapter %d opening: %w", ch.Chapter, err)
+		}
 		if n > 2*edgeProbeDepth && i >= edgeProbeDepth && i < n-edgeProbeDepth {
 			// Unprobed interior narrative sentinel (Probed:false, so nonNarrative is false). It
 			// bounds any edge run before it can reach the interior without reading a transcript.
-			chs = append(chs, edgeChapter{Chapter: ch.Chapter})
+			chs = append(chs, edgeChapter{Chapter: ch.Chapter, Opening: opening})
 			continue
 		}
 		words, present, err := chapterWordCount(workDir, ch.Chapter)
 		if err != nil {
 			return edgeClassification{}, fmt.Errorf("edge classify: count chapter %d words: %w", ch.Chapter, err)
-		}
-		opening, err := chapterOpening(workDir, ch.Chapter)
-		if err != nil {
-			return edgeClassification{}, fmt.Errorf("edge classify: read chapter %d opening: %w", ch.Chapter, err)
 		}
 		chs = append(chs, edgeChapter{Chapter: ch.Chapter, Words: words, HasTranscript: present, Probed: true, DurationSec: ch.Duration, Opening: opening})
 	}
