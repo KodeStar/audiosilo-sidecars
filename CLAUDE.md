@@ -631,7 +631,17 @@ internal/
             the same helper) are applied at scan time and reflected live on
             completed jobs via read-time patches; OverrideService owns the
             validate -> resolve -> persist -> reflect workflow (store injected as
-            a PersistFunc, so metaops still never imports store). Deps: stdlib
+            a PersistFunc, so metaops still never imports store). A patch's
+            HIDDEN flag is authoritative, but its COVERAGE is only the verdict as
+            of the match, so both it and every resolved verdict carry a monotonic
+            generation and snapshotLocked applies the NEWEST - a match reflects
+            instantly, and this job's (and every later scan's) resolution
+            supersedes it. Upstream gains sidecars over time, so an
+            unconditional patch froze a manual match's verdict forever: works
+            whose characters/recaps had since merged kept reporting "needed",
+            their badges never went green, and "exclude already covered" never
+            dropped them - through rescans AND restarts, since restoreCache
+            re-seeds the patch from the cached snapshot. Deps: stdlib
             HTTP + the meta module + audiosilo-server/pkg/match.
   events/   SSE hub: Publish -> monotonic-id fan-out, ring-buffer replay from
             Last-Event-ID, ephemeral heartbeats, slow-subscriber eviction, optional

@@ -104,7 +104,7 @@ func (m *ScanManager) restoreCache() {
 
 		// Move user-controlled state out of the cached base and into an explicit
 		// overlay. That makes a later false/nil ApplyOverride authoritative.
-		patch := overridePatch{hidden: book.Hidden}
+		patch := overridePatch{hidden: book.Hidden, gen: m.nextGenLocked()}
 		book.Hidden = false
 		if coverage.MatchedBy == "manual" {
 			manual := coverage
