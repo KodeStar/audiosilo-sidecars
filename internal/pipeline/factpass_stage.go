@@ -75,7 +75,7 @@ type factAssemblePromptData struct {
 func (e *Executor) factPass(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
 	plan, err := loadChunkPlan(book.WorkDir)
 	if err != nil {
-		return scheduler.StageResult{}, fmt.Errorf("fact_pass: load chunk plan (spelling_research must run first): %w", err)
+		return scheduler.StageResult{}, fmt.Errorf("fact_pass: load chunk plan (%s must run first): %w", chunkPlanAuthor(book), err)
 	}
 	if len(plan.Chunks) == 0 {
 		return scheduler.StageResult{}, fmt.Errorf("fact_pass: chunk plan has no chunks")
@@ -221,14 +221,20 @@ func (e *Executor) factPassChunk(ctx context.Context, book store.Book, r schedul
 		return agentUsage{}, 0, err
 	}
 
-	// The chunk's spelling sheet is a hard requirement (correcting produced it).
-	sheet := spelling.SheetName(chunk.To)
-	sheetSrc := filepath.Join(book.WorkDir, factsDir, sheet)
-	if !fsutil.IsFile(sheetSrc) {
-		return agentUsage{}, 0, fmt.Errorf("fact_pass: chunk %d spelling sheet %s missing (correcting must run first)", idx+1, filepath.Join(factsDir, sheet))
-	}
-	if err := st.CopyFile(sheetSrc, sheet); err != nil {
-		return agentUsage{}, 0, fmt.Errorf("fact_pass: stage spelling sheet: %w", err)
+	// The spoiler-bounded spelling sheet is what lets the agent trust a proper noun
+	// the ASR may have mangled, so on the audio path it is a hard requirement that
+	// correcting produced. An ebook has exact spellings by construction and never
+	// runs the spelling stages, so there is no sheet and none is wanted.
+	sheet := ""
+	if state.ParseKind(book.Kind) != state.KindEbook {
+		sheet = spelling.SheetName(chunk.To)
+		sheetSrc := filepath.Join(book.WorkDir, factsDir, sheet)
+		if !fsutil.IsFile(sheetSrc) {
+			return agentUsage{}, 0, fmt.Errorf("fact_pass: chunk %d spelling sheet %s missing (correcting must run first)", idx+1, filepath.Join(factsDir, sheet))
+		}
+		if err := st.CopyFile(sheetSrc, sheet); err != nil {
+			return agentUsage{}, 0, fmt.Errorf("fact_pass: stage spelling sheet: %w", err)
+		}
 	}
 
 	// The predecessor is safe context for every independent chunk. Current-book
@@ -245,15 +251,17 @@ func (e *Executor) factPassChunk(ctx context.Context, book store.Book, r schedul
 		hasInherited = true
 	}
 
-	// The chunk's corrected chapters ONLY - the load-bearing spoiler-scope invariant.
+	// The chunk's chapters ONLY - the load-bearing spoiler-scope invariant. The
+	// directory differs by kind but the [from,to] bound does not.
+	textDir := chapterTextDir(book)
 	for k := chunk.From; k <= chunk.To; k++ {
-		rel := filepath.Join(spelling.CorrectedDir, transcript.TextName(k))
+		rel := filepath.Join(textDir, transcript.TextName(k))
 		src := filepath.Join(book.WorkDir, rel)
 		if !fsutil.IsFile(src) {
 			continue // a genuinely absent chapter file is skipped; never reach outside [from,to]
 		}
 		if err := st.CopyFile(src, rel); err != nil {
-			return agentUsage{}, 0, fmt.Errorf("fact_pass: stage corrected chapter %d: %w", k, err)
+			return agentUsage{}, 0, fmt.Errorf("fact_pass: stage chapter %d text: %w", k, err)
 		}
 	}
 
@@ -325,9 +333,12 @@ func (e *Executor) assembleFacts(ctx context.Context, book store.Book, r schedul
 			return agentUsage{}, fmt.Errorf("fact_pass: stage %s for assembly: %w", name, err)
 		}
 	}
-	finalSpellingSheet := spelling.SheetName(plan.Chunks[len(plan.Chunks)-1].To)
-	if err := st.CopyFile(filepath.Join(book.WorkDir, factsDir, finalSpellingSheet), finalSpellingSheet); err != nil {
-		return agentUsage{}, fmt.Errorf("fact_pass: stage final spelling sheet for assembly: %w", err)
+	finalSpellingSheet := ""
+	if state.ParseKind(book.Kind) != state.KindEbook {
+		finalSpellingSheet = spelling.SheetName(plan.Chunks[len(plan.Chunks)-1].To)
+		if err := st.CopyFile(filepath.Join(book.WorkDir, factsDir, finalSpellingSheet), finalSpellingSheet); err != nil {
+			return agentUsage{}, fmt.Errorf("fact_pass: stage final spelling sheet for assembly: %w", err)
+		}
 	}
 	hasInherited := hasCarryover && pred != nil
 	if hasInherited {

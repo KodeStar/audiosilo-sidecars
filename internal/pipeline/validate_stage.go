@@ -12,6 +12,7 @@ import (
 	"github.com/kodestar/audiosilo-meta/pkg/extract"
 	"github.com/kodestar/audiosilo-meta/pkg/model"
 
+	"github.com/kodestar/audiosilo-sidecars/internal/ebook"
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/spelling"
@@ -77,7 +78,7 @@ func (e *Executor) validateSidecarsStage(ctx context.Context, book store.Book, r
 	}
 
 	// No-verbatim n-gram check against both transcript layers: every overlap is an ERROR.
-	ngramFindings, err := ngramCheck(book.WorkDir, charsPath, recapsPath)
+	ngramFindings, err := ngramCheck(book, book.WorkDir, charsPath, recapsPath)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("validating: ngram check: %w", err)
 	}
@@ -145,7 +146,7 @@ func decodeForValidation(charsPath, recapsPath string) (*model.Characters, *mode
 // overlap is a finding naming the locus, the source layer, and the offending run. A
 // layer that does not exist (or holds no .txt files) is skipped; a genuine read
 // failure inside the check is returned as an error.
-func ngramCheck(workDir, charsPath, recapsPath string) ([]string, error) {
+func ngramCheck(book store.Book, workDir, charsPath, recapsPath string) ([]string, error) {
 	var findings []string
 	sidecars := []string{charsPath, recapsPath}
 	sources := []struct {
@@ -155,10 +156,22 @@ func ngramCheck(workDir, charsPath, recapsPath string) ([]string, error) {
 		{"transcripts-text", filepath.Join(workDir, transcript.TextDir)},
 		{"transcripts-corrected", filepath.Join(workDir, spelling.CorrectedDir)},
 	}
+	if state.ParseKind(book.Kind) == state.KindEbook {
+		// The epub text is the only source layer, and checking against it is STRICTER
+		// than the audio equivalent: ASR mangles a word inside an otherwise copied run
+		// and hides the overlap, whereas the agent here read the exact published
+		// sentence, so a surviving run is a real one.
+		sources = []struct {
+			label string
+			dir   string
+		}{{"book text", filepath.Join(workDir, ebook.TextDir)}}
+	}
+	checked := 0
 	for _, src := range sources {
 		if !hasTxtFiles(src.dir) {
 			continue
 		}
+		checked++
 		hits, err := extract.NGram(src.dir, sidecars, ngramShingle)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", src.label, err)
@@ -168,6 +181,13 @@ func ngramCheck(workDir, charsPath, recapsPath string) ([]string, error) {
 				"near-verbatim overlap (%d words) at %s in %s vs %s: %q",
 				h.Words, h.Locus, filepath.Base(h.File), src.label, h.Text))
 		}
+	}
+	// A check that measured nothing is not a clean check. Silently skipping every
+	// layer would report "no verbatim overlap" for a book whose source text was never
+	// compared - exactly the reassuring-but-empty result the copyright rule cannot
+	// afford, since nothing downstream re-runs it.
+	if checked == 0 {
+		return nil, fmt.Errorf("no source text layer to check the sidecars against; the n-gram check would pass vacuously")
 	}
 	return findings, nil
 }

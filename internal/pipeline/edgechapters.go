@@ -598,6 +598,9 @@ func classifyBookEdges(workDir string) (edgeClassification, error) {
 	if err != nil {
 		return edgeClassification{}, fmt.Errorf("edge classify: read manifest (inspect must run first): %w", err)
 	}
+	if m.Style == audio.StyleEbook {
+		return classifyEbookEdges(m), nil
+	}
 	n := len(m.Chapters)
 	chs := make([]edgeChapter, 0, n)
 	for i, ch := range m.Chapters {
@@ -681,4 +684,25 @@ func noteEdgeExclusions(r scheduler.StageReport, class edgeClassification) {
 	}
 	msg += fmt.Sprintf("; audio file N holds spoken chapter N-%d", class.ChapterOffset)
 	r.Note(msg)
+}
+
+// classifyEbookEdges is the ebook counterpart: the manifest IS the logical universe,
+// so the count is all there is to derive.
+//
+// It exists because the audio classifier would be actively WRONG here, and wrong in
+// a way nothing downstream could detect. That classifier excludes an edge chapter
+// that is both short in words and short in duration - and an ebook manifest carries
+// no durations, so the duration half of the test passes for every chapter. The word
+// half alone would then exclude a genuinely short opening chapter, and
+// composeAssembleNote would tell the assembler that file N holds spoken chapter N-1.
+// Every fact would shift one chapter earlier, so every character reveal and every
+// recap would be gated one chapter too soon: mechanically valid, structurally
+// invisible, and a spoiler leak across the whole book.
+//
+// No such classification is needed anyway. extracting already quarantined the
+// front matter, the back matter and any suspected cross-book excerpt from the
+// table of contents, then numbered the survivors 1..N - so nothing INSIDE the
+// manifest is non-story, and there is no file-to-chapter offset to explain.
+func classifyEbookEdges(m audio.Manifest) edgeClassification {
+	return edgeClassification{LogicalCount: len(m.Chapters)}
 }
