@@ -14,11 +14,16 @@ import (
 // opaque metrics. It is persisted inside the sentinel so a crash-resume that
 // skips re-execution can still recover the branch and advance correctly.
 type StageResult struct {
-	MarkersContiguous  bool            `json:"markers_contiguous,omitempty"`
-	QAClean            bool            `json:"qa_clean,omitempty"`
-	RetranscribeNeeded bool            `json:"retranscribe_needed,omitempty"`
-	AuditPassed        bool            `json:"audit_passed,omitempty"`
-	Metrics            json.RawMessage `json:"metrics,omitempty"`
+	MarkersContiguous  bool `json:"markers_contiguous,omitempty"`
+	QAClean            bool `json:"qa_clean,omitempty"`
+	RetranscribeNeeded bool `json:"retranscribe_needed,omitempty"`
+	AuditPassed        bool `json:"audit_passed,omitempty"`
+	// ChaptersMapped (extracting): the epub's toc already yields a contiguous logical
+	// chapter universe, so chapter_mapping is skipped. Kept separate from
+	// MarkersContiguous despite the identical meaning: these values are read by a
+	// human debugging a parked book, and "markers_contiguous" on an epub is a lie.
+	ChaptersMapped bool            `json:"chapters_mapped,omitempty"`
+	Metrics        json.RawMessage `json:"metrics,omitempty"`
 	// RateSample is the stage's own report of how much work it did this run (see
 	// RateSample). nil = no rate observation, which the scheduler treats as "don't
 	// update the learned rate". It persists in the sentinel (additive, omitempty) but
@@ -41,6 +46,7 @@ func (r StageResult) Outcome(fixAttempts int) state.Outcome {
 		QAClean:            r.QAClean,
 		RetranscribeNeeded: r.RetranscribeNeeded,
 		AuditPassed:        r.AuditPassed,
+		ChaptersMapped:     r.ChaptersMapped,
 		FixAttempts:        fixAttempts,
 	}
 }

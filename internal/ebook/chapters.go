@@ -1,11 +1,16 @@
 package ebook
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/kodestar/audiosilo-meta/pkg/extract"
+
+	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 )
 
 // Doc is one emitted text section plus the verdict this package reached about it.
@@ -418,3 +423,62 @@ func collectChapters(docs []Doc) []Chapter {
 
 // chapterStem is the per-chapter filename stem, matching the audio path's chNNN.
 func chapterStem(n int) string { return fmt.Sprintf("ch%03d", n) }
+
+// WriteChapterText materializes one text file per LOGICAL chapter under TextDir,
+// concatenating the sections that make up each chapter in reading order.
+//
+// The filenames are chNNN.txt, matching the audio path's convention, so the
+// authoring tail's staging loop is the same code for both kinds. Chapter N's file
+// IS spoken chapter N: unlike audio, where m4b track numbers are fixed and a
+// file-to-chapter offset has to be carried through the prompts, extracting owns
+// these names, so the ebook path has no renumbering boundary at all.
+func WriteChapterText(workDir, splitDir string, u Universe) error {
+	dir := filepath.Join(workDir, TextDir)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return err
+	}
+	for _, c := range u.Chapters {
+		var b strings.Builder
+		for i, f := range c.Files {
+			raw, err := os.ReadFile(filepath.Join(splitDir, filepath.Base(f))) //nolint:gosec // both halves derive from the work dir
+			if err != nil {
+				return fmt.Errorf("chapter %d: read %s: %w", c.Chapter, f, err)
+			}
+			if i > 0 {
+				b.WriteString("\n\n")
+			}
+			b.Write(raw)
+		}
+		text := strings.TrimSpace(b.String()) + "\n"
+		if err := fsutil.WriteFileAtomic(filepath.Join(dir, ChapterFileName(c.Chapter)), []byte(text), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// WriteManifest records the extract stage's audit trail: every emitted section with
+// its label, size and chapter verdict. It is the ebook counterpart of probe.json -
+// what the chapter-mapping agent is given, and what a human reads to see why a book
+// parked.
+func WriteManifest(workDir string, u Universe) error {
+	out, err := json.MarshalIndent(u, "", "  ")
+	if err != nil {
+		return err
+	}
+	return fsutil.WriteFileAtomic(filepath.Join(workDir, ManifestName), append(out, '\n'), 0o644)
+}
+
+// ReadManifest loads a previously written universe, so a resumed or re-entered
+// stage can re-derive from the recorded sections without re-splitting the epub.
+func ReadManifest(workDir string) (Universe, error) {
+	raw, err := os.ReadFile(filepath.Join(workDir, ManifestName)) //nolint:gosec // path derives from the book's work dir
+	if err != nil {
+		return Universe{}, err
+	}
+	var u Universe
+	if err := json.Unmarshal(raw, &u); err != nil {
+		return Universe{}, fmt.Errorf("parse %s: %w", ManifestName, err)
+	}
+	return u, nil
+}

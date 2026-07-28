@@ -381,6 +381,8 @@ func (e *Executor) Execute(ctx context.Context, book store.Book, stage state.Sta
 		return e.spellingResearch(ctx, book, r)
 	case state.Correcting:
 		return e.correcting(ctx, book, r)
+	case state.Extracting:
+		return e.extract(ctx, book, r)
 	case state.FactPass:
 		return e.factPass(ctx, book, r)
 	case state.Synthesizing:

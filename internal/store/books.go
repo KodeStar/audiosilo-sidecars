@@ -485,6 +485,18 @@ func (db *DB) SetBookDuration(ctx context.Context, id int64, sec float64) error 
 	return checkAffected(res, err)
 }
 
+// SetBookWords records the word count of a book's extracted chapter universe
+// (written by the pipeline once extracting succeeds). An ebook has no runtime, so
+// this is what the Running list sizes it by in place of the duration chip. A pure
+// gauge write like SetBookDuration: it deliberately does NOT bump updated_at, since
+// it is bookkeeping derived from the source rather than a change of pipeline
+// position, and a spurious bump would reorder the Running list.
+func (db *DB) SetBookWords(ctx context.Context, id int64, words int) error {
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE books SET words=? WHERE id=?`, words, id)
+	return checkAffected(res, err)
+}
+
 // SetBookPipelineState updates ONLY the pipeline state (and updated_at), leaving
 // status and error untouched. The scheduler's advance() uses it: a normal forward
 // transition must never clobber a status set concurrently (a pause/cancel landing

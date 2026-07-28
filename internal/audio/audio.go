@@ -43,6 +43,11 @@ const (
 	// StyleFiles: multiple audio files, one chapter per file in name order. Split
 	// converts each whole file.
 	StyleFiles = "files"
+	// StyleEbook: no audio at all - the chapters came from an epub's table of
+	// contents (see internal/ebook). Duration is 0 throughout and FilePath is empty;
+	// the manifest exists because it IS the shared chapter-universe contract the
+	// authoring tail reads, whatever the source was.
+	StyleEbook = "ebook"
 )
 
 // Chapter is one normalized chapter on the whole-book timeline. Start/End/Duration
@@ -55,6 +60,10 @@ type Chapter struct {
 	End         float64 `json:"end"`
 	Duration    float64 `json:"duration"`
 	FilePath    string  `json:"file_path,omitempty"`
+	// Words is the chapter's word count. Written by the ebook path, where there is no
+	// duration to size a chapter by; omitted (0) on the audio path, whose word counts
+	// come from the transcripts.
+	Words int `json:"words,omitempty"`
 }
 
 // MarkerStats reports what the marker parser SAW versus what it understood, so a
