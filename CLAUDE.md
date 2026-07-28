@@ -356,7 +356,29 @@ internal/
             file-numbered `## Chapter N` headings (matching staged transcripts + the
             chunk validator - never renumber), and the ASSEMBLE step is the ONE
             file->spoken renumbering boundary (its note renders the concrete offset
-            mapping). Exclusions always surface as a stage note. Fact chunks and QA
+            mapping). The offset is DERIVED FROM THE NARRATION, never from counting
+            files: deriveNarratedNumbering reads the chapter number each probed file
+            ANNOUNCES (audio.SpokenChapterNumber - digits, spelled-out, optional
+            "Chapter" prefix; the whole candidate must parse as one number, so prose
+            opening "One more time" is rejected) and takes the offset from a run of
+            >= minAnnouncementRun (3) CONSECUTIVE files announcing CONSECUTIVE numbers.
+            Both conditions matter: one stray parse cannot shift a book, and files
+            repeating the same number (a stuck transcript) are not a numbering. Files
+            before the first numbered chapter are FrontMatter (the meta schema's
+            position 0 - an unnumbered Prologue is NOT chapter 1) and files past the
+            last numbered one are EndMatter (an Epilogue/bloopers reel: outside the
+            numbered range, its material belongs in the whole-book summaries, never a
+            chapter-gated entry). With no agreeing run the classifier keeps the old
+            positional behaviour byte-identically. This was a real incident: a 64-file
+            book (Audible intro, unnumbered Prologue, chapters 1-59, Epilogue,
+            bloopers, credits) counted as 62 logical chapters at offset 1, so EVERY
+            reveal and recap gate sat a chapter early and the position cap allowed
+            gates past the end of the book; the auditor correctly rejected them as
+            disclosing later material and the audit/fix loop burned round after round
+            chasing one clause at a time. Note the numbering is baked into
+            knowledge-final.md, so a book affected by this must be re-run from
+            fact_pass - retrying the fix loop only chases symptoms. Exclusions and the
+            derived mapping always surface as a stage note. Fact chunks and QA
             chapter partitions run concurrently
             behind the same executor-wide invocation semaphore. New capacity uses
             queue_concurrency * max_agents_per_book; legacy concurrency remains a
@@ -394,7 +416,22 @@ internal/
             cross-segment / multi-loop hits are residuals the recorded splice window covers:
             the window is [clip_start, clip_end] for a MID splice (both bounds constrain the
             span within +/-15s) or [clip_start, +Inf] for a TAIL splice (only the start,
-            with a position>=95% fallback when the hit has no usable time). A MID-CHAPTER
+            with a position>=95% fallback when the hit has no usable time). An UNTIMED
+            cross-segment hit (no first_sec, written as pos -1) is the characteristic shape
+            of a tail loop re-reported off the untouched transcripts-json/ layer, so that
+            positional fallback can never fire for it; crossHitTailCovered therefore falls
+            back to a phraseResolver (repairedPhraseResolver, injected so the rule stays
+            unit-testable) asking the decisive question the window arithmetic cannot: is the
+            looped phrase still in transcripts-repaired/? Gone = the splice resolved it;
+            still present = the repair under-covered and the chapter stays with the agent.
+            Without this EVERY untimed residual went to the agent, and adjudicate.md tells
+            the agent NOT to disposition a chapter a prior tail_clip round already repaired -
+            so it omitted one ("intentionally omitted" in its notes), the plan validator
+            rejected the plan for a missing required entry, and the stage failed identically
+            on every retry until the book parked agent_validation_exhausted. adjudicate.md
+            now also states that the auto-accepted list is EXHAUSTIVE - any other flagged
+            chapter the agent believes is already repaired still needs an explicit accept,
+            because an omission is not a disposition. A MID-CHAPTER
             multi-loop is covered ONLY by a recorded MID window (never a tail window); a mid
             window with an untimed hit is conservatively NOT covered; (3) plan
             clip_start_sec/clip_end_sec (per tail_clip/mid_clip entry) feeds the repair
@@ -427,7 +464,16 @@ internal/
             forever - a sampling process that never reaches zero) finishes instead of
             parking fix_loop_exhausted with round-N's findings still live. Blockers or a
             growing fix count still park, with the fix-count trajectory in the park
-            message (StageResult.ParkMessage). contrib appends an acceptance note to the
+            message (StageResult.ParkMessage). Both audit.json writers (audit.md AND
+            audit_verify.md) feed the same DisallowUnknownFields reader, so EACH must
+            state the exact two-field (`pass`/`findings`) shape and name the `nit` key
+            agents reach for - a prompts drift-guard test (auditJSONPrompts) pins that.
+            audit_verify.md had drifted to "the normal audit shape" while inviting NIT
+            reporting, so a PASSING verify emitted {"pass":true,"nit":0,"findings":[]}
+            and the reader rejected it on every retry: a finished book parked
+            agent_validation_exhausted one cosmetic key from done. A nit is a findings
+            entry with severity NIT, never a top-level key.
+            contrib appends an acceptance note to the
             contribution rows (process metadata only - the public issue/PR payload is
             unchanged). runAgent also enforces agent.book_budget_usd (default 75) as a
             preflight: summed stage_runs cost (superseded rows included, so Retry can't
@@ -539,8 +585,8 @@ internal/
   supervisor/ the health-tick babysitter (config supervisor.*): classifies incidents
             over book/stage-run snapshots (deterministic classifiers + optional
             model-assisted lane), decides bounded recovery actions, and applies them
-            through the scheduler seam. Two invariants are load-bearing (both fixed
-            after a live 5,867-cycle park/readmit ping-pong): (1) the parked-recovery
+            through the scheduler seam. Three invariants are load-bearing (all fixed
+            after live park/readmit ping-pongs): (1) the parked-recovery
             FINGERPRINT is stationary - derived from park code + stage + the latest
             non-superseded stage-run error, never from book.Error, which every
             park_escalate rewrites (state.SupervisorMessagePrefix prose is stripped);
@@ -549,7 +595,18 @@ internal/
             per rolling 24h (store.CountAutoRecoveriesSince; terminate_requeue is
             deliberately excluded as restart hygiene), enforced on BOTH the
             deterministic and the model-assisted lanes - past the cap the decision
-            converts to park_escalate + approval_required (human review).
+            converts to park_escalate + approval_required (human review); (3) the
+            AttemptGrowthFactor checks compare against a stage's HIGH-WATER MARK over
+            all its successful attempts (priorSuccessBaseline - max duration/tokens/
+            cost, cost only across attempts of the same comparableCost kind), never
+            whichever attempt happened to finish last, AND the duration check stays
+            silent below the absolute minGrowthElapsed (20min) floor. An agent stage's
+            duration tracks the work it was handed - a fixing round carrying three
+            blockers legitimately runs several times longer than one carrying a small
+            edit - so a loop stage's recent short round is an arbitrary sample, not a
+            budget. Without both guards a healthy 3m13s fixing run was stopped
+            (stop_budget) against a 62s predecessor at 1.8% of MaxStageDuration, and
+            the resulting park then spent the book's whole auto-recovery budget.
   metaops/  meta.audiosilo.app client (coverage/lookup, capped 1h TTL caches,
             graceful degrade) + async folder-scan job manager over audiosilo-meta
             pkg/scan + the library_roots PathAllowed check. Coverage resolves

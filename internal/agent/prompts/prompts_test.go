@@ -61,3 +61,32 @@ func TestEmbedIncludesAuthoring(t *testing.T) {
 		t.Errorf("embedded prompts missing authoring.md: %v", names)
 	}
 }
+
+// auditJSONPrompts are every prompt whose agent writes out/audit.json. They all feed the
+// SAME strict reader (DisallowUnknownFields), so each must state the exact-shape rule.
+var auditJSONPrompts = []string{"audit.md", "audit_verify.md"}
+
+// A book whose audit PASSED was parked because the verify prompt said only "write
+// out/audit.json in the normal audit shape" while inviting NIT reporting, so the agent
+// emitted {"pass":true,"nit":0,"findings":[]} and the strict reader rejected the unknown
+// key - on every retry, because the prompt never stated the constraint the reader enforces.
+// audit.md had been hardened against exactly this; audit_verify.md had drifted from it.
+func TestAuditPromptsStateTheExactOutputShape(t *testing.T) {
+	for _, name := range auditJSONPrompts {
+		b, err := files.ReadFile(name)
+		if err != nil {
+			t.Fatalf("ReadFile(%s): %v", name, err)
+		}
+		body := string(b)
+		for _, required := range []string{
+			"EXACTLY",       // the two-field rule is stated, not implied
+			"`nit` field",   // the specific key agents reach for is named
+			"top-level key", // and the rule is general, not just about nit
+		} {
+			if !strings.Contains(body, required) {
+				t.Errorf("%s must state the exact audit.json output shape (missing %q): a prompt that "+
+					"omits it parks a passing book on an unknown-field decode error", name, required)
+			}
+		}
+	}
+}

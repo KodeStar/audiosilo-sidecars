@@ -1468,7 +1468,7 @@ func (e *Executor) autoAcceptRepairedTails(rep *qa.Report, workDir string) []qa.
 	if err != nil {
 		byCh = nil
 	}
-	tailOnly := tailOnlyChapters(rep, byCh)
+	tailOnly := tailOnlyChapters(rep, byCh, repairedPhraseResolver(workDir))
 	var out []qa.PlanEntry
 	for _, ch := range qa.FlaggedChapters(rep) {
 		if !tailOnly[ch] {
@@ -1516,7 +1516,7 @@ const (
 // verdicts maps a chapter to its recorded tail_verdicts entry (ClipStart/ClipEnd are read
 // for the residual test); a chapter with no entry cannot have a covered residual. It reads
 // the report + verdicts only; it never touches the golden-tested qa detectors.
-func tailOnlyChapters(rep *qa.Report, verdicts map[int]repair.TailVerdict) map[int]bool {
+func tailOnlyChapters(rep *qa.Report, verdicts map[int]repair.TailVerdict, resolved phraseResolver) map[int]bool {
 	disq := map[int]bool{}
 	for _, o := range rep.WPHOutliers {
 		disq[o.Chapter] = true
@@ -1537,7 +1537,7 @@ func tailOnlyChapters(rep *qa.Report, verdicts map[int]repair.TailVerdict) map[i
 		disq[h.Chapter] = true
 	}
 	for _, h := range rep.CrossSegment {
-		if v, ok := verdicts[h.Chapter]; !ok || !crossHitTailCovered(h, v) {
+		if v, ok := verdicts[h.Chapter]; !ok || !crossHitTailCovered(h, v, resolved) {
 			disq[h.Chapter] = true
 		}
 	}
@@ -1592,9 +1592,56 @@ func spanCovered(startSec, endSec *float64, pos float64, v repair.TailVerdict) b
 // chapter's recorded splice window v. A CrossSegmentHit sets FirstSec/LastSec as a pair
 // (Pos derives from FirstSec), so the located span is [FirstSec, LastSec] and spanCovered
 // applies. For a MID window both bounds constrain; for a TAIL window only the start.
-func crossHitTailCovered(h qa.CrossSegmentHit, v repair.TailVerdict) bool {
-	return spanCovered(h.FirstSec, h.LastSec, h.Pos, v)
+//
+// An UNTIMED hit (no FirstSec, which the report writes as pos -1) is the characteristic
+// shape of a tail loop re-reported off the untouched transcripts-json/ layer, so
+// spanCovered's position fallback can never fire for it and every such residual was being
+// pushed to the agent. For those, resolved() supplies the decisive evidence spanCovered
+// lacks: whether the looped phrase is still in the repaired text. Gone means the splice
+// already removed it; still present means the repair under-covered, and the chapter stays
+// with the agent exactly as before. A timed hit never consults it - its own window
+// arithmetic is authoritative.
+func crossHitTailCovered(h qa.CrossSegmentHit, v repair.TailVerdict, resolved phraseResolver) bool {
+	if spanCovered(h.FirstSec, h.LastSec, h.Pos, v) {
+		return true
+	}
+	return h.FirstSec == nil && resolved != nil && resolved(h.Chapter, h.Phrase)
 }
+
+// phraseResolver reports whether a flagged phrase is ABSENT from a chapter's repaired
+// transcript, i.e. whether a splice already resolved that finding. It is injected so the
+// residual classification stays unit-testable without a work dir on disk; a nil resolver
+// (or one that cannot read the repaired layer) simply resolves nothing, leaving the
+// pre-existing window arithmetic as the only rule.
+type phraseResolver func(chapter int, phrase string) bool
+
+// repairedPhraseResolver builds the production phraseResolver over workDir's repaired
+// transcripts, memoizing each chapter's normalized text so a chapter with several hits
+// reads its file once. A missing or unreadable repaired file resolves nothing (the
+// conservative answer: the finding keeps the chapter with the agent).
+func repairedPhraseResolver(workDir string) phraseResolver {
+	cache := map[int]string{}
+	return func(chapter int, phrase string) bool {
+		text, ok := cache[chapter]
+		if !ok {
+			raw, err := os.ReadFile(filepath.Join(workDir, transcript.RepairedDir, transcript.TextName(chapter))) //nolint:gosec // book-owned work dir
+			if err == nil {
+				text = normalizeSpace(string(raw))
+			}
+			cache[chapter] = text
+		}
+		phrase = normalizeSpace(phrase)
+		if text == "" || phrase == "" {
+			return false
+		}
+		return !strings.Contains(text, phrase)
+	}
+}
+
+// normalizeSpace collapses every whitespace run to a single space so a phrase recorded
+// from the segment stream compares equal to the same words in the concatenated transcript
+// text, where line breaks fall in different places.
+func normalizeSpace(s string) string { return strings.Join(strings.Fields(s), " ") }
 
 // multiLoopTailCovered reports whether a multi-loop finding is a residual covered by the
 // chapter's recorded splice window v. A MID-CHAPTER loop overwrote interior narration, so

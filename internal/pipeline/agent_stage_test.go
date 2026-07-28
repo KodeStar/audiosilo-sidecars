@@ -947,7 +947,7 @@ func TestTailOnlyChaptersTailResiduals(t *testing.T) {
 		},
 		RetranscribeQueue: []int{25},
 	}
-	got := tailOnlyChapters(rep, verdicts)
+	got := tailOnlyChapters(rep, verdicts, nil)
 	wantTailOnly := map[int]bool{2: true, 8: true, 10: true, 12: true}
 	notTailOnly := []int{11, 13, 20, 21, 25, 30}
 	for ch := range wantTailOnly {
@@ -1092,7 +1092,7 @@ func TestTailOnlyChaptersMidWindowCoverage(t *testing.T) {
 			{Chapter: 43, Count: 6, FirstSec: f64ptr(1685), LastSec: f64ptr(1760), Pos: 60},
 		},
 	}
-	got := tailOnlyChapters(rep, verdicts)
+	got := tailOnlyChapters(rep, verdicts, nil)
 	for _, ch := range []int{40, 41} {
 		if !got[ch] {
 			t.Errorf("chapter %d should be a repaired residual (covered by the mid window)", ch)
@@ -1553,5 +1553,74 @@ func TestMarkersNormalizeNeverOverwritesAContiguousDraft(t *testing.T) {
 	}
 	if m.ChapterCount != 2 || len(m.Chapters) != 2 || m.Chapters[0].MarkerTitle != "002" {
 		t.Fatalf("contiguous draft was re-derived from probe.json: %+v", m)
+	}
+}
+
+// An untimed cross-segment hit (the report's "pos": -1, no first_sec) is what a tail loop
+// re-reported off the untouched transcripts-json/ layer looks like, so the positional
+// fallback can never cover it. Every such residual was therefore pushed to the agent -
+// and the adjudicate prompt tells the agent NOT to disposition a chapter a prior
+// tail_clip round already repaired, so it omitted the chapter, the plan validator
+// rejected the plan for a missing required entry, and the stage failed identically on
+// every retry until the book parked agent_validation_exhausted.
+func TestTailOnlyChaptersResolvesUntimedResidualFromRepairedText(t *testing.T) {
+	rep := &qa.Report{
+		RepeatedRuns: []qa.RepeatedRun{
+			{Chapter: 44, Kind: qa.KindEndFade, Length: 6, StartSec: 1029.5, Snippet: " Better Nate than Lever."},
+			{Chapter: 45, Kind: qa.KindEndFade, Length: 6, StartSec: 1000, Snippet: " Still looping."},
+		},
+		CrossSegment: []qa.CrossSegmentHit{
+			// ch44: the splice landed - the doubled phrase is gone from the repaired text.
+			{Chapter: 44, Count: 5, Pos: -1, Phrase: "Better Nate than Lever. Better Nate"},
+			// ch45: the splice under-covered - the phrase is still there.
+			{Chapter: 45, Count: 5, Pos: -1, Phrase: "Still looping. Still looping."},
+		},
+	}
+	verdicts := map[int]repair.TailVerdict{
+		44: {Chapter: 44, ClipStart: 1027},
+		45: {Chapter: 45, ClipStart: 998},
+	}
+	repaired := map[int]string{
+		44: "he'd make the same choice again in a heartbeat.\nAfter all, you know what they\nsay. Better Nate than Lever. Thank you.",
+		45: "and then it went wrong.\nStill looping. Still looping. Still looping.",
+	}
+	resolved := func(chapter int, phrase string) bool {
+		return !strings.Contains(normalizeSpace(repaired[chapter]), normalizeSpace(phrase))
+	}
+
+	// Without a resolver the window arithmetic alone leaves BOTH with the agent.
+	if got := tailOnlyChapters(rep, verdicts, nil); got[44] || got[45] {
+		t.Fatalf("untimed hits covered by window arithmetic alone: %#v", got)
+	}
+	got := tailOnlyChapters(rep, verdicts, resolved)
+	if !got[44] {
+		t.Errorf("chapter 44 is a resolved residual (phrase gone from the repaired text) and should auto-accept: %#v", got)
+	}
+	if got[45] {
+		t.Errorf("chapter 45's phrase is still in the repaired text - the repair under-covered, so it must stay with the agent: %#v", got)
+	}
+}
+
+// The resolver reads the repaired layer and is conservative about everything it cannot
+// prove: a chapter with no repaired file resolves nothing.
+func TestRepairedPhraseResolverReadsRepairedLayer(t *testing.T) {
+	work := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(work, transcript.RepairedDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Line breaks fall in different places than the phrase recorded from the segments.
+	body := "you know what they\nsay. Better Nate than Lever. Thank you."
+	if err := os.WriteFile(filepath.Join(work, transcript.RepairedDir, transcript.TextName(44)), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resolved := repairedPhraseResolver(work)
+	if !resolved(44, "Better Nate than Lever. Better Nate") {
+		t.Error("the doubled phrase is absent from the repaired text and should resolve")
+	}
+	if resolved(44, "Better  Nate\nthan Lever.") {
+		t.Error("a phrase still present (modulo whitespace) must not resolve")
+	}
+	if resolved(99, "anything") {
+		t.Error("a chapter with no repaired file must resolve nothing")
 	}
 }

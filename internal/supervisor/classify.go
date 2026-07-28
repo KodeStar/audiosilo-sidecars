@@ -54,6 +54,48 @@ func classifyError(message string) IncidentKind {
 
 func parseTime(v string) time.Time { t, _ := time.Parse(time.RFC3339Nano, v); return t }
 
+// minGrowthElapsed is the absolute floor below which the relative attempt-growth
+// duration check stays silent. Stage-relative growth is an early warning meant to
+// catch a runaway well before MaxStageDuration; firing it on a run measured in
+// minutes only reports ordinary agent-workload variance.
+const minGrowthElapsed = 20 * time.Minute
+
+// attemptBaseline is the high-water mark of a stage's successful attempts. The
+// question the growth checks ask is "has this attempt gone beyond anything the
+// stage has ever legitimately needed", so the baseline is the maximum rather than
+// whichever attempt happened to finish last - loop stages (auditing, fixing,
+// qa_adjudicating) run repeatedly over workloads of very different sizes, which
+// makes the most recent attempt an arbitrary sample.
+type attemptBaseline struct {
+	duration time.Duration
+	tokens   int64
+	cost     float64
+}
+
+// priorSuccessBaseline folds every successful earlier attempt of open's stage into
+// that high-water mark. Cost only accumulates from attempts whose cost is known and
+// of the same kind as open's (reported provider cost and local estimate are not
+// comparable), so a mixed history never compares the two against each other.
+func priorSuccessBaseline(runs []store.StageRun, open store.StageRun, openCostKind string, openCostKnown bool) attemptBaseline {
+	var b attemptBaseline
+	for idx := range runs {
+		r := runs[idx]
+		if r.ID == open.ID || r.Stage != open.Stage || r.FinishedAt == "" || r.Ok == nil || !*r.Ok {
+			continue
+		}
+		if d := parseTime(r.FinishedAt).Sub(parseTime(r.StartedAt)); d > b.duration {
+			b.duration = d
+		}
+		if t := r.InputTokens + r.OutputTokens + r.CacheReadTokens; t > b.tokens {
+			b.tokens = t
+		}
+		if cost, kind, known := comparableCost(r); known && openCostKnown && kind == openCostKind && cost > b.cost {
+			b.cost = cost
+		}
+	}
+	return b
+}
+
 func stageRunError(r store.StageRun) string {
 	var metrics map[string]any
 	if json.Unmarshal(r.Metrics, &metrics) != nil {
@@ -133,38 +175,34 @@ func Classify(s Snapshot, p Policy) []Incident {
 			incidents = append(incidents, i)
 		}
 		if p.AttemptGrowthFactor > 1 {
-			var previous *store.StageRun
-			for idx := range runs {
-				candidate := &runs[idx]
-				if candidate.ID != open.ID && candidate.Stage == open.Stage && candidate.FinishedAt != "" && candidate.Ok != nil && *candidate.Ok {
-					previous = candidate
-				}
+			prior := priorSuccessBaseline(runs, *open, openCostKind, openCostKnown)
+			// The relative checks only fire once the open attempt is itself large enough
+			// to be suspicious on its own. An agent stage's cost is a function of the work
+			// it was handed, not of drift: a fixing round carrying three blockers
+			// legitimately runs several times longer than one carrying a small edit, so a
+			// short earlier attempt is a sample, not a budget. Without minGrowthElapsed
+			// this killed a healthy 3m13s fixing run whose predecessor happened to take
+			// 62s - 1.8% of the absolute MaxStageDuration the check is meant to pre-empt.
+			if prior.duration >= time.Minute && elapsed >= minGrowthElapsed && elapsed > time.Duration(float64(prior.duration)*p.AttemptGrowthFactor) {
+				i := base
+				i.Kind = IncidentDurationLimit
+				i.Diagnosis = "stage duration is excessive compared with its longest successful attempt"
+				i.Evidence = []string{fmt.Sprintf("%s now versus %s at its longest (%.1fx limit)", elapsed.Round(time.Second), prior.duration.Round(time.Second), p.AttemptGrowthFactor)}
+				incidents = append(incidents, i)
 			}
-			if previous != nil {
-				priorDuration := parseTime(previous.FinishedAt).Sub(parseTime(previous.StartedAt))
-				if priorDuration >= time.Minute && elapsed > time.Duration(float64(priorDuration)*p.AttemptGrowthFactor) {
-					i := base
-					i.Kind = IncidentDurationLimit
-					i.Diagnosis = "stage duration is excessive compared with its previous successful attempt"
-					i.Evidence = []string{fmt.Sprintf("%s now versus %s previously (%.1fx limit)", elapsed.Round(time.Second), priorDuration.Round(time.Second), p.AttemptGrowthFactor)}
-					incidents = append(incidents, i)
-				}
-				priorTokens := previous.InputTokens + previous.OutputTokens + previous.CacheReadTokens
-				if priorTokens > 0 && float64(tokens) > float64(priorTokens)*p.AttemptGrowthFactor {
-					i := base
-					i.Kind = IncidentTokenLimit
-					i.Diagnosis = "stage token use is excessive compared with its previous successful attempt"
-					i.Evidence = []string{fmt.Sprintf("%d now versus %d previously (%.1fx limit)", tokens, priorTokens, p.AttemptGrowthFactor)}
-					incidents = append(incidents, i)
-				}
-				previousCost, previousCostKind, previousCostKnown := comparableCost(*previous)
-				if previousCostKnown && openCostKnown && previousCostKind == openCostKind && previousCost > 0 && openCost > previousCost*p.AttemptGrowthFactor {
-					i := base
-					i.Kind = IncidentCostLimit
-					i.Diagnosis = "stage cost is excessive compared with its previous successful attempt"
-					i.Evidence = []string{fmt.Sprintf("$%.4f now versus $%.4f previously, %s (%.1fx limit)", openCost, previousCost, openCostKind, p.AttemptGrowthFactor)}
-					incidents = append(incidents, i)
-				}
+			if prior.tokens > 0 && float64(tokens) > float64(prior.tokens)*p.AttemptGrowthFactor {
+				i := base
+				i.Kind = IncidentTokenLimit
+				i.Diagnosis = "stage token use is excessive compared with its heaviest successful attempt"
+				i.Evidence = []string{fmt.Sprintf("%d now versus %d at its heaviest (%.1fx limit)", tokens, prior.tokens, p.AttemptGrowthFactor)}
+				incidents = append(incidents, i)
+			}
+			if openCostKnown && prior.cost > 0 && openCost > prior.cost*p.AttemptGrowthFactor {
+				i := base
+				i.Kind = IncidentCostLimit
+				i.Diagnosis = "stage cost is excessive compared with its most expensive successful attempt"
+				i.Evidence = []string{fmt.Sprintf("$%.4f now versus $%.4f at its most expensive, %s (%.1fx limit)", openCost, prior.cost, openCostKind, p.AttemptGrowthFactor)}
+				incidents = append(incidents, i)
 			}
 		}
 	}

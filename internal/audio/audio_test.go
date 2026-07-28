@@ -656,3 +656,44 @@ func mtime(t *testing.T, path string) int64 {
 	}
 	return info.ModTime().UnixNano()
 }
+
+// SpokenChapterNumber reads the number a narrator announces at the start of a chapter. The
+// live case it exists for: a book whose file 2 is an unnumbered Prologue, so file 3 announces
+// "One." and the file->chapter offset is 2, not the 1 that counting files implies.
+func TestSpokenChapterNumber(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		opening string
+		want    int
+		wantOK  bool
+	}{
+		{"spelled", "One. Four more deaths and five days lost in zone two.", 1, true},
+		{"digits", "18. Havoc paused from tinkering with his new superweapon.", 18, true},
+		{"hyphenated", "Fifty-nine. Thanks for the save, Joe.", 59, true},
+		{"spelled two words", "Twenty One. The gate opened.", 21, true},
+		{"chapter prefix", "Chapter Twenty One. The gate opened.", 21, true},
+		{"chapter prefix digits", "Chapter 7. The gate opened.", 7, true},
+		{"exclamation terminator", "Three! Joe ran.", 3, true},
+		{"prologue", "Prologue Hello A musical voice called over as Joe peered around", 0, false},
+		{"epilogue", "Epilogue Getting out of Grandma's shoe was simple after the", 0, false},
+		{"bloopers", "Bloopers! He couldn't get out more than a painted grunt.", 0, false},
+		// The total-consumption rule: prose that merely STARTS with a number word is not an
+		// announcement. Without it every chapter opening "One more time" would read as chapter 1.
+		{"prose starting one", "One more time, Joe told himself.", 0, false},
+		{"prose starting two number words", "Two hundred guards. That was the count.", 0, false},
+		// A bare "Two hundred." IS parseable in isolation - deriveNarratedNumbering's requirement
+		// that consecutive files announce consecutive numbers is what stops a lone parse like this
+		// from shifting a book's numbering.
+		{"ambiguous bare number", "Two hundred. The count was grim.", 200, true},
+		{"no terminator nearby", "Joe walked into the room and looked around carefully", 0, false},
+		{"empty", "", 0, false},
+		{"whitespace", "   \n  ", 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := SpokenChapterNumber(tc.opening)
+			if ok != tc.wantOK || (tc.wantOK && got != tc.want) {
+				t.Errorf("SpokenChapterNumber(%q) = %d,%v want %d,%v", tc.opening, got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+}

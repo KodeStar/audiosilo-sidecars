@@ -223,6 +223,51 @@ func parseChapterNumberWords(s string) (int, bool) {
 	return total + current, seen
 }
 
+// spokenAnnouncementWords bounds how far into a chapter's narration an opening chapter
+// announcement may run. A narrator says "One.", "18.", "Chapter Twenty One." and then
+// begins the prose; front matter says "Prologue" / "Epilogue" and runs straight on with no
+// sentence break for a long while. Capping the candidate at a few words means an unnumbered
+// section is rejected on its own opening rather than by scanning to a distant period.
+const spokenAnnouncementWords = 4
+
+// SpokenChapterNumber parses the chapter number a narrator ANNOUNCES at the very start of a
+// chapter's transcript ("One. Four more deaths..." -> 1, "18. Havoc paused..." -> 18,
+// "Fifty-nine. Thanks for the save..." -> 59), or ok=false when the opening is not a chapter
+// announcement at all ("Prologue Hello...", "Epilogue Getting out...", "Bloopers! He...").
+//
+// It exists because an audio file's POSITION is not its chapter number: a book with an
+// unnumbered Prologue in file 2 has chapter 1 in file 3. The number the narrator speaks is
+// the only direct evidence of that mapping, and it is the numbering the meta schema's
+// position.chapter refers to.
+//
+// The whole candidate must parse as one number: the announcement is taken up to the first
+// sentence terminator (capped at spokenAnnouncementWords), an optional leading "chapter" is
+// dropped, and the remainder is parsed by the same vocabulary as the marker parser -
+// which rejects unknown words rather than guessing. That total-consumption rule is what
+// keeps prose out: a chapter opening "One more time, Joe..." yields the candidate
+// "one more time" and is rejected, rather than reading as chapter 1.
+func SpokenChapterNumber(text string) (int, bool) {
+	candidate := strings.TrimSpace(text)
+	if i := strings.IndexAny(candidate, ".!?"); i >= 0 {
+		candidate = candidate[:i]
+	}
+	fields := strings.Fields(candidate)
+	if len(fields) == 0 || len(fields) > spokenAnnouncementWords {
+		return 0, false
+	}
+	if strings.EqualFold(fields[0], "chapter") {
+		fields = fields[1:]
+	}
+	if len(fields) == 0 {
+		return 0, false
+	}
+	joined := strings.Join(fields, " ")
+	if n, err := strconv.Atoi(joined); err == nil {
+		return n, n >= 0
+	}
+	return parseChapterNumberWords(joined)
+}
+
 // contiguous reports whether chapters (already sorted by start) number a gapless
 // run i, i+1, ... starting at 0 or 1 - the historical validation. An empty list is
 // not contiguous. When false, the markers need the M5 markers_normalizing agent

@@ -136,6 +136,14 @@ splice is present in `transcripts-repaired/`, and their only remaining findings 
 tail-rate hits that read the untouched `transcripts-json/` layer. The pipeline has
 already accepted them for you. Do NOT write an entry for any of these chapters;
 disposition ONLY the other flagged chapters.
+
+This list is exhaustive: it is the ONLY set you may leave out. If some OTHER flagged
+chapter also looks already-repaired to you, it is not on this list because the
+pipeline could not confirm it mechanically - that is a chapter you must still
+disposition, with an explicit `accept` entry stating the evidence you found (for
+example that the looped phrase is gone from `transcripts-repaired/`). Omitting it
+is not a disposition: the plan is rejected for a missing entry and the whole round
+is retried, so a chapter you silently skip can never be resolved.
 {{end}}
 ## Output (only under out/)
 
