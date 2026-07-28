@@ -138,6 +138,40 @@ func TestMarkersNormalizeEmptyLegacyDraftReparsesProbeWithoutAgent(t *testing.T)
 	}
 }
 
+// TestMarkersNormalizeReparseStillConsultsAgentWhenAudioIsUnmapped closes the back door
+// in the free-recovery path. The reparse is a shortcut PAST the agent, so it has to clear
+// the same bar routing does: a re-derived map that numbers 1..N perfectly while dropping
+// an interlude must NOT complete the stage, or the book goes straight to split with a hole
+// in it - exactly the failure this stage exists to catch.
+func TestMarkersNormalizeReparseStillConsultsAgentWhenAudioIsUnmapped(t *testing.T) {
+	work := t.TempDir()
+	// Chapters 1-3 parse and number cleanly; the 1000s Interlude between 2 and 3 does not.
+	writeProbeJSON(t, work, `{
+		"format":{"duration":"5000.000","tags":{"title":"Holed"}},
+		"chapters":[
+			{"start_time":"20.000","end_time":"1000.000","tags":{"title":"Chapter 1"}},
+			{"start_time":"1000.000","end_time":"2000.000","tags":{"title":"Chapter 2"}},
+			{"start_time":"2000.000","end_time":"3000.000","tags":{"title":"Interlude"}},
+			{"start_time":"3000.000","end_time":"4980.000","tags":{"title":"Chapter 3"}}
+		]
+	}`)
+	writeManifestStruct(t, work, audio.Manifest{Source: "/books/holed.m4b", Title: "Holed", Style: audio.StyleMarkers, Duration: 5000})
+
+	fake := newFakeRunner()
+	fake.act = func(_ *fakeRunner, req agent.Request, _ int) (agent.Result, error) {
+		writeOut(t, req, "verdict.json", markerVerdict{Confident: false, Reason: "declined for the test"})
+		return agent.Result{}, nil
+	}
+	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Holed", WorkDir: work}, state.MarkersNormalizing, scheduler.StageReport{})
+	if err == nil {
+		t.Fatal("stage completed on a reparse that leaves an Interlude unmapped")
+	}
+	if fake.count(string(state.MarkersNormalizing)) == 0 {
+		t.Error("the agent was never consulted; the reparse took the free-completion shortcut")
+	}
+}
+
 func TestValidateMarkersManifestRejectsNumberAliasExplicitly(t *testing.T) {
 	out := t.TempDir()
 	raw := `{

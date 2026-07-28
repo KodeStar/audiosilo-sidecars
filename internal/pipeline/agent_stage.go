@@ -693,7 +693,11 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, r sche
 			return scheduler.StageResult{}, fmt.Errorf("markers_normalizing: deterministic probe reparse: %w", reparseErr)
 		}
 		draft, markers = rebuilt, stats
-		if markers.Contiguous {
+		// Usable(), not Contiguous(): the reparse is a shortcut PAST the agent, so it must
+		// clear the same bar the routing decision does. Gating on numbering alone would let
+		// a re-derived map that numbers 1..N while dropping an interlude complete the stage
+		// and go straight to split - the very failure this recovery path sits in front of.
+		if markers.Usable() {
 			if e.db != nil {
 				_ = e.db.SetBookChapters(context.WithoutCancel(ctx), book.ID, draft.ChapterCount)
 				_ = e.db.SetBookDuration(context.WithoutCancel(ctx), book.ID, draft.Duration)
