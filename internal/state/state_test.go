@@ -22,8 +22,9 @@ func TestTableCoversAllStatesWithLane(t *testing.T) {
 	stages := map[State]bool{
 		Inspecting: true, MarkersNormalizing: true, Splitting: true, ASR: true,
 		Sanitizing: true, QASweep: true, QAAdjudicating: true, Retranscribing: true,
-		SpellingResearch: true, Correcting: true, FactPass: true, Synthesizing: true,
-		Validating: true, Auditing: true, Fixing: true, Contributing: true,
+		SpellingResearch: true, Correcting: true, Extracting: true, ChapterMapping: true,
+		FactPass: true, Synthesizing: true, Validating: true, Auditing: true,
+		Fixing: true, Contributing: true,
 	}
 	for s := range table {
 		if stages[s] {
@@ -45,7 +46,8 @@ func TestLanesAssigned(t *testing.T) {
 		Inspecting: LaneMechanical, MarkersNormalizing: LaneAgent, Splitting: LaneMechanical,
 		ASR: LaneASR, Sanitizing: LaneMechanical, QASweep: LaneMechanical,
 		QAAdjudicating: LaneAgent, Retranscribing: LaneASR, SpellingResearch: LaneAgent,
-		Correcting: LaneMechanical, FactPass: LaneAgent, Synthesizing: LaneAgent,
+		Correcting: LaneMechanical, Extracting: LaneMechanical, ChapterMapping: LaneAgent,
+		FactPass: LaneAgent, Synthesizing: LaneAgent,
 		Validating: LaneMechanical, Auditing: LaneAgent, Fixing: LaneAgent,
 		Contributing: LaneMechanical,
 	}
@@ -69,15 +71,15 @@ func TestNextStateLegalPerTable(t *testing.T) {
 	}
 	for _, s := range All() {
 		if IsTerminal(s) {
-			if _, _, err := NextState(s, Outcome{}); err == nil {
+			if _, _, err := NextState(KindAudio, s, Outcome{}); err == nil {
 				t.Errorf("terminal %q should error on NextState", s)
 			}
 			continue
 		}
 		for _, o := range branches {
-			next, status, err := NextState(s, o)
+			next, status, err := NextState(KindAudio, s, o)
 			if err != nil {
-				t.Errorf("NextState(%q, %+v) error: %v", s, o, err)
+				t.Errorf("NextState(KindAudio, %q, %+v) error: %v", s, o, err)
 				continue
 			}
 			// The park exception: auditing with the fix budget spent stays put.
@@ -88,10 +90,10 @@ func TestNextStateLegalPerTable(t *testing.T) {
 				continue
 			}
 			if status != StatusNone {
-				t.Errorf("NextState(%q,%+v) status = %q, want none", s, o, status)
+				t.Errorf("NextState(KindAudio, %q,%+v) status = %q, want none", s, o, status)
 			}
 			if !legalNext(s, next) {
-				t.Errorf("NextState(%q,%+v) = %q, not a declared successor %v", s, o, next, table[s].Next)
+				t.Errorf("NextState(KindAudio, %q,%+v) = %q, not a declared successor %v", s, o, next, table[s].Next)
 			}
 		}
 	}
@@ -101,24 +103,24 @@ func TestNextStateLegalPerTable(t *testing.T) {
 // stages exactly as the pipeline requires.
 func TestConditionalSkips(t *testing.T) {
 	// Contiguous markers skip markers_normalizing.
-	if n, _, _ := NextState(Inspecting, Outcome{MarkersContiguous: true}); n != Splitting {
+	if n, _, _ := NextState(KindAudio, Inspecting, Outcome{MarkersContiguous: true}); n != Splitting {
 		t.Errorf("contiguous markers: got %q, want splitting", n)
 	}
-	if n, _, _ := NextState(Inspecting, Outcome{}); n != MarkersNormalizing {
+	if n, _, _ := NextState(KindAudio, Inspecting, Outcome{}); n != MarkersNormalizing {
 		t.Errorf("non-contiguous markers: got %q, want markers_normalizing", n)
 	}
 	// A clean qa_sweep skips adjudication (and thus retranscribe).
-	if n, _, _ := NextState(QASweep, Outcome{QAClean: true}); n != SpellingResearch {
+	if n, _, _ := NextState(KindAudio, QASweep, Outcome{QAClean: true}); n != SpellingResearch {
 		t.Errorf("clean qa: got %q, want spelling_research", n)
 	}
-	if n, _, _ := NextState(QASweep, Outcome{}); n != QAAdjudicating {
+	if n, _, _ := NextState(KindAudio, QASweep, Outcome{}); n != QAAdjudicating {
 		t.Errorf("dirty qa: got %q, want qa_adjudicating", n)
 	}
 	// Adjudication may loop back through retranscribe -> qa_sweep.
-	if n, _, _ := NextState(QAAdjudicating, Outcome{RetranscribeNeeded: true}); n != Retranscribing {
+	if n, _, _ := NextState(KindAudio, QAAdjudicating, Outcome{RetranscribeNeeded: true}); n != Retranscribing {
 		t.Errorf("adjudicate retranscribe: got %q, want retranscribing", n)
 	}
-	if n, _, _ := NextState(Retranscribing, Outcome{}); n != QASweep {
+	if n, _, _ := NextState(KindAudio, Retranscribing, Outcome{}); n != QASweep {
 		t.Errorf("retranscribe loop: got %q, want qa_sweep", n)
 	}
 }
@@ -127,7 +129,7 @@ func TestConditionalSkips(t *testing.T) {
 // MaxFixAttempts times, then parks needs_attention.
 func TestFixLoopCappedThenParks(t *testing.T) {
 	for attempts := 0; attempts < MaxFixAttempts; attempts++ {
-		next, status, err := NextState(Auditing, Outcome{FixAttempts: attempts})
+		next, status, err := NextState(KindAudio, Auditing, Outcome{FixAttempts: attempts})
 		if err != nil {
 			t.Fatalf("attempt %d: %v", attempts, err)
 		}
@@ -135,12 +137,12 @@ func TestFixLoopCappedThenParks(t *testing.T) {
 			t.Fatalf("attempt %d: got (%q,%q), want (fixing,none)", attempts, next, status)
 		}
 		// A fix pass returns to validating.
-		if n, _, _ := NextState(Fixing, Outcome{}); n != Validating {
+		if n, _, _ := NextState(KindAudio, Fixing, Outcome{}); n != Validating {
 			t.Fatalf("fixing should go to validating, got %q", n)
 		}
 	}
 	// Budget spent: park.
-	next, status, err := NextState(Auditing, Outcome{FixAttempts: MaxFixAttempts})
+	next, status, err := NextState(KindAudio, Auditing, Outcome{FixAttempts: MaxFixAttempts})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +150,7 @@ func TestFixLoopCappedThenParks(t *testing.T) {
 		t.Fatalf("exhausted: got (%q,%q), want (auditing,needs_attention)", next, status)
 	}
 	// A passing audit always reaches ready regardless of prior attempts.
-	if n, _, _ := NextState(Auditing, Outcome{AuditPassed: true, FixAttempts: MaxFixAttempts}); n != Ready {
+	if n, _, _ := NextState(KindAudio, Auditing, Outcome{AuditPassed: true, FixAttempts: MaxFixAttempts}); n != Ready {
 		t.Fatalf("passing audit should reach ready, got %q", n)
 	}
 }
@@ -164,7 +166,7 @@ func TestHappyPathToDone(t *testing.T) {
 	got := []State{cur}
 	for !IsTerminal(cur) {
 		o := Outcome{MarkersContiguous: true, QAClean: true, AuditPassed: true}
-		next, _, err := NextState(cur, o)
+		next, _, err := NextState(KindAudio, cur, o)
 		if err != nil {
 			t.Fatalf("from %q: %v", cur, err)
 		}
@@ -186,15 +188,15 @@ func TestHappyPathToDone(t *testing.T) {
 // member of table[s].Next), and for the terminal state it returns "".
 func TestMainlineNextIsDeclaredSuccessor(t *testing.T) {
 	for _, s := range All() {
-		next := MainlineNext(s)
+		next := MainlineNext(KindAudio, s)
 		if IsTerminal(s) {
 			if next != "" {
-				t.Errorf("MainlineNext(%q terminal) = %q, want \"\"", s, next)
+				t.Errorf("MainlineNext(KindAudio, %q terminal) = %q, want \"\"", s, next)
 			}
 			continue
 		}
 		if !legalNext(s, next) {
-			t.Errorf("MainlineNext(%q) = %q, not a declared successor %v", s, next, table[s].Next)
+			t.Errorf("MainlineNext(KindAudio, %q) = %q, not a declared successor %v", s, next, table[s].Next)
 		}
 	}
 }
@@ -211,9 +213,9 @@ func TestMainlineNextWalksMainlineToDone(t *testing.T) {
 	cur := Queued
 	got := []State{cur}
 	for !IsTerminal(cur) {
-		next := MainlineNext(cur)
+		next := MainlineNext(KindAudio, cur)
 		if next == "" {
-			t.Fatalf("MainlineNext(%q) = \"\" before reaching Done", cur)
+			t.Fatalf("MainlineNext(KindAudio, %q) = \"\" before reaching Done", cur)
 		}
 		got = append(got, next)
 		cur = next
@@ -309,6 +311,144 @@ func TestIsParkedWith(t *testing.T) {
 	for _, c := range cases {
 		if got := IsParkedWith(c.status, c.code, c.want...); got != c.expect {
 			t.Errorf("%s: IsParkedWith(%q,%q,%v) = %v, want %v", c.name, c.status, c.code, c.want, got, c.expect)
+		}
+	}
+}
+
+// TestEbookMainlineWalk pins the ebook front half and, just as importantly, that
+// it never touches the audio stages: an epub's text is already exact, so ASR,
+// transcript QA and spelling correction have nothing to do and must not be run.
+func TestEbookMainlineWalk(t *testing.T) {
+	want := []State{
+		Queued, Extracting, FactPass, Synthesizing, Validating, Auditing,
+		Ready, Contributing, Done,
+	}
+	var got []State
+	for cur := Queued; cur != ""; cur = MainlineNext(KindEbook, cur) {
+		got = append(got, cur)
+		if IsTerminal(cur) {
+			break
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ebook mainline = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ebook mainline = %v, want %v", got, want)
+		}
+	}
+
+	audioOnly := []State{Inspecting, MarkersNormalizing, Splitting, ASR, Sanitizing,
+		QASweep, QAAdjudicating, Retranscribing, SpellingResearch, Correcting}
+	for _, s := range got {
+		for _, a := range audioOnly {
+			if s == a {
+				t.Errorf("ebook mainline reached audio-only stage %q", s)
+			}
+		}
+	}
+}
+
+// TestAudioMainlineWalkUnchanged is the converse, and the regression guard that
+// adding the ebook path did not move the audio pipeline.
+func TestAudioMainlineWalkUnchanged(t *testing.T) {
+	want := []State{
+		Queued, Inspecting, Splitting, ASR, Sanitizing, QASweep, SpellingResearch,
+		Correcting, FactPass, Synthesizing, Validating, Auditing, Ready,
+		Contributing, Done,
+	}
+	var got []State
+	for cur := Queued; cur != ""; cur = MainlineNext(KindAudio, cur) {
+		got = append(got, cur)
+		if IsTerminal(cur) {
+			break
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("audio mainline = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("audio mainline = %v, want %v", got, want)
+		}
+	}
+	for _, s := range got {
+		if s == Extracting || s == ChapterMapping {
+			t.Errorf("audio mainline reached ebook-only stage %q", s)
+		}
+	}
+}
+
+// TestOrderMonotonicPerKind is what makes ONE shared order safe for two pipelines.
+// Order is compared across stages (the scheduler's queue bucketing and rewind, the
+// supervisor, HoldsSeriesLock), so a state placed at the wrong index would not fail
+// loudly - it would quietly mis-bucket or mis-compare. Both kinds must walk their
+// mainline in strictly increasing order.
+func TestOrderMonotonicPerKind(t *testing.T) {
+	for _, kind := range []Kind{KindAudio, KindEbook} {
+		prev := -1
+		for cur := Queued; cur != ""; cur = MainlineNext(kind, cur) {
+			if o := Order(cur); o <= prev {
+				t.Errorf("%s: order of %q is %d, not greater than the previous %d", kind, cur, o, prev)
+			} else {
+				prev = o
+			}
+			if IsTerminal(cur) {
+				break
+			}
+		}
+	}
+}
+
+// TestQueuedBranchesOnKind covers the one fork the table cannot express, since
+// both successors are a mainline.
+func TestQueuedBranchesOnKind(t *testing.T) {
+	cases := []struct {
+		kind Kind
+		want State
+	}{
+		{KindAudio, Inspecting},
+		{KindEbook, Extracting},
+		{Kind(""), Inspecting}, // a pre-migration row is audio
+	}
+	for _, c := range cases {
+		got, status, err := NextState(c.kind, Queued, Outcome{})
+		if err != nil || status != StatusNone || got != c.want {
+			t.Errorf("NextState(%q, Queued) = (%q, %q, %v), want %q", c.kind, got, status, err, c.want)
+		}
+		if m := MainlineNext(c.kind, Queued); m != c.want {
+			t.Errorf("MainlineNext(%q, Queued) = %q, want %q", c.kind, m, c.want)
+		}
+	}
+}
+
+// TestExtractingBranchesOnChaptersMapped: a contiguous chapter run from the toc
+// skips the agent stage entirely, which is the whole cost saving.
+func TestExtractingBranchesOnChaptersMapped(t *testing.T) {
+	if got, _, _ := NextState(KindEbook, Extracting, Outcome{ChaptersMapped: true}); got != FactPass {
+		t.Errorf("mapped chapters -> %q, want %q", got, FactPass)
+	}
+	if got, _, _ := NextState(KindEbook, Extracting, Outcome{}); got != ChapterMapping {
+		t.Errorf("unmapped chapters -> %q, want %q", got, ChapterMapping)
+	}
+}
+
+// TestParseKind: the DB read path is lenient (pre-migration rows are audio);
+// ValidKind is the strict input-boundary check.
+func TestParseKind(t *testing.T) {
+	for in, want := range map[string]Kind{
+		"": KindAudio, "audio": KindAudio, "ebook": KindEbook, "nonsense": KindAudio,
+	} {
+		if got := ParseKind(in); got != want {
+			t.Errorf("ParseKind(%q) = %q, want %q", in, got, want)
+		}
+	}
+	for in, want := range map[string]bool{
+		"": true, "audio": true, "ebook": true, "nonsense": false, "Audio": false,
+	} {
+		if got := ValidKind(in); got != want {
+			t.Errorf("ValidKind(%q) = %v, want %v", in, got, want)
 		}
 	}
 }

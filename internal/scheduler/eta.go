@@ -176,6 +176,7 @@ func toETABook(b store.Book, progress []store.Progress, fanout int) eta.Book {
 		ID:               b.ID,
 		State:            state.State(b.State),
 		Status:           state.Status(b.Status),
+		Kind:             state.ParseKind(b.Kind),
 		Series:           b.Series,
 		SeriesPos:        b.SeriesPos,
 		Chapters:         chapters,

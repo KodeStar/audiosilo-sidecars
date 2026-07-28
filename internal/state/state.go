@@ -4,18 +4,63 @@
 // scheduler (internal/scheduler) and the store (internal/store) consume it. Being
 // dependency-free keeps every rule exhaustively unit-testable.
 //
-// The pipeline mirrors EXTRACTION-AUDIO.md (validated on 11+ books):
+// There are two front halves, selected by the book's Kind, feeding one shared
+// authoring tail.
+//
+// Audio mirrors EXTRACTION-AUDIO.md (validated on 11+ books):
 //
 //	queued -> inspecting -> [markers_normalizing] -> splitting -> asr -> sanitizing
 //	-> qa_sweep -> [qa_adjudicating] -> [retranscribing -> qa_sweep]loop
-//	-> spelling_research -> correcting -> fact_pass -> synthesizing
-//	-> validating -> auditing -> [fixing -> validating]loop(max 3)
+//	-> spelling_research -> correcting -> fact_pass -> ...
+//
+// Ebook mirrors EXTRACTION.md, whose whole point is that exact text needs none of
+// the machinery that reconstructs it from audio:
+//
+//	queued -> extracting -> [chapter_mapping] -> fact_pass -> ...
+//
+// and both then run the shared tail:
+//
+//	... -> synthesizing -> validating -> auditing -> [fixing -> validating]loop(max 3)
 //	-> ready -> contributing -> done
 //
 // States in [brackets] are conditional (they may be skipped) or loop back.
 package state
 
 import "fmt"
+
+// Kind is a book's source modality: which front half of the pipeline it runs.
+// It is durable (books.kind) and chosen when the book is enqueued.
+type Kind string
+
+const (
+	// KindAudio is the default and what every pre-migration row is: an audiobook
+	// folder, transcribed and corrected before the authoring tail.
+	KindAudio Kind = "audio"
+	// KindEbook is a DRM-free epub, whose text is exact, so the audio front half
+	// (inspect/split/ASR/sanitize/QA/spelling) is skipped entirely.
+	KindEbook Kind = "ebook"
+)
+
+// ParseKind normalizes a stored kind, mapping "" to KindAudio. Lenient by design:
+// it is the DB read path, and rows written before the kind column existed carry
+// the empty string. Use ValidKind at an input boundary, where a typo must be
+// rejected rather than silently treated as audio.
+func ParseKind(s string) Kind {
+	if Kind(s) == KindEbook {
+		return KindEbook
+	}
+	return KindAudio
+}
+
+// ValidKind reports whether s names a kind, accepting "" as the audio default.
+func ValidKind(s string) bool {
+	switch Kind(s) {
+	case "", KindAudio, KindEbook:
+		return true
+	default:
+		return false
+	}
+}
 
 // State is a node in the pipeline. queued/ready/done are waypoints with no lane;
 // every other state is a "stage" that a lane worker executes.
@@ -34,6 +79,8 @@ const (
 	Retranscribing     State = "retranscribing"
 	SpellingResearch   State = "spelling_research"
 	Correcting         State = "correcting"
+	Extracting         State = "extracting"
+	ChapterMapping     State = "chapter_mapping"
 	FactPass           State = "fact_pass"
 	Synthesizing       State = "synthesizing"
 	Validating         State = "validating"
@@ -100,8 +147,20 @@ type Def struct {
 // conditional/loop target is listed FIRST and the mainline (happy-branch)
 // continuation LAST. MainlineNext depends on this ordering (it returns the last
 // successor), so keep the mainline entry last when editing a multi-successor row.
+// The ebook states sit at order 11/12, immediately before FactPass, rather than
+// at the front beside Inspecting. Two reasons, both load-bearing:
+//
+//   - order is compared, not just ordered: scheduler.queueGroup buckets anything
+//     with Order(st) <= Order(ASR) as ASR work, so an ebook in Extracting would
+//     render in the Running tab's ASR section despite never touching that lane.
+//   - order reads as "distance from Ready" for BOTH kinds this way: an ebook in
+//     Extracting genuinely is one step from FactPass, exactly like an audio book
+//     in Correcting.
+//
+// Nothing persists order (books.state stores the state string), so placing them
+// here costs only this comment.
 var table = map[State]Def{
-	Queued:             {Lane: LaneNone, Next: []State{Inspecting}, order: 0},
+	Queued:             {Lane: LaneNone, Next: []State{Extracting, Inspecting}, order: 0},
 	Inspecting:         {Lane: LaneMechanical, Next: []State{MarkersNormalizing, Splitting}, order: 1},
 	MarkersNormalizing: {Lane: LaneAgent, Next: []State{Splitting}, Agent: true, order: 2},
 	Splitting:          {Lane: LaneMechanical, Next: []State{ASR}, order: 3},
@@ -112,14 +171,16 @@ var table = map[State]Def{
 	Retranscribing:     {Lane: LaneASR, Next: []State{QASweep}, order: 8},
 	SpellingResearch:   {Lane: LaneAgent, Next: []State{Correcting}, Agent: true, order: 9},
 	Correcting:         {Lane: LaneMechanical, Next: []State{FactPass}, order: 10},
-	FactPass:           {Lane: LaneAgent, Next: []State{Synthesizing}, Agent: true, order: 11},
-	Synthesizing:       {Lane: LaneAgent, Next: []State{Validating}, Agent: true, order: 12},
-	Validating:         {Lane: LaneMechanical, Next: []State{Auditing}, order: 13},
-	Auditing:           {Lane: LaneAgent, Next: []State{Fixing, Ready}, Agent: true, order: 14},
-	Fixing:             {Lane: LaneAgent, Next: []State{Validating}, Agent: true, order: 15},
-	Ready:              {Lane: LaneNone, Next: []State{Contributing}, order: 16},
-	Contributing:       {Lane: LaneMechanical, Next: []State{Done}, order: 17},
-	Done:               {Lane: LaneNone, Next: nil, Terminal: true, order: 18},
+	Extracting:         {Lane: LaneMechanical, Next: []State{ChapterMapping, FactPass}, order: 11},
+	ChapterMapping:     {Lane: LaneAgent, Next: []State{FactPass}, Agent: true, order: 12},
+	FactPass:           {Lane: LaneAgent, Next: []State{Synthesizing}, Agent: true, order: 13},
+	Synthesizing:       {Lane: LaneAgent, Next: []State{Validating}, Agent: true, order: 14},
+	Validating:         {Lane: LaneMechanical, Next: []State{Auditing}, order: 15},
+	Auditing:           {Lane: LaneAgent, Next: []State{Fixing, Ready}, Agent: true, order: 16},
+	Fixing:             {Lane: LaneAgent, Next: []State{Validating}, Agent: true, order: 17},
+	Ready:              {Lane: LaneNone, Next: []State{Contributing}, order: 18},
+	Contributing:       {Lane: LaneMechanical, Next: []State{Done}, order: 19},
+	Done:               {Lane: LaneNone, Next: nil, Terminal: true, order: 20},
 }
 
 // All returns every state in canonical forward order.
@@ -166,7 +227,18 @@ func Order(s State) int { return table[s].order }
 // MainlineNext from Queued walks the pipeline's mainline to Done, skipping the
 // bracketed conditional stages. It returns "" for a terminal state (no successors).
 // It is the derivation the ETA engine's optimistic path uses.
-func MainlineNext(s State) State {
+// Queued is the one fork the table cannot express, because BOTH successors are a
+// mainline - Extracting for an ebook, Inspecting for an audio book - so the
+// "mainline continuation last" convention has nothing to say. kind decides it
+// here; every other state's mainline is kind-independent, since the two front
+// halves converge on FactPass.
+func MainlineNext(kind Kind, s State) State {
+	if s == Queued {
+		if kind == KindEbook {
+			return Extracting
+		}
+		return Inspecting
+	}
 	next := table[s].Next
 	if len(next) == 0 {
 		return ""
@@ -219,6 +291,12 @@ type Outcome struct {
 	AuditPassed bool
 	// FixAttempts (auditing): fix passes already completed, for the cap.
 	FixAttempts int
+	// ChaptersMapped (extracting): the epub's toc labels already yield a contiguous
+	// logical chapter universe, so chapter_mapping can be skipped. It deliberately
+	// does NOT reuse MarkersContiguous, whose meaning is identical: these values are
+	// written into the stage sentinel JSON a human reads when debugging a parked
+	// book, and "markers_contiguous" on an epub is a lie.
+	ChaptersMapped bool
 }
 
 // NextState computes the forward transition from cur given a completed stage's
@@ -226,7 +304,7 @@ type Outcome struct {
 // exhausted, where it returns (Auditing, StatusNeedsAttention) to park the book.
 // The returned state is always a table-declared successor of cur (asserted by
 // tests) except the park case, which stays on Auditing by design.
-func NextState(cur State, o Outcome) (State, Status, error) {
+func NextState(kind Kind, cur State, o Outcome) (State, Status, error) {
 	def, ok := table[cur]
 	if !ok {
 		return "", StatusNone, fmt.Errorf("unknown state %q", cur)
@@ -237,6 +315,22 @@ func NextState(cur State, o Outcome) (State, Status, error) {
 
 	var next State
 	switch cur {
+	case Queued:
+		// The one place kind selects a front half. It is an explicit parameter
+		// rather than an Outcome field because advanceWaypoints dispatches
+		// waypoints with a ZERO Outcome: a kind field there would default to
+		// audio and route every ebook into ffprobe.
+		if kind == KindEbook {
+			next = Extracting
+		} else {
+			next = Inspecting
+		}
+	case Extracting:
+		if o.ChaptersMapped {
+			next = FactPass // the toc already yields a contiguous chapter run
+		} else {
+			next = ChapterMapping
+		}
 	case Inspecting:
 		if o.MarkersContiguous {
 			next = Splitting // skip markers_normalizing

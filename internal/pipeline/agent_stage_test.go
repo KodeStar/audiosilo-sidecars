@@ -684,7 +684,7 @@ func TestQAAdjudicateAutoAcceptsRepairedTails(t *testing.T) {
 	if len(plan.Entries) != 1 || plan.Entries[0].Chapter != 2 || plan.Entries[0].Action != qa.ActionAccept {
 		t.Errorf("plan = %+v, want a single accept entry for chapter 2", plan.Entries)
 	}
-	next, _, err := state.NextState(state.QAAdjudicating, state.Outcome{RetranscribeNeeded: res.RetranscribeNeeded})
+	next, _, err := state.NextState(state.KindAudio, state.QAAdjudicating, state.Outcome{RetranscribeNeeded: res.RetranscribeNeeded})
 	if err != nil {
 		t.Fatal(err)
 	}

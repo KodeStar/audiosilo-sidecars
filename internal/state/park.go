@@ -44,6 +44,22 @@ const (
 	// PR to merge, after which the poller resolves the real work slug and re-admits it.
 	ParkCorePending ParkCode = "core_pending"
 
+	// ParkEbookUnreadable: the .epub could not be opened or parsed - not a zip, no
+	// container.xml/OPF, a spine entry missing from the archive, or DRM-wrapped.
+	// Human-fixable precondition (supply a DRM-free epub, or enqueue the audiobook
+	// instead), so it parks like the media-tools park and carries no auto-readmit.
+	ParkEbookUnreadable ParkCode = "ebook_unreadable"
+	// ParkEbookNoChapters: the split produced no numbered chapters AND no usable toc
+	// labels (or one spine document holds the whole book with no anchors). Distinct
+	// from ParkEbookChaptersNotConfident because there is nothing for an agent to map -
+	// the file itself is the problem, so the operator hint differs.
+	ParkEbookNoChapters ParkCode = "ebook_no_chapters"
+	// ParkEbookChaptersNotConfident: chapter_mapping could not defensibly map the toc
+	// onto a contiguous chapter universe. The direct analogue of
+	// ParkMarkersNotConfident, and parked for the same reason: a guessed chapter
+	// number is a wrong spoiler position, which nothing downstream can detect.
+	ParkEbookChaptersNotConfident ParkCode = "ebook_chapters_not_confident"
+
 	// ParkBudgetExceeded: the book's summed agent cost reached the configured per-book
 	// budget (agent.book_budget_usd), so an agent stage parked before spending more. A
 	// human decision: raise the budget in config.yaml (restart to apply), then Retry -

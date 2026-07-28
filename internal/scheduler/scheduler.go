@@ -822,7 +822,7 @@ func (s *Scheduler) advance(ctx context.Context, b store.Book, stage state.State
 		}
 	}
 
-	next, status, err := state.NextState(stage, result.Outcome(fixes))
+	next, status, err := state.NextState(state.ParseKind(b.Kind), stage, result.Outcome(fixes))
 	if err != nil {
 		s.setStatus(b.ID, state.StatusFailed, err.Error(), "", time.Time{})
 		return
@@ -901,7 +901,7 @@ func (s *Scheduler) advanceWaypoints(ctx context.Context) ([]store.Book, error) 
 			if b.Status != "" || !state.IsWaypoint(st) {
 				continue
 			}
-			next, _, err := state.NextState(st, state.Outcome{})
+			next, _, err := state.NextState(state.ParseKind(b.Kind), st, state.Outcome{})
 			if err != nil {
 				continue
 			}

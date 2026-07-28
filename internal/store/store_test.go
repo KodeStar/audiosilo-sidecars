@@ -955,3 +955,68 @@ func TestStatusNeedsAttentionLiteral(t *testing.T) {
 			statusNeedsAttention, string(state.StatusNeedsAttention))
 	}
 }
+
+// TestKindLiterals pins the store's local kind literals to internal/state, for the
+// same reason TestStatusNeedsAttentionLiteral pins the status one: the store keeps
+// these opaque and does not import internal/state in production, so this is the
+// only thing stopping the copies from drifting.
+func TestKindLiterals(t *testing.T) {
+	if kindAudio != string(state.KindAudio) {
+		t.Errorf("kindAudio = %q, want %q", kindAudio, string(state.KindAudio))
+	}
+	if kindEbook != string(state.KindEbook) {
+		t.Errorf("kindEbook = %q, want %q", kindEbook, string(state.KindEbook))
+	}
+}
+
+// TestCreateBookKindInvariant is the allowed/denied pair for the kind<->ebook_path
+// invariant. It is enforced in the store because the pipeline reads those two
+// columns to choose a front half: a row where they disagree routes a book into a
+// stage that cannot handle its input (an epub handed to ffprobe, or an ebook book
+// with nothing to extract). Rejecting beats silently dropping the odd field.
+func TestCreateBookKindInvariant(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	// Allowed: an audio book (kind defaulted), and an ebook with its epub.
+	audio, err := db.CreateBook(ctx, NewBook{SourcePath: "/lib/a", WorkDir: "wd-a", Title: "A"})
+	if err != nil {
+		t.Fatalf("audio book: %v", err)
+	}
+	if audio.Kind != kindAudio || audio.EbookPath != "" {
+		t.Errorf("audio book kind/ebook_path = %q/%q, want %q/\"\"", audio.Kind, audio.EbookPath, kindAudio)
+	}
+	book, err := db.CreateBook(ctx, NewBook{
+		SourcePath: "/lib/b", WorkDir: "wd-b", Title: "B",
+		Kind: kindEbook, EbookPath: "/lib/b/book.epub",
+	})
+	if err != nil {
+		t.Fatalf("ebook book: %v", err)
+	}
+	if book.Kind != kindEbook || book.EbookPath != "/lib/b/book.epub" {
+		t.Errorf("ebook kind/ebook_path = %q/%q", book.Kind, book.EbookPath)
+	}
+	// It must survive the round trip, not just the returned struct.
+	got, err := db.GetBook(ctx, book.ID)
+	if err != nil {
+		t.Fatalf("GetBook: %v", err)
+	}
+	if got.Kind != kindEbook || got.EbookPath != "/lib/b/book.epub" {
+		t.Errorf("round-tripped kind/ebook_path = %q/%q", got.Kind, got.EbookPath)
+	}
+
+	// Denied: each way the pair can disagree.
+	denied := []struct {
+		name string
+		nb   NewBook
+	}{
+		{"ebook without an epub", NewBook{SourcePath: "/lib/c", WorkDir: "wd-c", Title: "C", Kind: kindEbook}},
+		{"audio carrying an epub", NewBook{SourcePath: "/lib/d", WorkDir: "wd-d", Title: "D", EbookPath: "/lib/d/x.epub"}},
+		{"unknown kind", NewBook{SourcePath: "/lib/e", WorkDir: "wd-e", Title: "E", Kind: "pdf", EbookPath: "/lib/e/x.pdf"}},
+	}
+	for _, c := range denied {
+		if _, err := db.CreateBook(ctx, c.nb); !errors.Is(err, ErrInvalidKind) {
+			t.Errorf("%s: err = %v, want ErrInvalidKind", c.name, err)
+		}
+	}
+}

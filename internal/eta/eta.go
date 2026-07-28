@@ -115,12 +115,17 @@ var stageUnits = map[state.State]stageUnit{
 	state.Retranscribing:     {unitChapter, 60},
 	state.SpellingResearch:   {unitBook, 600},
 	state.Correcting:         {unitBook, 15},
-	state.FactPass:           {unitChunk, 900},
-	state.Synthesizing:       {unitBook, 700},
-	state.Validating:         {unitBook, 10},
-	state.Auditing:           {unitBook, 700},
-	state.Fixing:             {unitBook, 240},
-	state.Contributing:       {unitBook, 1},
+	// Extracting is a zip read plus HTML-to-text over a whole book: mechanical and
+	// fast, but not free on a 600-page novel. ChapterMapping mirrors
+	// MarkersNormalizing, the agent stage it is modelled on.
+	state.Extracting:     {unitBook, 20},
+	state.ChapterMapping: {unitBook, 180},
+	state.FactPass:       {unitChunk, 900},
+	state.Synthesizing:   {unitBook, 700},
+	state.Validating:     {unitBook, 10},
+	state.Auditing:       {unitBook, 700},
+	state.Fixing:         {unitBook, 240},
+	state.Contributing:   {unitBook, 1},
 }
 
 // Progress mirrors one store progress row (done/total) for a stage.
@@ -133,9 +138,13 @@ type Progress struct {
 // path and place it in the queue simulation. It is framework-free (no store or
 // scheduler import) so the scheduler builds it from a store.Book + progress rows.
 type Book struct {
-	ID        int64
-	State     state.State
-	Status    state.Status
+	ID     int64
+	State  state.State
+	Status state.Status
+	// Kind selects the front half the remaining-path walk follows (an ebook skips
+	// the audio stages entirely, so its estimate is much shorter). Zero value
+	// normalizes to audio.
+	Kind      state.Kind
 	Series    string
 	SeriesPos string
 	// Chapters is the manifest chapter count (0 = unknown -> DefaultChapters).
@@ -257,7 +266,7 @@ func remainingSegments(b Book, rates map[string]float64) []segment {
 	// every fork (skipping the conditional stages and routing the off-mainline stages
 	// back onto the mainline), so following it from any start is finite - every fork
 	// moves toward done and no off-mainline stage is re-entered.
-	for cur := b.State; cur != "" && !state.IsTerminal(cur); cur = state.MainlineNext(cur) {
+	for cur := b.State; cur != "" && !state.IsTerminal(cur); cur = state.MainlineNext(b.Kind, cur) {
 		if state.IsWaypoint(cur) {
 			continue // no lane, no cost
 		}

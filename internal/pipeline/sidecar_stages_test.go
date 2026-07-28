@@ -439,7 +439,7 @@ func TestValidateWarningRidesToAuditPass(t *testing.T) {
 	if !res.AuditPassed {
 		t.Fatal("AuditPassed=false for a warning-only book with a passing agent, want true")
 	}
-	next, _, err := state.NextState(state.Auditing, state.Outcome{AuditPassed: res.AuditPassed})
+	next, _, err := state.NextState(state.KindAudio, state.Auditing, state.Outcome{AuditPassed: res.AuditPassed})
 	if err != nil {
 		t.Fatal(err)
 	}

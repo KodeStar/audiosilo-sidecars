@@ -222,7 +222,9 @@ func runOne(ctx context.Context, opts RunOptions, matrix Matrix, profile Profile
 			fixAttempts++
 			result.FixRounds++
 		}
-		next, status, err := state.NextState(stage, stageResult.Outcome(fixAttempts))
+		// The benchmark replays the post-ASR authoring tail, which only the audio
+		// pipeline reaches; an ebook book never enters this harness.
+		next, status, err := state.NextState(state.KindAudio, stage, stageResult.Outcome(fixAttempts))
 		if err != nil {
 			populateResult(ctx, db, book.ID, &result)
 			return result, err

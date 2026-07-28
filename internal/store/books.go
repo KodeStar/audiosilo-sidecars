@@ -112,11 +112,18 @@ type Book struct {
 	// WorkID is the meta.audiosilo.app work this book was matched to at enqueue time
 	// (from its coverage verdict or a manual match), advisory enrichment keyed off
 	// the path identity. Empty when unmatched.
-	WorkID   string
-	State    string
-	Status   string
-	Error    string
-	Coverage json.RawMessage // '' in the DB decodes to nil
+	WorkID string
+	// Kind is the source modality driving the pipeline ("audio" or "ebook"); see
+	// internal/state.Kind. Pre-migration rows read "audio".
+	Kind string
+	// EbookPath is the .epub the pipeline extracts (empty for an audio book). For an
+	// epub beside an audiobook it differs from SourcePath, which stays the audiobook
+	// folder so the identity (and its ASIN) is unchanged.
+	EbookPath string
+	State     string
+	Status    string
+	Error     string
+	Coverage  json.RawMessage // '' in the DB decodes to nil
 	// ScratchBytes is the accounted on-disk size of the book's work dir, written by
 	// the split stage and PurgeScratch so reads never have to walk the dir.
 	ScratchBytes int64
@@ -128,6 +135,10 @@ type Book struct {
 	// pipeline right after inspect succeeds (0 = not yet known / pre-inspect). It
 	// rides on the book view so the Running list can show each book's length.
 	DurationSec float64
+	// Words is the extracted chapter universe's word count, written by the pipeline
+	// after extracting succeeds (0 = unknown / audio). An ebook has no runtime, so
+	// the Running list shows this in place of the duration chip.
+	Words int
 	// ParkCode is the typed park reason (empty = none): set when status becomes
 	// needs_attention, cleared whenever status clears. It rides beside Error.
 	ParkCode string
@@ -169,10 +180,54 @@ type NewBook struct {
 	IdentitySources map[string]string
 	// WorkID is the matched meta.audiosilo.app work id (advisory; empty when unmatched).
 	WorkID string
+	// Kind is the source modality ("" defaults to audio); EbookPath is the .epub an
+	// ebook book extracts. CreateBook enforces that the two agree.
+	Kind      string
+	EbookPath string
 	// Coverage is the advisory metadata-coverage snapshot captured at scan time
 	// (empty when unknown). It is stored as-is and returned on the book view.
 	Coverage json.RawMessage
 	State    string // "" defaults to queued
+}
+
+// ErrInvalidKind reports a NewBook whose kind and ebook_path disagree: an unknown
+// kind, an ebook with no epub to read, or an audio book carrying one.
+//
+// Enforced here rather than at the API boundary for the same reason the park_code
+// invariant is (see SetBookState): the pipeline reads these two columns to decide
+// which front half to run, so a row where they disagree routes a book into a stage
+// that cannot handle it. Rejecting - never silently dropping the odd field - also
+// matches the house rule that an ASIN without a region is an error, not a value to
+// discard.
+var ErrInvalidKind = errors.New("book kind and ebook_path disagree")
+
+// The two book kinds. Local literals rather than an internal/state import, for the
+// same reason statusNeedsAttention is one: the store stays free of the state
+// package in production. store_test.go asserts these equal state.KindAudio /
+// state.KindEbook, so the copies cannot drift.
+const (
+	kindAudio = "audio"
+	kindEbook = "ebook"
+)
+
+// normalizeKind validates the kind/ebook_path pair and returns the stored kind.
+func normalizeKind(kind, ebookPath string) (string, error) {
+	if kind == "" {
+		kind = kindAudio
+	}
+	switch kind {
+	case kindAudio:
+		if ebookPath != "" {
+			return "", fmt.Errorf("%w: audio book carries ebook_path %q", ErrInvalidKind, ebookPath)
+		}
+	case kindEbook:
+		if ebookPath == "" {
+			return "", fmt.Errorf("%w: ebook book has no ebook_path", ErrInvalidKind)
+		}
+	default:
+		return "", fmt.Errorf("%w: unknown kind %q", ErrInvalidKind, kind)
+	}
+	return kind, nil
 }
 
 func isUniqueViolation(err error) bool {
@@ -224,6 +279,10 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 	if err != nil {
 		return Book{}, err
 	}
+	kind, err := normalizeKind(nb.Kind, nb.EbookPath)
+	if err != nil {
+		return Book{}, err
+	}
 	st := nb.State
 	if st == "" {
 		st = "queued"
@@ -236,10 +295,10 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 	res, err := db.sql.ExecContext(ctx,
 		`INSERT INTO books
 		 (batch_id, source_path, work_dir, title, authors, narrators, series, series_pos, asin, isbn,
-		  identity_sources, work_id, state, status, error, coverage, created_at, updated_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'','',?,?,?)`,
+		  identity_sources, work_id, kind, ebook_path, state, status, error, coverage, created_at, updated_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'','',?,?,?)`,
 		batchID, nb.SourcePath, nb.WorkDir, nb.Title, authors, narrators, nb.Series, nb.SeriesPos,
-		nb.ASIN, nb.ISBN, idsrc, nb.WorkID, st, string(nb.Coverage), now, now)
+		nb.ASIN, nb.ISBN, idsrc, nb.WorkID, kind, nb.EbookPath, st, string(nb.Coverage), now, now)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return Book{}, ErrDuplicate
@@ -266,6 +325,8 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 		ISBN:            nb.ISBN,
 		IdentitySources: nb.IdentitySources,
 		WorkID:          nb.WorkID,
+		Kind:            kind,
+		EbookPath:       nb.EbookPath,
 		State:           st,
 		Coverage:        nb.Coverage,
 		CreatedAt:       now,
@@ -274,16 +335,16 @@ func (db *DB) CreateBook(ctx context.Context, nb NewBook) (Book, error) {
 }
 
 const bookCols = `id, batch_id, source_path, work_dir, title, authors, narrators, series, series_pos,
-	asin, isbn, identity_sources, work_id, state, status, error, coverage, scratch_bytes,
-	chapters, duration_sec, park_code, retry_at, created_at, updated_at`
+	asin, isbn, identity_sources, work_id, kind, ebook_path, state, status, error, coverage,
+	scratch_bytes, chapters, duration_sec, words, park_code, retry_at, created_at, updated_at`
 
 func scanBook(sc interface{ Scan(...any) error }) (Book, error) {
 	var b Book
 	var authors, narrators, idsrc, coverage string
 	if err := sc.Scan(&b.ID, &b.BatchID, &b.SourcePath, &b.WorkDir, &b.Title, &authors, &narrators,
-		&b.Series, &b.SeriesPos, &b.ASIN, &b.ISBN, &idsrc, &b.WorkID, &b.State, &b.Status,
-		&b.Error, &coverage, &b.ScratchBytes, &b.Chapters, &b.DurationSec, &b.ParkCode,
-		&b.RetryAt, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		&b.Series, &b.SeriesPos, &b.ASIN, &b.ISBN, &idsrc, &b.WorkID, &b.Kind, &b.EbookPath,
+		&b.State, &b.Status, &b.Error, &coverage, &b.ScratchBytes, &b.Chapters, &b.DurationSec,
+		&b.Words, &b.ParkCode, &b.RetryAt, &b.CreatedAt, &b.UpdatedAt); err != nil {
 		return Book{}, err
 	}
 	if authors != "" {
