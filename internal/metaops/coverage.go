@@ -178,8 +178,12 @@ type workVal struct {
 	title      string
 	series     *SeriesRef
 	recordings []RecordingRef
-	hasChars   bool
-	hasRecap   bool
+	// charNames are the work's character names and aliases, in sidecar order and
+	// unfiltered. SeriesGlossary filters them; caching them raw keeps this the
+	// single decode of the works/{id} payload.
+	charNames []string
+	hasChars  bool
+	hasRecap  bool
 }
 
 // searchVal is a cached fuzzy-match verdict (including a negative one), keyed on
@@ -193,8 +197,11 @@ type searchVal struct {
 	matched   bool
 }
 
-// SeriesRef is a work's series membership in a search result.
+// SeriesRef is a work's series membership in a search result. ID is the series
+// slug, which SeriesGlossary follows to reach the sibling volumes; some upstream
+// payloads omit it, so a consumer must tolerate "".
 type SeriesRef struct {
+	ID       string `json:"id,omitempty"`
 	Name     string `json:"name"`
 	Position string `json:"position"`
 }
@@ -218,6 +225,8 @@ type Client struct {
 	works      *ttlCache[string, workVal]            // key: work id
 	searchVerd *ttlCache[string, searchVal]          // key: normalized title|author
 	searchFeed *ttlCache[string, []WorkSearchResult] // key: "<limit>:<query>"
+	glossaries *ttlCache[string, Glossary]           // key: work id (see glossary.go)
+	seriesFeed *ttlCache[string, []string]           // key: series id -> member work ids
 }
 
 // ErrDisabled is returned by the search/manual-match paths when the client has no
@@ -239,6 +248,8 @@ func NewClient(baseURL string) *Client {
 		works:      newTTLCache[string, workVal](time.Now, coverageTTL),
 		searchVerd: newTTLCache[string, searchVal](time.Now, coverageTTL),
 		searchFeed: newTTLCache[string, []WorkSearchResult](time.Now, searchProxyTTL),
+		glossaries: newTTLCache[string, Glossary](time.Now, coverageTTL),
+		seriesFeed: newTTLCache[string, []string](time.Now, coverageTTL),
 	}
 }
 
@@ -433,9 +444,16 @@ func (c *Client) workDetail(ctx context.Context, workID string) (v workVal, foun
 		return cached, true, true
 	}
 	var res struct {
-		Title      string            `json:"title"`
-		Series     []SeriesRef       `json:"series"`
-		Characters []json.RawMessage `json:"characters"`
+		Title  string      `json:"title"`
+		Series []SeriesRef `json:"series"`
+		// Characters carries the names too, not just presence: SeriesGlossary needs
+		// them, and decoding them here keeps ONE mirror of the works/{id} payload
+		// and one cache entry per work (a sibling of the book being processed is
+		// usually already warm from the coverage path).
+		Characters []struct {
+			Name    string   `json:"name"`
+			Aliases []string `json:"aliases"`
+		} `json:"characters"`
 		Recaps     []json.RawMessage `json:"recaps"`
 		Recordings []struct {
 			ID        string `json:"id"`
@@ -457,6 +475,10 @@ func (c *Client) workDetail(ctx context.Context, workID string) (v workVal, foun
 	v = workVal{title: res.Title, hasChars: len(res.Characters) > 0, hasRecap: len(res.Recaps) > 0}
 	if len(res.Series) > 0 {
 		v.series = cloneSeriesRef(&res.Series[0])
+	}
+	for _, ch := range res.Characters {
+		v.charNames = append(v.charNames, ch.Name)
+		v.charNames = append(v.charNames, ch.Aliases...)
 	}
 	for _, rec := range res.Recordings {
 		r := RecordingRef{ID: rec.ID, RuntimeMin: rec.RuntimeMin, ASINs: rec.ASINs, ISBNs: rec.ISBNs}

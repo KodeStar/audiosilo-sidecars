@@ -244,6 +244,23 @@ internal/
             - Check's four gates miss that shape whenever the RHS is attested
             elsewhere, and it is deliberately NOT a fifth Check gate (Check is a
             contract-frozen golden-tested port).
+            reference.go is the OUTSIDE-EVIDENCE pre-pass (BuildReferenceMatches ->
+            spelling_reference_matches.json): it edit-distance-matches each candidate
+            against reference vocabularies and reports transcript forms no reference
+            spells that way. It exists because the agent's only native signal is
+            intra-transcript disagreement, which a CONSISTENTLY misheard name never
+            produces - "Torrin" 369 times and "Toren" never reads as settled, so a
+            whole Wandering Inn series published Torrin/Floss/Terriarch/Goddard.
+            ReferenceSource.Authority is the load-bearing part: VERIFIED (the meta
+            series glossary, the publisher's marker titles) comes from outside the
+            recording and may contradict it; CARRYOVER (the predecessor's ledger)
+            may not. Only a verified source marks a form "known" (and a known form
+            is never proposed against) - letting carryover settle a form would make
+            a propagated error immunise itself, which is exactly how one mistake
+            travels down a series. Bounds (maxMatchDistance 2, also <= len/3, first
+            letter must match) are calibrated against the six real misspellings;
+            NamesFromTitles mines marker titles ("Chapter 9: Toren") and yields
+            nothing for the bare-number tables real volumes often ship.
   agent/    M5: the agent-runner abstraction (Runner{ID,Detect,Run} over a normalized
             Request/Result/Usage) + claude and codex headless-CLI backends (prompt on
             STDIN never argv, --output-format json / codex --json JSONL, usage capture,
@@ -352,6 +369,14 @@ internal/
             covered -> submit per contribution.mode, resume-idempotent via the
             contributions rows; export.go composes the download zip + core-proposal
             JSON injected into api) - EVERY stage is now real.
+            spelling_research additionally assembles OUTSIDE spelling evidence before
+            it stages anything: referenceSources() ranks the metaops series glossary
+            and the publisher's marker titles as VERIFIED against the predecessor's
+            ledger as CARRYOVER, and BuildReferenceMatches turns that into the staged
+            spelling_reference_matches.json. The metaops dependency is reached through
+            the OPTIONAL MetaGlossary interface (type-asserted off the existing
+            e.meta), so a nil/!ok client simply runs the stage exactly as before -
+            the glossary is evidence, never a precondition.
             markers_normalizing's manifest contract has a COVERAGE half alongside the
             numbering one: validateMarkersManifest checks the corrected map against the
             RAW marker table from probe.json (never the draft - the draft is exactly what
@@ -662,7 +687,16 @@ internal/
             the resulting park then spent the book's whole auto-recovery budget.
   metaops/  meta.audiosilo.app client (coverage/lookup, capped 1h TTL caches,
             graceful degrade) + async folder-scan job manager over audiosilo-meta
-            pkg/scan + the library_roots PathAllowed check. Coverage resolves
+            pkg/scan + the library_roots PathAllowed check. glossary.go adds
+            SeriesGlossary (work -> its series -> the OTHER volumes' contributed
+            character names/aliases, <= 12 siblings, own TTL caches), the canonical
+            spelling evidence the spelling stage checks a transcript against; it
+            EXCLUDES the book's own sidecar (a book checked against itself makes its
+            mistakes self-attesting) and drops descriptive placeholder labels ("The
+            missing young gnoll child") since those are prose, not spellings. Every
+            no-data path (disabled client, no series, outage, uncontributed
+            siblings) returns an empty glossary and a NIL error - a metadata outage
+            must never park a book. Coverage resolves
             asin -> isbn -> a fuzzy title-search fallback scored by
             audiosilo-server's pure-stdlib pkg/match (Coverage carries matched_by
             "asin"|"isbn"|"search"|"manual" + work_title provenance). Scans STREAM:
@@ -755,7 +789,8 @@ events, config, store, scheduler, metaops, pipeline, web}`; `api -> {auth, secre
 events, config, store, scheduler, metaops}`; `scheduler -> {store, state, eta, events}`; `eta -> state` (pure, imported BY
 scheduler - never the reverse);
 `pipeline -> {audio, asr, transcript, qa, spelling, agent, repair, toolfetch, scratch,
-secrets, fsutil, store, state, scheduler}`; `agent`/`repair` are leaf helpers (no
+secrets, fsutil, metaops, store, state, scheduler}` (metaops since M7's contributing
+stage, and the spelling stage's series glossary); `agent`/`repair` are leaf helpers (no
 scheduler/store deps; `repair -> qa` for the shared Python-compat gram/repr helpers
 and the shared clip-floor predicate `qa.ClipStartInRange`/`qa.ClipStartFloorSec`);
 `state` is pure. Handlers marshal DTOs and call into the injected packages; they
@@ -1194,6 +1229,27 @@ Milestones from the workspace plan; each is shippable.
   keeps every completed paid extraction. Synthesis uses reveal-safe roster snapshots
   and an explicit coverage pass. The audit convergence re-entry now performs targeted
   semantic verification instead of accepting on mechanical validation alone.
+
+- **Post-M8 canonical-spelling round (done):** stopped the pipeline propagating its
+  own mishearings across a series. A whole Wandering Inn run published `Torrin` for
+  Toren, `Floss` for Flos, `Terriarch` for Teriarch, `Laken Goddard` for Godart,
+  `prognogator` for Prognugator and `Valsaif` for Valceif - every book internally
+  consistent, so nothing ever looked wrong. Two causes, both now addressed. (1) The
+  agent's only signal is intra-transcript disagreement, and a name misheard the SAME
+  way every time produces none; `spelling.BuildReferenceMatches` adds a deterministic
+  edit-distance pre-pass (`spelling_reference_matches.json`) that reports transcript
+  forms no reference source spells that way. (2) The series carryover was actively
+  REINFORCING the error - book 5's corrected text (book 6's gate-3 attestation
+  corpus) held `Torrin` 369x / `Floss` 1135x and `Toren`/`Flos` zero, and its ledger
+  recorded both as canonical, so gate 3 would happily attest the mistake and the
+  prompt told the agent the carried ledger wins. `metaops.SeriesGlossary` now pulls
+  the canonical names the community database records for the series' OTHER volumes
+  into `spelling-refs/series-glossary.txt` (already an allowed `reference_files`
+  citation and already in the dry-run corpus - no validator change), and
+  `ReferenceSource.Authority` ranks it ABOVE the carryover in both the Go engine and
+  spelling.md's evidence order. The prompt now also states that transcript frequency
+  is not evidence of spelling. Note the marker-title path helps only sometimes: some
+  volumes ship `Chapter 9: Toren`, others a bare `001..027` table.
 
 Still **not built**: signed installers / a friendlier packaged client (a possible
 follow-up per the meta EXTRACTION roadmap); a separately-deployable UI-only image

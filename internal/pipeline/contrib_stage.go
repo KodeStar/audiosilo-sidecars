@@ -31,6 +31,13 @@ import (
 type MetaCoverage interface {
 	CoverageFor(context.Context, metaops.BookIdentity) (metaops.Coverage, error)
 	CoverageForWork(context.Context, string) (metaops.Coverage, error)
+	// SeriesGlossary feeds the spelling stage's canonical-name evidence. It lives on
+	// this interface rather than a separately type-asserted one so the compiler
+	// holds the dependency: this feature exists because silent degradation let a
+	// misspelling propagate unnoticed across a whole series, and an optional
+	// interface would reintroduce exactly that failure mode - a wrapper or a
+	// signature change would drop the glossary with no error and no stage note.
+	SeriesGlossary(ctx context.Context, workID string) (metaops.Glossary, error)
 }
 
 // TokenResolver resolves a GitHub credential for the issue/pr contribution modes.

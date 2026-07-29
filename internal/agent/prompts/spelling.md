@@ -31,10 +31,33 @@ You work in the current directory. It contains:
 - `marker_titles.txt` - the recording's chapter-marker titles, one per line.
   This is tier-1 spelling evidence (the publisher's own spellings).
 - `chunk_plan.json` - the chunk boundaries the fact pass will use.
-{{if .HasCarryover}}- `spelling-refs/prior-marker_titles.txt`, `spelling-refs/prior-spellings.json`,
+- `spelling_reference_matches.json` - a MECHANICAL pre-pass: transcript forms that
+  no reference source spells that way, each paired with the closest name a
+  reference source DOES spell, with the edit distance and that source's
+  `authority`. Work through every entry. A name the transcript spells the same way
+  from beginning to end gives you no internal signal at all - there are no variants
+  to adjudicate and no cluster to resolve - so this report is the only place such a
+  name can surface. Entries are proposals, not instructions: two genuinely distinct
+  characters can sit one edit apart, and the do-not-merge rule below still governs.
+  A form the references already spell that way is never listed, so every listed
+  form is one no reference knows.
+{{if .HasGlossary}}- `spelling-refs/series-glossary.txt` - the canonical character names the community
+  metadata database records for the OTHER volumes of this series ({{.GlossaryWorks}}),
+  contributed and reviewed by people who read them. This is your highest-authority
+  spelling evidence: it comes from outside this recording, so it can CONTRADICT both
+  the audio and the carryover, which only ever tell you what the ASR heard. Cite it
+  as a `reference_files` entry to attest a correction.
+{{end}}{{if .HasCarryover}}- `spelling-refs/prior-marker_titles.txt`, `spelling-refs/prior-spellings.json`,
   `spelling-refs/prior-corrections.json` - the marker titles, accumulated ledger,
   and correction rules from the previous book in this series. The carried ledger
   WINS over this book's raw ASR: the model re-mishears the same names every book.
+  It does NOT win over the series glossary or a verified external source. The
+  carryover proves only that the PREVIOUS volume spelled a name this way, which is
+  not evidence that the spelling is right: a misheard name reproduces itself down a
+  whole series precisely because each book agrees with the one before it. When the
+  carryover and a verified source disagree, the verified source is right and the
+  carried spelling is the error being propagated - correct it here instead of
+  passing it on again.
   Prune any carried rule whose character or term does not appear in THIS book (a
   dead rule fails the correction gate). You may list `spelling-refs` (the
   directory) as a `reference_files` entry to attest a series name you know from the
@@ -49,15 +72,11 @@ Do not use any tool other than reading and writing files in this directory{{if .
 
 Resolve each name against evidence in this priority order:
 
-1. embedded metadata and exact chapter-marker labels (`marker_titles.txt`)
-{{if .HasCarryover}}2. the carried series ledger (`spelling-refs/prior-spellings.json`)
-3. official author, publisher, or series material
-4. the book's catalogue records or official table of contents
-5. book-scoped wiki page TITLES or structured navigation
-6. agreement among multiple independent references{{else}}2. official author, publisher, or series material
-3. the book's catalogue records or official table of contents
-4. book-scoped wiki page TITLES or structured navigation
-5. agreement among multiple independent references{{end}}
+{{.EvidencePriority}}
+
+The transcript's own frequency is NOT on this list. A name occurring 1135 times is
+1135 occurrences of one ASR decision, not 1135 pieces of evidence: the count says
+nothing about the spelling. Never let it outweigh a source above.
 
 Assign each ledger entry a status:
 
@@ -109,6 +128,14 @@ reader would miss.{{end}}
   cannot attest a correct spelling, write NO rule for it - list the name in
   `unresolved` (in BOTH output files) instead. An unresolved name handled by role
   loses nothing a reader would miss.
+{{if .HasReferenceMatches}}- Give every `spelling_reference_matches.json` entry a disposition. Either write the
+  rule, or record in the ledger `note` why the transcript form stands (two distinct
+  characters, a deliberate non-merge, a reference entry that does not refer to this
+  figure). Silently leaving a `verified`-authority proposal unaddressed is the exact
+  failure this report exists to prevent: a whole series was published with `Torrin`
+  for `Toren`, `Floss` for `Flos` and `Terriarch` for `Teriarch` because every book
+  agreed with itself and nothing ever compared it to anything outside.
+{{end}}
 - The validation gates attest your replacement AFTER deleting every "'s" from it:
   `Leaf's Crossing` is checked as the literal string `Leaf Crossing`. Prefer a
   canonical form without "'s". If the only correct canonical contains "'s" and its
@@ -155,7 +182,7 @@ one patch pass.
 }
 ```
 
-`reference_files` may list ONLY `marker_titles.txt`{{if .HasCarryover}} and the staged prior-book reference files under `spelling-refs/` (`spelling-refs/prior-spellings.json`, `spelling-refs/prior-corrections.json`, `spelling-refs/prior-marker_titles.txt`){{end}} - nothing you authored yourself. It is the attestation set the correction gate checks a replacement against, so listing your own output would let an invented name attest itself.
+`reference_files` may list ONLY `marker_titles.txt`{{if .HasGlossary}}, `spelling-refs/series-glossary.txt`{{end}}{{if .HasCarryover}} and the staged prior-book reference files under `spelling-refs/` (`spelling-refs/prior-spellings.json`, `spelling-refs/prior-corrections.json`, `spelling-refs/prior-marker_titles.txt`){{end}} - nothing you authored yourself. It is the attestation set the correction gate checks a replacement against, so listing your own output would let an invented name attest itself.
 
 2. `out/spellings.json`:
 
