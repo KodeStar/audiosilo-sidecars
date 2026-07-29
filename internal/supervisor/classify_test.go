@@ -77,6 +77,65 @@ func TestClassifyRunawayComparedWithPreviousSuccessfulAttempt(t *testing.T) {
 	}
 }
 
+// A fixing round carrying three blockers ran 3m13s where the previous round's
+// smaller edit took 62s. That is ordinary agent-workload variance - 1.8% of the
+// 180-minute absolute limit - but it tripped the 3x growth check, and the parked
+// book then burned its whole auto-recovery budget on park/readmit cycles.
+func TestClassifyGrowthIgnoresShortAttemptsOfALoopStage(t *testing.T) {
+	now := time.Date(2026, 7, 27, 15, 19, 7, 0, time.UTC)
+	ok := true
+	runs := []store.StageRun{
+		{ID: 1, Stage: "fixing", Attempt: 8, Ok: &ok,
+			StartedAt:  now.Add(-8*time.Minute - 49*time.Second).Format(time.RFC3339Nano),
+			FinishedAt: now.Add(-8*time.Minute - 9*time.Second).Format(time.RFC3339Nano)},
+		{ID: 2, Stage: "fixing", Attempt: 9, Ok: &ok,
+			StartedAt:  now.Add(-5*time.Minute - 57*time.Second).Format(time.RFC3339Nano),
+			FinishedAt: now.Add(-4*time.Minute - 55*time.Second).Format(time.RFC3339Nano)},
+		{ID: 3, Stage: "fixing", Attempt: 10,
+			StartedAt:   now.Add(-3*time.Minute - 13*time.Second).Format(time.RFC3339Nano),
+			HeartbeatAt: now.Add(-2 * time.Minute).Format(time.RFC3339Nano),
+			ProgressAt:  now.Add(-2 * time.Minute).Format(time.RFC3339Nano)},
+	}
+	p := Policy{MaxErrorRepeats: 2, AttemptGrowthFactor: 3, MaxStageDuration: 180 * time.Minute, StaleAfter: 20 * time.Minute, NoProgressAfter: 30 * time.Minute}
+	if got := kinds(Classify(Snapshot{Now: now, Book: store.Book{ID: 254, BatchID: "b"}, Runs: runs, RuntimeActive: true}, p)); got[IncidentDurationLimit] {
+		t.Fatalf("healthy 3m13s attempt flagged against a 62s predecessor: %#v", got)
+	}
+	// Past the absolute floor the check still protects against a real runaway.
+	runs[2].StartedAt = now.Add(-25 * time.Minute).Format(time.RFC3339Nano)
+	if got := kinds(Classify(Snapshot{Now: now, Book: store.Book{ID: 254, BatchID: "b"}, Runs: runs, RuntimeActive: true}, p)); !got[IncidentDurationLimit] {
+		t.Fatalf("25m attempt against a 62s baseline not flagged: %#v", got)
+	}
+}
+
+// The baseline is the stage's high-water mark, not whichever attempt finished
+// last, so one short round in a loop stage's history cannot make the next
+// ordinary round look pathological.
+func TestClassifyGrowthBaselineIsTheLongestSuccessfulAttempt(t *testing.T) {
+	now := time.Date(2026, 7, 18, 20, 0, 0, 0, time.UTC)
+	ok := true
+	runs := []store.StageRun{
+		{ID: 1, Stage: "auditing", Attempt: 1, Ok: &ok,
+			StartedAt:   now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
+			FinishedAt:  now.Add(-3*time.Hour + 40*time.Minute).Format(time.RFC3339Nano),
+			InputTokens: 500_000, CostUSD: 9, CostReported: true},
+		{ID: 2, Stage: "auditing", Attempt: 2, Ok: &ok,
+			StartedAt:   now.Add(-2 * time.Hour).Format(time.RFC3339Nano),
+			FinishedAt:  now.Add(-2*time.Hour + 2*time.Minute).Format(time.RFC3339Nano),
+			InputTokens: 20_000, CostUSD: 0.4, CostReported: true},
+		{ID: 3, Stage: "auditing", Attempt: 3,
+			StartedAt:   now.Add(-35 * time.Minute).Format(time.RFC3339Nano),
+			HeartbeatAt: now.Format(time.RFC3339Nano), ProgressAt: now.Format(time.RFC3339Nano),
+			InputTokens: 300_000, CostUSD: 5, CostReported: true},
+	}
+	p := Policy{MaxErrorRepeats: 2, AttemptGrowthFactor: 3}
+	got := kinds(Classify(Snapshot{Now: now, Book: store.Book{ID: 1, BatchID: "b"}, Runs: runs, RuntimeActive: true}, p))
+	for _, unwanted := range []IncidentKind{IncidentDurationLimit, IncidentTokenLimit, IncidentCostLimit} {
+		if got[unwanted] {
+			t.Errorf("%s flagged against the 2m/20k/$0.4 attempt instead of the 40m/500k/$9 one: %#v", unwanted, got)
+		}
+	}
+}
+
 func TestClassifyCostLimitUsesEstimateWhenProviderCostIsUnavailable(t *testing.T) {
 	now := time.Now().UTC()
 	estimate := 6.0

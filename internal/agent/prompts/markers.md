@@ -23,21 +23,33 @@ web access.
 
 ## Your task
 
-Map the raw recording markers to the work's LOGICAL chapters:
+Map the raw recording markers to the work's chapters.
+
+**Account for every second of the recording.** `probe.json` is authoritative and the
+draft may have DROPPED markers it could not read. Any audio you neither number as a
+chapter nor list under `excluded` is a validation failure - and if it slipped through it
+would simply never be transcribed, so the book's characters and recaps would be written
+as though that stretch did not exist.
 
 - The marker list is a recording timeline, NOT the position model. Marker 1 may
-  be opening credits while marker 2 is logical chapter 1.
-- EXCLUDE from the position model: opening credits, closing/end credits,
-  retailer or preview samples, and any publisher "Summary of Book N-1" or "The
-  Story So Far" recap marker. These are never logical chapters.
-- Renumber the surviving markers contiguously from the first logical chapter
-  (1, 2, 3, ...). If the book itself deliberately uses another scheme (Parts,
-  book-relative numbering), state that in the verdict and keep the book's own
-  logical numbers.
-- NEVER infer chapter numbers merely from the marker count. Read each marker
-  title; a heading like "N. Title" or "Chapter N: Title" states the real number.
-  If two markers announce swapped or out-of-order numbers, trust the announced
-  logical number over physical order.
+  be opening credits while marker 2 is chapter 1.
+- **An unnumbered NARRATIVE section is a chapter.** An `Interlude`, `Side Story`,
+  `Intermission`, `Mini Stories`, `Prologue`, `Epilogue`, a bonus story, or a split
+  chapter labelled `Chapter 10a` / `Chapter 10b` is story the listener hears in order.
+  Give it the next chapter number like any other. Do not drop it for lacking a number,
+  and do not worry that including it shifts the numbers of later chapters - the
+  pipeline reads the real chapter numbers from the narration later, so your job is
+  coverage and order, not matching the printed numbering.
+- **EXCLUDE only genuine non-chapter audio**: opening and closing credits, a
+  dedication or epigraph, retailer or preview samples, a preview/intro of a DIFFERENT
+  book bundled into the same file, bloopers or outtakes, and any publisher "Summary of
+  Book N-1" / "The Story So Far" recap. List each one in `excluded` with its title,
+  interval, and a short reason.
+- When in doubt, INCLUDE. A wrongly included stat sheet costs a little transcription;
+  a wrongly excluded interlude is a hole in the book that nothing downstream can fix.
+- Number the surviving markers contiguously from the first chapter (1, 2, 3, ...) in
+  recording order. The number you assign is a position in the split, not a claim about
+  the book's own numbering.
 - Preserve every chapter's file path exactly as it appears in the draft
   manifest, and preserve the recording layout Style. You may only renumber,
   exclude, and retitle - never move, retime, or invent an interval.
@@ -65,24 +77,45 @@ So read those titles before concluding anything:
 - What that check will NOT catch is an INTERIOR non-chapter marker, such as a
   publisher "Summary of Book N-1" recap sitting mid-book. That still needs your
   judgment.
+- If the titles carry no numbering at all - pure story titles like "Transfer
+  Paperwork" or "On the Nature of Shadows" - the table still states its order, in its
+  own sequence. Number them in recording order.
 
-So a numbering you can read is not, by itself, a reason to decline. Every other
-reason to decline still stands, unchanged: if the titles do not state an order, or
-one marker holds several chapters, or the labels are ambiguous, say so in the
-verdict and do NOT guess.
+So an unreadable numbering is not, by itself, a reason to decline. What remains a
+reason: one marker that plainly holds several chapters, or a table whose order you
+genuinely cannot establish - for instance markers that do not run in a single
+consistent direction, or a recording whose markers leave stretches of audio no marker
+describes at all. Say so in the verdict and do NOT guess.
 {{end}}
 ## Output (only under out/)
 
 1. `out/verdict.json` (ALWAYS) with exactly this shape:
 
-```
-{ "confident": true, "reason": "short explanation in your own words" }
+```json
+{
+  "confident": true,
+  "reason": "short explanation in your own words",
+  "excluded": [
+    { "title": "End Credits", "start": 89962.4, "end": 89998.1, "reason": "closing credits" }
+  ]
+}
 ```
 
-Set `confident` to false when you cannot produce a defensible mapping (ambiguous
-labels, one marker holding several chapters, missing headings). When not
-confident, say precisely why in `reason` and do NOT guess - a parked book waits
-for a human, which is correct.
+`excluded` lists every stretch of recording your map deliberately leaves out, with
+intervals copied from `probe.json`. It may be omitted only when your chapters cover
+the whole recording. Short runs of credits at either end need no entry.
+
+Set `confident` to false when you cannot produce a defensible mapping (one marker
+holding several chapters, labels too ambiguous to order). When not confident, say
+precisely why in `reason` and do NOT guess - a parked book waits for a human.
+
+Two things are NOT reasons to decline, because both have defensible answers:
+
+- **Titles with no numbers at all.** A table labelled only with story titles states
+  its order in its own sequence, exactly as a book split across separate audio files
+  states it in file order. Number them in recording order.
+- **Unnumbered sections between numbered chapters.** Include them in order, as above.
+  You are not being asked to reproduce the book's printed numbering.
 
 2. `out/manifest.json` - the corrected manifest, required ONLY when `confident` is
    true (when you are not confident, do NOT write a guessed manifest; the verdict

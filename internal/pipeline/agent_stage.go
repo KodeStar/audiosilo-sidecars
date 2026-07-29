@@ -612,6 +612,49 @@ type markersPromptData struct {
 type markerVerdict struct {
 	Confident bool   `json:"confident"`
 	Reason    string `json:"reason"`
+	// Excluded is every stretch of recording the mapping deliberately leaves out. It
+	// exists because "which audio is not a chapter" cannot be a silent decision: dropping
+	// a marker used to be indistinguishable from never having read it, which is how 27
+	// books lost 61 hours of narration. An exclusion must be DECLARED to be accepted, and
+	// what is declared lands on the book's event log.
+	Excluded []markerExclusion `json:"excluded,omitempty"`
+}
+
+// markerExclusion is one declared non-chapter stretch of the recording.
+type markerExclusion struct {
+	Title  string  `json:"title"`
+	Start  float64 `json:"start"`
+	End    float64 `json:"end"`
+	Reason string  `json:"reason"`
+}
+
+// covers reports whether the exclusion accounts for the whole of an unmapped span. The
+// bound is generous by a second at each end so an agent copying marker boundaries out of
+// probe.json is not tripped by float formatting.
+func (e markerExclusion) covers(s audio.UnmappedSpan) bool {
+	return e.Start <= s.Start+1.0 && e.End >= s.End-1.0
+}
+
+// undeclaredSpans returns the unmapped spans that are neither short enough to be ordinary
+// non-chapter material nor accounted for by a declared exclusion.
+func undeclaredSpans(spans []audio.UnmappedSpan, excluded []markerExclusion) []audio.UnmappedSpan {
+	var out []audio.UnmappedSpan
+	for _, s := range spans {
+		if s.Tolerated() {
+			continue
+		}
+		declared := false
+		for _, e := range excluded {
+			if e.covers(s) {
+				declared = true
+				break
+			}
+		}
+		if !declared {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // markersNormalize maps a non-contiguous recording's raw markers to logical work
@@ -650,7 +693,11 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, r sche
 			return scheduler.StageResult{}, fmt.Errorf("markers_normalizing: deterministic probe reparse: %w", reparseErr)
 		}
 		draft, markers = rebuilt, stats
-		if markers.Contiguous {
+		// Usable(), not Contiguous(): the reparse is a shortcut PAST the agent, so it must
+		// clear the same bar the routing decision does. Gating on numbering alone would let
+		// a re-derived map that numbers 1..N while dropping an interlude complete the stage
+		// and go straight to split - the very failure this recovery path sits in front of.
+		if markers.Usable() {
 			if e.db != nil {
 				_ = e.db.SetBookChapters(context.WithoutCancel(ctx), book.ID, draft.ChapterCount)
 				_ = e.db.SetBookDuration(context.WithoutCancel(ctx), book.ID, draft.Duration)
@@ -697,6 +744,16 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, r sche
 			inputPaths[ch.FilePath] = true
 		}
 	}
+	// The RAW marker table is what the corrected manifest is checked for coverage against.
+	// Checking against the draft would be circular - the draft is precisely the thing that
+	// may have dropped a marker.
+	rawMarkers, rawDuration, err := audio.ReadProbeMarkers(book.WorkDir)
+	if err != nil {
+		return scheduler.StageResult{}, fmt.Errorf("markers_normalizing: read probe markers: %w", err)
+	}
+	if rawDuration <= 0 {
+		rawDuration = draft.Duration
+	}
 	validate := func(_ agent.Result, s *agent.Staging) error {
 		// A not-confident verdict is a VALID terminal output: the agent followed the
 		// prompt's "do not guess" instruction and declined to invent a mapping, so it may
@@ -710,7 +767,7 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, r sche
 		if !v.Confident {
 			return nil
 		}
-		return validateMarkersManifest(s.OutDir(), draft, inputPaths)
+		return validateMarkersManifest(s.OutDir(), draft, inputPaths, rawMarkers, rawDuration, v.Excluded)
 	}
 	data := markersPromptData{
 		Title:          book.Title,
@@ -746,6 +803,15 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, r sche
 	if err := agent.Harvest(st, []agent.HarvestSpec{{From: audio.ManifestName, To: audio.ManifestName}}); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("markers_normalizing: harvest manifest: %w", err)
 	}
+	// Put every deliberate drop on the book's durable log. Excluding audio is a real
+	// editorial decision - it is how a bundled preview of the next book stays out of the
+	// sidecars - and the failure it replaces was precisely that such drops were invisible.
+	if r.Note != nil {
+		for _, ex := range verdict.Excluded {
+			r.Note(fmt.Sprintf("excluded %.1f min at %.0f-%.0fs (%s): %s",
+				(ex.End-ex.Start)/60, ex.Start, ex.End, strings.TrimSpace(ex.Title), strings.TrimSpace(ex.Reason)))
+		}
+	}
 	// Re-point the book's gauges at the HARVESTED map, exactly as the deterministic
 	// branch above does. Normalization exists to drop credits/sample markers, so the
 	// harvested chapter count is routinely lower than the draft count inspect recorded -
@@ -770,11 +836,19 @@ func (e *Executor) markersNormalize(ctx context.Context, book store.Book, r sche
 // validateMarkersManifest checks a CONFIDENT agent's out/manifest.json against the
 // contract: it parses as an audio.Manifest, keeps the draft's Style, numbers its
 // chapters uniquely/orderly/contiguously, every interval is start<end within [0,
-// Duration+1s], ChapterCount matches, and its file paths are a subset of the draft's
-// (the agent may only renumber/exclude/retitle, never invent an interval or file). The
-// caller gates this on a confident verdict (a not-confident verdict skips the manifest
+// Duration+1s], ChapterCount matches, its file paths are a subset of the draft's (the
+// agent may only renumber/exclude/retitle, never invent an interval or file), and it
+// COVERS the recording apart from spans it explicitly declared as excluded. The caller
+// gates this on a confident verdict (a not-confident verdict skips the manifest
 // requirement entirely and parks with its reason), so it need not re-read the verdict.
-func validateMarkersManifest(outDir string, draft audio.Manifest, inputPaths map[string]bool) error {
+//
+// The coverage half is checked against the RAW marker table from probe.json rather than
+// the draft, because the draft is exactly what may have dropped a marker. Nine books had
+// their interludes dropped by an agent that was consulted and answered - the numbering
+// contract alone had nothing to say about missing narration.
+func validateMarkersManifest(outDir string, draft audio.Manifest, inputPaths map[string]bool,
+	rawMarkers []audio.Marker, rawDuration float64, excluded []markerExclusion,
+) error {
 	raw, err := os.ReadFile(filepath.Join(outDir, audio.ManifestName)) //nolint:gosec // outDir is the agent's staged out/ dir under the work dir
 	if err != nil {
 		return fmt.Errorf("out/manifest.json: %v", err)
@@ -814,6 +888,16 @@ func validateMarkersManifest(outDir string, draft audio.Manifest, inputPaths map
 	}
 	if m.ChapterCount != len(m.Chapters) {
 		return fmt.Errorf("chapter_count %d does not match the %d chapters", m.ChapterCount, len(m.Chapters))
+	}
+	if undeclared := undeclaredSpans(audio.UnmappedSpans(m.Chapters, rawMarkers, rawDuration), excluded); len(undeclared) > 0 {
+		return fmt.Errorf(
+			"this audio is in neither a chapter nor the verdict's \"excluded\" list: %s. "+
+				"Every second of the recording must be accounted for. An unnumbered narrative "+
+				"section (Interlude, Side Story, Intermission, Prologue, Epilogue, a split "+
+				"\"Chapter 10a\") IS a chapter - give it the next chapter number. Only genuine "+
+				"non-chapter audio may be left out, and it must be listed in \"excluded\" with a "+
+				"reason",
+			audio.DescribeSpans(undeclared))
 	}
 	return nil
 }
@@ -1468,7 +1552,7 @@ func (e *Executor) autoAcceptRepairedTails(rep *qa.Report, workDir string) []qa.
 	if err != nil {
 		byCh = nil
 	}
-	tailOnly := tailOnlyChapters(rep, byCh)
+	tailOnly := tailOnlyChapters(rep, byCh, repairedPhraseResolver(workDir))
 	var out []qa.PlanEntry
 	for _, ch := range qa.FlaggedChapters(rep) {
 		if !tailOnly[ch] {
@@ -1516,7 +1600,7 @@ const (
 // verdicts maps a chapter to its recorded tail_verdicts entry (ClipStart/ClipEnd are read
 // for the residual test); a chapter with no entry cannot have a covered residual. It reads
 // the report + verdicts only; it never touches the golden-tested qa detectors.
-func tailOnlyChapters(rep *qa.Report, verdicts map[int]repair.TailVerdict) map[int]bool {
+func tailOnlyChapters(rep *qa.Report, verdicts map[int]repair.TailVerdict, resolved phraseResolver) map[int]bool {
 	disq := map[int]bool{}
 	for _, o := range rep.WPHOutliers {
 		disq[o.Chapter] = true
@@ -1537,7 +1621,7 @@ func tailOnlyChapters(rep *qa.Report, verdicts map[int]repair.TailVerdict) map[i
 		disq[h.Chapter] = true
 	}
 	for _, h := range rep.CrossSegment {
-		if v, ok := verdicts[h.Chapter]; !ok || !crossHitTailCovered(h, v) {
+		if v, ok := verdicts[h.Chapter]; !ok || !crossHitTailCovered(h, v, resolved) {
 			disq[h.Chapter] = true
 		}
 	}
@@ -1592,9 +1676,56 @@ func spanCovered(startSec, endSec *float64, pos float64, v repair.TailVerdict) b
 // chapter's recorded splice window v. A CrossSegmentHit sets FirstSec/LastSec as a pair
 // (Pos derives from FirstSec), so the located span is [FirstSec, LastSec] and spanCovered
 // applies. For a MID window both bounds constrain; for a TAIL window only the start.
-func crossHitTailCovered(h qa.CrossSegmentHit, v repair.TailVerdict) bool {
-	return spanCovered(h.FirstSec, h.LastSec, h.Pos, v)
+//
+// An UNTIMED hit (no FirstSec, which the report writes as pos -1) is the characteristic
+// shape of a tail loop re-reported off the untouched transcripts-json/ layer, so
+// spanCovered's position fallback can never fire for it and every such residual was being
+// pushed to the agent. For those, resolved() supplies the decisive evidence spanCovered
+// lacks: whether the looped phrase is still in the repaired text. Gone means the splice
+// already removed it; still present means the repair under-covered, and the chapter stays
+// with the agent exactly as before. A timed hit never consults it - its own window
+// arithmetic is authoritative.
+func crossHitTailCovered(h qa.CrossSegmentHit, v repair.TailVerdict, resolved phraseResolver) bool {
+	if spanCovered(h.FirstSec, h.LastSec, h.Pos, v) {
+		return true
+	}
+	return h.FirstSec == nil && resolved != nil && resolved(h.Chapter, h.Phrase)
 }
+
+// phraseResolver reports whether a flagged phrase is ABSENT from a chapter's repaired
+// transcript, i.e. whether a splice already resolved that finding. It is injected so the
+// residual classification stays unit-testable without a work dir on disk; a nil resolver
+// (or one that cannot read the repaired layer) simply resolves nothing, leaving the
+// pre-existing window arithmetic as the only rule.
+type phraseResolver func(chapter int, phrase string) bool
+
+// repairedPhraseResolver builds the production phraseResolver over workDir's repaired
+// transcripts, memoizing each chapter's normalized text so a chapter with several hits
+// reads its file once. A missing or unreadable repaired file resolves nothing (the
+// conservative answer: the finding keeps the chapter with the agent).
+func repairedPhraseResolver(workDir string) phraseResolver {
+	cache := map[int]string{}
+	return func(chapter int, phrase string) bool {
+		text, ok := cache[chapter]
+		if !ok {
+			raw, err := os.ReadFile(filepath.Join(workDir, transcript.RepairedDir, transcript.TextName(chapter))) //nolint:gosec // book-owned work dir
+			if err == nil {
+				text = normalizeSpace(string(raw))
+			}
+			cache[chapter] = text
+		}
+		phrase = normalizeSpace(phrase)
+		if text == "" || phrase == "" {
+			return false
+		}
+		return !strings.Contains(text, phrase)
+	}
+}
+
+// normalizeSpace collapses every whitespace run to a single space so a phrase recorded
+// from the segment stream compares equal to the same words in the concatenated transcript
+// text, where line breaks fall in different places.
+func normalizeSpace(s string) string { return strings.Join(strings.Fields(s), " ") }
 
 // multiLoopTailCovered reports whether a multi-loop finding is a residual covered by the
 // chapter's recorded splice window v. A MID-CHAPTER loop overwrote interior narration, so

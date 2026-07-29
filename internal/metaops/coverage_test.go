@@ -12,11 +12,15 @@ import (
 	"time"
 )
 
-// workRow is a fake work's title + sidecar presence.
+// workRow is a fake work's title + sidecar presence. chars, when set, lists the
+// work's character names for the series-glossary tests; when it is empty and c is
+// true the work reports one placeholder character, which is all the coverage tests
+// need.
 type workRow struct {
 	title                 string
 	seriesName, seriesPos string
 	c, r                  bool
+	chars                 []string
 }
 
 // cardRow is one work-kind search hit the fake returns.
@@ -26,10 +30,12 @@ type cardRow struct {
 
 // metaServer is a configurable fake meta.audiosilo.app.
 type metaServer struct {
-	lookup map[string]string  // asin/isbn -> work id ("" => 404)
-	work   map[string]workRow // work id -> detail (absent => 404)
-	search []cardRow          // work hits returned for any /search
-	extra  string             // an extra non-work result line to prove filtering
+	lookup      map[string]string   // asin/isbn -> work id ("" => 404)
+	work        map[string]workRow  // work id -> detail (absent => 404)
+	search      []cardRow           // work hits returned for any /search
+	extra       string              // an extra non-work result line to prove filtering
+	seriesWorks map[string][]string // series id -> member work ids (absent => 404)
+	onWorks     func(id string)     // optional hook, called on each /works/{id} request
 
 	mu       sync.Mutex // guards requests (concurrent coverage workers hit the fake)
 	requests map[string]int
@@ -67,6 +73,11 @@ func (s *metaServer) handler() http.Handler {
 	mux.HandleFunc("/api/v1/works/", func(w http.ResponseWriter, r *http.Request) {
 		s.count("works")
 		id := r.URL.Path[len("/api/v1/works/"):]
+		// onWorks lets a test interrupt a fan-out deterministically (no sleeps) by
+		// cancelling the caller's context part-way through.
+		if s.onWorks != nil {
+			s.onWorks(id)
+		}
 		wk, ok := s.work[id]
 		if !ok {
 			http.NotFound(w, r)
@@ -76,7 +87,14 @@ func (s *metaServer) handler() http.Handler {
 		if wk.seriesName != "" {
 			body += `,"series":[{"id":"s","name":"` + wk.seriesName + `","position":"` + wk.seriesPos + `"}]`
 		}
-		if wk.c {
+		switch {
+		case len(wk.chars) > 0:
+			parts := make([]string, 0, len(wk.chars))
+			for i, n := range wk.chars {
+				parts = append(parts, `{"id":"c`+string(rune('a'+i))+`","name":"`+n+`"}`)
+			}
+			body += `,"characters":[` + strings.Join(parts, ",") + `]`
+		case wk.c:
 			body += `,"characters":[{"id":"x","name":"X"}]`
 		}
 		if wk.r {
@@ -84,6 +102,20 @@ func (s *metaServer) handler() http.Handler {
 		}
 		body += `}`
 		_, _ = w.Write([]byte(body))
+	})
+	mux.HandleFunc("/api/v1/series/", func(w http.ResponseWriter, r *http.Request) {
+		s.count("series")
+		id := r.URL.Path[len("/api/v1/series/"):]
+		ids, ok := s.seriesWorks[id]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		parts := make([]string, 0, len(ids))
+		for _, wid := range ids {
+			parts = append(parts, `{"position":"1","work":{"id":"`+wid+`"}}`)
+		}
+		_, _ = w.Write([]byte(`{"id":"` + id + `","name":"S","works":[` + strings.Join(parts, ",") + `]}`))
 	})
 	mux.HandleFunc("/api/v1/search", func(w http.ResponseWriter, _ *http.Request) {
 		s.count("search")

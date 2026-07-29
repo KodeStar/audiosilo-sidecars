@@ -170,10 +170,11 @@ func newBookIdent(id BookIdentity, workID string) bookIdent {
 }
 
 // resolvedCov is a completed coverage verdict tagged with the fingerprint it was
-// resolved for.
+// resolved for and the generation it was recorded at (see ScanManager.gen).
 type resolvedCov struct {
 	fingerprint string
 	coverage    Coverage
+	gen         uint64
 }
 
 // scanJob is the mutable, in-memory job state (guarded by ScanManager.mu). The
@@ -204,12 +205,20 @@ type scanJob struct {
 	sem   chan struct{}  // coverage concurrency bound
 }
 
-// overridePatch is a live (this-session) override applied at read time to every
-// job's matching book, so a hide/manual-match issued after a scan completed still
-// reflects on the next poll without re-running coverage.
+// overridePatch is a live override applied at read time to every job's matching
+// book, so a hide/manual-match issued after a scan completed still reflects on
+// the next poll without re-running coverage.
+//
+// Its hidden flag is authoritative (the user's desired state). Its coverage is
+// NOT: it is the verdict as of the moment the match was made, kept only so the
+// match reflects immediately, and it is superseded by any NEWER resolution (see
+// gen and snapshotLocked). Upstream gains sidecars over time, so a frozen
+// verdict would otherwise report a since-contributed work as still "needed"
+// forever - including on a fresh rescan.
 type overridePatch struct {
 	hidden   bool
 	coverage *Coverage // non-nil for a manual match
+	gen      uint64
 }
 
 // ScanManager runs and tracks folder-scan jobs, keyed by job id. Jobs are held in
@@ -228,6 +237,18 @@ type ScanManager struct {
 	seq     int64
 	jobs    map[string]*scanJob
 	patches map[string]overridePatch // path -> live override patch
+	// gen is a monotonic counter stamped on every coverage verdict (a worker's
+	// resolution and an override patch alike) so snapshotLocked can apply the
+	// NEWEST one. A wall clock would work too; a counter keeps it deterministic
+	// for tests and needs no injected clock.
+	gen uint64
+}
+
+// nextGenLocked returns the next verdict generation. Caller holds mu (or has
+// exclusive access, as during construction).
+func (m *ScanManager) nextGenLocked() uint64 {
+	m.gen++
+	return m.gen
 }
 
 // ScanManagerOption customizes scan persistence without making tests and
@@ -343,13 +364,16 @@ func (m *ScanManager) List() []ScanJobSummary {
 
 // ApplyOverride reflects a just-persisted override on the in-memory jobs at read
 // time: matching books (by source path) show the new hidden flag and, for a
-// manual match, the resolved coverage. The full desired hidden state is retained
-// even when false so an unhide can override a cached scan that recorded the book
-// as hidden. Cheap - it stores one map entry consulted per book at snapshot time
-// - so a completed job reflects the change on the next poll.
+// manual match, the coverage resolved for it. The full desired hidden state is
+// retained even when false so an unhide can override a cached scan that recorded
+// the book as hidden. Cheap - it stores one map entry consulted per book at
+// snapshot time - so a completed job reflects the change on the next poll.
+//
+// The patched coverage is a point-in-time verdict, so it is stamped with a
+// generation and a later resolution outranks it (see overridePatch).
 func (m *ScanManager) ApplyOverride(sourcePath string, hidden bool, cov *Coverage) {
 	m.mu.Lock()
-	m.patches[sourcePath] = overridePatch{hidden: hidden, coverage: cov}
+	m.patches[sourcePath] = overridePatch{hidden: hidden, coverage: cov, gen: m.nextGenLocked()}
 	m.mu.Unlock()
 	m.persistCache()
 }
@@ -416,8 +440,12 @@ func (m *ScanManager) run(id, path string) {
 
 	// Replace the provisional list with the authoritative one and re-resolve
 	// coverage through the caches (only corrected-identity books re-hit the
-	// network), then wait for all coverage workers before marking done.
-	m.applyFinal(id, res, overrides)
+	// network), then wait for all coverage workers before marking done. The
+	// overrides are re-read for this authoritative pass: a hide/manual-match made
+	// DURING the walk is already persisted, so the final identities resolve
+	// against it rather than against the scan-start snapshot (whose verdict would
+	// then outrank the live patch, since it lands later).
+	m.applyFinal(id, res, m.loadOverrides())
 	m.waitCoverage(id)
 	m.finishDone(id, stats)
 }
@@ -497,7 +525,7 @@ func (m *ScanManager) resolveWorker(job *scanJob, path, fp string, bi bookIdent)
 	// wedges and coverage_done never reaches the total). Dropping the stale write
 	// (including the path-no-longer-present case) keeps resolved consistent.
 	if bi, ok := job.idents[path]; ok && bi.fp == fp {
-		job.resolved[path] = resolvedCov{fingerprint: fp, coverage: cov}
+		job.resolved[path] = resolvedCov{fingerprint: fp, coverage: cov, gen: m.nextGenLocked()}
 	}
 	m.mu.Unlock()
 }
@@ -551,14 +579,22 @@ func (m *ScanManager) snapshotLocked(job *scanJob) ScanJob {
 		if len(b.Sources) > 0 {
 			b.Sources = maps.Clone(b.Sources)
 		}
-		if rc, ok := job.resolved[b.Path]; ok && rc.fingerprint == job.idents[b.Path].fp {
-			applyCoverageMetadata(&b, rc.coverage)
-		}
-		if p, ok := m.patches[b.SourcePath]; ok {
+		// Coverage can come from two places: this job's resolved verdict (when it
+		// was resolved for the book's CURRENT identity) and a live override patch.
+		// The NEWER of the two wins, so a manual match shows up immediately on an
+		// already-finished job while this job's own resolution - and, crucially,
+		// every later scan's - supersedes that frozen verdict once it lands.
+		rc, resolved := job.resolved[b.Path]
+		resolved = resolved && rc.fingerprint == job.idents[b.Path].fp
+		p, patched := m.patches[b.SourcePath]
+		if patched {
 			b.Hidden = p.hidden
-			if p.coverage != nil {
-				applyCoverageMetadata(&b, *p.coverage)
-			}
+		}
+		switch {
+		case patched && p.coverage != nil && (!resolved || p.gen > rc.gen):
+			applyCoverageMetadata(&b, *p.coverage)
+		case resolved:
+			applyCoverageMetadata(&b, rc.coverage)
 		}
 		books[i] = b
 	}

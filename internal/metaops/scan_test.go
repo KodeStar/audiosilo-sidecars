@@ -438,6 +438,68 @@ func TestScanManagerRestoresLatestSuccessfulScan(t *testing.T) {
 	}
 }
 
+// TestRescanSupersedesStaleManualCoverage is the frozen-verdict regression: a
+// manual match stores the coverage as it was WHEN THE MATCH WAS MADE, and that
+// patch is re-seeded from the scan cache on every daemon start. Upstream gains
+// sidecars over time (that is the whole point of contributing them), so the patch
+// must never outrank a later resolution - otherwise a since-covered work reports
+// "needed" forever, its badges never go green, and "exclude already covered"
+// never drops it, no matter how often the library is rescanned.
+func TestRescanSupersedesStaleManualCoverage(t *testing.T) {
+	// Upstream knows the work but carries neither sidecar yet.
+	s := &metaServer{work: map[string]workRow{"w-manual": {title: "Matched Work"}}}
+	c, srv := newMeta(t, s)
+
+	root := t.TempDir()
+	canonRoot, _ := resolvePath(root)
+	sourcePath := filepath.Join(canonRoot, "Author/Book")
+	overrides := OverrideLookup(func(context.Context) (map[string]Override, error) {
+		return map[string]Override{sourcePath: {WorkID: "w-manual"}}, nil
+	})
+	books := []metascan.Book{{Path: "Author/Book", Title: "Book", AudioFiles: 1}}
+
+	cachePath := filepath.Join(t.TempDir(), "library-scan-cache.json")
+	m := NewScanManager(context.Background(), c, "", overrides, WithScanCache(cachePath))
+	m.scan = fakeScan(books, metascan.Stats{Books: 1})
+	id, err := m.Start(root)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	job := waitDone(t, m, id)
+	if got := job.Books[0].Coverage; !got.Known || got.HasCharacters || got.HasRecaps {
+		t.Fatalf("pre-contribution coverage = %+v", got)
+	}
+	// The user re-picks the same work by hand; Upsert reflects the verdict it just
+	// resolved (still sidecar-less) as a patch.
+	stale, err := c.CoverageForWork(context.Background(), "w-manual")
+	if err != nil {
+		t.Fatalf("CoverageForWork: %v", err)
+	}
+	m.ApplyOverride(sourcePath, false, &stale)
+
+	// Time passes: the sidecars are contributed and merged upstream.
+	s.work["w-manual"] = workRow{title: "Matched Work", c: true, r: true}
+
+	// The daemon restarts (fresh client, so no TTL cache carries the old detail)
+	// and restores the cached scan, which still shows the frozen verdict.
+	restored := NewScanManager(context.Background(), NewClient(srv.URL), "", overrides,
+		WithScanCache(cachePath))
+	if got, ok := restored.Get(id); !ok || got.Books[0].Coverage.HasCharacters {
+		t.Fatalf("restored cached scan should still show the frozen verdict: %+v", got.Books)
+	}
+
+	// Rescanning must re-derive it: the fresh verdict outranks the patch.
+	restored.scan = fakeScan(books, metascan.Stats{Books: 1})
+	newID, err := restored.Start(root)
+	if err != nil {
+		t.Fatalf("Start(rescan): %v", err)
+	}
+	fresh := waitDone(t, restored, newID)
+	if got := fresh.Books[0].Coverage; got.MatchedBy != "manual" || !got.HasCharacters || !got.HasRecaps {
+		t.Fatalf("rescan did not re-derive manual coverage: %+v", got)
+	}
+}
+
 func TestScanManagerCacheTracksLiveOverrides(t *testing.T) {
 	root := t.TempDir()
 	cachePath := filepath.Join(t.TempDir(), "library-scan-cache.json")

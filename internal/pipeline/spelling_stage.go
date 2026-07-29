@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -14,6 +15,7 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
+	"github.com/kodestar/audiosilo-sidecars/internal/metaops"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/spelling"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
@@ -57,6 +59,13 @@ var priorRefNames = []struct{ src, dst string }{
 	{spelling.CorrectionsFile, "prior-corrections.json"},
 }
 
+// seriesGlossaryFile is the canonical-name list drawn from the community metadata
+// database's OTHER volumes of this book's series. It lives under spelling-refs/, so
+// it is already an allowed reference_files citation and already lands in the
+// correction gate's attestation corpus - no validator change was needed to let a
+// rule attest an upstream-canonical spelling.
+const seriesGlossaryFile = "series-glossary.txt"
+
 // spellingPromptData feeds spelling.md. Field names MUST match the template (rendered
 // with missingkey=error).
 type spellingPromptData struct {
@@ -67,6 +76,16 @@ type spellingPromptData struct {
 	HasCarryover bool
 	WebAvailable bool
 	ChunkEnds    string
+	// HasGlossary reports that spelling-refs/series-glossary.txt was staged, and
+	// GlossaryWorks names the sibling volumes it came from (for the prompt's
+	// provenance sentence).
+	HasGlossary   bool
+	GlossaryWorks string
+	// HasReferenceMatches reports that the deterministic pre-pass proposed at least
+	// one correction against a reference vocabulary.
+	HasReferenceMatches bool
+	// EvidencePriority is the rendered evidence-priority list (see evidencePriority).
+	EvidencePriority string
 }
 
 // spellingResearch is the one web-enabled agent stage: it builds the canonical
@@ -102,6 +121,14 @@ func (e *Executor) spellingResearch(ctx context.Context, book store.Book, r sche
 			return scheduler.StageResult{}, fmt.Errorf("spelling_research: populate spelling-refs: %w", err)
 		}
 	}
+	// 3b) The series glossary: the canonical names the community database already
+	//     records for the OTHER volumes of this series. This is the only reference
+	//     that can catch a name the whole book (and the whole carryover chain) gets
+	//     consistently wrong - the transcript and the predecessor agree with each
+	//     other precisely because the error propagated. Best-effort: an outage, a
+	//     standalone work, or an uncontributed series yields no glossary and the
+	//     stage proceeds exactly as before.
+	glossary := e.seriesGlossary(ctx, book, r)
 
 	// 4) Stage the agent inputs.
 	st, err := agent.New(book.WorkDir, string(state.SpellingResearch), e.stageAttempt(ctx, book, state.SpellingResearch))
@@ -142,6 +169,28 @@ func (e *Executor) spellingResearch(ctx context.Context, book store.Book, r sche
 			return scheduler.StageResult{}, fmt.Errorf("spelling_research: stage %s: %w", name, err)
 		}
 	}
+	// The deterministic reference pre-pass. The agent's own signal is intra-transcript
+	// disagreement, and a name misheard the SAME way every time produces none - so
+	// this compares the candidates against outside vocabularies and stages the
+	// near-misses explicitly.
+	refMatches := spelling.BuildReferenceMatches(cand, referenceSources(book.WorkDir, glossary))
+	refJSON, err := spelling.MarshalReferenceMatches(refMatches)
+	if err != nil {
+		return scheduler.StageResult{}, fmt.Errorf("spelling_research: marshal reference matches: %w", err)
+	}
+	if err := st.WriteFile(spelling.ReferenceMatchesFile, refJSON); err != nil {
+		return scheduler.StageResult{}, fmt.Errorf("spelling_research: stage %s: %w", spelling.ReferenceMatchesFile, err)
+	}
+	if !refMatches.Empty() && r.Note != nil {
+		r.Note(fmt.Sprintf("reference check: %s differ from a known spelling (%s)",
+			countNoun(len(refMatches.Matches), "transcript form"), referenceMatchSummary(refMatches)))
+	}
+	// stageIfPresent keys off the file actually existing, so a glossary whose write
+	// failed simply is not staged rather than failing the stage.
+	glossaryRel := filepath.Join(spellingRefsDir, seriesGlossaryFile)
+	if err := e.stageIfPresent(st, book.WorkDir, glossaryRel, glossaryRel); err != nil {
+		return scheduler.StageResult{}, fmt.Errorf("spelling_research: stage %s: %w", seriesGlossaryFile, err)
+	}
 	// Stage ONLY the small prior-* carryover files, never the predecessor's corrected
 	// chapter texts (that would be another whole book of transcript in the context).
 	// The full spelling-refs/ still lives in the work dir for the dry-run corpus and
@@ -161,13 +210,17 @@ func (e *Executor) spellingResearch(ctx context.Context, book store.Book, r sche
 	// yields WebAvailable=false in the prompt.
 	runner, _ := e.ensureAgent(ctx)
 	data := spellingPromptData{
-		Title:        book.Title,
-		Authors:      authors(book),
-		Series:       book.Series,
-		SeriesPos:    book.SeriesPos,
-		HasCarryover: hasCarryover,
-		WebAvailable: runner != nil && runner.SupportsWeb(),
-		ChunkEnds:    plan.chunkEndsCSV(),
+		Title:               book.Title,
+		Authors:             authors(book),
+		Series:              book.Series,
+		SeriesPos:           book.SeriesPos,
+		HasCarryover:        hasCarryover,
+		WebAvailable:        runner != nil && runner.SupportsWeb(),
+		ChunkEnds:           plan.chunkEndsCSV(),
+		HasGlossary:         !glossary.Empty(),
+		GlossaryWorks:       strings.Join(glossary.Works, ", "),
+		HasReferenceMatches: !refMatches.Empty(),
+		EvidencePriority:    evidencePriority(!glossary.Empty(), hasCarryover),
 	}
 	// Build the dry-run corpus (the immutable transcript layers + marker titles +
 	// carryover refs) ONCE for the whole stage; each validation attempt reuses it and
@@ -247,8 +300,16 @@ func ensureMarkerTitles(workDir string) error {
 func populateSpellingRefs(workDir, predDir string) error {
 	dst := filepath.Join(workDir, spellingRefsDir)
 	// Already populated on a prior run: the predecessor's refs are immutable, so a
-	// non-empty spelling-refs/ needs no re-copy.
-	if dirNonEmpty(dst) {
+	// carryover that is already there needs no re-copy.
+	//
+	// The sentinel is THIS step's own output file, not "the directory is non-empty".
+	// spelling-refs/ has more than one daemon-side writer now (seriesGlossary also
+	// writes series-glossary.txt there), and a directory-level guard would let one
+	// writer suppress another: a book whose first attempt ran before its series
+	// predecessor finished would write a glossary, then find the directory non-empty
+	// on the retry that finally has a predecessor and silently skip the carryover
+	// entirely.
+	if fsutil.IsFile(filepath.Join(dst, priorSpellingsFile)) {
 		return nil
 	}
 	if err := os.MkdirAll(dst, 0o750); err != nil {
@@ -393,6 +454,144 @@ func checkDeadRules(dryRunDir string, corr *spelling.Corrections) error {
 		fmt.Fprintf(&b, "\nrule pattern %q matches nothing in the transcript - a dead rule; delete it or fix its pattern to a form that actually occurs", r.Pattern)
 	}
 	return errors.New(b.String())
+}
+
+// seriesGlossary fetches this book's series glossary from the community metadata
+// database and writes it under spelling-refs/. It is best-effort at every step: no
+// metadata client, no work id, an unreachable service, a standalone work, or a
+// series whose other volumes carry no sidecars all yield an empty glossary. The
+// stage then runs exactly as it did before, so this can never park a book.
+func (e *Executor) seriesGlossary(ctx context.Context, book store.Book, r scheduler.StageReport) metaops.Glossary {
+	path := filepath.Join(book.WorkDir, spellingRefsDir, seriesGlossaryFile)
+	// A run that produces no glossary must leave none behind. The work dir is
+	// durable, so a file from an earlier successful run would otherwise still be
+	// staged to the agent (stageIfPresent keys on the file) and still sit in the
+	// correction gate's attestation corpus, while HasGlossary is false and the
+	// pre-pass has no glossary vocabulary - the prompt would describe no such file
+	// and the agent would find one. Worse, book.WorkID is mutable: a book re-matched
+	// to a DIFFERENT work would keep the previous series' canonical names on disk,
+	// where they could attest a rule renaming a character to a wrong-series name.
+	discard := func() metaops.Glossary {
+		_ = os.Remove(path)
+		return metaops.Glossary{}
+	}
+
+	workID := strings.TrimSpace(book.WorkID)
+	if workID == "" || e.meta == nil {
+		return discard()
+	}
+	g, err := e.meta.SeriesGlossary(ctx, workID)
+	if err != nil || g.Empty() {
+		return discard()
+	}
+	// Atomic: this file becomes the agent's highest-authority spelling evidence AND
+	// rides into the correction gate's attestation corpus, so a torn write from a
+	// crash must never be picked up by the next run. WriteFileAtomic MkdirAlls the
+	// parent, so no explicit MkdirAll is needed here.
+	if err := fsutil.WriteFileAtomic(path, []byte(g.Lines()), 0o644); err != nil {
+		return discard()
+	}
+	if r.Note != nil {
+		note := fmt.Sprintf("series glossary: %s from %s in %q",
+			countNoun(len(g.Names), "canonical name"), countNoun(len(g.Works), "sibling volume"), g.SeriesName)
+		if g.Truncated > 0 {
+			note += fmt.Sprintf(" (%s dropped to keep it compact)", countNoun(g.Truncated, "further name"))
+		}
+		r.Note(note)
+	}
+	return g
+}
+
+// evidencePriority renders spelling.md's ordered evidence list.
+//
+// It is composed here rather than in the template because two of the seven tiers
+// are conditional, and expressing that with nested {{if}} means writing the whole
+// hand-numbered list once per combination - four copies today, eight the next time
+// a staged source is added, each free to drift from the others. The repo already
+// composes prompt blocks in Go for the same reason (EdgeNote, ChunkNote,
+// AssembleNote).
+//
+// The first two tiers are the daemon-staged vocabularies, ranked exactly as
+// spelling.Authority ranks them; the tail is the outside evidence only the agent
+// can reach.
+func evidencePriority(hasGlossary, hasCarryover bool) string {
+	var items []string
+	if hasGlossary {
+		items = append(items, "the community series glossary (`spelling-refs/series-glossary.txt`)")
+	}
+	items = append(items, "embedded metadata and exact chapter-marker labels (`marker_titles.txt`)")
+	if hasCarryover {
+		items = append(items, "the carried series ledger (`spelling-refs/prior-spellings.json`)")
+	}
+	items = append(items,
+		"official author, publisher, or series material",
+		"the book's catalogue records or official table of contents",
+		"book-scoped wiki page TITLES or structured navigation",
+		"agreement among multiple independent references",
+	)
+	lines := make([]string, len(items))
+	for i, it := range items {
+		lines[i] = fmt.Sprintf("%d. %s", i+1, it)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// referenceSources assembles the vocabularies BuildReferenceMatches compares the
+// transcript against, in descending authority.
+//
+// The ranking is the point. The series glossary and the publisher's chapter titles
+// are VERIFIED: they come from outside this book's audio, so they can contradict it.
+// The predecessor's ledger is CARRYOVER: it is evidence that the previous volume
+// spelled a name the same way, which is not evidence that the spelling is right -
+// one misheard name reproduces itself down a whole series precisely because every
+// book agrees with the one before it.
+func referenceSources(workDir string, glossary metaops.Glossary) []spelling.ReferenceSource {
+	var out []spelling.ReferenceSource
+	add := func(name string, auth spelling.Authority, names []string) {
+		if len(names) > 0 {
+			out = append(out, spelling.ReferenceSource{Name: name, Authority: auth, Names: names})
+		}
+	}
+
+	add(filepath.Join(spellingRefsDir, seriesGlossaryFile), spelling.AuthorityVerified, glossary.Names)
+
+	// The publisher's own chapter titles. Rich for some books ("Chapter 9: Toren"),
+	// a bare number table for others - in which case this contributes nothing, which
+	// is exactly why it cannot be the only reference.
+	if b, err := os.ReadFile(filepath.Join(workDir, markerTitlesFile)); err == nil { //nolint:gosec // daemon-written path
+		add(markerTitlesFile, spelling.AuthorityVerified, spelling.NamesFromTitles(string(b)))
+	}
+
+	add(filepath.Join(spellingRefsDir, priorSpellingsFile), spelling.AuthorityCarryover, priorLedgerNames(workDir))
+	return out
+}
+
+// priorLedgerNames reads the canonical forms out of the series predecessor's staged
+// ledger, sorted so equidistant matches resolve deterministically. It reuses
+// spelling.PriorCanonicals (the same reader the sheet audit uses on this file), so
+// the ledger's wire shape stays mirrored in exactly one place. A missing or
+// unreadable ledger yields no names - the carryover is best-effort.
+func priorLedgerNames(workDir string) []string {
+	set, ok, err := spelling.PriorCanonicals(filepath.Join(workDir, spellingRefsDir, priorSpellingsFile))
+	if err != nil || !ok {
+		return nil
+	}
+	return slices.Sorted(maps.Keys(set))
+}
+
+// referenceMatchSummary renders the highest-signal proposals for the stage note, so
+// the book log shows what the pre-pass actually found rather than just a count.
+func referenceMatchSummary(r *spelling.ReferenceMatches) string {
+	const maxShown = 3
+	parts := make([]string, 0, maxShown)
+	for i, m := range r.Matches {
+		if i >= maxShown {
+			parts = append(parts, "...")
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%s -> %s", m.Form, m.Reference))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // validateReferenceFiles enforces the gate-3 integrity boundary: a rule may only be
@@ -548,12 +747,6 @@ func (e *Executor) correcting(ctx context.Context, book store.Book, r scheduler.
 func isDir(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
-}
-
-// dirNonEmpty reports whether path is a directory holding at least one entry.
-func dirNonEmpty(path string) bool {
-	entries, err := os.ReadDir(path)
-	return err == nil && len(entries) > 0
 }
 
 // copyDirPlain copies every regular file under srcDir into dstDir (0644, preserving

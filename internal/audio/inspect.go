@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kodestar/audiosilo-meta/pkg/scan"
@@ -159,42 +160,132 @@ func ReparseMarkerManifest(workDir string, draft Manifest) (Manifest, MarkerStat
 	return m, stats, nil
 }
 
-func markerManifestFromProbe(source string, meta probeMeta) (Manifest, MarkerStats) {
-	var chapters []Chapter
+// ReadProbeMarkers loads the raw marker table and recording duration from an already
+// written probe.json. It is how a caller downstream of inspect (the marker-normalization
+// validator) can ask what the recording ACTUALLY contains, rather than trusting a manifest
+// that may have dropped markers.
+func ReadProbeMarkers(workDir string) ([]Marker, float64, error) {
+	raw, err := os.ReadFile(filepath.Join(workDir, ProbeName)) //nolint:gosec // workDir is the book's managed scratch directory
+	if err != nil {
+		return nil, 0, fmt.Errorf("read %s: %w", ProbeName, err)
+	}
+	var meta probeMeta
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return nil, 0, fmt.Errorf("parse %s: %w", ProbeName, err)
+	}
+	markers := make([]Marker, 0, len(meta.Chapters))
 	for _, ch := range meta.Chapters {
-		num, title, ok := chapterFromMarker(ch.Tags["title"])
+		markers = append(markers, Marker{
+			Title: ch.Tags["title"],
+			Start: parseFloat(ch.StartTime),
+			End:   parseFloat(ch.EndTime),
+		})
+	}
+	sort.SliceStable(markers, func(i, j int) bool { return markers[i].Start < markers[j].Start })
+	return markers, parseFloat(meta.Format.Duration), nil
+}
+
+func markerManifestFromProbe(source string, meta probeMeta) (Manifest, MarkerStats) {
+	markers := make([]Marker, 0, len(meta.Chapters))
+	for _, ch := range meta.Chapters {
+		markers = append(markers, Marker{
+			Title: ch.Tags["title"],
+			Start: parseFloat(ch.StartTime),
+			End:   parseFloat(ch.EndTime),
+		})
+	}
+	sort.SliceStable(markers, func(i, j int) bool { return markers[i].Start < markers[j].Start })
+
+	var chapters []Chapter
+	for _, mk := range markers {
+		num, title, ok := chapterFromMarker(mk.Title)
 		if !ok {
 			continue
 		}
-		start := parseFloat(ch.StartTime)
-		end := parseFloat(ch.EndTime)
 		chapters = append(chapters, Chapter{
-			Chapter: num, Title: title, MarkerTitle: ch.Tags["title"],
-			Start: start, End: end, Duration: end - start,
+			Chapter: num, Title: title, MarkerTitle: mk.Title,
+			Start: mk.Start, End: mk.End, Duration: mk.End - mk.Start,
 		})
 	}
 	sort.SliceStable(chapters, func(i, j int) bool { return chapters[i].Start < chapters[j].Start })
 
-	// Always write the manifest, even for a non-contiguous marker set: it is the DRAFT
-	// the markers_normalizing agent stage reads and corrects (renumber/exclude/retitle).
-	// contiguous() is still the routing decision - when it is false the state machine
-	// sends the book to markers_normalizing before split, which never runs on a draft.
+	positional := false
+	if len(chapters) == 0 {
+		if tiled := positionalChapters(markers); tiled != nil {
+			chapters, positional = tiled, true
+		}
+	}
+
+	duration := parseFloat(meta.Format.Duration)
+	spans := UnmappedSpans(chapters, markers, duration)
+
+	// Always write the manifest, even for an unusable marker set: it is the DRAFT the
+	// markers_normalizing agent stage reads and corrects (renumber/exclude/retitle).
+	// MarkerStats.Usable() is still the routing decision - when it is false the state
+	// machine sends the book to markers_normalizing before split, which never runs on a
+	// draft.
 	m := Manifest{
 		Source:       source,
 		Title:        meta.Format.Tags["title"],
 		Style:        StyleMarkers,
-		Duration:     parseFloat(meta.Format.Duration),
+		Duration:     duration,
 		ChapterCount: len(chapters),
 		Chapters:     chapters,
 	}
 	// Seen counts the RAW markers, so a table written in an unknown dialect (every
 	// marker dropped above) stays distinguishable from a genuinely markerless file.
+	// Recognized stays the honest PARSER count, so a positionally-numbered table still
+	// reports Recognized 0 - Positional is what says the chapters came from time order.
 	stats := MarkerStats{
-		Seen:       len(meta.Chapters),
+		Seen:       len(markers),
 		Recognized: len(chapters),
 		Contiguous: contiguous(chapters),
+		Positional: positional,
+		Unmapped:   spans,
+		Complete:   Complete(spans),
+	}
+	if positional {
+		stats.Recognized = 0
 	}
 	return m, stats
+}
+
+// positionalChapters numbers a marker table 1..N by its TIME order, for the one case
+// where that is the only defensible reading: no marker states a number at all, and the
+// markers tile the narration without a hole.
+//
+// A publisher who labels chapters with their titles ("Transfer Paperwork", "On the
+// Nature of Shadows") has still stated the order - in the table's own sequence - and a
+// multi-file book of exactly the same content is already numbered this way by file
+// order, with no agent asked. Refusing here only for a single-file book was an
+// inconsistency, not a safety property: 12 of the corpus's 13 title-only books were sent
+// to the agent, which produced this very mapping, and the 13th was declined and parked.
+//
+// It returns nil unless the table tiles, because a gappy title-only table gives no
+// evidence that the markers are the chapters, and a hole is exactly what must reach a
+// human. Credits at the ends are numbered like any other marker and dropped downstream by
+// the content-driven classifyBookEdges, the same treatment a bare-number "001".."064"
+// table already gets.
+func positionalChapters(markers []Marker) []Chapter {
+	if len(markers) == 0 {
+		return nil
+	}
+	for i, mk := range markers {
+		if mk.End <= mk.Start {
+			return nil
+		}
+		if i > 0 && mk.Start-markers[i-1].End >= MaxInteriorGapSec {
+			return nil
+		}
+	}
+	chs := make([]Chapter, 0, len(markers))
+	for i, mk := range markers {
+		chs = append(chs, Chapter{
+			Chapter: i + 1, Title: strings.TrimSpace(mk.Title), MarkerTitle: mk.Title,
+			Start: mk.Start, End: mk.End, Duration: mk.End - mk.Start,
+		})
+	}
+	return chs
 }
 
 // inspectFiles builds a synthesized-chapter manifest for a multi-file book: one
@@ -245,8 +336,9 @@ func inspectFiles(ctx context.Context, files []string, workDir, ffprobePath stri
 	// Seen/Recognized as 0 rather than the file count: the whole point of Seen is to make
 	// an unread marker dialect visible in the metrics, so reporting a marker count for a
 	// book that has none would poison exactly that signal. NoneRecognized() stays false
-	// (it needs Seen > 0), which is the correct verdict here.
-	return m, MarkerStats{Contiguous: true}, nil
+	// (it needs Seen > 0), which is the correct verdict here. Its chapters are laid end to
+	// end from each file's own duration, so the map covers the book by construction.
+	return m, MarkerStats{Contiguous: true, Complete: true}, nil
 }
 
 // fileProbeSummary is the probe.json written for a multi-file book (there is no

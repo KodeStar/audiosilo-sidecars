@@ -138,6 +138,40 @@ func TestMarkersNormalizeEmptyLegacyDraftReparsesProbeWithoutAgent(t *testing.T)
 	}
 }
 
+// TestMarkersNormalizeReparseStillConsultsAgentWhenAudioIsUnmapped closes the back door
+// in the free-recovery path. The reparse is a shortcut PAST the agent, so it has to clear
+// the same bar routing does: a re-derived map that numbers 1..N perfectly while dropping
+// an interlude must NOT complete the stage, or the book goes straight to split with a hole
+// in it - exactly the failure this stage exists to catch.
+func TestMarkersNormalizeReparseStillConsultsAgentWhenAudioIsUnmapped(t *testing.T) {
+	work := t.TempDir()
+	// Chapters 1-3 parse and number cleanly; the 1000s Interlude between 2 and 3 does not.
+	writeProbeJSON(t, work, `{
+		"format":{"duration":"5000.000","tags":{"title":"Holed"}},
+		"chapters":[
+			{"start_time":"20.000","end_time":"1000.000","tags":{"title":"Chapter 1"}},
+			{"start_time":"1000.000","end_time":"2000.000","tags":{"title":"Chapter 2"}},
+			{"start_time":"2000.000","end_time":"3000.000","tags":{"title":"Interlude"}},
+			{"start_time":"3000.000","end_time":"4980.000","tags":{"title":"Chapter 3"}}
+		]
+	}`)
+	writeManifestStruct(t, work, audio.Manifest{Source: "/books/holed.m4b", Title: "Holed", Style: audio.StyleMarkers, Duration: 5000})
+
+	fake := newFakeRunner()
+	fake.act = func(_ *fakeRunner, req agent.Request, _ int) (agent.Result, error) {
+		writeOut(t, req, "verdict.json", markerVerdict{Confident: false, Reason: "declined for the test"})
+		return agent.Result{}, nil
+	}
+	exe := NewExecutor(withAgentConfig(t.TempDir(), fake))
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Holed", WorkDir: work}, state.MarkersNormalizing, scheduler.StageReport{})
+	if err == nil {
+		t.Fatal("stage completed on a reparse that leaves an Interlude unmapped")
+	}
+	if fake.count(string(state.MarkersNormalizing)) == 0 {
+		t.Error("the agent was never consulted; the reparse took the free-completion shortcut")
+	}
+}
+
 func TestValidateMarkersManifestRejectsNumberAliasExplicitly(t *testing.T) {
 	out := t.TempDir()
 	raw := `{
@@ -148,9 +182,74 @@ func TestValidateMarkersManifestRejectsNumberAliasExplicitly(t *testing.T) {
 		t.Fatal(err)
 	}
 	draft := audio.Manifest{Source: "/x/book.m4b", Style: audio.StyleMarkers, Duration: 2}
-	err := validateMarkersManifest(out, draft, nil)
+	markers := []audio.Marker{{Title: "Chapter 1", Start: 0, End: 2}}
+	err := validateMarkersManifest(out, draft, nil, markers, 2, nil)
 	if err == nil || !strings.Contains(err.Error(), `unknown field "number"`) {
 		t.Fatalf("validation error = %v, want explicit unknown number field", err)
+	}
+}
+
+// TestValidateMarkersManifestRejectsUndeclaredNarration is the agent-side half of the
+// coverage contract. Nine books had an interlude dropped by an agent that WAS consulted
+// and answered confidently: the numbering contract it was checked against had nothing to
+// say about audio left out of the map. Now a drop has to be declared to be accepted.
+func TestValidateMarkersManifestRejectsUndeclaredNarration(t *testing.T) {
+	// A map that skips a 1000s interlude between chapters 2 and 3 - perfectly numbered.
+	write := func(t *testing.T) string {
+		t.Helper()
+		out := t.TempDir()
+		raw := `{
+			"source":"/x/book.m4b","style":"markers","duration":5000,"chapter_count":3,
+			"chapters":[
+				{"chapter":1,"start":20,"end":1000,"duration":980},
+				{"chapter":2,"start":1000,"end":2000,"duration":1000},
+				{"chapter":3,"start":3000,"end":4980,"duration":1980}]
+		}`
+		if err := os.WriteFile(filepath.Join(out, audio.ManifestName), []byte(raw), 0o644); err != nil { //nolint:gosec // test artifact
+			t.Fatal(err)
+		}
+		return out
+	}
+	draft := audio.Manifest{Source: "/x/book.m4b", Style: audio.StyleMarkers, Duration: 5000}
+	markers := []audio.Marker{
+		{Title: "Opening Credits", Start: 0, End: 20},
+		{Title: "Chapter 1", Start: 20, End: 1000},
+		{Title: "Chapter 2", Start: 1000, End: 2000},
+		{Title: "Interlude", Start: 2000, End: 3000},
+		{Title: "Chapter 3", Start: 3000, End: 4980},
+		{Title: "End Credits", Start: 4980, End: 5000},
+	}
+
+	err := validateMarkersManifest(write(t), draft, nil, markers, 5000, nil)
+	if err == nil {
+		t.Fatal("a map that silently drops a 1000s Interlude was accepted")
+	}
+	if !strings.Contains(err.Error(), "Interlude") {
+		t.Errorf("error = %v, want it to name the dropped Interlude so the retry can fix it", err)
+	}
+
+	// DECLARING the exclusion is what makes it acceptable - that is the whole mechanism,
+	// since a bundled preview of the NEXT book genuinely must be left out.
+	declared := []markerExclusion{{Title: "Interlude", Start: 2000, End: 3000, Reason: "preview of another book"}}
+	if err := validateMarkersManifest(write(t), draft, nil, markers, 5000, declared); err != nil {
+		t.Errorf("a declared exclusion was still rejected: %v", err)
+	}
+
+	// Credits at the edges never need declaring; they are ordinary non-chapter audio.
+	full := t.TempDir()
+	raw := `{
+		"source":"/x/book.m4b","style":"markers","duration":5000,"chapter_count":4,
+		"chapters":[
+			{"chapter":1,"start":20,"end":1000,"duration":980},
+			{"chapter":2,"start":1000,"end":2000,"duration":1000},
+			{"chapter":3,"start":2000,"end":3000,"duration":1000},
+			{"chapter":4,"start":3000,"end":4980,"duration":1980}]
+	}`
+	if err := os.WriteFile(filepath.Join(full, audio.ManifestName), []byte(raw), 0o644); err != nil { //nolint:gosec // test artifact
+		t.Fatal(err)
+	}
+	if err := validateMarkersManifest(full, draft, nil, markers, 5000, nil); err != nil {
+		t.Errorf("a complete map was rejected over its 20s credits: %v", err)
 	}
 }
 
@@ -947,7 +1046,7 @@ func TestTailOnlyChaptersTailResiduals(t *testing.T) {
 		},
 		RetranscribeQueue: []int{25},
 	}
-	got := tailOnlyChapters(rep, verdicts)
+	got := tailOnlyChapters(rep, verdicts, nil)
 	wantTailOnly := map[int]bool{2: true, 8: true, 10: true, 12: true}
 	notTailOnly := []int{11, 13, 20, 21, 25, 30}
 	for ch := range wantTailOnly {
@@ -1092,7 +1191,7 @@ func TestTailOnlyChaptersMidWindowCoverage(t *testing.T) {
 			{Chapter: 43, Count: 6, FirstSec: f64ptr(1685), LastSec: f64ptr(1760), Pos: 60},
 		},
 	}
-	got := tailOnlyChapters(rep, verdicts)
+	got := tailOnlyChapters(rep, verdicts, nil)
 	for _, ch := range []int{40, 41} {
 		if !got[ch] {
 			t.Errorf("chapter %d should be a repaired residual (covered by the mid window)", ch)
@@ -1351,16 +1450,11 @@ func TestMarkersPromptExplainsVocabularyGap(t *testing.T) {
 			t.Errorf("gap prompt missing %q", want)
 		}
 	}
-	// The existing rules must survive alongside it - the new section explains how to
-	// read announced numbers, it does not license numbering by position.
-	if !strings.Contains(got, "NEVER infer chapter numbers merely from the marker count") {
-		t.Error("gap prompt dropped the infer-from-count prohibition")
-	}
-	// ...and it must not NARROW the decline criteria the Output section lists. A book
-	// whose bare-number titles state a clean order can still be undeliverable (one
-	// marker holding several chapters), and the section must not read as "an order you
-	// can see means map it anyway".
-	if !strings.Contains(got, "one marker holds several chapters") {
+	// It must not NARROW the decline criteria the Output section lists. A book whose
+	// titles state a clean order can still be undeliverable (one marker holding several
+	// chapters), and the section must not read as "an order you can see means map it
+	// anyway".
+	if !strings.Contains(got, "holds several chapters") {
 		t.Error("gap prompt narrowed the decline criteria: the other not-confident cases must stay stated")
 	}
 
@@ -1372,6 +1466,53 @@ func TestMarkersPromptExplainsVocabularyGap(t *testing.T) {
 	}
 	if strings.Contains(got, "recognized NONE") {
 		t.Error("the vocabulary-gap section must not render when markers WERE recognized")
+	}
+}
+
+// TestMarkersPromptStatesTheCoverageContract pins the rules that stop a mapping from
+// losing narration, in BOTH renderings of the template. They are prompt-side halves of a
+// mechanical check - the validator rejects an undeclared hole - so a prompt that stopped
+// stating them would turn a clean run into a retry loop the agent cannot diagnose.
+//
+// The verdict's "excluded" key is pinned for the same reason audit.json's shape is: it is
+// read by a Go struct, and an agent that never learns the key can only fail validation.
+func TestMarkersPromptStatesTheCoverageContract(t *testing.T) {
+	base := markersPromptData{Title: "Garden of Sanctuary", Authors: "pirateaba", Style: "markers", Duration: 112389, ChapterCount: 19}
+	for _, gap := range []bool{true, false} {
+		data := base
+		data.NoneRecognized, data.MarkersSeen = gap, 25
+		got, err := prompts.Render("markers.md", data)
+		if err != nil {
+			t.Fatalf("render (gap=%v): %v", gap, err)
+		}
+		for _, want := range []string{
+			"Account for every second", // the coverage rule itself
+			"Interlude",                // named, because it is the shape that lost 61 hours
+			"When in doubt, INCLUDE",   // the tie-breaker, in the safe direction
+			`"excluded"`,               // the verdict key the Go reader parses
+			"bloopers or outtakes",     // the exclusions that must stay possible
+			"DIFFERENT",                // ...including a preview of another book
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("gap=%v: markers.md no longer states %q", gap, want)
+			}
+		}
+	}
+}
+
+// TestMarkerExclusionShapeMatchesPrompt pins the verdict JSON the prompt shows against the
+// struct that reads it, so the two cannot drift apart silently. audit_verify.md drifted
+// exactly this way and parked a finished book one cosmetic key from done.
+func TestMarkerExclusionShapeMatchesPrompt(t *testing.T) {
+	var v markerVerdict
+	sample := `{"confident":true,"reason":"r","excluded":[{"title":"End Credits","start":89962.4,"end":89998.1,"reason":"closing credits"}]}`
+	dec := json.NewDecoder(strings.NewReader(sample))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&v); err != nil {
+		t.Fatalf("the shape markers.md documents does not parse into markerVerdict: %v", err)
+	}
+	if len(v.Excluded) != 1 || v.Excluded[0].Title != "End Credits" || v.Excluded[0].End != 89998.1 {
+		t.Fatalf("decoded = %+v", v)
 	}
 }
 
@@ -1553,5 +1694,74 @@ func TestMarkersNormalizeNeverOverwritesAContiguousDraft(t *testing.T) {
 	}
 	if m.ChapterCount != 2 || len(m.Chapters) != 2 || m.Chapters[0].MarkerTitle != "002" {
 		t.Fatalf("contiguous draft was re-derived from probe.json: %+v", m)
+	}
+}
+
+// An untimed cross-segment hit (the report's "pos": -1, no first_sec) is what a tail loop
+// re-reported off the untouched transcripts-json/ layer looks like, so the positional
+// fallback can never cover it. Every such residual was therefore pushed to the agent -
+// and the adjudicate prompt tells the agent NOT to disposition a chapter a prior
+// tail_clip round already repaired, so it omitted the chapter, the plan validator
+// rejected the plan for a missing required entry, and the stage failed identically on
+// every retry until the book parked agent_validation_exhausted.
+func TestTailOnlyChaptersResolvesUntimedResidualFromRepairedText(t *testing.T) {
+	rep := &qa.Report{
+		RepeatedRuns: []qa.RepeatedRun{
+			{Chapter: 44, Kind: qa.KindEndFade, Length: 6, StartSec: 1029.5, Snippet: " Better Nate than Lever."},
+			{Chapter: 45, Kind: qa.KindEndFade, Length: 6, StartSec: 1000, Snippet: " Still looping."},
+		},
+		CrossSegment: []qa.CrossSegmentHit{
+			// ch44: the splice landed - the doubled phrase is gone from the repaired text.
+			{Chapter: 44, Count: 5, Pos: -1, Phrase: "Better Nate than Lever. Better Nate"},
+			// ch45: the splice under-covered - the phrase is still there.
+			{Chapter: 45, Count: 5, Pos: -1, Phrase: "Still looping. Still looping."},
+		},
+	}
+	verdicts := map[int]repair.TailVerdict{
+		44: {Chapter: 44, ClipStart: 1027},
+		45: {Chapter: 45, ClipStart: 998},
+	}
+	repaired := map[int]string{
+		44: "he'd make the same choice again in a heartbeat.\nAfter all, you know what they\nsay. Better Nate than Lever. Thank you.",
+		45: "and then it went wrong.\nStill looping. Still looping. Still looping.",
+	}
+	resolved := func(chapter int, phrase string) bool {
+		return !strings.Contains(normalizeSpace(repaired[chapter]), normalizeSpace(phrase))
+	}
+
+	// Without a resolver the window arithmetic alone leaves BOTH with the agent.
+	if got := tailOnlyChapters(rep, verdicts, nil); got[44] || got[45] {
+		t.Fatalf("untimed hits covered by window arithmetic alone: %#v", got)
+	}
+	got := tailOnlyChapters(rep, verdicts, resolved)
+	if !got[44] {
+		t.Errorf("chapter 44 is a resolved residual (phrase gone from the repaired text) and should auto-accept: %#v", got)
+	}
+	if got[45] {
+		t.Errorf("chapter 45's phrase is still in the repaired text - the repair under-covered, so it must stay with the agent: %#v", got)
+	}
+}
+
+// The resolver reads the repaired layer and is conservative about everything it cannot
+// prove: a chapter with no repaired file resolves nothing.
+func TestRepairedPhraseResolverReadsRepairedLayer(t *testing.T) {
+	work := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(work, transcript.RepairedDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Line breaks fall in different places than the phrase recorded from the segments.
+	body := "you know what they\nsay. Better Nate than Lever. Thank you."
+	if err := os.WriteFile(filepath.Join(work, transcript.RepairedDir, transcript.TextName(44)), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resolved := repairedPhraseResolver(work)
+	if !resolved(44, "Better Nate than Lever. Better Nate") {
+		t.Error("the doubled phrase is absent from the repaired text and should resolve")
+	}
+	if resolved(44, "Better  Nate\nthan Lever.") {
+		t.Error("a phrase still present (modulo whitespace) must not resolve")
+	}
+	if resolved(99, "anything") {
+		t.Error("a chapter with no repaired file must resolve nothing")
 	}
 }

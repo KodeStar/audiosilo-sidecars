@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -265,13 +266,13 @@ func TestComposeChunkAndAssembleNotes(t *testing.T) {
 // TestComposeEdgeNoteEmptyWhenNothingExcluded pins the exact note wording and the
 // empty-string contract when there is nothing to exclude.
 func TestComposeEdgeNoteEmptyWhenNothingExcluded(t *testing.T) {
-	if got := composeEdgeNote(76, nil, nil); got != "" {
+	if got := composeEdgeNote(76, nil, nil, nil, nil); got != "" {
 		t.Errorf("note with no exclusions = %q, want empty", got)
 	}
 	want := "Audio files 1 and 78 are non-narrative (opening announcement / closing credits), " +
 		"not story chapters. The work's logical story chapters are 1-76 as spoken in the " +
 		"narration; facts and positions use those spoken chapter numbers."
-	if got := composeEdgeNote(76, []int{1}, []int{78}); got != want {
+	if got := composeEdgeNote(76, []int{1}, []int{78}, nil, nil); got != want {
 		t.Errorf("note = %q\nwant %q", got, want)
 	}
 }
@@ -424,5 +425,190 @@ func TestAuditPromptCarriesEdgeNote(t *testing.T) {
 		if !strings.Contains(prompt, sub) {
 			t.Errorf("audit prompt missing %q; got:\n%s", sub, prompt)
 		}
+	}
+}
+
+// inflameChapters models the live book that exposed the positional-numbering bug: an Audible
+// intro (file 1), an UNNUMBERED Prologue (file 2), chapters 1-59 (files 3-61), an Epilogue
+// (62), a bloopers reel (63) and closing credits (64). Counting positions made that 62
+// logical chapters at offset 1, so every reveal and recap gate landed a chapter early and the
+// audit rejected them as disclosing later material for round after round.
+func inflameChapters() []edgeChapter {
+	chs := []edgeChapter{
+		{Chapter: 1, Words: 3, HasTranscript: true, Probed: true, DurationSec: 19.6, Opening: "This is Audible."},
+		{Chapter: 2, Words: 1800, HasTranscript: true, Probed: true, DurationSec: 677.9, Opening: "Prologue Hello A musical voice called over as Joe peered around from the fluffy chair"},
+	}
+	for file := 3; file <= 61; file++ {
+		ch := edgeChapter{Chapter: file, Words: 2500, HasTranscript: true, DurationSec: 900}
+		// Only the probe window is read for a large book; the interior stays an unprobed sentinel.
+		if file <= edgeProbeDepth || file > 64-edgeProbeDepth {
+			ch.Probed = true
+			ch.Opening = fmt.Sprintf("%d. The chapter begins here with some narration.", file-2)
+		}
+		chs = append(chs, ch)
+	}
+	return append(chs,
+		edgeChapter{Chapter: 62, Words: 1900, HasTranscript: true, Probed: true, DurationSec: 712, Opening: "Epilogue Getting out of Grandma's shoe was simple after the"},
+		edgeChapter{Chapter: 63, Words: 800, HasTranscript: true, Probed: true, DurationSec: 309, Opening: "Bloopers! He couldn't get out more than a painted grunt."},
+		edgeChapter{Chapter: 64, Words: 40, HasTranscript: true, Probed: true, DurationSec: 27.6, Opening: "This has been a production of Audible Studios."},
+	)
+}
+
+func TestClassifyEdgeChaptersUsesNarratedNumbering(t *testing.T) {
+	got := classifyEdgeChapters(inflameChapters())
+	if got.ChapterOffset != 2 {
+		t.Errorf("offset = %d, want 2 (file 3 announces chapter 1)", got.ChapterOffset)
+	}
+	if got.LogicalCount != 59 {
+		t.Errorf("logical count = %d, want 59 (files 3-61 are chapters 1-59)", got.LogicalCount)
+	}
+	if len(got.FrontMatter) != 1 || got.FrontMatter[0] != 2 {
+		t.Errorf("front matter = %v, want [2] (the unnumbered Prologue)", got.FrontMatter)
+	}
+	if len(got.EndMatter) != 2 || got.EndMatter[0] != 62 || got.EndMatter[1] != 63 {
+		t.Errorf("end matter = %v, want [62 63] (Epilogue and bloopers)", got.EndMatter)
+	}
+	if len(got.ExcludedLeading) != 1 || got.ExcludedLeading[0] != 1 {
+		t.Errorf("excluded leading = %v, want [1]", got.ExcludedLeading)
+	}
+	if len(got.ExcludedTrailing) != 1 || got.ExcludedTrailing[0] != 64 {
+		t.Errorf("excluded trailing = %v, want [64]", got.ExcludedTrailing)
+	}
+	// The mapping the fact-pass assembly is told must be the derived one; "N-1" was the bug.
+	if !strings.Contains(got.AssembleNote, "spoken story chapter N-2") {
+		t.Errorf("assemble note must carry the derived offset: %q", got.AssembleNote)
+	}
+	if !strings.Contains(got.EdgeNote, "1-59") || !strings.Contains(got.EdgeNote, "position 0") {
+		t.Errorf("edge note must carry the numbered range and the front-matter rule: %q", got.EdgeNote)
+	}
+}
+
+// TestClassifyEdgeChaptersPositionsInteriorUnnumberedSections is the "Garden of Sanctuary"
+// (The Wandering Inn 15) shape, which a single offset cannot describe: unnumbered sections
+// sit BETWEEN numbered chapters, and chapter 10 is split across two files.
+//
+// The rule is round UP - an unnumbered section takes the number of the chapter it precedes -
+// because that is the direction that cannot leak. A listener who has finished chapter 10 has
+// necessarily heard the interlude before it; one who has only finished 9 has not, so gating
+// the interlude's material at 9 would disclose it early.
+func TestClassifyEdgeChaptersPositionsInteriorUnnumberedSections(t *testing.T) {
+	spoken := func(n int) string { return fmt.Sprintf("%d. The morning came slowly over the hills.", n) }
+	unnumbered := "The city of Pallass never truly slept, and Erin knew it."
+	// files 1-7 = chapters 1-7, 8 = Mini Stories, 9-10 = chapters 8-9, 11 = Interlude,
+	// 12-13 = chapter 10a/10b, 14-23 = chapters 11-20.
+	// 23 files is more than 2*edgeProbeDepth, so classifyBookEdges word-counts only files
+	// 1-8 and 16-23. The interior is UNPROBED - which is the realistic shape, and the one
+	// that matters: the announcements must still be read there, or the interlude at file 11
+	// is invisible to the numbering.
+	var chs []edgeChapter
+	add := func(file int, opening string) {
+		c := edgeChapter{Chapter: file, Opening: opening}
+		if file <= edgeProbeDepth || file > 23-edgeProbeDepth {
+			c.Words, c.HasTranscript, c.Probed, c.DurationSec = 5000, true, true, 5000
+		}
+		chs = append(chs, c)
+	}
+	for f := 1; f <= 7; f++ {
+		add(f, spoken(f))
+	}
+	add(8, unnumbered)
+	add(9, spoken(8))
+	add(10, spoken(9))
+	add(11, unnumbered)
+	add(12, spoken(10))
+	add(13, spoken(10))
+	for f := 14; f <= 23; f++ {
+		add(f, spoken(f-3))
+	}
+
+	got := classifyEdgeChapters(chs)
+	if got.LogicalCount != 20 {
+		t.Errorf("logical count = %d, want 20 - the book's own last chapter number, not its 23 audio files", got.LogicalCount)
+	}
+	if got.ConstantOffset() {
+		t.Error("ConstantOffset() = true, but files 1 and 14 sit at different shifts")
+	}
+	want := map[int]int{1: 1, 7: 7, 8: 8, 9: 8, 10: 9, 11: 10, 12: 10, 13: 10, 14: 11, 23: 20}
+	for file, wantPos := range want {
+		if pos, ok := got.PositionOf(file); !ok || pos != wantPos {
+			t.Errorf("PositionOf(file %d) = %d,%v; want %d", file, pos, ok, wantPos)
+		}
+	}
+	if len(got.FrontMatter) != 0 || len(got.EndMatter) != 0 {
+		t.Errorf("front=%v end=%v; every file here is inside the numbered range", got.FrontMatter, got.EndMatter)
+	}
+	// The assembly stage must be handed the mapping, not a formula it cannot satisfy.
+	for _, want := range []string{"do NOT shift", "audio files 1-8 hold chapters 1-8", "1-20"} {
+		if !strings.Contains(got.AssembleNote, want) {
+			t.Errorf("assemble note missing %q: %q", want, got.AssembleNote)
+		}
+	}
+}
+
+// TestNarratedNumberingIgnoresAStrayParse guards the believability rule. Only the
+// corroborated run is trusted outright; a lone opening that happens to parse as a number
+// must not renumber the book around it.
+func TestNarratedNumberingIgnoresAStrayParse(t *testing.T) {
+	var chs []edgeChapter
+	for f := 1; f <= 12; f++ {
+		opening := fmt.Sprintf("%d. Real narration follows here.", f)
+		if f == 9 {
+			opening = "Two. Words opened the door and he stepped through." // a stray parse
+		}
+		chs = append(chs, edgeChapter{Chapter: f, Words: 4000, HasTranscript: true, Probed: true, DurationSec: 3000, Opening: opening})
+	}
+	got := classifyEdgeChapters(chs)
+	if got.LogicalCount != 12 {
+		t.Errorf("logical count = %d, want 12; a stray 'Two.' in file 9 must not renumber the book", got.LogicalCount)
+	}
+	if pos, ok := got.PositionOf(9); !ok || pos != 9 {
+		t.Errorf("PositionOf(9) = %d,%v; want 9 - the stray announcement is discarded, not believed", pos, ok)
+	}
+}
+
+// With no announcements to read, the classifier keeps its previous positional behaviour
+// exactly - the overwhelming majority of books, whose prompts must render as before.
+func TestClassifyEdgeChaptersFallsBackWithoutAnnouncements(t *testing.T) {
+	chs := []edgeChapter{{Chapter: 1, Words: 3, HasTranscript: true, Probed: true, DurationSec: 2, Opening: "This is Audible."}}
+	for file := 2; file <= 20; file++ {
+		chs = append(chs, edgeChapter{Chapter: file, Words: 2500, HasTranscript: true, Probed: true, DurationSec: 900,
+			Opening: "The morning came slowly over the hills and Joe considered his options."})
+	}
+	got := classifyEdgeChapters(chs)
+	if got.ChapterOffset != 1 || got.LogicalCount != 19 {
+		t.Errorf("offset/logical = %d/%d, want 1/19 (positional fallback)", got.ChapterOffset, got.LogicalCount)
+	}
+	if len(got.FrontMatter) != 0 || len(got.EndMatter) != 0 {
+		t.Errorf("fallback must claim no unnumbered sections: front=%v end=%v", got.FrontMatter, got.EndMatter)
+	}
+}
+
+// A single stray parse must not shift a book: the run requirement needs consecutive files to
+// announce consecutive numbers.
+func TestClassifyEdgeChaptersIgnoresIsolatedNumberOpening(t *testing.T) {
+	chs := []edgeChapter{{Chapter: 1, Words: 3, HasTranscript: true, Probed: true, DurationSec: 2, Opening: "This is Audible."}}
+	for file := 2; file <= 20; file++ {
+		opening := "The morning came slowly over the hills and Joe considered his options."
+		if file == 5 {
+			opening = "Two hundred. The count was grim." // parses to 200 -> offset -195, but stands alone
+		}
+		chs = append(chs, edgeChapter{Chapter: file, Words: 2500, HasTranscript: true, Probed: true, DurationSec: 900, Opening: opening})
+	}
+	got := classifyEdgeChapters(chs)
+	if got.ChapterOffset != 1 || got.LogicalCount != 19 {
+		t.Errorf("one stray announcement shifted the book: offset/logical = %d/%d, want 1/19", got.ChapterOffset, got.LogicalCount)
+	}
+}
+
+// Consecutive files repeating the SAME number (a stuck transcript) are not a numbering.
+func TestClassifyEdgeChaptersRejectsRepeatedSameNumber(t *testing.T) {
+	var chs []edgeChapter
+	for file := 1; file <= 12; file++ {
+		chs = append(chs, edgeChapter{Chapter: file, Words: 2500, HasTranscript: true, Probed: true, DurationSec: 900,
+			Opening: "Seven. The same opening every time."})
+	}
+	got := classifyEdgeChapters(chs)
+	if got.ChapterOffset != 0 || got.LogicalCount != 12 {
+		t.Errorf("a stuck repeated announcement was treated as a numbering: offset/logical = %d/%d, want 0/12", got.ChapterOffset, got.LogicalCount)
 	}
 }
