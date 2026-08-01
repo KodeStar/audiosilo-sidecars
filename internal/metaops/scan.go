@@ -99,6 +99,16 @@ type ScannedBook struct {
 	// Hidden is true when a persisted (or live) override hides this book from the
 	// default candidate list.
 	Hidden bool `json:"hidden,omitempty"`
+	// ForceAudio is the persisted "use the audio, not the epub" override, stated
+	// rather than inferred.
+	//
+	// Kind is what the pipeline acts on, and forcing audio ERASES it - which is
+	// lossy: a forced hybrid and a folder whose epub could not be read both end up
+	// Kind "" with an EbookPath, so every reader had to reconstruct the override from
+	// the absence of fields. That reconstruction was exact only because nothing else
+	// produced that combination, which is a coincidence and not an invariant. The
+	// client renders this directly and the overlay sets it in both directions.
+	ForceAudio bool `json:"force_audio,omitempty"`
 	// Sources records where each field came from ("tag" | "path" | "filename" |
 	// "metadata"). A known metadata match supplies the authoritative series fields.
 	Sources map[string]string `json:"sources,omitempty"`
@@ -674,7 +684,7 @@ func (m *ScanManager) snapshotLocked(job *scanJob) ScanJob {
 		resolved = resolved && rc.fingerprint == job.idents[b.Path].fp
 		p, patched := m.patches[b.SourcePath]
 		if patched {
-			b.Hidden = p.hidden
+			b.Hidden, b.ForceAudio = p.hidden, p.forceAudio
 			// A live force_audio must reflect on the NEXT poll, not only after a
 			// rescan: the candidate list re-renders from the cached scan, so a
 			// toggle would otherwise appear to do nothing until the user rescanned.
@@ -773,7 +783,7 @@ func convertBook(b metascan.Book, root string, overrides map[string]Override) (S
 	}
 	workID := ""
 	if ov, ok := overrides[sb.SourcePath]; ok {
-		sb.Hidden = ov.Hidden
+		sb.Hidden, sb.ForceAudio = ov.Hidden, ov.ForceAudio
 		workID = ov.WorkID
 	}
 	return sb, newBookIdent(id, workID)
@@ -900,7 +910,7 @@ func ebookOnlyCandidates(epubs map[string]ebook.Candidate, claimed map[string]bo
 func applyOverride(sb *ScannedBook, overrides map[string]Override) bookIdent {
 	workID := ""
 	if ov, ok := overrides[sb.SourcePath]; ok {
-		sb.Hidden = ov.Hidden
+		sb.Hidden, sb.ForceAudio = ov.Hidden, ov.ForceAudio
 		workID = ov.WorkID
 	}
 	return newBookIdent(BookIdentity{

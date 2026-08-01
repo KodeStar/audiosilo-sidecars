@@ -187,7 +187,7 @@ func (e *Executor) auditReentryAccept(ctx context.Context, book store.Book, r sc
 		_ = os.Remove(auditAcceptedPath(book.WorkDir))
 		return scheduler.StageResult{}, false, nil
 	}
-	class, err := classifyBookEdges(book.WorkDir)
+	class, err := classifyBookEdges(book)
 	if err != nil {
 		return scheduler.StageResult{}, false, fmt.Errorf("auditing: verification classify edges: %w", err)
 	}

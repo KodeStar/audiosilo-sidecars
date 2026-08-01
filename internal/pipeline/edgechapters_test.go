@@ -191,7 +191,7 @@ func TestClassifyBookEdgesUniformShortBookSaturates(t *testing.T) {
 		counts[i] = 10
 	}
 	seedWordsManifest(t, work, audio.StyleFiles, counts)
-	class, err := classifyBookEdges(work)
+	class, err := classifyBookEdges(store.Book{WorkDir: work})
 	if err != nil {
 		t.Fatalf("classifyBookEdges: %v", err)
 	}
@@ -313,7 +313,7 @@ func TestClassifyManifestEdgesReadsTranscripts(t *testing.T) {
 			work := t.TempDir()
 			// chapter 1 = 3-word intro, 2-3 = narrative, 4 = 80-word credits.
 			seedWordsManifest(t, work, style, []int{3, 3000, 3000, 80})
-			class, err := classifyBookEdges(work)
+			class, err := classifyBookEdges(store.Book{WorkDir: work})
 			if err != nil {
 				t.Fatalf("classifyBookEdges: %v", err)
 			}
@@ -338,7 +338,7 @@ func TestClassifyManifestEdgesNormalBookNoExclusions(t *testing.T) {
 		t.Run(style, func(t *testing.T) {
 			work := t.TempDir()
 			seedWordsManifest(t, work, style, []int{2500, 3000, 2800, 3100})
-			class, err := classifyBookEdges(work)
+			class, err := classifyBookEdges(store.Book{WorkDir: work})
 			if err != nil {
 				t.Fatalf("classifyBookEdges: %v", err)
 			}

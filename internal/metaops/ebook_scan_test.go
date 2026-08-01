@@ -216,3 +216,40 @@ func TestForceAudioPatchReflectsBothWays(t *testing.T) {
 		}
 	})
 }
+
+// TestForceAudioIsStatedNotInferred: force_audio is a field the server sets, not a
+// shape a reader reconstructs. Erasing Kind is how the PIPELINE is told what to run,
+// but it is lossy as a signal - discovery also leaves Kind empty when an epub is
+// unreadable or a folder holds several, which is discovery declining to choose
+// rather than a decision the user made. Inferring from that shape reads one as the
+// other.
+func TestForceAudioIsStatedNotInferred(t *testing.T) {
+	dir := "/lib/book"
+	epub := ebook.Candidate{Path: dir + "/book.epub", Dir: dir, Title: "Book"}
+
+	forced := ScannedBook{SourcePath: dir, Title: "Book"}
+	annotateEbook(&forced, map[string][]ebook.Candidate{dir: {epub}}, map[string]bool{},
+		map[string]Override{dir: {ForceAudio: true}})
+	applyOverride(&forced, map[string]Override{dir: {ForceAudio: true}})
+	if !forced.ForceAudio {
+		t.Error("ForceAudio = false for a book whose override forces audio")
+	}
+	if forced.Kind != "" || forced.EbookPath == "" {
+		t.Errorf("kind %q / ebook_path %q: the pipeline is still told to run audio while reporting the epub",
+			forced.Kind, forced.EbookPath)
+	}
+
+	// The same OUTWARD shape (no kind, an ebook_path) from an unreadable epub is NOT
+	// a forced-audio book, and must not report as one.
+	unreadable := ScannedBook{SourcePath: dir, Title: "Book"}
+	bad := epub
+	bad.MetaErr = "drm"
+	annotateEbook(&unreadable, map[string][]ebook.Candidate{dir: {bad}}, map[string]bool{}, map[string]Override{})
+	applyOverride(&unreadable, map[string]Override{})
+	if unreadable.ForceAudio {
+		t.Error("ForceAudio = true for an unreadable epub; that is discovery declining, not a user choice")
+	}
+	if unreadable.Kind != "" {
+		t.Errorf("kind = %q, want empty: an unreadable epub cannot drive the pipeline", unreadable.Kind)
+	}
+}

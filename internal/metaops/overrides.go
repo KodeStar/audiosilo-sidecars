@@ -80,14 +80,18 @@ func (s *OverrideService) Upsert(ctx context.Context, req OverrideRequest, roots
 	if sp == "" {
 		return OverrideResult{}, ErrNoSourcePath
 	}
-	// Canonicalize the source path (abs + symlink-eval + clean) so the persisted
-	// key matches the canonical SourcePath a scan computes (ScanManager.Start
+	// Canonicalize the source path (abs + symlink-eval + clean) so the persisted key
+	// matches the canonical SourcePath a scan computes (ScanManager.Start
 	// canonicalizes its root the same way). Without this, a trailing-slash or
 	// symlinked spelling stores an override the scan overlay never finds.
-	if canon, err := resolvePath(sp); err == nil {
-		sp = canon
-	}
-	if ok, err := PathAllowed(sp, roots); err != nil || !ok {
+	//
+	// AllowedPath does the resolve and the allow-list check together, so this shares
+	// ONE policy with the API's create path: a path that cannot be resolved is not
+	// allowed. Resolving separately and ignoring the error meant a failure here
+	// persisted the raw string while the same failure at POST /books was a refusal -
+	// two answers to one question, in the one place both write the same key.
+	sp, ok, err := AllowedPath(sp, roots)
+	if err != nil || !ok {
 		return OverrideResult{}, ErrPathNotAllowed
 	}
 

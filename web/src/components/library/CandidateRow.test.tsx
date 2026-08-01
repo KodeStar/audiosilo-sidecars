@@ -107,8 +107,9 @@ describe('epub candidates', () => {
 
   it('offers the epub back once audio is forced', () => {
     const onToggle = vi.fn();
-    // force_audio applied: kind cleared, ebook_path still reported.
-    renderRow({ ...base, ebook_path: '/lib/a/book.epub' }, onToggle);
+    // force_audio applied: the server states it; kind is cleared because that is
+    // what the pipeline acts on, but the flag is what the toggle renders from.
+    renderRow({ ...base, ebook_path: '/lib/a/book.epub', force_audio: true }, onToggle);
     screen.getByText('Use epub').click();
     expect(onToggle).toHaveBeenCalledWith(expect.anything(), false);
   });

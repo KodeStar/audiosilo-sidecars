@@ -250,6 +250,8 @@ export interface ScannedBook {
   // True when the user has hidden this book from the default candidate list (a
   // persisted daemon-side override). Excluded from the default view; re-showable.
   hidden?: boolean;
+  /** The persisted "use the audio, not the epub" override, stated by the server. */
+  force_audio?: boolean;
   // Present when this exact canonical source_path is already persisted in the
   // pipeline. Such a row remains visible in Library but cannot be selected again.
   pipeline_book?: PipelineBookRef;

@@ -219,3 +219,40 @@ func TestReparseManifestRecoversAfterAVocabularyUpgrade(t *testing.T) {
 		}
 	}
 }
+
+// TestChapterMapResumesAHarvestedMapWithoutTheAgent: the stage writes the agent's
+// map back to the extract manifest, THEN materializes, THEN writes the sentinel. A
+// crash in that window leaves a contiguous draft, which skipped the reparse gate and
+// sent the book back to the agent - paying a second time for a map already on disk,
+// and risking a park if that round declined. A harvested map is recognizable by its
+// agent-stamped sections.
+func TestChapterMapResumesAHarvestedMapWithoutTheAgent(t *testing.T) {
+	harvested := ebook.Universe{
+		Contiguous: true,
+		Chapters: []ebook.Chapter{
+			{Chapter: 1, Files: []string{"002.txt"}, Words: 400},
+			{Chapter: 2, Files: []string{"003.txt"}, Words: 300},
+		},
+		Docs: []ebook.Doc{
+			{Index: 1, File: "001.txt", Spine: 1, Label: "Cover", Words: 10, Quarantine: "front matter"},
+			{Index: 2, File: "002.txt", Spine: 2, Label: "I", Words: 400, Chapter: 1, Source: ebook.SourceAgent},
+			{Index: 3, File: "003.txt", Spine: 3, Label: "II", Words: 300, Chapter: 2, Source: ebook.SourceAgent},
+		},
+	}
+	if !agentMapped(harvested) {
+		t.Fatal("agentMapped = false for a map the agent produced")
+	}
+
+	// A label-derived draft that merely came out contiguous must NOT match, or the
+	// stage would skip an agent round it was never given.
+	labelDerived := harvested
+	labelDerived.Docs = append([]ebook.Doc(nil), harvested.Docs...)
+	for i := range labelDerived.Docs {
+		if labelDerived.Docs[i].Source == ebook.SourceAgent {
+			labelDerived.Docs[i].Source = ebook.SourceStrict
+		}
+	}
+	if agentMapped(labelDerived) {
+		t.Error("agentMapped = true for a label-derived draft; only a harvested map may skip the agent")
+	}
+}

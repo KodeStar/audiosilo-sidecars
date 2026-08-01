@@ -532,20 +532,26 @@ describe('ebook candidates', () => {
   // force_audio would silently clear it - handing the pipeline an epub the user
   // had already rejected as the wrong edition.
   it('preserves a live force_audio through an unrelated hide', () => {
-    const forced = hybrid({ kind: undefined }); // discovery expresses forced audio by clearing kind
+    // The server STATES it. It is not inferred from the erased kind: an unreadable
+    // or ambiguous epub also leaves a row kind-less with an ebook_path, and that is
+    // discovery declining to choose, not a decision the user made.
+    const forced = hybrid({ kind: undefined, force_audio: true });
     expect(currentForceAudio(forced)).toBe(true);
     expect(overridePayload(forced, { hidden: true }).force_audio).toBe(true);
   });
 
-  it('does not invent force_audio for an ebook-only or plain audio book', () => {
+  it('does not invent force_audio for a row the server did not flag', () => {
     expect(currentForceAudio(hybrid({ ebook_path: '/root/b' }))).toBe(false);
     expect(currentForceAudio(hybrid({ kind: undefined, ebook_path: undefined }))).toBe(false);
+    // Kind-less WITH an epub, but no override: an unreadable epub, not a choice.
+    expect(currentForceAudio(hybrid({ kind: undefined }))).toBe(false);
   });
 
   it('lets the toggle set and clear it explicitly', () => {
     expect(overridePayload(hybrid(), { forceAudio: true }).force_audio).toBe(true);
-    expect(overridePayload(hybrid({ kind: undefined }), { forceAudio: false }).force_audio).toBe(
-      false,
-    );
+    expect(
+      overridePayload(hybrid({ kind: undefined, force_audio: true }), { forceAudio: false })
+        .force_audio,
+    ).toBe(false);
   });
 });

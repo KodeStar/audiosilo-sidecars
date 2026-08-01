@@ -114,7 +114,7 @@ func (e *Executor) synthesize(ctx context.Context, book store.Book, r scheduler.
 // returned so no consumer can reach its raw ChapterCount past the logical count. Errors
 // are unprefixed; each stage wraps with its own name.
 func (e *Executor) sidecarStageInputs(ctx context.Context, book store.Book) (edgeClassification, bool, string, error) {
-	class, err := classifyBookEdges(book.WorkDir)
+	class, err := classifyBookEdges(book)
 	if err != nil {
 		return edgeClassification{}, false, "", err
 	}

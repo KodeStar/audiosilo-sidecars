@@ -8,7 +8,13 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 )
 
-const scanCacheVersion = 1
+// scanCacheVersion invalidates a cache whose shape this code can no longer read
+// correctly. Bumped to 2 when force_audio became a stated field: a v1 entry recorded
+// the override only by ERASING kind, so restoring it would seed an overlay with
+// forceAudio false over a kind-less row - and the overlay would then "restore" the
+// epub, silently contradicting the user's persisted choice. Discarding is safe; a
+// cached scan is explicitly stale until rescanned.
+const scanCacheVersion = 2
 
 // scanCacheFile is deliberately private: it is daemon state, not an API
 // contract. Only a successful, complete snapshot is stored, so an interrupted or
@@ -104,8 +110,8 @@ func (m *ScanManager) restoreCache() {
 
 		// Move user-controlled state out of the cached base and into an explicit
 		// overlay. That makes a later false/nil ApplyOverride authoritative.
-		patch := overridePatch{hidden: book.Hidden, gen: m.nextGenLocked()}
-		book.Hidden = false
+		patch := overridePatch{hidden: book.Hidden, forceAudio: book.ForceAudio, gen: m.nextGenLocked()}
+		book.Hidden, book.ForceAudio = false, false
 		if coverage.MatchedBy == "manual" {
 			manual := coverage
 			patch.coverage = &manual

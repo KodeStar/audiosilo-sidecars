@@ -61,9 +61,38 @@ func (e *Executor) chapterMapping(ctx context.Context, book store.Book, r schedu
 	}
 	splitDir := filepath.Join(book.WorkDir, ebook.ExtractDir)
 
-	// Upgrade recovery, free. A newer label vocabulary may resolve outright what an
-	// older one could not, so re-derive from the recorded sections before paying for
-	// an agent round.
+	// Crash recovery, free. A CONTIGUOUS draft carrying the agent's own verdicts is a
+	// map this stage already harvested and wrote back, before crashing between that
+	// write and the sentinel. Re-materialize from it instead of paying for a second
+	// round: the map passed the validator, so it is exactly as good as one a fresh
+	// round would produce - and a fresh round could legitimately return a DIFFERENT
+	// numbering, or decline and park a book whose correct output is already on disk.
+	if draft.Contiguous && agentMapped(draft) {
+		if err := e.materializeEbookChapters(ctx, book, draft, splitDir, ""); err != nil {
+			return scheduler.StageResult{}, err
+		}
+		if r.Note != nil {
+			r.Note(fmt.Sprintf("resumed the chapter mapping already harvested for this book (%s) - no agent round needed",
+				countNoun(len(draft.Chapters), "chapter")))
+		}
+		if r.Progress != nil {
+			r.Progress(1, 1)
+		}
+		// NO RateSample, for the same reason as the reparse below: this is a
+		// re-materialization, while the stage's real cost was the agent round it is
+		// skipping. Observing it would drag the learned rate toward zero.
+		result := scheduler.StageResult{Metrics: metrics(map[string]any{
+			"chapters": len(draft.Chapters), "resumed_harvest": true,
+		})}
+		if err := scheduler.WriteSentinel(book.WorkDir, string(state.ChapterMapping), result); err != nil {
+			return scheduler.StageResult{}, err
+		}
+		return result, nil
+	}
+
+	// Upgrade recovery, also free. A newer label vocabulary may resolve outright what
+	// an older one could not, so re-derive from the recorded sections before paying
+	// for an agent round.
 	//
 	// Gated on the draft being non-contiguous, which is what makes it safe: a map the
 	// agent already produced is contiguous by construction (the validator accepts
@@ -313,6 +342,18 @@ func validateChapterMap(outDir string, inputFiles map[string]bool) error {
 // applies, so the post-run harvest can never accept a file validation rejected.
 // Sharing one decoder is the point: two readers of one artifact that disagree about
 // what is valid is worse than either rule alone.
+// agentMapped reports whether a universe's numbering came from the mapping agent.
+// applyChapterMap stamps every mapped section, so one is enough to tell a harvested
+// map from a label-derived draft.
+func agentMapped(u ebook.Universe) bool {
+	for _, d := range u.Docs {
+		if d.Source == ebook.SourceAgent {
+			return true
+		}
+	}
+	return false
+}
+
 func readChapterMap(outDir string) (agentChapterMap, error) {
 	var m agentChapterMap
 	if err := decodeSidecarFile(filepath.Join(outDir, chaptersFileName), &m); err != nil {

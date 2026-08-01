@@ -58,7 +58,7 @@ func TestClassifyEbookEdgesExcludesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	class, err := classifyBookEdges(work)
+	class, err := classifyBookEdges(store.Book{WorkDir: work, Kind: "ebook"})
 	if err != nil {
 		t.Fatalf("classifyBookEdges: %v", err)
 	}
@@ -121,5 +121,49 @@ func TestNgramCheckUsesTheEbookLayer(t *testing.T) {
 	}
 	if len(findings) == 0 {
 		t.Error("no finding for a verbatim run copied straight out of the book text")
+	}
+}
+
+// TestClassifyBookEdgesRejectsAKindMismatch: the book row is the authority on kind,
+// and every other reader in the authoring tail dispatches on it. Letting the edge
+// classifier decide from the manifest alone made them two independent sources of
+// truth, and a disagreement routes half the tail down each path - the audio
+// classifier over an ebook's durationless manifest excludes a short opening chapter
+// and shifts every reveal one chapter early, silently. Both directions must fail.
+func TestClassifyBookEdgesRejectsAKindMismatch(t *testing.T) {
+	ebookManifest := audio.Manifest{
+		Style: audio.StyleEbook, ChapterCount: 3,
+		Chapters: []audio.Chapter{{Chapter: 1, Words: 3000}, {Chapter: 2, Words: 3000}, {Chapter: 3, Words: 3000}},
+	}
+	audioManifest := audio.Manifest{
+		Style: audio.StyleFiles, ChapterCount: 3,
+		Chapters: []audio.Chapter{{Chapter: 1, Duration: 600}, {Chapter: 2, Duration: 600}, {Chapter: 3, Duration: 600}},
+	}
+	cases := []struct {
+		name     string
+		kind     string
+		manifest audio.Manifest
+		wantErr  bool
+	}{
+		{"ebook row over an ebook manifest", "ebook", ebookManifest, false},
+		{"audio row over an audio manifest", "audio", audioManifest, false},
+		{"pre-migration row over an audio manifest", "", audioManifest, false},
+		{"ebook row over an audio manifest", "ebook", audioManifest, true},
+		{"audio row over an ebook manifest", "audio", ebookManifest, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			work := t.TempDir()
+			if err := audio.WriteManifest(work, c.manifest); err != nil {
+				t.Fatal(err)
+			}
+			_, err := classifyBookEdges(store.Book{WorkDir: work, Kind: c.kind})
+			if c.wantErr && err == nil {
+				t.Error("a kind/style disagreement was accepted; it must be loud, never a silent chapter shift")
+			}
+			if !c.wantErr && err != nil {
+				t.Errorf("agreeing kind and style rejected: %v", err)
+			}
+		})
 	}
 }

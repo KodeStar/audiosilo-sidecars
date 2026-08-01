@@ -11,6 +11,8 @@ import (
 
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
+	"github.com/kodestar/audiosilo-sidecars/internal/state"
+	"github.com/kodestar/audiosilo-sidecars/internal/store"
 	"github.com/kodestar/audiosilo-sidecars/internal/transcript"
 )
 
@@ -593,12 +595,28 @@ const edgeProbeDepth = 8
 // chapters are word-counted; each unprobed interior chapter enters the classifier as an
 // unprobed narrative sentinel (Probed:false, so it can never belong to a maximal edge run). A
 // small book is probed in full so the degenerate all-small fallback still sees every chapter.
-func classifyBookEdges(workDir string) (edgeClassification, error) {
-	m, err := audio.ReadManifest(workDir)
+func classifyBookEdges(book store.Book) (edgeClassification, error) {
+	m, err := audio.ReadManifest(book.WorkDir)
 	if err != nil {
 		return edgeClassification{}, fmt.Errorf("edge classify: read manifest (inspect must run first): %w", err)
 	}
-	if m.Style == audio.StyleEbook {
+	// The BOOK ROW is the authority on kind; the manifest must agree with it. Every
+	// other reader in the authoring tail (chapterTextDir, chunkPlanAuthor,
+	// factPassChunk, ngramCheck) dispatches on book.Kind, so letting this one decide
+	// from the manifest alone made them two independent sources of truth for the same
+	// question. A disagreement would route half the tail down each path - the audio
+	// edge classifier over an ebook's text layer, whose durationless manifest makes
+	// its word-and-duration test degenerate to word-only, excluding a short opening
+	// chapter and shifting every reveal and recap one chapter early. That is silent,
+	// so the mismatch has to be loud.
+	wantEbook := state.ParseKind(book.Kind) == state.KindEbook
+	haveEbook := m.Style == audio.StyleEbook
+	if wantEbook != haveEbook {
+		return edgeClassification{}, fmt.Errorf(
+			"edge classify: book kind is %q but %s records style %q; the chapter universe and the book row disagree about what this is",
+			state.ParseKind(book.Kind), audio.ManifestName, m.Style)
+	}
+	if haveEbook {
 		return classifyEbookEdges(m)
 	}
 	n := len(m.Chapters)
@@ -610,7 +628,7 @@ func classifyBookEdges(workDir string) (edgeClassification, error) {
 		// coverage. Reading it at the edges alone left the entire interior of a long book
 		// unnumbered evidence-wise, so any unnumbered section in the middle had to be guessed
 		// around - and a book carrying interludes is exactly the shape that needs it.
-		opening, err := chapterOpening(workDir, ch.Chapter)
+		opening, err := chapterOpening(book.WorkDir, ch.Chapter)
 		if err != nil {
 			return edgeClassification{}, fmt.Errorf("edge classify: read chapter %d opening: %w", ch.Chapter, err)
 		}
@@ -620,7 +638,7 @@ func classifyBookEdges(workDir string) (edgeClassification, error) {
 			chs = append(chs, edgeChapter{Chapter: ch.Chapter, Opening: opening})
 			continue
 		}
-		words, present, err := chapterWordCount(workDir, ch.Chapter)
+		words, present, err := chapterWordCount(book.WorkDir, ch.Chapter)
 		if err != nil {
 			return edgeClassification{}, fmt.Errorf("edge classify: count chapter %d words: %w", ch.Chapter, err)
 		}

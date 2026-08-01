@@ -100,7 +100,7 @@ func (e *Executor) factPass(ctx context.Context, book store.Book, r scheduler.St
 	// Classify the book's edge chapters (a non-narrative intro/credits file on a
 	// files-style book) so the chunk agents get the EdgeNote and the assembler the
 	// LOGICAL story-chapter count. A normal book yields an empty note and the raw count.
-	class, err := classifyBookEdges(book.WorkDir)
+	class, err := classifyBookEdges(book)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("fact_pass: %w", err)
 	}

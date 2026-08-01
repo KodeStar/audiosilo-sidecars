@@ -278,12 +278,15 @@ export function overridePayload(
   };
 }
 
-// currentForceAudio reads a book's live force_audio state. There is no dedicated
-// field: discovery expresses it by clearing kind while still reporting the epub,
-// so a candidate that HAS an epub beside an audiobook but is not kind "ebook" is
-// one the user (or the persisted override) told us to transcribe.
+// currentForceAudio reads a book's live force_audio state.
+//
+// The server states it. It used to be RECONSTRUCTED from the absence of fields -
+// "has an epub beside an audiobook but is not kind ebook" - because forcing audio
+// erases kind. That was exact only because nothing else produced that combination:
+// an unreadable or ambiguous epub also leaves kind empty with an ebook_path, and
+// would have read as a user decision it never was.
 export function currentForceAudio(book: ScannedBook): boolean {
-  return !!book.ebook_path && book.ebook_path !== book.source_path && book.kind !== 'ebook';
+  return !!book.force_audio;
 }
 
 // seriesGapHint reports the series for which a selected book skips an earlier
