@@ -55,3 +55,38 @@ func TestPathAllowedSymlinkEscapeDenied(t *testing.T) {
 		t.Error("a symlink escaping the root should be denied")
 	}
 }
+
+// TestAllowedPathReturnsTheCheckedPath: the value a caller PERSISTS must be the one
+// the allow-list actually checked. Storing the raw string leaves a window in which a
+// symlink that passed the check is repointed before the path is opened stages later,
+// and it lets one folder be enqueued twice under two spellings, bypassing the UNIQUE
+// constraint and the already-enqueued guard.
+func TestAllowedPathReturnsTheCheckedPath(t *testing.T) {
+	root := t.TempDir()
+	inside := filepath.Join(root, "book")
+	if err := os.MkdirAll(inside, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	resolvedRoot, err := resolvePath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Allowed: a trailing slash and a "." segment resolve to the same canonical path,
+	// which is exactly the spelling collision the raw string let through.
+	for _, spelling := range []string{inside, inside + string(filepath.Separator), filepath.Join(root, ".", "book")} {
+		got, ok, err := AllowedPath(spelling, []string{root})
+		if err != nil || !ok {
+			t.Fatalf("AllowedPath(%q) = ok %v, err %v; want allowed", spelling, ok, err)
+		}
+		if want := filepath.Join(resolvedRoot, "book"); got != want {
+			t.Errorf("AllowedPath(%q) = %q, want the canonical %q", spelling, got, want)
+		}
+	}
+
+	// Denied: outside every root, reported as ok=false with no error.
+	outside := t.TempDir()
+	if _, ok, err := AllowedPath(outside, []string{root}); err != nil || ok {
+		t.Errorf("AllowedPath(outside) = ok %v, err %v; want denied", ok, err)
+	}
+}

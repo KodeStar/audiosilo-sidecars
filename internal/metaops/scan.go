@@ -539,8 +539,13 @@ func (m *ScanManager) applyFinal(id string, res *metascan.Result, overrides map[
 		// the ISBN the audio tags lacked - and the fingerprint is what the coverage
 		// worker resolves against. Building it first discarded that ISBN for the one
 		// purpose it was harvested for, falling back to a fuzzy title match.
+		//
+		// applyOverride MUTATES sb, so it must run before the append, exactly as in the
+		// ebook-only loop below - appending first copies the pre-override value and any
+		// field the override sets is silently dropped.
+		ident := applyOverride(&sb, overrides)
 		books = append(books, sb)
-		job.idents[sb.Path] = applyOverride(&sb, overrides)
+		job.idents[sb.Path] = ident
 	}
 	// Every epub no audiobook claimed becomes a candidate in its own right.
 	for _, sb := range ebookOnlyCandidates(epubs, claimed, job.path) {

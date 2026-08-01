@@ -178,7 +178,12 @@ func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
 			results = append(results, res)
 			continue
 		}
-		if ok, perr := metaops.PathAllowed(sp, roots); perr != nil || !ok {
+		// Persist the RESOLVED path, for the same reason the ebook branch does: the
+		// allow-list check resolves symlinks but the value is re-opened stages later,
+		// and it is also the UNIQUE key that stops one folder being enqueued twice
+		// under two spellings.
+		sp, ok, perr := metaops.AllowedPath(sp, roots)
+		if perr != nil || !ok {
 			res.Error = "path not allowed"
 			results = append(results, res)
 			continue
@@ -272,11 +277,8 @@ func ebookCandidate(c bookCandidate, roots []string) (kind, ebookPath, errMsg st
 	// so storing the raw string leaves a window in which a symlink that passed the
 	// check can be repointed outside every library root, and the stage would follow
 	// it and feed that file to an agent.
-	resolved, err := metaops.ResolvePath(ebookPath)
-	if err != nil {
-		return "", "", "ebook_path not allowed"
-	}
-	if ok, err := metaops.PathAllowed(resolved, roots); err != nil || !ok {
+	resolved, ok, err := metaops.AllowedPath(ebookPath, roots)
+	if err != nil || !ok {
 		return "", "", "ebook_path not allowed"
 	}
 	return kind, resolved, ""

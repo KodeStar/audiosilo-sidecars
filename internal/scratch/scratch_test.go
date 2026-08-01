@@ -3,6 +3,7 @@ package scratch
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
@@ -104,5 +105,54 @@ func TestPurgeRefusesOutsideRoot(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(outside, audio.ChaptersDir)); err != nil {
 		t.Error("Purge removed chapters/ outside the work root")
+	}
+}
+
+// TestInvalidatedStagesCoversEveryReclaimedDir is the guard on the coupling the
+// artifact table exists to hold. A reclaimed directory whose producing stage keeps
+// its sentinel wedges the book permanently: Retry re-runs an earlier stage, the
+// skipped stage never rebuilds the directory, and its successor fails forever on the
+// missing input. Retry only drops the CURRENT stage's sentinel, so there is no way
+// out but delete and re-enqueue.
+func TestInvalidatedStagesCoversEveryReclaimedDir(t *testing.T) {
+	for _, kind := range []state.Kind{state.KindAudio, state.KindEbook} {
+		stages := InvalidatedStages(kind)
+		for _, a := range artifactsFor(kind) {
+			if a.Stage == "" {
+				continue
+			}
+			if !slices.Contains(stages, a.Stage) {
+				t.Errorf("kind %s reclaims %s but does not invalidate %s", kind, a.Dir, a.Stage)
+			}
+		}
+	}
+}
+
+// TestEbookTextLayerInvalidatesBothWriters: ebook-text/ is written by extracting when
+// the derived universe is contiguous and by chapter_mapping when it is not, so a
+// purge must re-run whichever produced it. Listing only extracting wedged every book
+// that needed the mapping agent - which, on the validation corpus, is a third of them.
+func TestEbookTextLayerInvalidatesBothWriters(t *testing.T) {
+	stages := InvalidatedStages(state.KindEbook)
+	for _, want := range []state.State{state.Extracting, state.ChapterMapping} {
+		if !slices.Contains(stages, want) {
+			t.Errorf("ebook purge does not invalidate %s; a Retry would skip it into an empty text layer", want)
+		}
+	}
+	// An audio book must be unaffected by the ebook entries.
+	if got := InvalidatedStages(state.KindAudio); !slices.Equal(got, []state.State{state.Splitting}) {
+		t.Errorf("audio invalidates %v, want only splitting", got)
+	}
+}
+
+// TestPurgeRequiredIsEbookOnly pins the licensing predicate: an ebook's reclaimed
+// layers are its copyrighted source prose, so the purge is an obligation; audio
+// scratch is a disk-space preference the operator may switch off.
+func TestPurgeRequiredIsEbookOnly(t *testing.T) {
+	if !PurgeRequired(state.KindEbook) {
+		t.Error("an ebook purge must not be optional")
+	}
+	if PurgeRequired(state.KindAudio) || PurgeRequired("") {
+		t.Error("audio scratch is a preference, not an obligation")
 	}
 }

@@ -183,20 +183,6 @@ func (s *Scheduler) Delete(ctx context.Context, id int64) error {
 	return nil
 }
 
-// purgeInvalidatedStages are the stage sentinels a scratch purge must drop so the
-// book re-runs those stages instead of trusting a stale "done" marker. Their
-// durable output (the chapter FLACs) IS the scratch scratch.Purge reclaims, so
-// after a purge the content-truth sentinel would otherwise let runStage's crash-
-// resume fast-path skip the stage and hand a later stage (ASR, M3) an empty
-// chapters/. Coupled to scratch.Purge's reclaim set - it grows as later milestones
-// reclaim more scratch (e.g. ASR working files in M3).
-var purgeInvalidatedStages = []state.State{state.Splitting}
-
-// purgeInvalidatedEbookStages is the same idea for an ebook book: the purge removes
-// extracting's output, so its sentinel must go too or a later Retry skips the stage
-// and hands fact_pass an empty text directory.
-var purgeInvalidatedEbookStages = []state.State{state.Extracting}
-
 // PurgeScratch reclaims a book's split chapters/ (the M2 heavy scratch) while
 // keeping its durables (probe.json/manifest.json/transcripts). It is a manual,
 // user-initiated reclaim: allowed only when the book is done, paused, or
@@ -239,12 +225,10 @@ func (s *Scheduler) purgeScratchInner(ctx context.Context, b store.Book) error {
 	}
 	// The reclaimed artifacts include a completed stage's output, so drop that
 	// stage's sentinel (and its recorded success) - a later Retry/reconcile must
-	// re-run it rather than skip it and feed the next stage an empty chapters/.
-	invalidated := purgeInvalidatedStages
-	if kind == state.KindEbook {
-		invalidated = purgeInvalidatedEbookStages
-	}
-	for _, st := range invalidated {
+	// re-run it rather than skip it and feed the next stage an empty directory. The
+	// list is DERIVED from the same table Purge deletes from, so a newly reclaimed
+	// directory cannot be added without its stage coming with it.
+	for _, st := range scratch.InvalidatedStages(kind) {
 		_ = os.Remove(SentinelPath(b.WorkDir, string(st)))
 	}
 	// Re-account what remains (the durables) in one walk so scratch_bytes reflects

@@ -32,6 +32,7 @@ import (
 
 	"github.com/kodestar/audiosilo-sidecars/internal/eta"
 	"github.com/kodestar/audiosilo-sidecars/internal/events"
+	"github.com/kodestar/audiosilo-sidecars/internal/scratch"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
@@ -274,6 +275,14 @@ func (s *Scheduler) Reconcile(ctx context.Context) error {
 	return nil
 }
 
+// purgeWanted reports whether this book's scratch should be reclaimed automatically:
+// either the operator asked for it, or the book's kind makes it an obligation.
+// autoPurge is a disk-space preference for the contribution flow and must not be able
+// to switch off a licensing rule (see scratch.PurgeRequired).
+func (s *Scheduler) purgeWanted(b store.Book) bool {
+	return s.autoPurge || scratch.PurgeRequired(state.ParseKind(b.Kind))
+}
+
 // startupGC reclaims the scratch of every already-done book that still accounts
 // scratch on disk (a daemon that crashed before auto-purge ran, or was upgraded into
 // auto-purge). It runs in a background goroutine started from Reconcile (off the
@@ -286,15 +295,14 @@ func (s *Scheduler) startupGC(ctx context.Context, books []store.Book) {
 		if ctx.Err() != nil {
 			return
 		}
-		if !state.IsTerminal(state.State(b.State)) {
+		if !state.IsTerminal(state.State(b.State)) || !s.purgeWanted(b) {
 			continue
 		}
-		// The scratch gauge is the cheap filter, but it cannot be trusted to decide an
-		// ebook: extracting and chapter_mapping do not account scratch, so a book can
-		// hold its whole source text while reporting zero. An ebook is therefore always
-		// swept - Purge is idempotent and a no-op once the layers are gone.
-		isEbook := state.ParseKind(b.Kind) == state.KindEbook
-		if !isEbook && (!s.autoPurge || b.ScratchBytes <= 0) {
+		// Presence, not the gauge. scratch_bytes counts the DURABLES too, so an
+		// already-swept book still reports a non-zero size and would pay a full
+		// RemoveAll sweep, a recursive walk of its work dir and a DB write on every
+		// boot. A few stats answer the question honestly instead.
+		if !scratch.HasReclaimable(s.workRoot, b.WorkDir, state.ParseKind(b.Kind)) {
 			continue
 		}
 		// Reserve the book for the reclaim (mirroring PurgeScratch): a terminal book is
@@ -869,11 +877,7 @@ func (s *Scheduler) advance(ctx context.Context, b store.Book, stage state.State
 	// Auto-purge: a book that just reached done no longer needs its scratch. The worker
 	// already holds this book's in-flight slot, so reclaim WITHOUT reserving (that would
 	// see itself busy). A failure is logged, never fails the stage.
-	// An EBOOK purges regardless of the flag. autoPurge is a disk-space preference for
-	// the contribution flow, but an ebook's reclaimable layers hold the book's
-	// copyrighted source prose, and "source material never outlives the derivation" is
-	// a licensing obligation rather than a preference - it must not be switchable off.
-	if next == state.Done && (s.autoPurge || state.ParseKind(b.Kind) == state.KindEbook) {
+	if next == state.Done && s.purgeWanted(b) {
 		s.autoPurgeDone(ctx, b.ID)
 	}
 }

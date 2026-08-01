@@ -126,14 +126,15 @@ var boilerplateCues = []string{
 	"about the publisher", "colophon", "copyright",
 }
 
-// frontMatterLabels are the toc labels that name apparatus rather than story. Used
-// only to EXPLAIN a quarantine, never to decide one: the decision is positional
-// (before the first numbered chapter, after the last), so an unrecognized label at
-// the edges is quarantined just the same.
 // apparatusCues name apparatus that an exact label match cannot catch, because the
 // label carries the book's own words: "Books by Rick Riordan", "List of
 // Illustrations", "About the Author and Illustrator". Matched case-insensitively as
 // substrings, and only at the EDGES of a titled-only book.
+//
+// It holds only the terms the other vocabularies do not. isApparatus composes it with
+// boilerplateCues (the public-domain apparatus every Gutenberg epub ends with - a
+// licence runs ~2,900 words and reads as a chapter on any size test) and excerptCues,
+// so a term is stated once and every list that should see it does.
 //
 // They matter far more than they look. A numbered book excludes its apparatus by
 // position, off numbers the book itself states; a titled-only book has nothing but
@@ -142,19 +143,20 @@ var boilerplateCues = []string{
 //
 // Prologue, Epilogue, Interlude and Part are deliberately absent: those are story.
 var apparatusCues = []string{
-	"about the author", "about the illustrator", "about the publisher",
-	"books by", "also by", "other books", "more by",
+	"about the author", "about the illustrator",
+	"books by", "other books", "more by",
 	"list of illustrations", "list of maps", "list of characters",
 	"table of contents", "title page", "half title",
-	"copyright", "dedication", "acknowledg", "colophon", "imprint",
+	"dedication", "acknowledg", "imprint",
 	"afterword", "foreword", "preface", "introduction",
 	"newsletter", "reading group", "discussion questions",
-	// Public-domain apparatus, which every Gutenberg-derived epub ends with and which
-	// is long enough (~2,900 words) to read as a chapter on any size test.
-	"project gutenberg", "license", "licence", "transcriber",
-	"appendix", "glossary", "bibliography",
 }
 
+// frontMatterLabels are the toc labels that name apparatus rather than story. For a
+// NUMBERED book they only EXPLAIN a quarantine, never decide one: the decision is
+// positional (before the first numbered chapter, after the last), so an unrecognized
+// label at the edges is quarantined just the same. isApparatus also consults them for
+// the titled-only path, where there are no numbers to be positional about.
 var frontMatterLabels = map[string]bool{
 	"cover": true, "title page": true, "titlepage": true, "contents": true,
 	"table of contents": true, "copyright": true, "dedication": true,
@@ -292,18 +294,15 @@ const ordinalOutlierRatio = 10
 // has each section's opening words and can say what it is. Guessing is what costs,
 // because the shifted position is published and nothing downstream re-derives it.
 func ordinalSizeOutlier(chs []Chapter) (position, median int) {
-	if len(chs) < minChapters {
-		return 0, 0
-	}
 	words := make([]int, 0, len(chs))
 	for _, c := range chs {
 		words = append(words, c.Words)
 	}
-	sort.Ints(words)
-	median = words[len(words)/2]
-	if median <= 0 {
+	if len(words) == 0 {
 		return 0, 0
 	}
+	sort.Ints(words)
+	median = words[len(words)/2]
 	for i, c := range chs {
 		if c.Words*ordinalOutlierRatio < median {
 			return i + 1, median
@@ -389,9 +388,10 @@ func storySpan(docs []Doc) (first, last int) {
 
 // isSpineContinuation reports whether next is an unlabeled remainder of the same
 // spine document as prev.
+// It does not test Quarantine: storySpan runs BEFORE quarantineEdges, so no section
+// carries one yet.
 func isSpineContinuation(prev, next Doc) bool {
-	return next.Chapter == 0 && next.Quarantine == "" &&
-		strings.TrimSpace(next.Label) == "" && next.Spine == prev.Spine
+	return next.Chapter == 0 && strings.TrimSpace(next.Label) == "" && next.Spine == prev.Spine
 }
 
 // titledStorySpan guesses the story span for a book whose toc carries labels but no
@@ -420,7 +420,9 @@ func isApparatus(d Doc) bool {
 	if frontMatterLabels[label] {
 		return true
 	}
-	return containsAny(label, apparatusCues) || containsAny(label, excerptCues)
+	return containsAny(label, apparatusCues) ||
+		containsAny(label, boilerplateCues) ||
+		containsAny(label, excerptCues)
 }
 
 // looksLikeExcerpt reports whether a quarantined trailing section is plausibly a
@@ -527,9 +529,10 @@ func assignOrdinals(docs []Doc, first, last int) {
 // its facts to a chapter the reader finishes BEFORE reading it, firing every reveal
 // in it one section early. It folds FORWARD, into the chapter it precedes.
 //
-// The forward pass runs first and anchors only on sections that were already
-// numbered, so a continuation folded by the backward pass can never act as an anchor
-// and drag an interstitial back the way it came.
+// The interstitial pass runs first, walking BACKWARD so each section sees the chapter
+// it precedes. It anchors only on sections that were already numbered, so a
+// continuation folded by the second pass can never act as an anchor and drag an
+// interstitial back the way it came.
 func foldContinuations(docs []Doc, first, last int) {
 	if first < 0 {
 		return
@@ -537,18 +540,15 @@ func foldContinuations(docs []Doc, first, last int) {
 	next := 0
 	for i := last; i >= first; i-- {
 		switch {
-		case docs[i].Quarantine != "":
 		case docs[i].Chapter > 0:
 			next = docs[i].Chapter
 		case strings.TrimSpace(docs[i].Label) != "" && next > 0:
 			docs[i].Chapter, docs[i].Source = next, SourceInterstitial
 		}
 	}
+	// Then the continuation pass, forward.
 	current := 0
 	for i := first; i <= last; i++ {
-		if docs[i].Quarantine != "" {
-			continue
-		}
 		if docs[i].Chapter > 0 {
 			current = docs[i].Chapter
 			continue

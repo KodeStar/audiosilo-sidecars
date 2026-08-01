@@ -12,29 +12,30 @@ Delete this file once the list is empty.
 
 ### 1. `force_audio` cannot be turned back off once it is in the scan cache
 
-`internal/metaops/scan_cache.go` lifts only `hidden` out of a cached scan result
-into a read-time overlay, so a `force_audio` override applied after a scan is
-reflected, but clearing one is not - the cached candidate keeps the audio
-verdict until the folder is rescanned.
+`force_audio` is already in the read-time overlay. The problem is its
+REPRESENTATION: unlike `hidden`, it is not a field on `ScannedBook` - it is
+encoded by erasing `Kind`, which is lossy. So the overlay can apply
+`forceAudio == true` but cannot undo it once `annotateEbook` baked `Kind: ""`
+into the cached base at scan time.
 
-Not a correctness bug (the pipeline reads the override, not the cache), but the
-Library row lies about which source will be used until a rescan.
+The client half has the same shape: `currentForceAudio` reconstructs a
+persisted server boolean from the absence of three fields. That is exact today
+only because nothing else sets `EbookPath` without `Kind` - a coincidence, not
+an invariant.
 
-**Fix direction:** put `force_audio` in the same read-time overlay as `hidden`.
+**Fix direction:** add `force_audio bool` to `ScannedBook` and set it from the
+override, exactly as `hidden` is; then `currentForceAudio` is `!!book.force_audio`
+and the cache case closes with it. Note `Override` already carries the field on
+the wire - it is missing only from the object the UI renders.
 
-### 2. `source_path` is not canonicalized in `handleCreateBooks`
+### 2. Path canonicalization is not applied at every metaops boundary
 
-`internal/api/handlers_pipeline.go` resolves and persists the path for the ebook
-branch, but the general create path stores whatever the client sent. Two spellings
-of one folder (a trailing slash, a symlinked root) therefore bypass both the
-UNIQUE constraint and the "already enqueued" guard, so one book can be created
-twice and processed twice.
+FIXED for the API: `metaops.AllowedPath` now resolves once and returns the
+canonical path, and both `handleCreateBooks` call sites persist it.
 
-**Pre-existing - it affects audio equally and is not introduced by this branch.**
-Worth fixing, but it is not an ebook change and does not belong in this PR.
-
-**Fix direction:** run every incoming `source_path` through `metaops.ResolvePath`
-in the handler, as the ebook branch now does.
+Still open: `OverrideService.Upsert` treats a resolve failure as "keep the raw
+string" while the API treats it as "not allowed" - two policies for one failure.
+Worth unifying on the next pass through `metaops`.
 
 ### 3. Two sources of truth for "is this an ebook"
 
@@ -66,17 +67,23 @@ Costs money and can park a completed book; it cannot publish a wrong number
 **Fix direction:** write the sentinel before persisting the map, or record the
 harvest separately from the derived manifest.
 
-### 5. The per-kind artifact lists are four parallel lists
+### 5. The remaining per-kind switches in `internal/pipeline`
 
-`reclaimable`/`ebookReclaimable` in `internal/scratch`, the purge-invalidated
-sentinel list in `internal/scheduler`, and the kind switches in
-`internal/pipeline` each encode part of "which artifacts belong to which stage
-for which kind". They are consistent today but nothing holds them so, and a
-desync runs `fact_pass` over zero chapters.
+The load-bearing half of this is FIXED: `internal/scratch` now holds one
+`{dir, stage}` artifact table, `Purge` folds over the dirs and
+`scratch.InvalidatedStages` derives the sentinel list from the same rows, so the
+reclaim set and the invalidation set cannot drift. (They already had: the ebook
+list omitted `chapter_mapping`, which wedged any book that needed the mapping
+agent - a third of the validation corpus - if it was ever purged.)
 
-This is the branch's one real structural fragility. **Fix direction:** one
-artifact registry - stage, kind, directory, durable-or-reclaimable - that all
-four derive from.
+Still open, and lower risk: `chapterTextDir` / `chunkPlanAuthor` / `isEbook` in
+`internal/pipeline` are per-kind NAMING rather than a safety coupling. Folding
+them into the same table would be tidier but nothing silently breaks if they
+drift - the stage fails loudly on a missing file.
+
+Also noted: `classifyBookEdges` dispatches on the manifest's `Style` while the
+rest of the tail dispatches on `book.Kind` (item 3 above), which is the one
+remaining place two sources of truth could disagree.
 
 ## Fixed on the branch (for reference)
 

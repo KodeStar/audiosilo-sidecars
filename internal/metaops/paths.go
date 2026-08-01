@@ -21,23 +21,49 @@ func PathAllowed(target string, roots []string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	return containedIn(rt, roots), nil
+}
+
+// pathAllowedResolved is PathAllowed's containment half, for a target already
+// resolved. Keeping it separate is what lets AllowedPath resolve exactly once.
+func pathAllowedResolved(resolved string, roots []string) (bool, error) {
+	if len(roots) == 0 {
+		return true, nil
+	}
+	return containedIn(resolved, roots), nil
+}
+
+// containedIn reports whether the already-resolved rt sits inside any of roots.
+func containedIn(rt string, roots []string) bool {
 	for _, root := range roots {
 		rr, err := resolvePath(root)
 		if err != nil {
 			continue // an unresolvable configured root simply cannot match
 		}
 		if rt == rr || strings.HasPrefix(rt, rr+string(filepath.Separator)) {
-			return true, nil
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
-// ResolvePath is resolvePath, exported for callers that must PERSIST a canonical
-// path rather than merely check one. Storing the raw string a caller supplied
-// leaves a window in which a symlink that passed an allow-list check can be
-// repointed before the path is used.
-func ResolvePath(p string) (string, error) { return resolvePath(p) }
+// AllowedPath is PathAllowed plus the canonical path it checked.
+//
+// Callers that PERSIST a path must store this rather than the raw string they were
+// given: keeping the raw form leaves a window in which a symlink that passed the
+// allow-list check is repointed before the path is used, so the path checked and the
+// path opened are not the same one. It also resolves once instead of twice, which
+// matters in the per-candidate loop that enqueues a whole library over SMB.
+//
+// ok is false with a nil error when the path simply falls outside the allow-list.
+func AllowedPath(target string, roots []string) (resolved string, ok bool, err error) {
+	resolved, err = resolvePath(target)
+	if err != nil {
+		return "", false, err
+	}
+	ok, err = pathAllowedResolved(resolved, roots)
+	return resolved, ok, err
+}
 
 // resolvePath returns the absolute, symlink-evaluated form of p. It falls back to
 // the cleaned absolute path when the target does not yet exist (EvalSymlinks

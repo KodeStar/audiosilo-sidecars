@@ -1,6 +1,6 @@
 import { memo } from 'react';
 import type { ScannedBook } from '@/api/types';
-import { isManualMatch, matchProvenanceLabel } from '@/lib/candidates';
+import { currentForceAudio, isManualMatch, matchProvenanceLabel } from '@/lib/candidates';
 import { stateLabel } from '@/lib/pipelineState';
 import { CoverageBadge } from './CoverageBadge';
 
@@ -104,7 +104,9 @@ export const CandidateRow = memo(function CandidateRow({
   // A HYBRID row has an epub AND an audiobook: source_path is the folder while
   // ebook_path names the file inside it. Only such a row can fall back to audio.
   const hybrid = !!book.ebook_path && book.ebook_path !== book.source_path;
-  const forcedAudio = !isEbook && hybrid;
+  // Shared with the value the toggle SENDS (overridePayload), so the button's label
+  // and the request it makes cannot drift apart.
+  const forcedAudio = currentForceAudio(book);
   const pipelineBook = book.pipeline_book;
   const provenance = matchProvenanceLabel(book.coverage);
   const manual = isManualMatch(book.coverage);

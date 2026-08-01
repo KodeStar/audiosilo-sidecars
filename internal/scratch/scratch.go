@@ -82,15 +82,37 @@ func Confined(workRoot, workDir string) (string, bool) {
 	return wd, true
 }
 
-// reclaimable names the work-dir subdirectories a purge removes: the split
-// chapters/, the agent staged-context dirs under _runs/, and the M5 tail-clip /
-// full-chapter re-transcription scratch (clips/, retranscribe/). None is a durable
-// (transcripts, facts, sidecars, reports) and none is a stage INPUT (so removing them
-// invalidates no sentinel), so a purge can reclaim them freely.
-var reclaimable = []string{audio.ChaptersDir, agent.RunsDir, repair.ClipsDir, repair.RetranscribeDir}
+// artifact is one reclaimable work-dir directory together with the stage that
+// produced it.
+//
+// The pairing is the point. A purge must remove the directory AND drop the sentinel
+// of the stage that wrote it, or runStage's crash-resume fast path skips that stage
+// on the next Retry and hands its successor an empty directory. Keeping the two
+// facts in one table is what stops them drifting: they were previously two lists in
+// two packages, and the ebook one had already lost chapter_mapping - a book parked
+// at chapter_mapping, purged, then retried re-ran extracting (which writes no text
+// for a non-contiguous universe), skipped chapter_mapping on its surviving sentinel,
+// and wedged permanently at fact_pass with no chunk plan.
+//
+// Stage may be empty for a directory no stage's resume depends on.
+type artifact struct {
+	Dir   string
+	Stage state.State
+}
 
-// ebookReclaimable names the layers an EBOOK book reclaims on top of the shared
-// list: the raw split output and the per-chapter text derived from it.
+// audioArtifacts are reclaimed for every book: the split chapters/, the agent
+// staged-context dirs under _runs/, and the tail-clip / full-chapter
+// re-transcription scratch. Only chapters/ is a stage INPUT, so only splitting has a
+// sentinel to invalidate.
+var audioArtifacts = []artifact{
+	{Dir: audio.ChaptersDir, Stage: state.Splitting},
+	{Dir: agent.RunsDir},
+	{Dir: repair.ClipsDir},
+	{Dir: repair.RetranscribeDir},
+}
+
+// ebookArtifacts are reclaimed on top of the shared list for an EBOOK book: the raw
+// split output and the per-chapter text derived from it.
 //
 // They are kind-specific rather than global because the audio path's equivalent
 // layer, transcripts-corrected/, is DURABLE - it is the n-gram source for a later
@@ -101,7 +123,67 @@ var reclaimable = []string{audio.ChaptersDir, agent.RunsDir, repair.ClipsDir, re
 // copyrighted source prose. The repo's rule is that source material never outlives
 // the derivation, so purging it is required, not an optimization - and it is cheap
 // to regenerate from the epub if a retry needs it.
-var ebookReclaimable = []string{ebook.ExtractDir, ebook.TextDir}
+//
+// BOTH stages are listed against the text layer because either can write it:
+// extracting materializes it only when the derived universe is contiguous, and
+// chapter_mapping writes it otherwise.
+var ebookArtifacts = []artifact{
+	{Dir: ebook.ExtractDir, Stage: state.Extracting},
+	{Dir: ebook.TextDir, Stage: state.ChapterMapping},
+}
+
+// artifactsFor returns the artifacts a book of this kind reclaims. An empty or
+// unknown kind is audio, so a pre-migration book reclaims exactly what it always did.
+func artifactsFor(kind state.Kind) []artifact {
+	if kind == state.KindEbook {
+		return slices.Concat(audioArtifacts, ebookArtifacts)
+	}
+	return audioArtifacts
+}
+
+// InvalidatedStages returns the stages whose sentinels a purge must drop for this
+// kind, derived from the same table Purge deletes from so the two cannot disagree.
+func InvalidatedStages(kind state.Kind) []state.State {
+	var out []state.State
+	for _, a := range artifactsFor(kind) {
+		if a.Stage != "" && !slices.Contains(out, a.Stage) {
+			out = append(out, a.Stage)
+		}
+	}
+	return out
+}
+
+// PurgeRequired reports whether reclaiming this kind's scratch is an obligation
+// rather than a disk-space preference.
+//
+// An ebook's reclaimed layers hold the book's copyrighted source prose, and "source
+// material never outlives the derivation" is a licensing rule - so it must not be
+// switchable off by contribution.auto_purge, which exists to control disk use. The
+// predicate lives here, beside the artifact list that makes it true, rather than
+// being restated as a kind comparison at each scheduler call site.
+func PurgeRequired(kind state.Kind) bool {
+	return kind == state.KindEbook
+}
+
+// HasReclaimable reports whether any reclaimable directory is actually present.
+//
+// It is the cheap precondition for a purge: a few stats against a full RemoveAll
+// sweep, a recursive DirSize walk of the whole work dir and a DB write. The
+// scratch_bytes gauge cannot serve that purpose, because DirSize counts the DURABLES
+// too - so an already-purged book still reports a non-zero size and would be swept
+// again on every daemon boot.
+func HasReclaimable(workRoot, workDir string, kind state.Kind) bool {
+	wd, ok := Confined(workRoot, workDir)
+	if !ok {
+		return false
+	}
+	for _, a := range artifactsFor(kind) {
+		if _, err := os.Stat(filepath.Join(wd, a.Dir)); err == nil {
+			return true
+		}
+	}
+	return false
+}
 
 // Purge deletes a book's reclaimable scratch - the split chapters/ directory, the
 // agent staged-context dirs (_runs/), and the tail-clip/re-transcription scratch
@@ -109,20 +191,15 @@ var ebookReclaimable = []string{ebook.ExtractDir, ebook.TextDir}
 // transcripts, facts, sidecars). It is a no-op when the work dir is absent. The
 // deletion is confined to workRoot.
 //
-// kind selects the extra ebook layers (see ebookReclaimable); an empty or unknown
-// kind is treated as audio, so a pre-migration book reclaims exactly what it always
-// did.
+// kind selects the extra ebook layers (see ebookArtifacts); an empty or unknown kind
+// is treated as audio, so a pre-migration book reclaims exactly what it always did.
 func Purge(workRoot, workDir string, kind state.Kind) error {
 	wd, ok := Confined(workRoot, workDir)
 	if !ok {
 		return nil // nothing safe to remove
 	}
-	dirs := reclaimable
-	if kind == state.KindEbook {
-		dirs = slices.Concat(reclaimable, ebookReclaimable)
-	}
-	for _, dir := range dirs {
-		if err := os.RemoveAll(filepath.Join(wd, dir)); err != nil {
+	for _, a := range artifactsFor(kind) {
+		if err := os.RemoveAll(filepath.Join(wd, a.Dir)); err != nil {
 			return err
 		}
 	}
