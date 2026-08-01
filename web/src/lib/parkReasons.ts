@@ -15,6 +15,12 @@ const PARK_HINTS: Record<string, string> = {
     'The agent output failed validation repeatedly. Retry re-runs the stage.',
   markers_not_confident:
     "Chapter markers could not be normalized confidently. Check the audio's chapters, then Retry.",
+  ebook_unreadable:
+    'The epub could not be read - it may be DRM-protected, corrupt, or missing content it references. Supply a DRM-free copy, then Retry.',
+  ebook_no_chapters:
+    "The epub's table of contents names no chapters this build can use, so there is nothing to map automatically. Check the file, then Retry.",
+  ebook_chapters_not_confident:
+    'Chapter mapping could not derive a confident chapter numbering. Inspect extract_manifest.json in the work dir, then Retry.',
   qa_no_converge:
     'Transcript QA repairs stopped making progress. Inspect qa_report.md in the work dir; Retry grants one fresh adjudication round.',
   spelling_gate_failure:

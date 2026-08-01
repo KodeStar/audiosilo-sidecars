@@ -199,6 +199,18 @@ internal/
             /mlx AND whisper.cpp -ojf) + Complete (resume/skip test, ports
             transcript_is_complete) + writers (transcripts-json/ normalized,
             transcripts-text/ concatenated text). NEVER writes transcripts-raw/.
+  ebook/    M9: the epub front half. BuildUniverse turns audiosilo-meta pkg/extract's
+            per-section split into the LOGICAL chapter universe the sidecars publish
+            positions against, then WriteChapterText/WriteManifest materialize it.
+            Two rules are load-bearing: quarantine is POSITIONAL (everything outside
+            the first..last numbered section is excluded regardless of length -
+            a trailing promo excerpt of ANOTHER book is a full chapter, so any
+            word-count rule waves it through), and a Loose label reading is accepted
+            only when the whole book's labels form a contiguous run (Contiguous),
+            because "I An Irate Neighbor" and "MIX" are ambiguous per-label. Find
+            walks a library for .epub files and reads each OPF for identity, never a
+            content document. Pure + table-tested; a 33-book corpus test is env-gated
+            on AUDIOSILO_EPUB_DIR.
   scratch/  per-book DirSize gauge + Purge (removes chapters/, keeps durables),
             confined to the work root. Reclaimed manually (purge-scratch), by M7's
             auto-purge when a book reaches done (contribution.auto_purge, default on),
@@ -609,7 +621,9 @@ internal/
             CanStart/NextState guards, the audit fix-loop cap. Pure, no I/O. M6 added
             ParkCode (typed park reasons - M7 added contrib_unavailable, core_needed,
             core_pending; the reliability round added budget_exceeded; the ASR
-            decode-timeout hotfix added asr_decode_timeout, so 15 now),
+            decode-timeout hotfix added asr_decode_timeout, and M9 added
+            ebook_unreadable / ebook_no_chapters / ebook_chapters_not_confident,
+            so 20 now),
             MainlineNext (the optimistic mainline
             successor the ETA engine walks - the table's Next ordering is load-bearing:
             conditional/loop target first, mainline continuation LAST),
@@ -1230,6 +1244,36 @@ Milestones from the workspace plan; each is shippable.
   and an explicit coverage pass. The audit convergence re-entry now performs targeted
   semantic verification instead of accepting on mechanical validation alone.
 
+- **M9 (done): ebook input.** An EPUB is now a first-class source. The pipeline
+  gains a second FRONT HALF - `queued -> extracting -> [chapter_mapping] ->
+  fact_pass` - feeding the unchanged authoring tail, so an epub skips inspect,
+  split, ASR, sanitize, QA sweep, QA adjudication and spelling research entirely.
+  All of those exist to reconstruct clean, correctly-spelled, correctly-chaptered
+  text from audio, and an epub already has it.
+  Measured over a 33-book library: 26 books route straight to `fact_pass`, 5 need
+  the mapping agent, 2 park. Pieces: `books.kind`/`ebook_path`/`words`
+  (migration 0011, invariant enforced in the store like park_code);
+  `internal/ebook`; the `extracting` and `chapter_mapping` stages (the latter
+  cloned from `markers_normalizing`, including its FREE deterministic re-derivation
+  and its not-confident park); a kind-aware final-text layer so the tail reads
+  either kind; and epub discovery in the Library scan.
+  Load-bearing decisions, each guarding a SILENT failure: the new states sit at
+  order 11/12 (at the front, `scheduler.queueGroup` would have rendered every
+  ebook in the ASR section of a lane it never enters); `classifyEbookEdges`
+  replaces the audio edge classifier, whose word-and-duration rule degenerates to
+  word-only on a durationless manifest and would exclude a short opening chapter,
+  shifting every reveal and recap one chapter early; `ngramCheck` now FAILS when it
+  checked nothing, instead of reporting a vacuous pass on the one gate standing
+  between the pipeline and republishing the author's prose; and the purge is
+  kind-aware, because an ebook's text is the copyrighted source and must not
+  outlive the derivation while audio's `transcripts-corrected/` is durable.
+  Depends on audiosilo-meta **v0.8.0**, which added toc-anchor splitting (12 of
+  the 33 books put several chapters in one spine document, and emitting one file
+  per document silently merged them), a much wider chapter-label vocabulary (the
+  old one recognized ZERO labels across the corpus), and `ReadMetadata`.
+  Deferred: MOBI/AZW/PDF, DRM of any kind, and using an epub as a spelling
+  reference for the audio path.
+
 - **Post-M8 canonical-spelling round (done):** stopped the pipeline propagating its
   own mishearings across a series. A whole Wandering Inn run published `Torrin` for
   Toren, `Floss` for Flos, `Terriarch` for Teriarch, `Laken Goddard` for Godart,
@@ -1255,7 +1299,9 @@ Still **not built**: signed installers / a friendlier packaged client (a possibl
 follow-up per the meta EXTRACTION roadmap); a separately-deployable UI-only image
 (scoped out of M8, deferred). The contributing stage submits sidecars but never
 retracts them - cancelling a core_pending book leaves its already-opened add-work
-issue for a maintainer to close. **Ebook input** (accept an EPUB and skip the
+issue for a maintainer to close. **Ebook input SHIPPED in M9** (below); the
+former proposal in [EBOOK-INPUT.md](EBOOK-INPUT.md) is kept only as the original
+design trail. **Ebook input** (accept an EPUB and skip the
 audio / ASR / QA / spelling stages, reusing the fact_pass -> synthesis -> audit
 back half) is designed but unbuilt - see [EBOOK-INPUT.md](EBOOK-INPUT.md). All
 four tabs report `ready` on `/system`. Keep this file honest as milestones land.

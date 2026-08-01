@@ -1,9 +1,27 @@
 # Ebook input (design proposal)
 
-> Status: **proposal, not yet implemented.** A future milestone (call it "M9").
-> This documents the shape of adding EPUB input to the pipeline so the work can
-> be scoped and spiked before it is built. Hyphens, never em dashes (workspace
-> rule).
+> Status: **SUPERSEDED - shipped as M9.** Kept as the original design trail; see
+> the M9 entry in [CLAUDE.md](CLAUDE.md) for what actually shipped.
+>
+> Three things this proposal got wrong, all found by measuring against a real
+> 33-book library rather than the single worked example in audiosilo-meta's
+> EXTRACTION.md:
+>
+> 1. **`Split`'s chapter inference was assumed to mostly work.** It recognized
+>    ZERO labels across the whole corpus - real tocs write `1. Title`,
+>    `Chapter One .....`, `CHAPTER I.`, `1 - Title`, none of which the old
+>    `^(?:chapter\s+)?(\d+)$` pattern matches.
+> 2. **Fragment-anchor splitting was not mentioned at all**, yet 12 of 33 books
+>    point several toc entries at ONE spine document. Emitting one file per
+>    document silently merged those chapters - and since chapter numbers are the
+>    spoiler positions, that shipped wrong reveal gates without erroring.
+> 3. **"The back half is reused unchanged" was false.** It took about seven touch
+>    points, and one of them (the edge classifier) would have corrupted spoiler
+>    positions silently had the shim this document proposed been used.
+>
+> The proposed manual chapter-mapping UI - called out here as "the largest single
+> piece" - was not built. An agent stage cloned from `markers_normalizing` covers
+> it, park and Retry included.
 
 ## The idea
 
