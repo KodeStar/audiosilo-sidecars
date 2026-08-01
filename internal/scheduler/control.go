@@ -303,15 +303,21 @@ func (s *Scheduler) unreserve(id int64) {
 	s.notify()
 }
 
-// purgeAllowed reports whether a book is in a state where reclaiming its chapters
-// is safe: terminal (done), or parked paused/failed (cancel marks a book failed).
-// A running book (status none, non-terminal) still needs its chapters.
+// purgeAllowed reports whether a book is in a state where reclaiming its scratch is
+// safe: terminal (done), or PARKED - paused, failed (cancel marks a book failed), or
+// needs_attention. A parked book holds no worker, and a purge invalidates the
+// sentinels of the stages whose inputs it removed, so a later Retry regenerates them.
+// A running book (status none, non-terminal) still needs its scratch.
+//
+// needs_attention belongs here because it is the longest park there is: it waits on a
+// human. An ebook sitting at chapter_mapping for weeks was otherwise unable to
+// release its copyrighted source text by any means.
 func purgeAllowed(b store.Book) bool {
 	if state.IsTerminal(state.State(b.State)) {
 		return true
 	}
 	switch state.Status(b.Status) {
-	case state.StatusPaused, state.StatusFailed:
+	case state.StatusPaused, state.StatusFailed, state.StatusNeedsAttention:
 		return true
 	default:
 		return false
