@@ -324,17 +324,12 @@ func slugify(s string) string {
 
 // isSeriesOpener reports whether this book opens its series (so it must NOT carry a
 // chapter-0 "previously" recap). A seriesless book is trivially an opener; otherwise
-// it is an opener when no same-series predecessor exists. findSeriesPredecessor is
-// owned by series.go (shared with the spelling/fact-pass carryover discovery).
+// it is an opener when neither a LOCAL predecessor (findSeriesPredecessor, owned by
+// series.go and shared with the spelling/fact-pass carryover discovery) nor an
+// upstream one exists. seriesStatus (series_prior.go) owns both halves.
 func (e *Executor) isSeriesOpener(ctx context.Context, book store.Book) (bool, error) {
-	if strings.TrimSpace(book.Series) == "" {
-		return true, nil
-	}
-	_, found, err := findSeriesPredecessor(ctx, e.db, book)
-	if err != nil {
-		return false, err
-	}
-	return !found, nil
+	opener, _, err := e.seriesStatus(ctx, book)
+	return opener, err
 }
 
 // mdFilter selects the .md files under facts/ for staging (the knowledge sheets and

@@ -16,6 +16,11 @@ type fixPromptData struct {
 	Title          string
 	ChapterCount   int
 	EdgeNote       string
+	IsSeriesOpener bool
+	// HasSeriesPrior reports that series-previously.md was staged: the ONE source the
+	// fixer may draw prior-book content from when an audit finding asks for the
+	// chapter-0 "previously" recap.
+	HasSeriesPrior bool
 	VerifiedLedger string
 }
 
@@ -28,29 +33,31 @@ func (e *Executor) fixSidecars(ctx context.Context, book store.Book, r scheduler
 	if r.Progress != nil {
 		r.Progress(0, 1)
 	}
-	class, seriesOpener, ledger, err := e.sidecarStageInputs(ctx, book)
+	in, err := e.sidecarStageInputs(ctx, book)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("fixing: %w", err)
 	}
-	noteEdgeExclusions(r, class)
+	noteEdgeExclusions(r, in.class)
 
 	st, err := agent.New(book.WorkDir, string(state.Fixing), e.stageAttempt(ctx, book, state.Fixing))
 	if err != nil {
 		return scheduler.StageResult{}, err
 	}
-	if err := stageFixInputs(st, book.WorkDir); err != nil {
+	if err := stageFixInputs(st, book.WorkDir, in.prior); err != nil {
 		return scheduler.StageResult{}, err
 	}
 
 	validate := func(_ agent.Result, s *agent.Staging) error {
-		_, _, _, verr := loadOutSidecars(s.OutDir(), class.LogicalCount, seriesOpener)
+		_, _, _, verr := loadOutSidecars(s.OutDir(), in.class.LogicalCount, in.seriesOpener)
 		return verr
 	}
 	data := fixPromptData{
 		Title:          book.Title,
-		ChapterCount:   class.LogicalCount,
-		EdgeNote:       class.EdgeNote,
-		VerifiedLedger: ledger,
+		ChapterCount:   in.class.LogicalCount,
+		EdgeNote:       in.class.EdgeNote,
+		IsSeriesOpener: in.seriesOpener,
+		HasSeriesPrior: in.prior.present(),
+		VerifiedLedger: in.ledger,
 	}
 	usage, err := e.runAgent(ctx, book, state.Fixing, r, st, "fix.md", data, false, validate)
 	if err != nil {
@@ -70,11 +77,15 @@ func (e *Executor) fixSidecars(ctx context.Context, book store.Book, r scheduler
 }
 
 // stageFixInputs copies the fixer's input set: the authoring contract, the current
-// sidecars, the audit findings, the validation report, and the fact notes (the only
-// source the fixer may draw new wording from).
-func stageFixInputs(st *agent.Staging, workDir string) error {
+// sidecars, the audit findings, the validation report, the fact notes (the only source
+// the fixer may draw new wording from), and, for a book-2+ whose predecessor is only
+// covered upstream, that predecessor's published recap material.
+func stageFixInputs(st *agent.Staging, workDir string, prior seriesPrior) error {
 	if err := stageAuthoring(st); err != nil {
 		return fmt.Errorf("fixing: stage authoring.md: %w", err)
+	}
+	if err := stageSeriesPrior(st, prior); err != nil {
+		return fmt.Errorf("fixing: %w", err)
 	}
 	if err := stageSidecars(st, workDir); err != nil {
 		return err
