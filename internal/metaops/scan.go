@@ -14,6 +14,9 @@ import (
 	"time"
 
 	metascan "github.com/kodestar/audiosilo-meta/pkg/scan"
+
+	"github.com/kodestar/audiosilo-sidecars/internal/ebook"
+	"github.com/kodestar/audiosilo-sidecars/internal/state"
 )
 
 // coverageWorkers bounds concurrent per-book coverage lookups during a scan, so a
@@ -45,6 +48,9 @@ type Override struct {
 	Hidden    bool
 	WorkID    string
 	WorkTitle string
+	// ForceAudio runs the audio pipeline for a candidate whose folder also holds an
+	// epub (a wrong edition, an abridgement, a bad conversion).
+	ForceAudio bool
 }
 
 // OverrideLookup supplies the current set of candidate overrides (keyed by a
@@ -77,6 +83,18 @@ type ScannedBook struct {
 	RuntimeMin     int      `json:"runtime_min,omitempty"`
 	Chapters       int      `json:"chapters,omitempty"`
 	AudioFiles     int      `json:"audio_files"`
+	// Kind is the pipeline front half this candidate would run: "audio", or "ebook"
+	// when an epub supplies the text.
+	Kind string `json:"kind,omitempty"`
+	// EbookPath is the .epub that would drive the pipeline. For an ebook-only
+	// candidate it equals SourcePath; for an epub sitting BESIDE an audiobook it
+	// differs, because SourcePath stays the audiobook folder - the durable identity,
+	// whose tags carry the ASIN.
+	EbookPath string `json:"ebook_path,omitempty"`
+	// EbookNote explains a discovery decision the user would otherwise find
+	// puzzling: an unreadable epub, or several in one folder (where we refuse to
+	// guess which one is the book).
+	EbookNote string `json:"ebook_note,omitempty"`
 	// Hidden is true when a persisted (or live) override hides this book from the
 	// default candidate list.
 	Hidden bool `json:"hidden,omitempty"`
@@ -192,6 +210,7 @@ type scanJob struct {
 
 	walkDirs    int
 	walkGroups  int
+	walkEpubs   int
 	groupsDone  int
 	groupsTotal int
 
@@ -415,6 +434,25 @@ func (m *ScanManager) loadOverrides() map[string]Override {
 func (m *ScanManager) run(id, path string) {
 	overrides := m.loadOverrides()
 
+	// Walk for epubs CONCURRENTLY with the audio scan: they read the same tree
+	// independently, and the epub pass is cheap (container + OPF only, never a
+	// content document). A failure here never fails the scan - an unreadable epub
+	// tree should cost the epub annotations, not the whole library.
+	epubCh := make(chan map[string]ebook.Candidate, 1)
+	go func() {
+		found, ferr := ebook.Find(m.ctx, path, func(dirs, n int) {
+			m.mu.Lock()
+			if job, ok := m.jobs[id]; ok {
+				job.walkEpubs = n
+			}
+			m.mu.Unlock()
+		})
+		if ferr != nil {
+			found = nil
+		}
+		epubCh <- found
+	}()
+
 	res, stats, err := m.scan(path, metascan.Options{
 		FFprobePath: m.ffprobePath,
 		OnWalk: func(dirsScanned, groupsFound int) {
@@ -445,7 +483,11 @@ func (m *ScanManager) run(id, path string) {
 	// DURING the walk is already persisted, so the final identities resolve
 	// against it rather than against the scan-start snapshot (whose verdict would
 	// then outrank the live patch, since it lands later).
-	m.applyFinal(id, res, m.loadOverrides())
+	// Merge at applyFinal, NOT during the stream. The streaming pass is explicitly
+	// provisional, while applyFinal replaces the whole list with the corroborated
+	// one - annotating a streamed row with an epub the walker had not yet reached
+	// would flicker rows and churn the coverage fingerprints into a re-dispatch.
+	m.applyFinal(id, res, m.loadOverrides(), <-epubCh)
 	m.waitCoverage(id)
 	m.finishDone(id, stats)
 }
@@ -466,19 +508,28 @@ func (m *ScanManager) streamBook(id string, b metascan.Book, overrides map[strin
 
 // applyFinal swaps in the authoritative (corroborated, sorted) book list and
 // (re)dispatches coverage for each, then moves the phase to "coverage".
-func (m *ScanManager) applyFinal(id string, res *metascan.Result, overrides map[string]Override) {
+func (m *ScanManager) applyFinal(id string, res *metascan.Result, overrides map[string]Override, epubs map[string]ebook.Candidate) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	job, ok := m.jobs[id]
 	if !ok {
 		return
 	}
-	books := make([]ScannedBook, 0, len(res.Books))
+	byDir := ebook.ByDir(epubs)
+	claimed := map[string]bool{}
+	books := make([]ScannedBook, 0, len(res.Books)+len(epubs))
 	for _, b := range res.Books {
 		sb, bi := convertBook(b, job.path, overrides)
+		annotateEbook(&sb, byDir, claimed, overrides)
 		books = append(books, sb)
 		job.idents[sb.Path] = bi
 	}
+	// Every epub no audiobook claimed becomes a candidate in its own right.
+	for _, sb := range ebookOnlyCandidates(epubs, claimed, job.path, overrides) {
+		books = append(books, sb)
+		job.idents[sb.Path] = identityOf(sb)
+	}
+	sortScannedBooks(books)
 	job.books = books
 	job.phase = "coverage"
 	for _, sb := range books {
@@ -671,4 +722,99 @@ func convertBook(b metascan.Book, root string, overrides map[string]Override) (S
 		workID = ov.WorkID
 	}
 	return sb, newBookIdent(id, workID)
+}
+
+// annotateEbook marks an audiobook candidate whose folder also holds an epub, so
+// the pipeline reads the exact text instead of transcribing the audio.
+//
+// SourcePath deliberately stays the audiobook folder. It is the durable identity
+// every override, POST /books call and queue row keys on, and the audio tags carry
+// the ASIN - by far the strongest coverage-match key. The epub supplies the text;
+// the audiobook keeps supplying the identity.
+//
+// A folder holding SEVERAL epubs is left as audio with a note. Picking one would be
+// a guess, and the wrong text attributes another book's plot to this one - the same
+// hazard the extract stage quarantines cross-book excerpts for.
+func annotateEbook(sb *ScannedBook, byDir map[string][]ebook.Candidate, claimed map[string]bool, overrides map[string]Override) {
+	cands := byDir[sb.SourcePath]
+	if len(cands) == 0 {
+		return
+	}
+	for _, c := range cands {
+		claimed[c.Path] = true
+	}
+	if len(cands) > 1 {
+		sb.EbookNote = fmt.Sprintf("%d epubs in this folder - none selected, so the audio will be transcribed", len(cands))
+		return
+	}
+	c := cands[0]
+	if c.MetaErr != "" {
+		sb.EbookNote = "an epub is present but could not be read (it may be DRM-protected), so the audio will be transcribed"
+		return
+	}
+	if overrides[sb.SourcePath].ForceAudio {
+		sb.EbookNote = "an epub is present; using the audio instead"
+		sb.EbookPath = c.Path
+		return
+	}
+	sb.Kind, sb.EbookPath = string(state.KindEbook), c.Path
+	// Fill only what the audio scan LEFT EMPTY. Tags always win: an ASIN-bearing
+	// audiobook is a stronger identity than an epub's OPF, and a calibre series
+	// field is frequently wrong (one corpus book self-reports the wrong series).
+	if sb.ISBN == "" && c.ISBN != "" {
+		sb.ISBN = c.ISBN
+		if sb.Sources == nil {
+			sb.Sources = map[string]string{}
+		}
+		sb.Sources["isbn"] = "epub"
+	}
+}
+
+// ebookOnlyCandidates turns every epub no audiobook claimed into a candidate of its
+// own, so a text-only library scans like an audio one.
+func ebookOnlyCandidates(epubs map[string]ebook.Candidate, claimed map[string]bool, root string, overrides map[string]Override) []ScannedBook {
+	out := make([]ScannedBook, 0, len(epubs))
+	for path, c := range epubs {
+		if claimed[path] {
+			continue
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			rel = filepath.Base(path)
+		}
+		sb := ScannedBook{
+			Path: filepath.ToSlash(rel), SourcePath: path,
+			Title: c.Title, Subtitle: c.Subtitle, Authors: c.Authors,
+			Series: c.Series, SeriesPosition: c.SeriesPos, ISBN: c.ISBN,
+			Kind: string(state.KindEbook), EbookPath: path,
+			Sources: map[string]string{"title": "epub"},
+		}
+		if c.MetaErr != "" {
+			// Reported, never silently dropped: the user should see the book they
+			// own and learn why it is unusable.
+			sb.Kind, sb.EbookPath = "", ""
+			sb.EbookNote = "this epub could not be read (it may be DRM-protected)"
+		}
+		if ov, ok := overrides[sb.SourcePath]; ok {
+			sb.Hidden = ov.Hidden
+		}
+		out = append(out, sb)
+	}
+	return out
+}
+
+// identityOf builds the coverage identity for a candidate the audio scanner did not
+// produce. An epub rarely carries an ASIN, so these resolve on the ISBN or
+// title-search rungs of the coverage cascade.
+func identityOf(sb ScannedBook) bookIdent {
+	return newBookIdent(BookIdentity{
+		ASIN: sb.ASIN, ISBN: sb.ISBN, Title: sb.Title,
+		Authors: sb.Authors, Series: sb.Series, SeriesPos: sb.SeriesPosition,
+	}, "")
+}
+
+// sortScannedBooks restores a stable order after the ebook-only candidates are
+// appended, so the Library list does not reshuffle between scans.
+func sortScannedBooks(books []ScannedBook) {
+	sort.Slice(books, func(i, j int) bool { return books[i].Path < books[j].Path })
 }

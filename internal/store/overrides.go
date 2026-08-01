@@ -13,13 +13,19 @@ type Override struct {
 	Hidden     bool
 	WorkID     string
 	WorkTitle  string
+	// ForceAudio makes a candidate whose folder also holds an epub run the AUDIO
+	// pipeline anyway - for an abridged epub, a different edition, or a bad
+	// conversion. Durable, because "the epub here is wrong" is a property of the
+	// folder, not of one enqueue: the Library list re-renders from the scan cache
+	// on every rescan, so a non-persisted choice would be lost immediately.
+	ForceAudio bool
 	UpdatedAt  string
 }
 
 // meaningful reports whether an override says anything worth persisting. A row
 // that is neither hidden nor manually matched is the absence of an override, so
 // UpsertOverride deletes it rather than storing an inert row.
-func (o Override) meaningful() bool { return o.Hidden || o.WorkID != "" }
+func (o Override) meaningful() bool { return o.Hidden || o.WorkID != "" || o.ForceAudio }
 
 // UpsertOverride writes the full desired state for a source_path and returns the
 // stored row (so callers need no follow-up GetOverride for updated_at). It
@@ -35,12 +41,13 @@ func (db *DB) UpsertOverride(ctx context.Context, ov Override) (Override, error)
 	}
 	ts := timestamp(nowFn())
 	_, err := db.sql.ExecContext(ctx,
-		`INSERT INTO candidate_overrides (source_path, hidden, work_id, work_title, updated_at)
-		 VALUES (?,?,?,?,?)
+		`INSERT INTO candidate_overrides (source_path, hidden, work_id, work_title, force_audio, updated_at)
+		 VALUES (?,?,?,?,?,?)
 		 ON CONFLICT(source_path) DO UPDATE SET
 		   hidden=excluded.hidden, work_id=excluded.work_id,
-		   work_title=excluded.work_title, updated_at=excluded.updated_at`,
-		ov.SourcePath, boolToInt(ov.Hidden), ov.WorkID, ov.WorkTitle, ts)
+		   work_title=excluded.work_title, force_audio=excluded.force_audio,
+		   updated_at=excluded.updated_at`,
+		ov.SourcePath, boolToInt(ov.Hidden), ov.WorkID, ov.WorkTitle, boolToInt(ov.ForceAudio), ts)
 	if err != nil {
 		return Override{}, err
 	}
@@ -51,7 +58,7 @@ func (db *DB) UpsertOverride(ctx context.Context, ov Override) (Override, error)
 // ListOverrides returns all overrides ordered by source_path.
 func (db *DB) ListOverrides(ctx context.Context) ([]Override, error) {
 	rows, err := db.sql.QueryContext(ctx,
-		`SELECT source_path, hidden, work_id, work_title, updated_at
+		`SELECT source_path, hidden, work_id, work_title, force_audio, updated_at
 		 FROM candidate_overrides ORDER BY source_path`)
 	if err != nil {
 		return nil, err
@@ -70,10 +77,11 @@ func (db *DB) ListOverrides(ctx context.Context) ([]Override, error) {
 
 func scanOverride(sc interface{ Scan(...any) error }) (Override, error) {
 	var ov Override
-	var hidden int
-	if err := sc.Scan(&ov.SourcePath, &hidden, &ov.WorkID, &ov.WorkTitle, &ov.UpdatedAt); err != nil {
+	var hidden, forceAudio int
+	if err := sc.Scan(&ov.SourcePath, &hidden, &ov.WorkID, &ov.WorkTitle, &forceAudio, &ov.UpdatedAt); err != nil {
 		return Override{}, err
 	}
 	ov.Hidden = hidden != 0
+	ov.ForceAudio = forceAudio != 0
 	return ov, nil
 }
