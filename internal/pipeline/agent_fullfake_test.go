@@ -1,11 +1,14 @@
 package pipeline
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
+	"github.com/kodestar/audiosilo-sidecars/internal/ebook"
 	"github.com/kodestar/audiosilo-sidecars/internal/qa"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
@@ -61,6 +64,8 @@ func fullFakeAct(t *testing.T, opts fullFakeOpts) func(*fakeRunner, agent.Reques
 		switch req.Stage {
 		case string(state.MarkersNormalizing):
 			return fakeMarkersAct(t, req)
+		case string(state.ChapterMapping):
+			return fakeChapterMapAct(t, req)
 		case string(state.QAAdjudicating):
 			return fakeAdjudicateAct(t, req, opts)
 		case string(state.SpellingResearch):
@@ -148,4 +153,51 @@ func fullFakeConfig(dataDir string, fake *fakeRunner) Config {
 		ContribMode: contribModeLocal,
 		ExportRoot:  filepath.Join(dataDir, "export"),
 	}
+}
+
+// fakeChapterMapAct scripts the chapter_mapping agent: it reads the draft the
+// extract stage recorded and numbers the surviving story sections 1..N, which is
+// what a confident agent would return for a book whose toc the parser could not
+// read as a contiguous run (a Part-structured book, or a titled-only toc).
+func fakeChapterMapAct(t *testing.T, req agent.Request) (agent.Result, error) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(req.Dir, ebook.ManifestName))
+	if err != nil {
+		t.Fatalf("fake chapter_mapping: read staged draft: %v", err)
+	}
+	var draft ebook.Universe
+	if err := json.Unmarshal(raw, &draft); err != nil {
+		t.Fatalf("fake chapter_mapping: parse staged draft: %v", err)
+	}
+
+	type chapter struct {
+		Chapter int      `json:"chapter"`
+		Title   string   `json:"title"`
+		Files   []string `json:"files"`
+	}
+	type quarantined struct {
+		File   string `json:"file"`
+		Reason string `json:"reason"`
+	}
+	out := struct {
+		Chapters   []chapter     `json:"chapters"`
+		Quarantine []quarantined `json:"quarantine"`
+	}{Chapters: []chapter{}, Quarantine: []quarantined{}}
+
+	n := 0
+	for _, d := range draft.Docs {
+		if d.Quarantine != "" {
+			out.Quarantine = append(out.Quarantine, quarantined{File: d.File, Reason: d.Quarantine})
+			continue
+		}
+		n++
+		out.Chapters = append(out.Chapters, chapter{Chapter: n, Title: d.Label, Files: []string{d.File}})
+	}
+	body, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		t.Fatalf("fake chapter_mapping: encode: %v", err)
+	}
+	writeOutRaw(t, req, "chapters.json", string(body))
+	writeOutRaw(t, req, "verdict.json", `{"confident": true, "reason": "numbered the story sections in reading order"}`)
+	return agent.Result{Usage: agent.Usage{Model: "sonnet", Input: 120, Output: 60, CostUSD: 0.02, Turns: 1}}, nil
 }

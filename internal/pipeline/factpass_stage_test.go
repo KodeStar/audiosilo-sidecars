@@ -13,6 +13,7 @@ import (
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
+	"github.com/kodestar/audiosilo-sidecars/internal/ebook"
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/spelling"
@@ -71,9 +72,15 @@ func seedFactPassInputs(t *testing.T, work string, chunks []chunkRange) chunkPla
 // transcripts-corrected/ (how the fake infers the chunk it is working).
 func stagedChapterRange(t *testing.T, dir string) (int, int) {
 	t.Helper()
+	// Read whichever text layer the stage staged. The directory differs by book kind
+	// (transcripts-corrected/ for audio, ebook-text/ for an epub), and hardcoding the
+	// audio one made this fake blind to an ebook chunk that was staged correctly.
 	entries, err := os.ReadDir(filepath.Join(dir, spelling.CorrectedDir))
 	if err != nil {
-		t.Fatalf("read staged corrected dir: %v", err)
+		entries, err = os.ReadDir(filepath.Join(dir, ebook.TextDir))
+	}
+	if err != nil {
+		t.Fatalf("read staged chapter text dir: %v", err)
 	}
 	lo, hi := 0, 0
 	for _, ent := range entries {
@@ -89,7 +96,7 @@ func stagedChapterRange(t *testing.T, dir string) (int, int) {
 		}
 	}
 	if lo == 0 {
-		t.Fatalf("no corrected chapters staged in %s", dir)
+		t.Fatalf("no chapter text staged in %s", dir)
 	}
 	return lo, hi
 }
