@@ -744,6 +744,7 @@ func TestCreateBooksEbookKind(t *testing.T) {
 	dirNoPath := mkdir("no-path")
 	dirAudioWithEpub := mkdir("audio-with-epub")
 	dirBadKind := mkdir("bad-kind")
+	dirForeignEpub := mkdir("foreign-epub")
 	inside := mk(filepath.Join(root, "ebooks"), "in.epub")
 	beside := mk(audioDir, "beside.epub")
 	outside := mk(filepath.Join(t.TempDir(), "elsewhere"), "out.epub")
@@ -756,6 +757,7 @@ func TestCreateBooksEbookKind(t *testing.T) {
 		{"source_path":"` + notEpub + `","title":"Not an epub","kind":"ebook","ebook_path":"` + notEpub + `"},
 		{"source_path":"` + dirNoPath + `","title":"Missing epub path","kind":"ebook"},
 		{"source_path":"` + dirAudioWithEpub + `","title":"Audio carrying an epub","ebook_path":"` + inside + `"},
+		{"source_path":"` + dirForeignEpub + `","title":"Someone else's epub","kind":"ebook","ebook_path":"` + inside + `"},
 		{"source_path":"` + dirBadKind + `","title":"Unknown kind","kind":"pdf"}
 	]}`
 	resp := env.do(t, http.MethodPost, "/api/v1/books", token, body)
@@ -793,6 +795,10 @@ func TestCreateBooksEbookKind(t *testing.T) {
 		root + "/no-path":         `ebook_path is required for kind "ebook"`,
 		root + "/audio-with-epub": `ebook_path is only valid with kind "ebook"`,
 		root + "/bad-kind":        `unknown kind "pdf" (want "audio" or "ebook")`,
+		// An allow-listed epub that belongs to a DIFFERENT book. Permitted by the
+		// allow-list, but attaching it here would publish one book's sidecars - and
+		// its plot - under another book's identity and ASIN.
+		root + "/foreign-epub": "ebook_path must be the candidate itself or a file in its folder",
 	}
 	for path, wantErr := range denied {
 		r := byPath[path]

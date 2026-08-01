@@ -69,6 +69,36 @@ func TestPurgeKindAware(t *testing.T) {
 		}
 	})
 
+	t.Run("ebook also strips the prose kept in the durable manifest", func(t *testing.T) {
+		wd := seed(t)
+		if err := ebook.WriteManifest(wd, ebook.Universe{Docs: []ebook.Doc{
+			{Index: 1, File: "001.txt", Label: "Chapter 1", Head: "It was a bright cold day in April"},
+			{Index: 2, File: "002.txt", Label: "Chapter 2", Head: "The hallway smelt of boiled cabbage"},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := Purge(filepath.Dir(wd), wd, state.KindEbook); err != nil {
+			t.Fatal(err)
+		}
+		// The manifest itself is a durable: a re-entered chapter_mapping reads it.
+		u, err := ebook.ReadManifest(wd)
+		if err != nil {
+			t.Fatalf("ebook purge removed the extract manifest, which chapter_mapping needs: %v", err)
+		}
+		if len(u.Docs) != 2 {
+			t.Fatalf("docs = %d, want the 2 recorded sections", len(u.Docs))
+		}
+		for _, d := range u.Docs {
+			if d.Head != "" {
+				t.Errorf("section %d kept its opening words (%q) through the purge; "+
+					"40 words per section is the author's prose outliving the derivation", d.Index, d.Head)
+			}
+			if d.Label == "" {
+				t.Errorf("section %d lost its label; only Head is prose", d.Index)
+			}
+		}
+	})
+
 	t.Run("an unknown or empty kind behaves as audio", func(t *testing.T) {
 		wd := seed(t)
 		if err := Purge(filepath.Dir(wd), wd, ""); err != nil {

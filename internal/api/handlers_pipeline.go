@@ -188,7 +188,7 @@ func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
 			results = append(results, res)
 			continue
 		}
-		kind, ebookPath, kerr := ebookCandidate(c, roots)
+		kind, ebookPath, kerr := ebookCandidate(c, sp, roots)
 		if kerr != "" {
 			res.Error = kerr
 			results = append(results, res)
@@ -244,7 +244,10 @@ func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
 // audiobook folder stays the identity while the epub supplies the text. Checking
 // only source_path would let a caller name any epub on disk as long as the folder
 // it paired it with was permitted.
-func ebookCandidate(c bookCandidate, roots []string) (kind, ebookPath, errMsg string) {
+//
+// sourcePath is the caller's already-resolved source_path, which the epub must
+// belong to (see the containment check below).
+func ebookCandidate(c bookCandidate, sourcePath string, roots []string) (kind, ebookPath, errMsg string) {
 	kind = strings.TrimSpace(c.Kind)
 	ebookPath = strings.TrimSpace(c.EbookPath)
 	if !state.ValidKind(kind) {
@@ -280,6 +283,18 @@ func ebookCandidate(c bookCandidate, roots []string) (kind, ebookPath, errMsg st
 	resolved, ok, err := metaops.AllowedPath(ebookPath, roots)
 	if err != nil || !ok {
 		return "", "", "ebook_path not allowed"
+	}
+	// The epub must BELONG to the candidate: either it IS the candidate (an
+	// ebook-only book) or it sits directly in its folder, which is exactly the
+	// pairing discovery makes (ebook.ByDir keys on the containing directory).
+	//
+	// Without this, the allow-list is the only constraint, so any permitted epub can
+	// be attached to any permitted audiobook folder - and the sidecars derived from
+	// one book would then be published under the other's identity and ASIN. That is
+	// the same "another book's text reaches the fact pass" hazard the extract stage
+	// quarantines cross-book excerpts for, and nothing downstream could detect it.
+	if resolved != sourcePath && filepath.Dir(resolved) != sourcePath {
+		return "", "", "ebook_path must be the candidate itself or a file in its folder"
 	}
 	return kind, resolved, ""
 }

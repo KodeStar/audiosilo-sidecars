@@ -56,6 +56,12 @@ func (e *Executor) extract(ctx context.Context, book store.Book, r scheduler.Sta
 		return scheduler.StageResult{}, fmt.Errorf("extracting: write manifest: %w", err)
 	}
 
+	// Reported BEFORE the park below, because the epub's own warnings ("multiple toc
+	// labels target this file and its anchors could not be located") are exactly the
+	// evidence a human needs for a book that parks with nothing mappable - and the
+	// park is the one exit that would otherwise emit no notes at all.
+	notes(r, u, man)
+
 	// Nothing numbered AND nothing an agent could map from: the file itself is the
 	// problem, so a mapping round would only burn tokens confirming it.
 	if len(u.Chapters) == 0 && u.Labeled < 2 {
@@ -64,8 +70,12 @@ func (e *Executor) extract(ctx context.Context, book store.Book, r scheduler.Sta
 				"It may be a single unstructured document. Nothing can be mapped from it automatically.",
 				len(u.Docs), u.Labeled))
 	}
-
-	notes(r, u, man)
+	// The routing sentence sits after the park, not inside notes(): a parked book
+	// never reaches chapter mapping, so promising that it will is worse than silence.
+	if !u.Contiguous && r.Note != nil {
+		r.Note(fmt.Sprintf("the %d chapter numbers read from the table of contents do not form a contiguous run, "+
+			"so chapter mapping will derive them", len(u.Chapters)))
+	}
 
 	// Only a contiguous universe may be published against. When it is not, the stage
 	// still succeeds - it wrote the draft manifest - and routes to chapter_mapping,
@@ -167,10 +177,6 @@ func notes(r scheduler.StageReport, u ebook.Universe, man *extract.Manifest) {
 		for _, w := range man.Warnings {
 			r.Note("epub: " + w)
 		}
-	}
-	if !u.Contiguous {
-		r.Note(fmt.Sprintf("the %d chapter numbers read from the table of contents do not form a contiguous run, "+
-			"so chapter mapping will derive them", len(u.Chapters)))
 	}
 }
 

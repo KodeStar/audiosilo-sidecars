@@ -10,22 +10,22 @@ Delete this file once the list is empty.
 
 ## Open
 
-### 1. `force_audio` cannot be turned back off once it is in the scan cache
+### 1. `force_audio` is encoded by erasing `Kind`, which is lossy
 
-`force_audio` is already in the read-time overlay. The problem is its
-REPRESENTATION: unlike `hidden`, it is not a field on `ScannedBook` - it is
-encoded by erasing `Kind`, which is lossy. So the overlay can apply
-`forceAudio == true` but cannot undo it once `annotateEbook` baked `Kind: ""`
-into the cached base at scan time.
+FIXED for the user-visible half: `snapshotLocked` now applies the overlay in BOTH
+directions, so clearing the toggle restores the epub on the next poll instead of
+waiting for a rescan (`TestForceAudioPatchReflectsBothWays`).
 
-The client half has the same shape: `currentForceAudio` reconstructs a
-persisted server boolean from the absence of three fields. That is exact today
-only because nothing else sets `EbookPath` without `Kind` - a coincidence, not
-an invariant.
+Still open is the REPRESENTATION it works around. Unlike `hidden`, `force_audio`
+is not a field on `ScannedBook` - it is encoded by erasing `Kind` - so both halves
+RECONSTRUCT a persisted server boolean from the absence of fields: the overlay
+from `EbookPath != "" && Kind == "" && EbookPath != SourcePath`, and the client's
+`currentForceAudio` from the same three. That is exact today only because nothing
+else sets `EbookPath` without `Kind` - a coincidence, not an invariant.
 
 **Fix direction:** add `force_audio bool` to `ScannedBook` and set it from the
 override, exactly as `hidden` is; then `currentForceAudio` is `!!book.force_audio`
-and the cache case closes with it. Note `Override` already carries the field on
+and both reconstructions go away. Note `Override` already carries the field on
 the wire - it is missing only from the object the UI renders.
 
 ### 2. Path canonicalization is not applied at every metaops boundary

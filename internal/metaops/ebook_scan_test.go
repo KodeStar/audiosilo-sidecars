@@ -164,3 +164,55 @@ func TestForceAudioPatchIsANoOpForAnEbookOnlyBook(t *testing.T) {
 		t.Error("force_audio downgraded an ebook-only candidate; there is no audio to run")
 	}
 }
+
+// TestForceAudioPatchReflectsBothWays pins the live overlay as a TOGGLE.
+//
+// The candidate list re-renders from the cached scan, so a patch that only ever
+// switches a row to audio makes "use the epub" appear to do nothing until the user
+// rescans - the same staleness the setting direction exists to avoid.
+func TestForceAudioPatchReflectsBothWays(t *testing.T) {
+	newJob := func(sb ScannedBook) (*ScanManager, *scanJob) {
+		m := &ScanManager{patches: map[string]overridePatch{}}
+		return m, &scanJob{
+			books:    []ScannedBook{sb},
+			idents:   map[string]bookIdent{},
+			resolved: map[string]resolvedCov{},
+		}
+	}
+	hybrid := ScannedBook{
+		Path: "D", SourcePath: "/lib/D", EbookPath: "/lib/D/b.epub", Kind: string(state.KindEbook),
+	}
+
+	t.Run("setting it switches the row to audio", func(t *testing.T) {
+		m, job := newJob(hybrid)
+		m.patches["/lib/D"] = overridePatch{forceAudio: true, gen: 1}
+		got := m.snapshotLocked(job).Books[0]
+		if got.Kind != "" || got.EbookNote != noteUsingAudio {
+			t.Errorf("got kind=%q note=%q, want the audio verdict", got.Kind, got.EbookNote)
+		}
+	})
+
+	t.Run("clearing it switches the row back", func(t *testing.T) {
+		// The state a rescan leaves behind once force_audio is persisted: kind cleared,
+		// the epub still named.
+		forced := hybrid
+		forced.Kind, forced.EbookNote = "", noteUsingAudio
+		m, job := newJob(forced)
+		m.patches["/lib/D"] = overridePatch{forceAudio: false, gen: 2}
+		got := m.snapshotLocked(job).Books[0]
+		if got.Kind != string(state.KindEbook) || got.EbookNote != "" {
+			t.Errorf("got kind=%q note=%q, want the epub restored without a rescan", got.Kind, got.EbookNote)
+		}
+	})
+
+	t.Run("a row with no epub is never promoted", func(t *testing.T) {
+		// Several epubs in one folder, or an unreadable one: discovery leaves the note
+		// but no EbookPath, and there is nothing to promote the row to.
+		audio := ScannedBook{Path: "D", SourcePath: "/lib/D", EbookNote: "2 epubs in this folder"}
+		m, job := newJob(audio)
+		m.patches["/lib/D"] = overridePatch{forceAudio: false, gen: 1}
+		if got := m.snapshotLocked(job).Books[0]; got.Kind != "" {
+			t.Errorf("kind = %q, want an audio row left alone", got.Kind)
+		}
+	})
+}

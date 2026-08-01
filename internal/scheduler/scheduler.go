@@ -521,7 +521,7 @@ func queueSnapshot(books []store.Book, inflight map[int64]inflightBook) map[int6
 		if b.Status != "" && !running {
 			continue
 		}
-		if queueGroup(st) == queueGroupASR {
+		if queueGroup(state.ParseKind(b.Kind), st) == queueGroupASR {
 			bucket := asrQueueBucket(b, ib, running, holders[b.ID])
 			buckets[bucket] = append(buckets[bucket], b)
 			continue
@@ -626,7 +626,13 @@ func asrQueueBucket(b store.Book, ib inflightBook, running, holdsSeriesLock bool
 	return queueBucketPreparing
 }
 
-func queueGroup(st state.State) string {
+func queueGroup(kind state.Kind, st state.State) string {
+	// An ebook never enters the ASR lane. Its own stages sort past ASR in the state
+	// order, but `queued` does not - so without the kind a freshly enqueued epub is
+	// bucketed (and rendered) as ASR work in a lane it will never use.
+	if kind == state.KindEbook {
+		return queueGroupProcessing
+	}
 	if st == state.Retranscribing || state.Order(st) <= state.Order(state.ASR) {
 		return queueGroupASR
 	}

@@ -679,6 +679,51 @@ func TestContributeNoMatchParksCoreNeeded(t *testing.T) {
 	}
 }
 
+// TestContributeEbookCoreProposalUsesEpubIdentity pins the two ways an ebook's
+// identity differs from an audiobook's in a PUBLIC add-work proposal.
+//
+// The proposal is a factual claim in the community database, and nothing downstream
+// re-checks it: an ISBN read from an epub's OPF names the print/ebook edition, so
+// filing it under audiobook_isbns states something false; and the language, which is
+// REQUIRED, comes from ASR on the audio path - a stage an ebook never runs - so it
+// has to come from the OPF the extract stage already opened.
+func TestContributeEbookCoreProposalUsesEpubIdentity(t *testing.T) {
+	db := openContribDB(t)
+	meta := newFakeMeta(t, nil, nil) // nothing resolves -> core_needed
+
+	epub := filepath.Join(t.TempDir(), "book.epub")
+	buildTestEpub(t, epub, [][2]string{{"Chapter 1", "one"}}) // its OPF states language "en"
+
+	b := contribBook(t, db, store.NewBook{
+		Title: "A Test Book", ISBN: "9780857521405",
+		Kind: "ebook", EbookPath: epub,
+		IdentitySources: map[string]string{"title": metaops.IdentitySourceEpub, "isbn": metaops.IdentitySourceEpub},
+	}, baseChars("x"), baseRecaps("x"))
+	cfg := contribConfig(t, db, contribModeIssue, "", meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
+
+	_, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{})
+	assertPark(t, err, state.ParkCoreNeeded)
+
+	raw, rerr := os.ReadFile(filepath.Join(b.WorkDir, contribDir, coreProposalName))
+	if rerr != nil {
+		t.Fatalf("core proposal not written: %v", rerr)
+	}
+	var p contrib.CoreProposal
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.AudiobookISBNs) != 0 {
+		t.Errorf("audiobook_isbns = %v, want empty: the ISBN came from the epub's OPF", p.AudiobookISBNs)
+	}
+	if len(p.PrintISBNs) != 1 || p.PrintISBNs[0] != "9780857521405" {
+		t.Errorf("print_isbns = %v, want the epub's ISBN", p.PrintISBNs)
+	}
+	if p.Language != "en" {
+		t.Errorf("language = %q, want en from the epub's OPF (an ebook writes no asr.json, "+
+			"and Validate rejects an empty language)", p.Language)
+	}
+}
+
 func TestContributeCorePendingWhenProposalSubmitted(t *testing.T) {
 	db := openContribDB(t)
 	b := contribBook(t, db, store.NewBook{Title: "Mystery Book"}, baseChars("x"), baseRecaps("x"))

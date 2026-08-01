@@ -221,6 +221,13 @@ func applyChapterMap(draft ebook.Universe, m agentChapterMap) ebook.Universe {
 
 	out := draft
 	out.Chapters = nil
+	// The draft's verdicts described a derivation the agent has just replaced, so they
+	// must not ride along into the persisted manifest: "the toc states no chapter
+	// numbers, so the N story sections were numbered in reading order" beside the
+	// agent's map, or a suspected-excerpt flag against a section the agent mapped as a
+	// chapter, describes a book that no longer exists. The agent's per-section
+	// quarantine reasons are the record now.
+	out.Notes, out.Suspected = nil, false
 	out.Docs = make([]ebook.Doc, len(draft.Docs))
 	copy(out.Docs, draft.Docs)
 	for i := range out.Docs {

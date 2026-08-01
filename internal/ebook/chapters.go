@@ -3,6 +3,7 @@ package ebook
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -705,6 +706,37 @@ func ReadManifest(workDir string) (Universe, error) {
 	return u, nil
 }
 
+// StripHeads clears the recorded section openings from a persisted manifest, and
+// reports nothing when there is no manifest to strip.
+//
+// The manifest is a DURABLE audit trail - it must survive the purge, because a
+// re-entered chapter_mapping reads it. But Head is the one field in it that holds
+// the book's own words, and a section is not the unit that matters: 40 words times
+// several hundred sections is thousands of words of the author's prose sitting in
+// the work dir indefinitely, long after extract/ and ebook-text/ were reclaimed
+// precisely so it would not. The rule is that source material never outlives the
+// derivation, so the purge takes the heads with the rest of the prose; a rewound
+// book repopulates them when extracting re-runs.
+func StripHeads(workDir string) error {
+	u, err := ReadManifest(workDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // nothing extracted (yet): nothing to strip
+		}
+		return err
+	}
+	stripped := false
+	for i := range u.Docs {
+		if u.Docs[i].Head != "" {
+			u.Docs[i].Head, stripped = "", true
+		}
+	}
+	if !stripped {
+		return nil
+	}
+	return WriteManifest(workDir, u)
+}
+
 // HeadWords is how much of a section's opening PopulateHeads records. Deliberately
 // tiny: enough to recognize front matter or another book's first page, far too
 // little to be a source of prose.
@@ -734,7 +766,11 @@ func readHead(path string, buf []byte) string {
 		return ""
 	}
 	defer func() { _ = f.Close() }()
-	n, err := f.Read(buf)
+	// ReadFull, not Read: a single Read may legally return far less than the buffer
+	// (it routinely does over SMB, which is where these libraries live), and a short
+	// head is the mapping agent's only evidence for what a section is.
+	// io.ErrUnexpectedEOF simply means the section is shorter than the buffer.
+	n, err := io.ReadFull(f, buf)
 	if n == 0 && err != nil {
 		return ""
 	}

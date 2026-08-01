@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -462,6 +463,14 @@ func (m *ScanManager) run(id, path string) {
 		// to publish a number nothing renders.
 		found, ferr := ebook.Find(walkCtx, path, nil)
 		if ferr != nil {
+			// Logged, never silent. The failure is total, not partial - every epub
+			// candidate disappears from a scan that still reports "done" - so an
+			// operator wondering why a text-only library came back empty has nothing
+			// else to go on. (ebook.Find deliberately reports a cancelled metadata
+			// pass rather than returning a truncated set; swallowing it here without a
+			// word would undo that.)
+			slog.Warn("scan: epub discovery failed; candidates will show no epub source",
+				"path", path, "err", ferr)
 			found = nil
 		}
 		epubCh <- found
@@ -672,9 +681,19 @@ func (m *ScanManager) snapshotLocked(job *scanJob) ScanJob {
 			// Only meaningful for a hybrid candidate - an ebook-only book has no
 			// audio to fall back to, so forcing it would enqueue an .epub into
 			// ffprobe.
-			if p.forceAudio && b.Kind == string(state.KindEbook) && b.EbookPath != b.SourcePath {
-				b.Kind = ""
-				b.EbookNote = noteUsingAudio
+			// Both directions, or the toggle is one-way: the cached row keeps the
+			// audio verdict until a rescan, so "use the epub" appears to do nothing.
+			// A hybrid is the only row either case can touch - discovery leaves a
+			// multi-epub or unreadable-epub row with no EbookPath at all, and an
+			// ebook-only row has EbookPath == SourcePath (there is no audio to fall
+			// back to, so forcing one would enqueue an .epub into ffprobe).
+			if hybrid := b.EbookPath != "" && b.EbookPath != b.SourcePath; hybrid {
+				switch {
+				case p.forceAudio && b.Kind == string(state.KindEbook):
+					b.Kind, b.EbookNote = "", noteUsingAudio
+				case !p.forceAudio && b.Kind == "":
+					b.Kind, b.EbookNote = string(state.KindEbook), ""
+				}
 			}
 		}
 		switch {
@@ -765,6 +784,15 @@ func convertBook(b metascan.Book, root string, overrides map[string]Override) (S
 // the same thing, and a drift between them would read as two different states.
 const noteUsingAudio = "an epub is present; using the audio instead"
 
+// IdentitySourceEpub is the Sources value recording that an identity field was read
+// from an epub's OPF rather than from the audiobook's tags.
+//
+// It is exported because it outlives the scan: POST /books persists Sources into
+// books.identity_sources, and the contributing stage keys on it to tell a PRINT
+// ISBN (which an OPF states) from an audiobook one, which are different fields in
+// the community database's add-work form.
+const IdentitySourceEpub = "epub"
+
 // annotateEbook marks an audiobook candidate whose folder also holds an epub, so
 // the pipeline reads the exact text instead of transcribing the audio.
 //
@@ -807,8 +835,29 @@ func annotateEbook(sb *ScannedBook, byDir map[string][]ebook.Candidate, claimed 
 		if sb.Sources == nil {
 			sb.Sources = map[string]string{}
 		}
-		sb.Sources["isbn"] = "epub"
+		sb.Sources["isbn"] = IdentitySourceEpub
 	}
+}
+
+// epubSources records which identity fields an ebook-only candidate took from the
+// OPF. Every populated field is named, not just the title: Sources is what the
+// Library's provenance tooltips render AND what the contributing stage reads to tell
+// a print ISBN from an audiobook one, so a field claimed by no source reads as
+// though it came from the audiobook's tags.
+func epubSources(c ebook.Candidate) map[string]string {
+	src := map[string]string{"title": IdentitySourceEpub}
+	for field, present := range map[string]bool{
+		"subtitle":        c.Subtitle != "",
+		"authors":         len(c.Authors) > 0,
+		"isbn":            c.ISBN != "",
+		"series":          c.Series != "",
+		"series_position": c.SeriesPos != "",
+	} {
+		if present {
+			src[field] = IdentitySourceEpub
+		}
+	}
+	return src
 }
 
 // ebookOnlyCandidates turns every epub no audiobook claimed into a candidate of its
@@ -828,7 +877,7 @@ func ebookOnlyCandidates(epubs map[string]ebook.Candidate, claimed map[string]bo
 			Title: c.Title, Subtitle: c.Subtitle, Authors: c.Authors,
 			Series: c.Series, SeriesPosition: c.SeriesPos, ISBN: c.ISBN,
 			Kind: string(state.KindEbook), EbookPath: path,
-			Sources: map[string]string{"title": "epub"},
+			Sources: epubSources(c),
 		}
 		if c.MetaErr != "" {
 			// Reported, never silently dropped: the user should see the book they

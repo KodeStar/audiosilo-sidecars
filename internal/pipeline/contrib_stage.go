@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kodestar/audiosilo-meta/pkg/canonical"
+	"github.com/kodestar/audiosilo-meta/pkg/extract"
 	"github.com/kodestar/audiosilo-meta/pkg/model"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
@@ -327,7 +328,7 @@ func (e *Executor) needsCore(ctx context.Context, book store.Book) (park, err er
 
 // writeCoreProposal prefills contrib/core_proposal.json from the book row for the UI
 // to complete: the factual fields the scan knows (title/authors/narrators/series/
-// asin/isbn), the ASR-detected language, the manifest runtime in minutes, and an
+// asin/isbn), the detected language, the manifest runtime in minutes, and an
 // honest provenance line. Region is left blank (unknown - the UI defaults it to "us");
 // everything unknown is omitted (never guessed).
 func (e *Executor) writeCoreProposal(book store.Book) error {
@@ -337,7 +338,7 @@ func (e *Executor) writeCoreProposal(book store.Book) error {
 		Narrators:      book.Narrators,
 		SeriesName:     book.Series,
 		SeriesPosition: book.SeriesPos,
-		Language:       readASRProvenance(book.WorkDir).Language,
+		Language:       proposalLanguage(book),
 		RuntimeMin:     manifestRuntimeMin(book.WorkDir),
 		Sources:        coreProvenanceLine,
 	}
@@ -345,7 +346,17 @@ func (e *Executor) writeCoreProposal(book store.Book) error {
 		p.ASINs = []contrib.RegionASIN{{ASIN: asin}} // Region left for the user
 	}
 	if isbn := strings.TrimSpace(book.ISBN); isbn != "" {
-		p.AudiobookISBNs = []string{isbn}
+		// An ISBN harvested from an epub's OPF identifies the PRINT/ebook edition, not
+		// the audiobook - filing it under audiobook_isbns states something false in a
+		// public add-work issue, and nothing downstream re-checks it. The scan already
+		// records where each identity field came from, so key on that rather than on
+		// the book kind: a hybrid candidate whose audio tags supplied the ISBN is still
+		// an audiobook ISBN even though the book runs the ebook pipeline.
+		if book.IdentitySources["isbn"] == metaops.IdentitySourceEpub {
+			p.PrintISBNs = []string{isbn}
+		} else {
+			p.AudiobookISBNs = []string{isbn}
+		}
 	}
 	out, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
@@ -354,6 +365,27 @@ func (e *Executor) writeCoreProposal(book store.Book) error {
 	// WriteFileAtomic MkdirAlls the parent, so no explicit MkdirAll is needed here.
 	path := filepath.Join(book.WorkDir, contribDir, coreProposalName)
 	return fsutil.WriteFileAtomic(path, append(out, '\n'), 0o644)
+}
+
+// proposalLanguage is the book's language for the add-work proposal.
+//
+// The audio path detects it during ASR and records it in asr.json. An ebook never
+// runs ASR, so that file does not exist - and Language is a REQUIRED field, so an
+// empty one makes POST /books/{id}/contribute/core reject the prefilled proposal
+// until a human types a value the epub already states. Read the OPF instead: it is
+// the same file the extract stage opened, and books.ebook_path is durable.
+func proposalLanguage(book store.Book) string {
+	if lang := strings.TrimSpace(readASRProvenance(book.WorkDir).Language); lang != "" {
+		return lang
+	}
+	if state.ParseKind(book.Kind) != state.KindEbook || book.EbookPath == "" {
+		return ""
+	}
+	md, err := extract.ReadMetadata(book.EbookPath)
+	if err != nil || md == nil {
+		return "" // omit, never guess: the UI asks the user for it
+	}
+	return strings.TrimSpace(md.Language)
 }
 
 // coveredDimensions reports which sidecar dimensions the resolved work already carries
