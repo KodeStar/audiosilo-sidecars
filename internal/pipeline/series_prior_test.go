@@ -209,10 +209,18 @@ func TestStageSeriesPriorWritesTheMaterial(t *testing.T) {
 		"Killing Floor", "Lee Child", "meta.audiosilo.app", "CC BY-SA 3.0",
 		"own words", "Reacher is arrested in Margrave.", "He leaves with the conspiracy broken.",
 		"through chapter 30", "The operation collapses.",
+		// The volume is identified as AN earlier one, never as the adjacent one.
+		"an earlier volume in this series",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("staged material missing %q:\n%s", want, body)
 		}
+	}
+	// The lookup walks past nearer volumes that publish no recaps, so the header must
+	// not assert adjacency: an agent told this is "the previous book" would present a
+	// three-volumes-back recap as everything that has happened since.
+	if strings.Contains(body, "immediately before") || strings.Contains(body, "volume before this book") {
+		t.Errorf("staged material claims the volume is the adjacent one:\n%s", body)
 	}
 	if strings.Contains(body, "\u2014") {
 		t.Error("staged material contains an em dash (hyphens only)")

@@ -28,10 +28,11 @@ You work in the current directory. It contains ONLY:
   probable names when the sheet cites an official source, wiki page title, multiple
   agreeing references, or the spelling is an ordinary English name. Only unresolved
   terms must be replaced by roles.
-{{if .HasSeriesPrior}}- `series-previously.md` - the community metadata database's published recap of
-  the volume BEFORE this one. It is the only material you have about the earlier
-  book, and it is for the `chapter: 0` series recap and nothing else. Never use it
-  to add a card, a claim, or a detail about THIS book.
+{{if .HasSeriesPrior}}- `series-previously.md` - the community metadata database's published recap of an
+  EARLIER volume in this series (it names which one; it is not necessarily the
+  volume directly before this book). It is the only material you have about any
+  earlier book, and it is for the `chapter: 0` series recap and nothing else. Never
+  use it to add a card, a claim, or a detail about THIS book.
 {{end}}- `out/` - the ONLY place you write output.
 
 There are deliberately NO transcripts, manifest, or QA files here. Do not use any
@@ -78,7 +79,8 @@ not in this table and not in the fact notes must not appear in the sidecars.
   most useful recap in a series.
   {{if .HasSeriesPrior}}Ground it ONLY in `series-previously.md`: rewrite that material in your own
   words, never copying a sentence, and never supplement it from your own knowledge
-  of the earlier book. Anything that file does not state, you do not know.{{else}}Ground it in the prior-book content of the inherited knowledge sheet. If the
+  of the earlier book. Anything that file does not state, you do not know - so cover
+  the volume it names rather than claiming to recap the whole series so far.{{else}}Ground it in the prior-book content of the inherited knowledge sheet. If the
   sheet carries no prior-book content, write a short recap from what the notes do
   establish about events before this book and invent nothing - never fill the gap
   from your own knowledge of the earlier book.{{end}}{{end}}

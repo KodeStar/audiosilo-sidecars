@@ -22,10 +22,16 @@ const (
 	priorFetchBudget = 30 * time.Second
 )
 
-// SeriesPrior is the community-published recap material of the volume immediately
-// before a book in its series - the only legitimate source for that book's
-// `chapter: 0` `scope: "series"` "previously" recap when the predecessor was never
-// processed locally (it is already covered upstream, so nobody re-derives it).
+// SeriesPrior is the community-published recap material of the NEAREST EARLIER volume
+// in a book's series that has published recaps - the only legitimate source for that
+// book's `chapter: 0` `scope: "series"` "previously" recap when the earlier volumes
+// were never processed locally (they are already covered upstream, so nobody
+// re-derives them).
+//
+// It is not necessarily the ADJACENT volume: upstream sidecar coverage is sparse, so
+// the walk passes over nearer volumes that publish none. Consumers must therefore
+// claim only what the material states and never present it as everything that
+// happened before the book.
 //
 // The text is CC BY-SA 3.0 community writing from meta.audiosilo.app, not the novel.
 type SeriesPrior struct {
@@ -55,9 +61,11 @@ type SeriesPriorQuery struct {
 	SeriesPos  string
 }
 
-// SeriesPriorFor returns the published recap material of the volume immediately
-// preceding this book in its series: the covered work with the highest series
-// position strictly below this book's that HAS published recaps.
+// SeriesPriorFor returns the published recap material of the nearest earlier volume
+// in this book's series: the covered work with the highest series position strictly
+// below this book's that HAS published recaps, within maxPriorFetches of it. Nearer
+// volumes that publish none are passed over, so the result is not necessarily the
+// adjacent volume.
 //
 // It is best-effort by design and mirrors CoverageFor's contract: a disabled client,
 // a book with no series, an unreachable upstream, or a series whose earlier volumes

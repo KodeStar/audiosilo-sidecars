@@ -15,7 +15,7 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
 
-// seriesPriorFile is the durable record of the predecessor volume's community-published
+// seriesPriorFile is the durable record of an earlier series volume's community-published
 // recap material, written into the book's work dir the first time it is obtained.
 const seriesPriorFile = "series_prior.json"
 
@@ -149,9 +149,12 @@ func writeSeriesPrior(path string, p seriesPrior) error {
 	return fsutil.WriteFileAtomic(path, append(out, '\n'), 0o644)
 }
 
-// markdown renders the staged series-previously.md: a header naming the predecessor
-// and the licence of the text, then the material itself. It states the ONE permitted
-// use so the rule travels with the file, not only with the prompt.
+// markdown renders the staged series-previously.md: a header naming the volume the
+// material came from and the licence of the text, then the material itself. It states
+// the ONE permitted use so the rule travels with the file, not only with the prompt.
+// It never claims the volume is the ADJACENT one - metaops walks past nearer volumes
+// that publish no recaps, so asserting adjacency would invite the agent to present an
+// older book's events as everything that happened since.
 func (p seriesPrior) markdown() string {
 	var b strings.Builder
 	b.WriteString("# Previously in this series\n\n")
@@ -160,11 +163,13 @@ func (p seriesPrior) markdown() string {
 		by = "Unknown"
 	}
 	fmt.Fprintf(&b, "Source: the community metadata database at meta.audiosilo.app, for %q by %s -\n"+
-		"the volume immediately before this book. This text is CC BY-SA 3.0 community\n"+
-		"writing about that book. It is NOT the novel and NOT this book's source text.\n\n", p.Title, by)
+		"an earlier volume in this series. This text is CC BY-SA 3.0 community writing\n"+
+		"about that book. It is NOT the novel and NOT this book's source text.\n\n", p.Title, by)
 	b.WriteString("Use it ONLY to ground this book's `chapter: 0` `scope: \"series\"` \"previously\"\n" +
-		"recap. Rewrite it in your own words - never copy a sentence from it - and do not\n" +
-		"add anything about the earlier book that is not stated below.\n")
+		"recap. Rewrite it in your own words - never copy a sentence from it - and claim\n" +
+		"only what it states. It is the material for the one volume named above, not a\n" +
+		"summary of everything that happened before this book, so do not present it as\n" +
+		"the whole story so far.\n")
 	if p.InShort != "" {
 		b.WriteString("\n## The earlier book in short\n\n" + p.InShort + "\n")
 	}
