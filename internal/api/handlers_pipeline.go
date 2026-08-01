@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/kodestar/audiosilo-sidecars/internal/ebook"
 	"github.com/kodestar/audiosilo-sidecars/internal/metaops"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
@@ -119,6 +121,15 @@ type bookCandidate struct {
 	WorkID     string            `json:"work_id,omitempty"`
 	Coverage   json.RawMessage   `json:"coverage,omitempty"`
 	Sources    map[string]string `json:"sources,omitempty"`
+	// Kind selects the pipeline front half ("" or "audio" | "ebook"); EbookPath is
+	// the .epub an ebook book extracts.
+	//
+	// For an epub beside an audiobook the two paths DIFFER: source_path stays the
+	// audiobook folder (the durable identity, whose tags carry the ASIN) while
+	// ebook_path names the text to read. Both are therefore allow-list checked
+	// independently.
+	Kind      string `json:"kind,omitempty"`
+	EbookPath string `json:"ebook_path,omitempty"`
 }
 
 type createBooksRequest struct {
@@ -172,6 +183,12 @@ func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
 			results = append(results, res)
 			continue
 		}
+		kind, ebookPath, kerr := ebookCandidate(c, roots)
+		if kerr != "" {
+			res.Error = kerr
+			results = append(results, res)
+			continue
+		}
 		sources := c.Sources
 		if sources == nil {
 			sources = map[string]string{}
@@ -189,6 +206,8 @@ func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
 			ISBN:            strings.TrimSpace(c.ISBN),
 			IdentitySources: sources,
 			WorkID:          strings.TrimSpace(c.WorkID),
+			Kind:            kind,
+			EbookPath:       ebookPath,
 			Coverage:        c.Coverage,
 		}
 		b, err := a.store.CreateBook(ctx, nb)
@@ -210,6 +229,41 @@ func (a *API) handleCreateBooks(w http.ResponseWriter, r *http.Request) {
 		a.sched.Notify()
 	}
 	writeJSON(w, http.StatusOK, createBooksResponse{BatchID: batch.ID, Results: results})
+}
+
+// ebookCandidate validates a candidate's kind/ebook_path pair and returns the
+// values to persist, or a per-candidate error message.
+//
+// The epub gets its OWN allow-list check rather than riding on source_path's,
+// because for an epub beside an audiobook the two are different paths - the
+// audiobook folder stays the identity while the epub supplies the text. Checking
+// only source_path would let a caller name any epub on disk as long as the folder
+// it paired it with was permitted.
+func ebookCandidate(c bookCandidate, roots []string) (kind, ebookPath, errMsg string) {
+	kind = strings.TrimSpace(c.Kind)
+	ebookPath = strings.TrimSpace(c.EbookPath)
+	if !state.ValidKind(kind) {
+		return "", "", fmt.Sprintf("unknown kind %q (want \"audio\" or \"ebook\")", kind)
+	}
+	if state.ParseKind(kind) != state.KindEbook {
+		// Reject rather than silently drop: a caller that sent an epub meant it, and
+		// quietly enqueuing the audio pipeline instead would transcribe a book whose
+		// text was already to hand.
+		if ebookPath != "" {
+			return "", "", "ebook_path is only valid with kind \"ebook\""
+		}
+		return kind, "", ""
+	}
+	if ebookPath == "" {
+		return "", "", "ebook_path is required for kind \"ebook\""
+	}
+	if !ebook.IsEpub(ebookPath) {
+		return "", "", "ebook_path must name a .epub file"
+	}
+	if ok, err := metaops.PathAllowed(ebookPath, roots); err != nil || !ok {
+		return "", "", "ebook_path not allowed"
+	}
+	return kind, ebookPath, ""
 }
 
 // workRoot is the daemon's per-book scratch-dir root (<data>/work). The
@@ -280,6 +334,10 @@ type bookView struct {
 	// DurationSec is the book's total audio duration in seconds, written after
 	// inspect (0 before inspect / for a pre-migration book - the UI hides the chip).
 	DurationSec float64 `json:"duration_sec,omitempty"`
+	// Kind is the source modality ("audio"/"ebook"); Words is the extracted word
+	// count an ebook shows in place of a duration, which it does not have.
+	Kind  string `json:"kind,omitempty"`
+	Words int    `json:"words,omitempty"`
 	// TotalCostUSD is the summed agent spend across the book's stage runs (0 for a
 	// book that has run only mechanical/ASR stages or none yet), attached on both the
 	// list and detail views so the Running/Done UI can show a per-book cost.
@@ -396,6 +454,7 @@ func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64
 		Timing: timing, ActiveAgentInvocations: activeInvocations, MaxAgentsPerBook: maxAgentsPerBook, SeriesBlockedBy: seriesBlockedBy, FanoutSupported: state.SupportsAgentFanout(state.State(b.State)),
 		CurrentWorkUnits: current, CompletedWorkUnits: completed, RemainingWorkUnits: remaining,
 		Progress: progress, ScratchBytes: b.ScratchBytes, DurationSec: b.DurationSec,
+		Kind: string(state.ParseKind(b.Kind)), Words: b.Words,
 		TotalCostUSD: totalCostUSD, Contribution: contribution,
 		CreatedAt: b.CreatedAt, UpdatedAt: b.UpdatedAt,
 	}

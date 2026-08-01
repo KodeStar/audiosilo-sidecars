@@ -707,3 +707,101 @@ func TestPipelineEndpointsRequireAuthAndWiring(t *testing.T) {
 	}
 	resp.Body.Close()
 }
+
+// TestCreateBooksEbookKind is the allowed/denied pair for the ebook enqueue path.
+//
+// The epub gets its OWN allow-list check rather than riding on source_path's,
+// because for an epub beside an audiobook the two are different paths: the
+// audiobook folder stays the identity (its tags carry the ASIN) while the epub
+// supplies the text. Checking only source_path would let a caller name any epub on
+// disk as long as it paired it with a permitted folder.
+func TestCreateBooksEbookKind(t *testing.T) {
+	root := t.TempDir()
+	env := newPipelineEnv(t, []string{root})
+	token := env.login(t)
+
+	mk := func(dir, name string) string {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	mkdir := func(parts ...string) string {
+		p := filepath.Join(append([]string{root}, parts...)...)
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	// PathAllowed resolves symlinks, so every source_path must exist on disk or it
+	// is rejected before the kind check this test is about ever runs.
+	audioDir := mkdir("audiobook")
+	dirOutsideEpub := mkdir("audiobook", "x")
+	dirNoPath := mkdir("no-path")
+	dirAudioWithEpub := mkdir("audio-with-epub")
+	dirBadKind := mkdir("bad-kind")
+	inside := mk(filepath.Join(root, "ebooks"), "in.epub")
+	beside := mk(audioDir, "beside.epub")
+	outside := mk(filepath.Join(t.TempDir(), "elsewhere"), "out.epub")
+	notEpub := mk(filepath.Join(root, "ebooks"), "in.mobi")
+
+	body := `{"candidates":[
+		{"source_path":"` + inside + `","title":"Ebook only","kind":"ebook","ebook_path":"` + inside + `"},
+		{"source_path":"` + audioDir + `","title":"Epub beside audio","kind":"ebook","ebook_path":"` + beside + `"},
+		{"source_path":"` + dirOutsideEpub + `","title":"Epub outside roots","kind":"ebook","ebook_path":"` + outside + `"},
+		{"source_path":"` + notEpub + `","title":"Not an epub","kind":"ebook","ebook_path":"` + notEpub + `"},
+		{"source_path":"` + dirNoPath + `","title":"Missing epub path","kind":"ebook"},
+		{"source_path":"` + dirAudioWithEpub + `","title":"Audio carrying an epub","ebook_path":"` + inside + `"},
+		{"source_path":"` + dirBadKind + `","title":"Unknown kind","kind":"pdf"}
+	]}`
+	resp := env.do(t, http.MethodPost, "/api/v1/books", token, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("create books = %d, want 200", resp.StatusCode)
+	}
+	var cr createBooksResponse
+	_ = json.NewDecoder(resp.Body).Decode(&cr)
+	resp.Body.Close()
+
+	byPath := map[string]bookCreateResult{}
+	for _, r := range cr.Results {
+		byPath[r.SourcePath] = r
+	}
+
+	// Allowed: an ebook-only book, where source_path and ebook_path are the same file.
+	got := byPath[inside]
+	if !got.Created {
+		t.Fatalf("ebook-only book not created: %+v", got)
+	}
+	if got.Book == nil || got.Book.Kind != "ebook" {
+		t.Errorf("book view kind = %+v, want ebook", got.Book)
+	}
+
+	// Allowed: an epub BESIDE an audiobook - source_path stays the folder, so the
+	// book keeps the audio identity while extracting reads the epub.
+	if b := byPath[audioDir]; !b.Created || b.Book == nil || b.Book.Kind != "ebook" {
+		t.Errorf("epub-beside-audio book not created as an ebook: %+v", b)
+	}
+
+	// Denied, each for its own reason.
+	denied := map[string]string{
+		audioDir + "/x":           "ebook_path not allowed",
+		notEpub:                   "ebook_path must name a .epub file",
+		root + "/no-path":         `ebook_path is required for kind "ebook"`,
+		root + "/audio-with-epub": `ebook_path is only valid with kind "ebook"`,
+		root + "/bad-kind":        `unknown kind "pdf" (want "audio" or "ebook")`,
+	}
+	for path, wantErr := range denied {
+		r := byPath[path]
+		if r.Created {
+			t.Errorf("%s was created; want denied with %q", path, wantErr)
+			continue
+		}
+		if r.Error != wantErr {
+			t.Errorf("%s error = %q, want %q", path, r.Error, wantErr)
+		}
+	}
+}
