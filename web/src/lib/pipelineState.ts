@@ -22,6 +22,8 @@ export const LABELS: Record<string, string> = {
   retranscribing: 'Retranscribing',
   spelling_research: 'Spelling research',
   correcting: 'Correcting',
+  extracting: 'Extracting',
+  chapter_mapping: 'Mapping chapters',
   fact_pass: 'Fact pass',
   synthesizing: 'Synthesizing',
   validating: 'Validating',

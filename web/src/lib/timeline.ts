@@ -18,7 +18,7 @@ export interface TimelineStage {
 // passes. Off-mainline stages (markers_normalizing, qa_adjudicating,
 // retranscribing, fixing) are NOT in this list - they are inserted only when
 // the book is currently in one of them.
-export const MAINLINE: string[] = [
+export const MAINLINE_AUDIO: string[] = [
   'queued',
   'inspecting',
   'splitting',
@@ -39,8 +39,34 @@ export const MAINLINE: string[] = [
 // An off-mainline stage is shown at its natural position: inserted immediately
 // after the mainline stage it forks from. Only the book's CURRENT off-mainline
 // stage is inserted (state is a single value), so at most one of these appears.
+// The ebook front half. An epub's text is already exact, so everything the audio
+// pipeline does to reconstruct clean text from sound - inspect, split, ASR,
+// sanitize, QA, spelling - has nothing to do and is not in this path at all.
+export const MAINLINE_EBOOK: string[] = [
+  'queued',
+  'extracting',
+  'fact_pass',
+  'synthesizing',
+  'validating',
+  'auditing',
+  'ready',
+  'contributing',
+  'done',
+];
+
+// MAINLINE is the audio path, kept as the default export name so a caller with no
+// book kind to hand (and every pre-ebook call site) behaves exactly as before.
+export const MAINLINE = MAINLINE_AUDIO;
+
+// mainlineFor picks the path for a book kind. An absent or unknown kind is audio,
+// matching the server's ParseKind, so a pre-migration book renders unchanged.
+export function mainlineFor(kind?: string): string[] {
+  return kind === 'ebook' ? MAINLINE_EBOOK : MAINLINE_AUDIO;
+}
+
 export const OFF_MAINLINE_AFTER: Record<string, string> = {
   markers_normalizing: 'inspecting',
+  chapter_mapping: 'extracting',
   qa_adjudicating: 'qa_sweep',
   retranscribing: 'qa_sweep',
   fixing: 'auditing',
@@ -52,6 +78,8 @@ export const OFF_MAINLINE_AFTER: Record<string, string> = {
 // compactLabel, so they are intentionally omitted here.
 export const COMPACT_LABELS: Record<string, string> = {
   inspecting: 'Inspect',
+  extracting: 'Extract',
+  chapter_mapping: 'Chapters',
   markers_normalizing: 'Markers',
   splitting: 'Split',
   asr: 'ASR',
@@ -77,10 +105,11 @@ export function compactLabel(stage: string): string {
 
 // buildOrder returns the mainline with the current off-mainline stage (if any)
 // spliced in at its natural position.
-function buildOrder(state: string): string[] {
+function buildOrder(state: string, kind?: string): string[] {
+  const mainline = mainlineFor(kind);
   const anchor = OFF_MAINLINE_AFTER[state];
-  if (!anchor) return MAINLINE;
-  const order = [...MAINLINE];
+  if (!anchor) return mainline;
+  const order = [...mainline];
   const idx = order.indexOf(anchor);
   if (idx >= 0) order.splice(idx + 1, 0, state);
   return order;
@@ -97,8 +126,8 @@ function buildOrder(state: string): string[] {
 // stage), whose `ready` chip reads done rather than active. An unknown state
 // leaves every chip pending. Loops (audit -> fix -> audit, retranscribe -> qa)
 // are not predicted - only the current position is shown.
-export function timelineStages(state: string, status: string): TimelineStage[] {
-  const order = buildOrder(state);
+export function timelineStages(state: string, status: string, kind?: string): TimelineStage[] {
+  const order = buildOrder(state, kind);
   const activeIdx = state === 'done' ? order.length : order.indexOf(state);
   // The current stage reads as done (not active) when the book is idle-complete:
   // fully done, or settled at the `ready` waypoint with nothing running.

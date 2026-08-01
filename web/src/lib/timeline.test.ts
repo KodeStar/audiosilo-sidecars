@@ -154,3 +154,42 @@ describe('compactLabel', () => {
     expect(compactLabel('done')).toBe('Done');
   });
 });
+
+describe('per-kind mainline', () => {
+  it('routes an ebook through extracting, never through the audio stages', () => {
+    const stages = timelineStages('fact_pass', '', 'ebook').map((s) => s.stage);
+    expect(stages).toContain('extracting');
+    for (const audioOnly of [
+      'inspecting',
+      'splitting',
+      'asr',
+      'sanitizing',
+      'qa_sweep',
+      'spelling_research',
+      'correcting',
+    ]) {
+      expect(stages).not.toContain(audioOnly);
+    }
+  });
+
+  it('leaves the audio path unchanged, with no ebook stages', () => {
+    const stages = timelineStages('fact_pass', '', 'audio').map((s) => s.stage);
+    expect(stages).toContain('asr');
+    expect(stages).not.toContain('extracting');
+    expect(stages).not.toContain('chapter_mapping');
+  });
+
+  it('treats an absent kind as audio, so a pre-migration book renders unchanged', () => {
+    expect(timelineStages('fact_pass', '').map((s) => s.stage)).toEqual(
+      timelineStages('fact_pass', '', 'audio').map((s) => s.stage),
+    );
+  });
+
+  it('inserts chapter_mapping after extracting as the active chip', () => {
+    const stages = timelineStages('chapter_mapping', '', 'ebook');
+    const idx = stages.findIndex((s) => s.stage === 'chapter_mapping');
+    expect(idx).toBeGreaterThan(0);
+    expect(stages[idx - 1].stage).toBe('extracting');
+    expect(stages[idx].status).toBe('active');
+  });
+});

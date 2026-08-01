@@ -10,7 +10,7 @@ import type {
   QueueStatsEvent,
   StageProgressEvent,
 } from '@/api/types';
-import { MAINLINE, OFF_MAINLINE_AFTER } from '@/lib/timeline';
+import { MAINLINE_AUDIO, OFF_MAINLINE_AFTER, mainlineFor } from '@/lib/timeline';
 
 // applyBookState patches the matching book's state + lane + status + error +
 // park_code + retry_at. An event for a book not in the list is ignored (a newly created
@@ -288,8 +288,11 @@ const SECTION_ORDER: RunningSectionKey[] = [
 // and keeps the bundled UI intelligible against an older daemon. The daemon's
 // queue_group remains authoritative whenever it is present.
 function fallbackQueueGroup(book: BookView): 'processing' | 'asr' {
-  const asrIndex = MAINLINE.indexOf('asr');
-  const stateIndex = mainlineIndex(book.state);
+  // An ebook never enters the ASR lane, so it is always processing. Falling through
+  // would compare against an 'asr' index of -1 and mis-bucket every ebook.
+  if (book.kind === 'ebook') return 'processing';
+  const asrIndex = MAINLINE_AUDIO.indexOf('asr');
+  const stateIndex = mainlineIndex(book.state, book.kind);
   if (book.state === 'retranscribing' || (stateIndex >= 0 && stateIndex <= asrIndex)) {
     return 'asr';
   }
@@ -361,11 +364,12 @@ export function queueBucketLabel(book: BookView): string {
 // retranscribing, fixing) resolves to the mainline stage it forks from; an unknown
 // state sorts as not-started (-1). Reuses the timeline module's stage tables (the
 // hand-mirror of the Go state table) so there is a single ordered stage list.
-function mainlineIndex(state: string): number {
-  const i = MAINLINE.indexOf(state);
+function mainlineIndex(state: string, kind?: string): number {
+  const mainline = mainlineFor(kind);
+  const i = mainline.indexOf(state);
   if (i >= 0) return i;
   const anchor = OFF_MAINLINE_AFTER[state];
-  return anchor ? MAINLINE.indexOf(anchor) : -1;
+  return anchor ? mainline.indexOf(anchor) : -1;
 }
 
 // sortBooks follows the scheduler's served queue positions: post-ASR Processing
@@ -402,8 +406,8 @@ export function sortBooks(books: BookView[]): BookView[] {
       const aa = (a.active_agent_invocations ?? 0) > 0;
       const ab = (b.active_agent_invocations ?? 0) > 0;
       if (aa !== ab) return aa ? -1 : 1;
-      const ia = mainlineIndex(a.state);
-      const ib = mainlineIndex(b.state);
+      const ia = mainlineIndex(a.state, a.kind);
+      const ib = mainlineIndex(b.state, b.kind);
       if (ia !== ib) return ib - ia;
       return a.id - b.id;
     }

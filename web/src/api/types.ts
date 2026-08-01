@@ -467,6 +467,13 @@ export interface BookView {
   // Total audio duration in seconds, written after inspect. Absent (or 0) before
   // inspect / for a pre-migration book - the Running list hides the length chip.
   duration_sec?: number;
+  // Which pipeline front half the book runs: "audio" (the default, and every
+  // pre-migration book) or "ebook". Mirrors internal/state.Kind.
+  kind?: string;
+  // Word count of an ebook's extracted chapters, written after extracting. An
+  // ebook has no runtime, so the Running list shows this in place of the length
+  // chip. Absent (or 0) for an audio book.
+  words?: number;
   // Summed agent spend across the book's stage runs in USD (0 for a book that has
   // run only mechanical/ASR stages or none yet, or when the backend reports no cost).
   // Present on both the list and detail views.

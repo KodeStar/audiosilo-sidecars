@@ -10,7 +10,7 @@ import { availableActions, formatBytes, isDone, type BookAction } from '@/lib/bo
 import { fetchAllEvents, formatLogEvent, formatLogTime, logToText } from '@/lib/bookLog';
 import { formatCost } from '@/lib/cost';
 import { triggerBlobDownload } from '@/lib/download';
-import { formatDuration, formatEta } from '@/lib/duration';
+import { formatDuration, formatEta, formatWords } from '@/lib/duration';
 import { parkHint } from '@/lib/parkReasons';
 import { normalizeLane, stateChipClass, stateLabel, statusBadge } from '@/lib/pipelineState';
 import { parseTimestamp } from '@/lib/time';
@@ -220,6 +220,12 @@ export const BookRow = memo(function BookRow({
             {(book.duration_sec ?? 0) > 0 && (
               <span className="text-[11px] text-dim" title="Total audio length">
                 {formatDuration(book.duration_sec ?? 0)} length
+              </span>
+            )}
+            {/* An ebook has no runtime, so its size chip is words instead. */}
+            {(book.words ?? 0) > 0 && (
+              <span className="text-[11px] text-dim" title="Extracted word count">
+                {formatWords(book.words ?? 0)}
               </span>
             )}
             {book.scratch_bytes > 0 && (

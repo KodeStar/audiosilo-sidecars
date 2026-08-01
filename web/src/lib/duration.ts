@@ -35,3 +35,13 @@ export function formatEta(seconds: number): string {
   const { h, m } = splitHM(minutes);
   return m > 0 ? `~${h}h ${m}m` : `~${h}h`;
 }
+
+// formatWords renders an extracted word count compactly ("142k words"). It is an
+// ebook's size chip, standing in for the length chip an audio book gets - an epub
+// has no runtime to show.
+export function formatWords(words: number): string {
+  if (words <= 0) return '';
+  if (words < 1000) return `${words} words`;
+  if (words < 1_000_000) return `${Math.round(words / 1000)}k words`;
+  return `${(words / 1_000_000).toFixed(1)}M words`;
+}
