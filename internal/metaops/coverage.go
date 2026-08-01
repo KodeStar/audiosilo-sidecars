@@ -176,14 +176,28 @@ type lookupVal struct {
 
 type workVal struct {
 	title      string
+	authors    []string
 	series     *SeriesRef
 	recordings []RecordingRef
 	// charNames are the work's character names and aliases, in sidecar order and
 	// unfiltered. SeriesGlossary filters them; caching them raw keeps this the
 	// single decode of the works/{id} payload.
 	charNames []string
-	hasChars  bool
-	hasRecap  bool
+	// recaps are the work's published chaptered recaps and inShort/ending are its
+	// recap_summary. SeriesPriorFor reads them to ground a book-2+ chapter-0
+	// "previously" recap; decoding them here keeps ONE mirror of the payload.
+	recaps   []recapEntry
+	inShort  string
+	ending   string
+	hasChars bool
+	hasRecap bool
+}
+
+// recapEntry is one published recap from a work's recaps sidecar.
+type recapEntry struct {
+	chapter int
+	scope   string
+	text    string
 }
 
 // searchVal is a cached fuzzy-match verdict (including a negative one), keyed on
@@ -226,7 +240,7 @@ type Client struct {
 	searchVerd *ttlCache[string, searchVal]          // key: normalized title|author
 	searchFeed *ttlCache[string, []WorkSearchResult] // key: "<limit>:<query>"
 	glossaries *ttlCache[string, Glossary]           // key: work id (see glossary.go)
-	seriesFeed *ttlCache[string, []string]           // key: series id -> member work ids
+	seriesFeed *ttlCache[string, seriesFeedVal]      // key: series id -> the member listing
 }
 
 // ErrDisabled is returned by the search/manual-match paths when the client has no
@@ -249,7 +263,7 @@ func NewClient(baseURL string) *Client {
 		searchVerd: newTTLCache[string, searchVal](time.Now, coverageTTL),
 		searchFeed: newTTLCache[string, []WorkSearchResult](time.Now, searchProxyTTL),
 		glossaries: newTTLCache[string, Glossary](time.Now, coverageTTL),
-		seriesFeed: newTTLCache[string, []string](time.Now, coverageTTL),
+		seriesFeed: newTTLCache[string, seriesFeedVal](time.Now, coverageTTL),
 	}
 }
 
@@ -444,8 +458,11 @@ func (c *Client) workDetail(ctx context.Context, workID string) (v workVal, foun
 		return cached, true, true
 	}
 	var res struct {
-		Title  string      `json:"title"`
-		Series []SeriesRef `json:"series"`
+		Title   string      `json:"title"`
+		Series  []SeriesRef `json:"series"`
+		Authors []struct {
+			Name string `json:"name"`
+		} `json:"authors"`
 		// Characters carries the names too, not just presence: SeriesGlossary needs
 		// them, and decoding them here keeps ONE mirror of the works/{id} payload
 		// and one cache entry per work (a sibling of the book being processed is
@@ -454,7 +471,20 @@ func (c *Client) workDetail(ctx context.Context, workID string) (v workVal, foun
 			Name    string   `json:"name"`
 			Aliases []string `json:"aliases"`
 		} `json:"characters"`
-		Recaps     []json.RawMessage `json:"recaps"`
+		// Recaps carries the texts too (not just presence) for the same reason:
+		// SeriesPriorFor grounds a book-2+ chapter-0 recap in the predecessor's
+		// published recaps.
+		Recaps []struct {
+			Through struct {
+				Chapter int `json:"chapter"`
+			} `json:"through"`
+			Scope string `json:"scope"`
+			Text  string `json:"text"`
+		} `json:"recaps"`
+		RecapSummary struct {
+			InShort string `json:"in_short"`
+			Ending  string `json:"ending"`
+		} `json:"recap_summary"`
 		Recordings []struct {
 			ID        string `json:"id"`
 			Narrators []struct {
@@ -472,13 +502,27 @@ func (c *Client) workDetail(ctx context.Context, workID string) (v workVal, foun
 	if !f {
 		return workVal{}, false, true
 	}
-	v = workVal{title: res.Title, hasChars: len(res.Characters) > 0, hasRecap: len(res.Recaps) > 0}
+	v = workVal{
+		title:    res.Title,
+		inShort:  res.RecapSummary.InShort,
+		ending:   res.RecapSummary.Ending,
+		hasChars: len(res.Characters) > 0,
+		hasRecap: len(res.Recaps) > 0,
+	}
 	if len(res.Series) > 0 {
 		v.series = cloneSeriesRef(&res.Series[0])
+	}
+	for _, a := range res.Authors {
+		if a.Name != "" {
+			v.authors = append(v.authors, a.Name)
+		}
 	}
 	for _, ch := range res.Characters {
 		v.charNames = append(v.charNames, ch.Name)
 		v.charNames = append(v.charNames, ch.Aliases...)
+	}
+	for _, rc := range res.Recaps {
+		v.recaps = append(v.recaps, recapEntry{chapter: rc.Through.Chapter, scope: rc.Scope, text: rc.Text})
 	}
 	for _, rec := range res.Recordings {
 		r := RecordingRef{ID: rec.ID, RuntimeMin: rec.RuntimeMin, ASINs: rec.ASINs, ISBNs: rec.ISBNs}

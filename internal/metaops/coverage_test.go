@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,6 +22,18 @@ type workRow struct {
 	seriesName, seriesPos string
 	c, r                  bool
 	chars                 []string
+	// authors, recaps, inShort and ending are the published recap material the
+	// series-prior tests read; they are ignored by the coverage tests.
+	authors []string
+	recaps  []recapRow
+	inShort string
+	ending  string
+}
+
+// recapRow is one published chaptered recap on a fake work.
+type recapRow struct {
+	chapter int
+	text    string
 }
 
 // cardRow is one work-kind search hit the fake returns.
@@ -35,6 +48,7 @@ type metaServer struct {
 	search      []cardRow           // work hits returned for any /search
 	extra       string              // an extra non-work result line to prove filtering
 	seriesWorks map[string][]string // series id -> member work ids (absent => 404)
+	seriesName  string              // the name every series listing reports (default "S")
 	onWorks     func(id string)     // optional hook, called on each /works/{id} request
 
 	mu       sync.Mutex // guards requests (concurrent coverage workers hit the fake)
@@ -87,6 +101,13 @@ func (s *metaServer) handler() http.Handler {
 		if wk.seriesName != "" {
 			body += `,"series":[{"id":"s","name":"` + wk.seriesName + `","position":"` + wk.seriesPos + `"}]`
 		}
+		if len(wk.authors) > 0 {
+			parts := make([]string, 0, len(wk.authors))
+			for _, a := range wk.authors {
+				parts = append(parts, `{"id":"p","name":"`+a+`"}`)
+			}
+			body += `,"authors":[` + strings.Join(parts, ",") + `]`
+		}
 		switch {
 		case len(wk.chars) > 0:
 			parts := make([]string, 0, len(wk.chars))
@@ -97,8 +118,18 @@ func (s *metaServer) handler() http.Handler {
 		case wk.c:
 			body += `,"characters":[{"id":"x","name":"X"}]`
 		}
-		if wk.r {
+		switch {
+		case len(wk.recaps) > 0:
+			parts := make([]string, 0, len(wk.recaps))
+			for _, rc := range wk.recaps {
+				parts = append(parts, fmt.Sprintf(`{"through":{"chapter":%d},"scope":"book","text":%q}`, rc.chapter, rc.text))
+			}
+			body += `,"recaps":[` + strings.Join(parts, ",") + `]`
+		case wk.r:
 			body += `,"recaps":[{"through":{"chapter":1},"text":"t"}]`
+		}
+		if wk.inShort != "" || wk.ending != "" {
+			body += fmt.Sprintf(`,"recap_summary":{"in_short":%q,"ending":%q}`, wk.inShort, wk.ending)
 		}
 		body += `}`
 		_, _ = w.Write([]byte(body))
@@ -113,9 +144,19 @@ func (s *metaServer) handler() http.Handler {
 		}
 		parts := make([]string, 0, len(ids))
 		for _, wid := range ids {
-			parts = append(parts, `{"position":"1","work":{"id":"`+wid+`"}}`)
+			// Each member reports its own series position (the prior walk cuts on it);
+			// a work the fake does not define falls back to "1" as before.
+			pos := "1"
+			if wk, ok := s.work[wid]; ok && wk.seriesPos != "" {
+				pos = wk.seriesPos
+			}
+			parts = append(parts, `{"position":"`+pos+`","work":{"id":"`+wid+`"}}`)
 		}
-		_, _ = w.Write([]byte(`{"id":"` + id + `","name":"S","works":[` + strings.Join(parts, ",") + `]}`))
+		name := s.seriesName
+		if name == "" {
+			name = "S"
+		}
+		_, _ = w.Write([]byte(`{"id":"` + id + `","name":"` + name + `","works":[` + strings.Join(parts, ",") + `]}`))
 	})
 	mux.HandleFunc("/api/v1/search", func(w http.ResponseWriter, _ *http.Request) {
 		s.count("search")
