@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -39,7 +40,7 @@ func buildTestEpub(t *testing.T, path string, chapters [][2]string) {
 
 	var items, spine, nav strings.Builder
 	for i, c := range chapters {
-		id := "c" + itoa(i+1)
+		id := "c" + strconv.Itoa(i+1)
 		href := id + ".xhtml"
 		items.WriteString(`<item id="` + id + `" href="` + href + `" media-type="application/xhtml+xml"/>`)
 		spine.WriteString(`<itemref idref="` + id + `"/>`)
@@ -66,18 +67,6 @@ func buildTestEpub(t *testing.T, path string, chapters [][2]string) {
 	if err := zw.Close(); err != nil {
 		t.Fatalf("close zip: %v", err)
 	}
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b []byte
-	for n > 0 {
-		b = append([]byte{byte('0' + n%10)}, b...)
-		n /= 10
-	}
-	return string(b)
 }
 
 func words(n int) string { return strings.TrimSpace(strings.Repeat("word ", n)) }

@@ -3,7 +3,8 @@ import {
   compactLabel,
   timelineStages,
   COMPACT_LABELS,
-  MAINLINE,
+  MAINLINE_AUDIO,
+  MAINLINE_EBOOK,
   OFF_MAINLINE_AFTER,
   type TimelineStatus,
 } from './timeline';
@@ -122,7 +123,11 @@ describe('timeline / pipelineState stage-graph drift guard', () => {
     const known = new Set(Object.keys(LABELS));
     const timelineStageTokens = new Set<string>([
       ...Object.keys(COMPACT_LABELS),
-      ...MAINLINE,
+      // BOTH mainlines. MAINLINE is the audio path only, so spreading just that
+      // would leave every ebook-only stage unguarded by the very test whose job is
+      // catching a stage the labels do not know.
+      ...MAINLINE_AUDIO,
+      ...MAINLINE_EBOOK,
       ...Object.keys(OFF_MAINLINE_AFTER),
     ]);
     for (const stage of timelineStageTokens) {
@@ -191,5 +196,19 @@ describe('per-kind mainline', () => {
     expect(idx).toBeGreaterThan(0);
     expect(stages[idx - 1].stage).toBe('extracting');
     expect(stages[idx].status).toBe('active');
+  });
+});
+
+// A regression guard for the call site, not the function: timelineStages grew a
+// kind parameter and BookRow initially did not pass it, so every ebook rendered the
+// audio stages it never runs. The default must therefore stay audio (so untouched
+// callers behave as before) AND an ebook must be visibly different.
+describe('kind argument is load-bearing at the call site', () => {
+  it('produces a different timeline for an ebook than for the default', () => {
+    const dflt = timelineStages('fact_pass', '').map((s) => s.stage);
+    const book = timelineStages('fact_pass', '', 'ebook').map((s) => s.stage);
+    expect(book).not.toEqual(dflt);
+    expect(dflt).toContain('asr');
+    expect(book).not.toContain('asr');
   });
 });

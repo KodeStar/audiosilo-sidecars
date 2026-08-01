@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -11,7 +10,6 @@ import (
 
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
 	"github.com/kodestar/audiosilo-sidecars/internal/ebook"
-	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
@@ -73,7 +71,7 @@ func (e *Executor) extract(ctx context.Context, book store.Book, r scheduler.Sta
 	// still succeeds - it wrote the draft manifest - and routes to chapter_mapping,
 	// which corrects it exactly as markers_normalizing does for audio.
 	if u.Contiguous {
-		if err := e.materializeEbookChapters(ctx, book, u, splitDir, man); err != nil {
+		if err := e.materializeEbookChapters(ctx, book, u, splitDir, man.Title); err != nil {
 			return scheduler.StageResult{}, err
 		}
 	}
@@ -102,11 +100,11 @@ func (e *Executor) extract(ctx context.Context, book store.Book, r scheduler.Sta
 // The chunk plan is computed HERE rather than in spelling_research, its author on
 // the audio path, because that stage never runs for an ebook - there are no ASR
 // misspellings to research.
-func (e *Executor) materializeEbookChapters(ctx context.Context, book store.Book, u ebook.Universe, splitDir string, man *extract.Manifest) error {
+func (e *Executor) materializeEbookChapters(ctx context.Context, book store.Book, u ebook.Universe, splitDir, title string) error {
 	if err := ebook.WriteChapterText(book.WorkDir, splitDir, u); err != nil {
 		return fmt.Errorf("extracting: write chapter text: %w", err)
 	}
-	if err := writeManifestJSON(book.WorkDir, ebookManifest(book, u, man)); err != nil {
+	if err := audio.WriteManifest(book.WorkDir, ebookManifest(book, u, title)); err != nil {
 		return fmt.Errorf("extracting: write manifest: %w", err)
 	}
 	chs := make([]chapterWords, 0, len(u.Chapters))
@@ -133,10 +131,10 @@ func (e *Executor) materializeEbookChapters(ctx context.Context, book store.Book
 // classifyBookEdges, the chunk planner and the sidecar stages all consult it
 // whatever the source was. An ebook's chapters carry Words instead of a Duration,
 // and StyleEbook tells those readers not to reason about time.
-func ebookManifest(book store.Book, u ebook.Universe, man *extract.Manifest) audio.Manifest {
+func ebookManifest(book store.Book, u ebook.Universe, epubTitle string) audio.Manifest {
 	title := book.Title
-	if title == "" && man != nil {
-		title = man.Title
+	if title == "" {
+		title = epubTitle
 	}
 	out := audio.Manifest{
 		Source:       book.EbookPath,
@@ -154,30 +152,14 @@ func ebookManifest(book store.Book, u ebook.Universe, man *extract.Manifest) aud
 	return out
 }
 
-// writeManifestJSON writes the shared manifest.json for a source that has no audio
-// to probe.
-func writeManifestJSON(workDir string, m audio.Manifest) error {
-	out, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return err
-	}
-	return fsutil.WriteFileAtomic(filepath.Join(workDir, audio.ManifestName), append(out, '\n'), 0o644)
-}
-
 // notes surfaces the extract verdict on the book's durable log: what was excluded,
 // and - loudly - anything that looks like another book's text.
 func notes(r scheduler.StageReport, u ebook.Universe, man *extract.Manifest) {
 	if r.Note == nil {
 		return
 	}
-	excluded := 0
-	for _, d := range u.Docs {
-		if d.Quarantine != "" {
-			excluded++
-		}
-	}
 	r.Note(fmt.Sprintf("extracted %d chapters from %d sections (%d excluded as front/back matter), %d words",
-		len(u.Chapters), len(u.Docs), excluded, u.Words))
+		len(u.Chapters), len(u.Docs), quarantinedCount(u), u.Words))
 	for _, n := range u.Notes {
 		r.Note(n)
 	}
@@ -190,4 +172,17 @@ func notes(r scheduler.StageReport, u ebook.Universe, man *extract.Manifest) {
 		r.Note(fmt.Sprintf("the %d chapter numbers read from the table of contents do not form a contiguous run, "+
 			"so chapter mapping will derive them", len(u.Chapters)))
 	}
+}
+
+// quarantinedCount is how many sections were excluded from the chapter universe.
+// Shared by the extract and chapter-mapping notes so one number is not computed two
+// ways in one package.
+func quarantinedCount(u ebook.Universe) int {
+	n := 0
+	for _, d := range u.Docs {
+		if d.Quarantine != "" {
+			n++
+		}
+	}
+	return n
 }

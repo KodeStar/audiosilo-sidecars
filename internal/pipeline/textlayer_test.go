@@ -54,7 +54,7 @@ func TestClassifyEbookEdgesExcludesNothing(t *testing.T) {
 			{Chapter: 3, Title: "The End", Words: 2500},
 		},
 	}
-	if err := writeManifestJSON(work, m); err != nil {
+	if err := audio.WriteManifest(work, m); err != nil {
 		t.Fatal(err)
 	}
 
@@ -89,7 +89,7 @@ func TestNgramCheckFailsWithNothingToCheck(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := ngramCheck(store.Book{Kind: "ebook"}, work, chars, recaps); err == nil {
+	if _, err := ngramCheck(store.Book{Kind: "ebook", WorkDir: work}, chars, recaps); err == nil {
 		t.Error("ngramCheck returned no error with no source layer; a vacuous pass must be loud")
 	}
 }
@@ -115,7 +115,7 @@ func TestNgramCheckUsesTheEbookLayer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	findings, err := ngramCheck(store.Book{Kind: "ebook"}, work, chars, recaps)
+	findings, err := ngramCheck(store.Book{Kind: "ebook", WorkDir: work}, chars, recaps)
 	if err != nil {
 		t.Fatalf("ngramCheck: %v", err)
 	}

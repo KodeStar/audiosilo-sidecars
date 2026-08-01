@@ -210,7 +210,6 @@ type scanJob struct {
 
 	walkDirs    int
 	walkGroups  int
-	walkEpubs   int
 	groupsDone  int
 	groupsTotal int
 
@@ -450,15 +449,18 @@ func (m *ScanManager) run(id, path string) {
 	// independently, and the epub pass is cheap (container + OPF only, never a
 	// content document). A failure here never fails the scan - an unreadable epub
 	// tree should cost the epub annotations, not the whole library.
+	// Scoped to this job, not the daemon: a scan that fails part-way must not leave
+	// the epub walker crawling the rest of the library and opening every file it
+	// finds, long after the scan it belonged to is gone.
+	walkCtx, cancelWalk := context.WithCancel(m.ctx)
+	defer cancelWalk()
+
 	epubCh := make(chan map[string]ebook.Candidate, 1)
 	go func() {
-		found, ferr := ebook.Find(m.ctx, path, func(dirs, n int) {
-			m.mu.Lock()
-			if job, ok := m.jobs[id]; ok {
-				job.walkEpubs = n
-			}
-			m.mu.Unlock()
-		})
+		// No progress callback: the epub walk finishes well inside the audio scan it
+		// runs beside, and reporting it would take the manager lock once per directory
+		// to publish a number nothing renders.
+		found, ferr := ebook.Find(walkCtx, path, nil)
 		if ferr != nil {
 			found = nil
 		}
@@ -537,11 +539,14 @@ func (m *ScanManager) applyFinal(id string, res *metascan.Result, overrides map[
 		job.idents[sb.Path] = bi
 	}
 	// Every epub no audiobook claimed becomes a candidate in its own right.
-	for _, sb := range ebookOnlyCandidates(epubs, claimed, job.path, overrides) {
+	for _, sb := range ebookOnlyCandidates(epubs, claimed, job.path) {
+		ident := applyOverride(&sb, overrides)
 		books = append(books, sb)
-		job.idents[sb.Path] = identityOf(sb)
+		job.idents[sb.Path] = ident
 	}
-	sortScannedBooks(books)
+	// Re-sort after the ebook-only candidates are appended, so the Library list does
+	// not reshuffle between scans.
+	sort.Slice(books, func(i, j int) bool { return books[i].Path < books[j].Path })
 	job.books = books
 	job.phase = "coverage"
 	for _, sb := range books {
@@ -660,7 +665,7 @@ func (m *ScanManager) snapshotLocked(job *scanJob) ScanJob {
 			// ffprobe.
 			if p.forceAudio && b.Kind == string(state.KindEbook) && b.EbookPath != b.SourcePath {
 				b.Kind = ""
-				b.EbookNote = "an epub is present; using the audio instead"
+				b.EbookNote = noteUsingAudio
 			}
 		}
 		switch {
@@ -746,6 +751,11 @@ func convertBook(b metascan.Book, root string, overrides map[string]Override) (S
 	return sb, newBookIdent(id, workID)
 }
 
+// noteUsingAudio is the verdict shown when an epub is present but the audio runs
+// anyway. One const because the live patch and the persisted override are saying
+// the same thing, and a drift between them would read as two different states.
+const noteUsingAudio = "an epub is present; using the audio instead"
+
 // annotateEbook marks an audiobook candidate whose folder also holds an epub, so
 // the pipeline reads the exact text instead of transcribing the audio.
 //
@@ -775,7 +785,7 @@ func annotateEbook(sb *ScannedBook, byDir map[string][]ebook.Candidate, claimed 
 		return
 	}
 	if overrides[sb.SourcePath].ForceAudio {
-		sb.EbookNote = "an epub is present; using the audio instead"
+		sb.EbookNote = noteUsingAudio
 		sb.EbookPath = c.Path
 		return
 	}
@@ -794,7 +804,7 @@ func annotateEbook(sb *ScannedBook, byDir map[string][]ebook.Candidate, claimed 
 
 // ebookOnlyCandidates turns every epub no audiobook claimed into a candidate of its
 // own, so a text-only library scans like an audio one.
-func ebookOnlyCandidates(epubs map[string]ebook.Candidate, claimed map[string]bool, root string, overrides map[string]Override) []ScannedBook {
+func ebookOnlyCandidates(epubs map[string]ebook.Candidate, claimed map[string]bool, root string) []ScannedBook {
 	out := make([]ScannedBook, 0, len(epubs))
 	for path, c := range epubs {
 		if claimed[path] {
@@ -817,26 +827,26 @@ func ebookOnlyCandidates(epubs map[string]ebook.Candidate, claimed map[string]bo
 			sb.Kind, sb.EbookPath = "", ""
 			sb.EbookNote = "this epub could not be read (it may be DRM-protected)"
 		}
-		if ov, ok := overrides[sb.SourcePath]; ok {
-			sb.Hidden = ov.Hidden
-		}
 		out = append(out, sb)
 	}
 	return out
 }
 
-// identityOf builds the coverage identity for a candidate the audio scanner did not
-// produce. An epub rarely carries an ASIN, so these resolve on the ISBN or
-// title-search rungs of the coverage cascade.
-func identityOf(sb ScannedBook) bookIdent {
+// applyOverride folds a candidate's persisted override in and returns its coverage
+// identity - the tail convertBook runs for every audio book.
+//
+// It is shared rather than re-spelled per path because the WorkID half is easy to
+// forget: it is what pins a manually-matched book to that work, and dropping it
+// leaves the override persisted but ignored on every rescan, so coverage silently
+// re-resolves down the ISBN/title rungs instead.
+func applyOverride(sb *ScannedBook, overrides map[string]Override) bookIdent {
+	workID := ""
+	if ov, ok := overrides[sb.SourcePath]; ok {
+		sb.Hidden = ov.Hidden
+		workID = ov.WorkID
+	}
 	return newBookIdent(BookIdentity{
 		ASIN: sb.ASIN, ISBN: sb.ISBN, Title: sb.Title,
 		Authors: sb.Authors, Series: sb.Series, SeriesPos: sb.SeriesPosition,
-	}, "")
-}
-
-// sortScannedBooks restores a stable order after the ebook-only candidates are
-// appended, so the Library list does not reshuffle between scans.
-func sortScannedBooks(books []ScannedBook) {
-	sort.Slice(books, func(i, j int) bool { return books[i].Path < books[j].Path })
+	}, workID)
 }

@@ -98,6 +98,10 @@ type Universe struct {
 // looking like a dedication and starts looking like a chapter of another book.
 const excerptWordFloor = 2000
 
+// minChapters is the shortest run treated as a real chapter universe, matching the
+// floor extract.Contiguous applies to a label-derived one.
+const minChapters = 3
+
 // excerptCues are label fragments that announce a promo excerpt. Matched
 // case-insensitively as substrings.
 var excerptCues = []string{
@@ -192,22 +196,27 @@ func BuildUniverse(m *extract.Manifest) Universe {
 		first, last = titledStorySpan(docs)
 	}
 
-	quarantineEdges(docs, first, last, &u)
+	u.Suspected = quarantineEdges(docs, first, last)
+	if u.Suspected {
+		u.Notes = append(u.Notes, "a trailing section looks like an excerpt of a different book and was excluded; "+
+			"confirm before contributing, since another book's text must never reach the fact pass")
+	}
 
 	if !numbered {
 		assignOrdinals(docs, first, last)
-		if n := countNumbered(docs); n >= 3 {
-			u.Contiguous = true
-			u.Notes = append(u.Notes, fmt.Sprintf(
-				"the toc states no chapter numbers, so the %d story sections were numbered in reading order", n))
-		}
 	}
-
 	foldContinuations(docs, first, last)
 	u.Docs = docs
-	u.Chapters = collectChapters(docs)
-	if len(u.Chapters) < 3 {
+	u.Chapters = CollectChapters(docs, nil)
+	// minChapters is the same floor extract.Contiguous applies to a label-derived
+	// run, restated once for the ordinal path rather than in both branches.
+	if len(u.Chapters) < minChapters {
 		u.Contiguous = false
+	} else if !numbered {
+		u.Contiguous = true
+		u.Notes = append(u.Notes, fmt.Sprintf(
+			"the toc states no chapter numbers, so the %d story sections were numbered in reading order",
+			len(u.Chapters)))
 	}
 	return u
 }
@@ -229,16 +238,6 @@ func anyNumbered(docs []Doc) bool {
 		}
 	}
 	return false
-}
-
-func countNumbered(docs []Doc) int {
-	n := 0
-	for _, d := range docs {
-		if d.Chapter > 0 {
-			n++
-		}
-	}
-	return n
 }
 
 // storySpan returns the index of the first and last NUMBERED section. Everything
@@ -282,7 +281,7 @@ func isApparatus(d Doc) bool {
 	if frontMatterLabels[label] {
 		return true
 	}
-	return hasExcerptCue(label)
+	return containsAny(label, excerptCues)
 }
 
 // looksLikeExcerpt reports whether a quarantined trailing section is plausibly a
@@ -297,26 +296,18 @@ func isApparatus(d Doc) bool {
 // Either way the section is already excluded. This only decides whether to raise
 // the flag that asks a human to look.
 func looksLikeExcerpt(d Doc) bool {
-	if hasExcerptCue(d.Label) {
+	if containsAny(d.Label, excerptCues) {
 		return true
 	}
-	return d.Words >= excerptWordFloor && !isBoilerplate(d.Label)
+	return d.Words >= excerptWordFloor && !containsAny(d.Label, boilerplateCues)
 }
 
-// isBoilerplate reports whether a label names apparatus that is long by nature.
-func isBoilerplate(label string) bool {
+// containsAny reports whether label contains any of cues, case-insensitively. One
+// scanner for both cue lists, so the two cannot drift apart (a TrimSpace added to
+// one and not the other would silently change which sections get flagged).
+func containsAny(label string, cues []string) bool {
 	low := strings.ToLower(label)
-	for _, cue := range boilerplateCues {
-		if strings.Contains(low, cue) {
-			return true
-		}
-	}
-	return false
-}
-
-func hasExcerptCue(label string) bool {
-	low := strings.ToLower(label)
-	for _, cue := range excerptCues {
+	for _, cue := range cues {
 		if strings.Contains(low, cue) {
 			return true
 		}
@@ -331,12 +322,12 @@ func hasExcerptCue(label string) bool {
 // short; a trailing promo excerpt is a full chapter of a DIFFERENT book, thousands
 // of words long, so any word-count rule waves it straight through and its content
 // reaches the fact pass. Position is what distinguishes it.
-func quarantineEdges(docs []Doc, first, last int, u *Universe) {
+func quarantineEdges(docs []Doc, first, last int) (suspected bool) {
 	if first < 0 {
 		for i := range docs {
 			docs[i].Quarantine = quarantineNoStory
 		}
-		return
+		return false
 	}
 	for i := range docs {
 		if i >= first && i <= last {
@@ -351,15 +342,12 @@ func quarantineEdges(docs []Doc, first, last int, u *Universe) {
 			}
 		case looksLikeExcerpt(docs[i]):
 			docs[i].Quarantine = quarantineExcerpt
-			u.Suspected = true
+			suspected = true
 		default:
 			docs[i].Quarantine = quarantineBack
 		}
 	}
-	if u.Suspected {
-		u.Notes = append(u.Notes, "a trailing section looks like an excerpt of a different book and was excluded; "+
-			"confirm before contributing, since another book's text must never reach the fact pass")
-	}
+	return suspected
 }
 
 // assignOrdinals numbers the story sections 1..N in reading order.
@@ -398,9 +386,6 @@ func foldContinuations(docs []Doc, first, last int) {
 		}
 	}
 }
-
-// collectChapters folds the sections into logical chapters, in chapter order.
-func collectChapters(docs []Doc) []Chapter { return CollectChapters(docs, nil) }
 
 // CollectChapters folds sections into logical chapters in chapter order. titles
 // overrides a chapter's title when the caller has a better one than the labels do
@@ -452,6 +437,12 @@ func ReparseManifest(workDir string) (Universe, error) {
 	if err != nil {
 		return Universe{}, err
 	}
+	return ReparseUniverse(prev), nil
+}
+
+// ReparseUniverse re-derives a chapter universe from an already-loaded one, so a
+// caller holding the draft does not read and parse the same manifest twice.
+func ReparseUniverse(prev Universe) Universe {
 	docs := make([]extract.DocEntry, 0, len(prev.Docs))
 	for _, d := range prev.Docs {
 		docs = append(docs, extract.DocEntry{
@@ -469,11 +460,8 @@ func ReparseManifest(workDir string) (Universe, error) {
 	for i := range u.Docs {
 		u.Docs[i].Head = heads[u.Docs[i].File]
 	}
-	return u, nil
+	return u
 }
-
-// chapterStem is the per-chapter filename stem, matching the audio path's chNNN.
-func chapterStem(n int) string { return fmt.Sprintf("ch%03d", n) }
 
 // WriteChapterText materializes one text file per LOGICAL chapter under TextDir,
 // concatenating the sections that make up each chapter in reading order.
@@ -543,15 +531,33 @@ const HeadWords = 40
 // that cannot be read is left with an empty Head rather than failing the stage -
 // the mapping agent simply has less to go on for that one.
 func PopulateHeads(u *Universe, splitDir string) {
+	buf := make([]byte, headReadBytes)
 	for i := range u.Docs {
-		raw, err := os.ReadFile(filepath.Join(splitDir, filepath.Base(u.Docs[i].File))) //nolint:gosec // both halves derive from the work dir
-		if err != nil {
-			continue
-		}
-		fields := strings.Fields(string(raw))
-		if len(fields) > HeadWords {
-			fields = fields[:HeadWords]
-		}
-		u.Docs[i].Head = strings.Join(fields, " ")
+		u.Docs[i].Head = readHead(filepath.Join(splitDir, filepath.Base(u.Docs[i].File)), buf)
 	}
+}
+
+// headReadBytes bounds how much of a section is read to find its opening words.
+// HeadWords of prose is a few hundred bytes, so one page is a generous ceiling -
+// and reading whole sections instead would pull a 400-section book fully into
+// memory and split every word of it to keep 40.
+const headReadBytes = 4096
+
+// readHead returns a section's opening HeadWords, or "" when it cannot be read (a
+// missing head costs the mapping agent some context; it is not worth failing over).
+func readHead(path string, buf []byte) string {
+	f, err := os.Open(path) //nolint:gosec // path derives from the book's work dir
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = f.Close() }()
+	n, err := f.Read(buf)
+	if n == 0 && err != nil {
+		return ""
+	}
+	fields := strings.Fields(string(buf[:n]))
+	if len(fields) > HeadWords {
+		fields = fields[:HeadWords]
+	}
+	return strings.Join(fields, " ")
 }

@@ -2,11 +2,7 @@ package pipeline
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -32,7 +28,6 @@ type chapterMapPromptData struct {
 	SectionCount  int
 	LabeledCount  int
 	NumberedCount int
-	NoneNumbered  bool
 	HeadWords     int
 }
 
@@ -74,8 +69,8 @@ func (e *Executor) chapterMapping(ctx context.Context, book store.Book, r schedu
 	// agent already produced is contiguous by construction (the validator accepts
 	// nothing else), so this can never overwrite the agent's work with a re-derivation.
 	if !draft.Contiguous {
-		if rebuilt, rerr := ebook.ReparseManifest(book.WorkDir); rerr == nil && rebuilt.Contiguous {
-			if err := e.completeChapterMap(ctx, book, rebuilt, splitDir); err != nil {
+		if rebuilt := ebook.ReparseUniverse(draft); rebuilt.Contiguous {
+			if err := e.materializeEbookChapters(ctx, book, rebuilt, splitDir, ""); err != nil {
 				return scheduler.StageResult{}, err
 			}
 			if r.Note != nil {
@@ -145,7 +140,6 @@ func (e *Executor) chapterMapping(ctx context.Context, book store.Book, r schedu
 		SectionCount:  len(draft.Docs),
 		LabeledCount:  draft.Labeled,
 		NumberedCount: numbered,
-		NoneNumbered:  numbered == 0,
 		HeadWords:     ebook.HeadWords,
 	}
 	usage, err := e.runAgent(ctx, book, state.ChapterMapping, r, st, "epubchapters.md", data, false, validate)
@@ -176,12 +170,12 @@ func (e *Executor) chapterMapping(ctx context.Context, book store.Book, r schedu
 	if err := ebook.WriteManifest(book.WorkDir, final); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("chapter_mapping: write manifest: %w", err)
 	}
-	if err := e.completeChapterMap(ctx, book, final, splitDir); err != nil {
+	if err := e.materializeEbookChapters(ctx, book, final, splitDir, ""); err != nil {
 		return scheduler.StageResult{}, err
 	}
 	if r.Note != nil {
 		r.Note(fmt.Sprintf("mapped %s (%d sections excluded)",
-			countNoun(len(final.Chapters), "chapter"), len(final.Docs)-mappedSections(final)))
+			countNoun(len(final.Chapters), "chapter"), quarantinedCount(final)))
 	}
 	if r.Progress != nil {
 		r.Progress(1, 1)
@@ -199,22 +193,6 @@ func (e *Executor) chapterMapping(ctx context.Context, book store.Book, r schedu
 		return scheduler.StageResult{}, err
 	}
 	return result, nil
-}
-
-// completeChapterMap materializes everything the authoring tail reads, once a
-// trustworthy chapter universe exists. Shared by the free reparse and the agent
-// path so the two cannot produce different on-disk state.
-func (e *Executor) completeChapterMap(ctx context.Context, book store.Book, u ebook.Universe, splitDir string) error {
-	return e.materializeEbookChapters(ctx, book, u, splitDir, nil)
-}
-
-// mappedSections counts the sections that ended up inside a chapter.
-func mappedSections(u ebook.Universe) int {
-	n := 0
-	for _, c := range u.Chapters {
-		n += len(c.Files)
-	}
-	return n
 }
 
 // applyChapterMap folds the agent's map back onto the recorded sections, so the
@@ -255,43 +233,15 @@ func applyChapterMap(draft ebook.Universe, m agentChapterMap) ebook.Universe {
 	return out
 }
 
-// readChapterMap decodes the agent's map.
-func readChapterMap(outDir string) (agentChapterMap, error) {
-	raw, err := os.ReadFile(filepath.Join(outDir, chaptersFileName)) //nolint:gosec // outDir is the agent's staged out/ dir under the work dir
-	if err != nil {
-		return agentChapterMap{}, err
-	}
-	var m agentChapterMap
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&m); err != nil {
-		return agentChapterMap{}, err
-	}
-	return m, nil
-}
-
 // validateChapterMap is the mechanical gate on a confident mapping.
 //
 // Every rule here exists because breaking it produces a WRONG chapter number
 // rather than an error, and a wrong chapter number is a wrong spoiler position in
 // the published sidecars - which nothing downstream re-derives or re-checks.
 func validateChapterMap(outDir string, inputFiles map[string]bool) error {
-	raw, err := os.ReadFile(filepath.Join(outDir, chaptersFileName)) //nolint:gosec // outDir is the agent's staged out/ dir under the work dir
+	m, err := readChapterMap(outDir)
 	if err != nil {
-		return fmt.Errorf("out/%s: %v", chaptersFileName, err)
-	}
-	var m agentChapterMap
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&m); err != nil {
-		return fmt.Errorf("out/%s is not valid chapter-map JSON: %v", chaptersFileName, err)
-	}
-	var trailing any
-	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if err == nil {
-			err = errors.New("additional JSON value")
-		}
-		return fmt.Errorf("out/%s has trailing content: %v", chaptersFileName, err)
+		return err
 	}
 
 	if len(m.Chapters) < 2 {
@@ -343,6 +293,18 @@ func validateChapterMap(outDir string, inputFiles map[string]bool) error {
 		return fmt.Errorf("chapter numbers must be unique and run 1..%d with no gaps; got %v", len(nums), nums)
 	}
 	return nil
+}
+
+// readChapterMap decodes the agent's map with the same strictness the validator
+// applies, so the post-run harvest can never accept a file validation rejected.
+// Sharing one decoder is the point: two readers of one artifact that disagree about
+// what is valid is worse than either rule alone.
+func readChapterMap(outDir string) (agentChapterMap, error) {
+	var m agentChapterMap
+	if err := decodeSidecarFile(filepath.Join(outDir, chaptersFileName), &m); err != nil {
+		return agentChapterMap{}, fmt.Errorf("out/%s: %w", chaptersFileName, err)
+	}
+	return m, nil
 }
 
 // contiguousFrom1 reports whether nums is exactly 1..len(nums), in any order.

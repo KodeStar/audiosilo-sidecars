@@ -326,7 +326,9 @@ export const BookRow = memo(function BookRow({
         </div>
       </div>
 
-      {!done && <StageTimeline state={book.state} status={book.status} lane={book.lane} />}
+      {!done && (
+        <StageTimeline state={book.state} status={book.status} lane={book.lane} kind={book.kind} />
+      )}
 
       {expanded && (
         <div className="flex flex-col gap-3 rounded-lg border border-edge/50 bg-raised/40 p-3">
@@ -371,8 +373,20 @@ function TimingBreakdown({ book }: { book: BookView }) {
 // StageTimeline renders the compact stage-chip row for an active book. The active
 // chip (the current stage) reuses the lane-colored state-chip styling; done and
 // pending chips use the muted timeline styles.
-function StageTimeline({ state, status, lane }: { state: string; status: string; lane: string }) {
-  const stages = timelineStages(state, status);
+function StageTimeline({
+  state,
+  status,
+  lane,
+  kind,
+}: {
+  state: string;
+  status: string;
+  lane: string;
+  kind?: string;
+}) {
+  // kind selects the pipeline: without it every ebook renders the audio stages it
+  // never runs, and its current stage is not in the list at all.
+  const stages = timelineStages(state, status, kind);
   return (
     <div className="flex flex-wrap gap-1">
       {stages.map((s) => (

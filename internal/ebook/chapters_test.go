@@ -1,6 +1,7 @@
 package ebook
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/kodestar/audiosilo-meta/pkg/extract"
@@ -8,7 +9,7 @@ import (
 
 // doc is a terse builder for a split-epub manifest entry.
 func doc(i int, label string, words int) extract.DocEntry {
-	return extract.DocEntry{Index: i, Spine: i, File: chapterStem(i) + ".txt", Label: label, Words: words}
+	return extract.DocEntry{Index: i, Spine: i, File: ChapterFileName(i), Label: label, Words: words}
 }
 
 func manifest(docs ...extract.DocEntry) *extract.Manifest {
@@ -23,18 +24,6 @@ func chapterNums(u Universe) []int {
 	return out
 }
 
-func equalInts(a, b []int) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 func TestBuildUniverseNumberedChapters(t *testing.T) {
 	u := BuildUniverse(manifest(
 		doc(1, "Cover", 5),
@@ -47,7 +36,7 @@ func TestBuildUniverseNumberedChapters(t *testing.T) {
 	if !u.Contiguous {
 		t.Fatalf("Contiguous = false, want true (notes: %v)", u.Notes)
 	}
-	if got := chapterNums(u); !equalInts(got, []int{1, 2, 3}) {
+	if got := chapterNums(u); !slices.Equal(got, []int{1, 2, 3}) {
 		t.Errorf("chapters = %v, want [1 2 3]", got)
 	}
 	if u.Chapters[0].Title != "The Start" {
@@ -85,7 +74,7 @@ func TestBuildUniverseQuarantinesLongTrailingExcerpt(t *testing.T) {
 	if !u.Contiguous {
 		t.Fatalf("Contiguous = false, want true")
 	}
-	if got := chapterNums(u); !equalInts(got, []int{1, 2, 3}) {
+	if got := chapterNums(u); !slices.Equal(got, []int{1, 2, 3}) {
 		t.Errorf("chapters = %v, want [1 2 3] - the excerpt must not become chapter 4", got)
 	}
 	last := u.Docs[3]
@@ -119,7 +108,7 @@ func TestBuildUniverseFoldsContinuations(t *testing.T) {
 		doc(3, "Chapter 2", 1600),
 		doc(4, "Chapter 3", 1600),
 	))
-	if got := chapterNums(u); !equalInts(got, []int{1, 2, 3}) {
+	if got := chapterNums(u); !slices.Equal(got, []int{1, 2, 3}) {
 		t.Fatalf("chapters = %v, want [1 2 3]", got)
 	}
 	if len(u.Chapters[0].Files) != 2 {
@@ -148,7 +137,7 @@ func TestBuildUniverseOrdinalsForTitledOnlyToc(t *testing.T) {
 	}
 	// "Introduction" is not in the apparatus vocabulary, so it stays story rather
 	// than being silently dropped - the conservative direction.
-	if got := chapterNums(u); !equalInts(got, []int{1, 2, 3, 4}) {
+	if got := chapterNums(u); !slices.Equal(got, []int{1, 2, 3, 4}) {
 		t.Errorf("chapters = %v, want [1 2 3 4]", got)
 	}
 	if u.Docs[2].Source != SourceOrdinal {
@@ -186,7 +175,7 @@ func TestBuildUniverseLooseAcceptedOnlyWhenWholeRunAgrees(t *testing.T) {
 	if !agreeing.Contiguous {
 		t.Errorf("a contiguous run of Roman labels was rejected (notes: %v)", agreeing.Notes)
 	}
-	if got := chapterNums(agreeing); !equalInts(got, []int{1, 2, 3, 4}) {
+	if got := chapterNums(agreeing); !slices.Equal(got, []int{1, 2, 3, 4}) {
 		t.Errorf("chapters = %v, want [1 2 3 4]", got)
 	}
 
@@ -258,7 +247,7 @@ func TestExcerptFlagIgnoresBoilerplate(t *testing.T) {
 		if u.Docs[3].Quarantine == "" {
 			t.Errorf("%q was not quarantined", label)
 		}
-		if got := chapterNums(u); !equalInts(got, []int{1, 2, 3}) {
+		if got := chapterNums(u); !slices.Equal(got, []int{1, 2, 3}) {
 			t.Errorf("%q: chapters = %v, want [1 2 3]", label, got)
 		}
 	}

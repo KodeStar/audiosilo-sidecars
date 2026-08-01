@@ -54,10 +54,6 @@ export const MAINLINE_EBOOK: string[] = [
   'done',
 ];
 
-// MAINLINE is the audio path, kept as the default export name so a caller with no
-// book kind to hand (and every pre-ebook call site) behaves exactly as before.
-export const MAINLINE = MAINLINE_AUDIO;
-
 // mainlineFor picks the path for a book kind. An absent or unknown kind is audio,
 // matching the server's ParseKind, so a pre-migration book renders unchanged.
 export function mainlineFor(kind?: string): string[] {

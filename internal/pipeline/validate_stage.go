@@ -12,7 +12,6 @@ import (
 	"github.com/kodestar/audiosilo-meta/pkg/extract"
 	"github.com/kodestar/audiosilo-meta/pkg/model"
 
-	"github.com/kodestar/audiosilo-sidecars/internal/ebook"
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/spelling"
@@ -20,6 +19,9 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 	"github.com/kodestar/audiosilo-sidecars/internal/transcript"
 )
+
+// ngramSource is one text layer the sidecars are measured against.
+type ngramSource struct{ label, dir string }
 
 // ngramShingle is the shingle width for the no-verbatim overlap check (8-word runs);
 // it matches the historical metaextract ngram default and the synthesis prompt's
@@ -78,7 +80,7 @@ func (e *Executor) validateSidecarsStage(ctx context.Context, book store.Book, r
 	}
 
 	// No-verbatim n-gram check against both transcript layers: every overlap is an ERROR.
-	ngramFindings, err := ngramCheck(book, book.WorkDir, charsPath, recapsPath)
+	ngramFindings, err := ngramCheck(book, charsPath, recapsPath)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("validating: ngram check: %w", err)
 	}
@@ -146,13 +148,11 @@ func decodeForValidation(charsPath, recapsPath string) (*model.Characters, *mode
 // overlap is a finding naming the locus, the source layer, and the offending run. A
 // layer that does not exist (or holds no .txt files) is skipped; a genuine read
 // failure inside the check is returned as an error.
-func ngramCheck(book store.Book, workDir, charsPath, recapsPath string) ([]string, error) {
+func ngramCheck(book store.Book, charsPath, recapsPath string) ([]string, error) {
+	workDir := book.WorkDir
 	var findings []string
 	sidecars := []string{charsPath, recapsPath}
-	sources := []struct {
-		label string
-		dir   string
-	}{
+	sources := []ngramSource{
 		{"transcripts-text", filepath.Join(workDir, transcript.TextDir)},
 		{"transcripts-corrected", filepath.Join(workDir, spelling.CorrectedDir)},
 	}
@@ -161,10 +161,11 @@ func ngramCheck(book store.Book, workDir, charsPath, recapsPath string) ([]strin
 		// than the audio equivalent: ASR mangles a word inside an otherwise copied run
 		// and hides the overlap, whereas the agent here read the exact published
 		// sentence, so a surviving run is a real one.
-		sources = []struct {
-			label string
-			dir   string
-		}{{"book text", filepath.Join(workDir, ebook.TextDir)}}
+		//
+		// The directory comes from chapterTextDir, not a local join: that helper is
+		// the single answer to "where is this book's final chapter text", and a second
+		// spelling of it here would be the first place to drift.
+		sources = []ngramSource{{"book text", filepath.Join(workDir, chapterTextDir(book))}}
 	}
 	checked := 0
 	for _, src := range sources {

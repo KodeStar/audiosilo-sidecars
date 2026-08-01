@@ -13,6 +13,8 @@ package ebook
 import (
 	"path/filepath"
 	"strings"
+
+	"github.com/kodestar/audiosilo-sidecars/internal/transcript"
 )
 
 // Work-dir layout for the ebook path.
@@ -40,8 +42,13 @@ func IsEpub(name string) bool {
 	return strings.EqualFold(filepath.Ext(name), ".epub")
 }
 
-// ChapterFileName is the per-chapter text file for logical chapter n, matching the
-// audio path's chNNN.txt convention so the back half's staging loop is identical.
+// ChapterFileName is the per-chapter text file for logical chapter n.
+//
+// It delegates to transcript.TextName rather than formatting chNNN itself, because
+// that is what READS these files: factPassChunk stages
+// <chapterTextDir>/transcript.TextName(k). Two independent spellings of the same
+// name would drift silently - a mismatched pad width stages zero chapters, and the
+// staging loop skips a missing chapter file rather than erroring.
 func ChapterFileName(n int) string {
-	return chapterStem(n) + ".txt"
+	return transcript.TextName(n)
 }

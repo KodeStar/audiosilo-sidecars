@@ -121,7 +121,7 @@ func TestEbookOnlyCandidates(t *testing.T) {
 		"/lib/claimed.epub": cand("/lib", "/lib/claimed.epub", "Claimed", ""),
 		"/lib/bad.epub":     {Path: "/lib/bad.epub", Dir: "/lib", Title: "Bad", MetaErr: "drm"},
 	}
-	got := ebookOnlyCandidates(epubs, map[string]bool{"/lib/claimed.epub": true}, "/lib", nil)
+	got := ebookOnlyCandidates(epubs, map[string]bool{"/lib/claimed.epub": true}, "/lib")
 
 	byPath := map[string]ScannedBook{}
 	for _, sb := range got {

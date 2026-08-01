@@ -103,7 +103,7 @@ func TestValidateChapterMapRejects(t *testing.T) {
 		{
 			"unknown field",
 			`{"chapters":[{"chapter":1,"title":"","files":["001.txt"],"start":0}],"quarantine":[]}`,
-			"not valid chapter-map JSON",
+			`unknown field "start"`,
 		},
 		{
 			"trailing content",

@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
@@ -117,8 +118,8 @@ func Purge(workRoot, workDir string, kind state.Kind) error {
 		return nil // nothing safe to remove
 	}
 	dirs := reclaimable
-	if state.ParseKind(string(kind)) == state.KindEbook {
-		dirs = append(append([]string{}, reclaimable...), ebookReclaimable...)
+	if kind == state.KindEbook {
+		dirs = slices.Concat(reclaimable, ebookReclaimable)
 	}
 	for _, dir := range dirs {
 		if err := os.RemoveAll(filepath.Join(wd, dir)); err != nil {

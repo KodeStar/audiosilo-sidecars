@@ -18,7 +18,7 @@ The current directory contains only:
 You do not have the book's text, and you do not need it. Everything here is a
 label, a size, and an opening line. Do not use the web or your own knowledge of
 the book.
-{{if .NoneNumbered}}
+{{if eq .NumberedCount 0}}
 ## Why the draft has no numbers
 
 The parser read no chapter number from ANY label. That usually means the book

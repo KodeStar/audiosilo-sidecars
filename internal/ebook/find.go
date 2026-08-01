@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/kodestar/audiosilo-meta/pkg/extract"
 )
@@ -20,11 +21,9 @@ type Candidate struct {
 	Title     string
 	Subtitle  string
 	Authors   []string
-	Language  string
 	ISBN      string
 	Series    string
 	SeriesPos string
-	SizeBytes int64
 
 	// MetaErr is set when the OPF could not be read - a DRM-wrapped or corrupt
 	// file. Such a candidate is still REPORTED, with a filename-derived title, so
@@ -39,21 +38,32 @@ type Candidate struct {
 // crawl.
 const maxWalkDepth = 8
 
+// metadataWorkers bounds the concurrent OPF reads. Reading an epub's identity is
+// latency-bound, not CPU-bound - a zip open, the central directory, then two small
+// inflate+parse steps - and a book library usually lives on a NAS, where each of
+// those is a network round trip. Doing them serially inside the walk cost tens of
+// seconds on a thousand-book library over SMB; a small pool hides that latency
+// without hammering the filesystem.
+const metadataWorkers = 12
+
 // Find walks root and returns every .epub beneath it, keyed by absolute path.
 //
 // It reads each file's container and OPF but never a content document, so it stays
 // cheap enough to run across a whole library during a scan. A file it cannot parse
 // is reported with MetaErr rather than dropped.
 //
+// The walk collects paths and the metadata reads run afterwards over a bounded
+// pool, so directory traversal is never blocked behind a zip parse.
+//
 // onProgress, when non-nil, is called as directories are walked so a caller can
 // stream progress; it may be called from the walking goroutine.
 func Find(ctx context.Context, root string, onProgress func(dirs, found int)) (map[string]Candidate, error) {
-	out := map[string]Candidate{}
 	rootAbs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
 	}
-	dirs, found := 0, 0
+	var paths []string
+	dirs := 0
 
 	err = filepath.WalkDir(rootAbs, func(p string, d fs.DirEntry, err error) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -76,30 +86,61 @@ func Find(ctx context.Context, root string, onProgress func(dirs, found int)) (m
 			}
 			dirs++
 			if onProgress != nil {
-				onProgress(dirs, found)
+				onProgress(dirs, len(paths))
 			}
 			return nil
 		}
-		if !IsEpub(d.Name()) {
-			return nil
+		if IsEpub(d.Name()) {
+			paths = append(paths, p)
 		}
-		found++
-		out[p] = describe(p, d)
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
+	return readMetadata(ctx, paths), nil
+}
+
+// readMetadata resolves each path's identity over a bounded worker pool.
+func readMetadata(ctx context.Context, paths []string) map[string]Candidate {
+	out := make(map[string]Candidate, len(paths))
+	if len(paths) == 0 {
+		return out
+	}
+	workers := min(metadataWorkers, len(paths))
+
+	var (
+		mu sync.Mutex
+		wg sync.WaitGroup
+	)
+	work := make(chan string)
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := range work {
+				c := describe(p)
+				mu.Lock()
+				out[p] = c
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, p := range paths {
+		if ctx.Err() != nil {
+			break
+		}
+		work <- p
+	}
+	close(work)
+	wg.Wait()
+	return out
 }
 
 // describe reads one epub's OPF identity, degrading to a filename-derived title
 // when the file cannot be parsed.
-func describe(path string, d fs.DirEntry) Candidate {
+func describe(path string) Candidate {
 	c := Candidate{Path: path, Dir: filepath.Dir(path)}
-	if info, err := d.Info(); err == nil {
-		c.SizeBytes = info.Size()
-	}
 	md, err := extract.ReadMetadata(path)
 	if err != nil {
 		c.MetaErr = err.Error()
@@ -107,7 +148,7 @@ func describe(path string, d fs.DirEntry) Candidate {
 		return c
 	}
 	c.Title, c.Subtitle = md.Title, md.Subtitle
-	c.Authors, c.Language = md.Authors, md.Language
+	c.Authors = md.Authors
 	c.ISBN, c.Series, c.SeriesPos = md.ISBN, md.Series, md.SeriesPos
 	if c.Title == "" {
 		c.Title = titleFromFileName(path)
