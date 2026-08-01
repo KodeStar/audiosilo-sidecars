@@ -135,10 +135,13 @@ func TestBuildUniverseOrdinalsForTitledOnlyToc(t *testing.T) {
 	if !u.Contiguous {
 		t.Fatalf("Contiguous = false, want true (notes: %v)", u.Notes)
 	}
-	// "Introduction" is not in the apparatus vocabulary, so it stays story rather
-	// than being silently dropped - the conservative direction.
-	if got := chapterNums(u); !slices.Equal(got, []int{1, 2, 3, 4}) {
-		t.Errorf("chapters = %v, want [1 2 3 4]", got)
+	// "Introduction" is apparatus and is trimmed. Keeping it is NOT the conservative
+	// direction: a titled-only book has nothing but these labels to go on, so an
+	// untrimmed Introduction becomes chapter 1 and every real chapter publishes one
+	// position low - a wrong spoiler gate on every reveal in the book. Losing an
+	// introduction's text costs a little context; a shifted position leaks plot.
+	if got := chapterNums(u); !slices.Equal(got, []int{1, 2, 3}) {
+		t.Errorf("chapters = %v, want [1 2 3]", got)
 	}
 	if u.Docs[2].Source != SourceOrdinal {
 		t.Errorf("source = %q, want %q", u.Docs[2].Source, SourceOrdinal)
@@ -261,5 +264,188 @@ func TestExcerptFlagIgnoresBoilerplate(t *testing.T) {
 	))
 	if !u.Suspected {
 		t.Error("an unlabeled 4200-word trailing section must still raise the flag")
+	}
+}
+
+// docSpine is doc with an explicit spine document, for the anchor-split cases where
+// several sections were carved out of one file.
+func docSpine(i, spine int, label string, words int) extract.DocEntry {
+	d := doc(i, label, words)
+	d.Spine = spine
+	return d
+}
+
+func filesOf(u Universe, chapter int) []string {
+	for _, c := range u.Chapters {
+		if c.Chapter == chapter {
+			return c.Files
+		}
+	}
+	return nil
+}
+
+// TestBuildUniversePrefersTheLongerContiguousRun: looseNums is a superset of
+// strictNums, so both can be contiguous at once - a toc that drops its separator on
+// the last entries gives strict [1 2 3] and loose [1..5]. Preferring strict there
+// ends the story span at chapter 3 and quarantines the book's real final chapters as
+// back matter, silently (a short chapter never trips the excerpt flag).
+func TestBuildUniversePrefersTheLongerContiguousRun(t *testing.T) {
+	u := BuildUniverse(manifest(
+		doc(1, "1. Arrival", 3000),
+		doc(2, "2. The Road", 3000),
+		doc(3, "3. The River", 3000),
+		doc(4, "4 The Mountain", 1500), // no separator -> Loose
+		doc(5, "5 The Sea", 1500),
+	))
+	if !u.Contiguous {
+		t.Fatalf("Contiguous = false, want true (notes: %v)", u.Notes)
+	}
+	if got := chapterNums(u); !slices.Equal(got, []int{1, 2, 3, 4, 5}) {
+		t.Errorf("chapters = %v, want [1 2 3 4 5]: the loose run covers the whole book", got)
+	}
+	for _, d := range u.Docs {
+		if d.Quarantine != "" {
+			t.Errorf("section %s quarantined as %q; it is a story chapter", d.File, d.Quarantine)
+		}
+	}
+}
+
+// TestBuildUniverseOrdinalsSkipUnlabeledSections: with no numbers anywhere, only a
+// section the toc NAMED starts a chapter. Numbering an unlabeled continuation too
+// inserts a phantom chapter and shifts every later position by one - and the same
+// physical book folds correctly whenever its toc happens to number its entries, so
+// correctness would depend on that accident.
+func TestBuildUniverseOrdinalsSkipUnlabeledSections(t *testing.T) {
+	u := BuildUniverse(manifest(
+		doc(1, "Cover", 5),
+		doc(2, "Perseus Wants a Hug", 3000),
+		doc(3, "", 2500), // second half of the same story, no toc entry
+		doc(4, "Psyche Ninjas a Box", 3100),
+		doc(5, "Phaethon Fails Driver's Ed", 2900),
+		doc(6, "About the Author", 60),
+	))
+	if got := chapterNums(u); !slices.Equal(got, []int{1, 2, 3}) {
+		t.Fatalf("chapters = %v, want [1 2 3] for a three-story book", got)
+	}
+	if got := filesOf(u, 1); !slices.Equal(got, []string{ChapterFileName(2), ChapterFileName(3)}) {
+		t.Errorf("chapter 1 files = %v, want the story and its unlabeled continuation", got)
+	}
+}
+
+// TestBuildUniverseKeepsTheLastChaptersTail: an anchor-split chapter's closing pages
+// are their own unlabeled section AFTER the last numbered one. Ending the span at
+// the last number throws the book's ending away as back matter.
+func TestBuildUniverseKeepsTheLastChaptersTail(t *testing.T) {
+	u := BuildUniverse(manifest(
+		docSpine(1, 1, "Chapter 1", 3000),
+		docSpine(2, 2, "Chapter 2", 3000),
+		docSpine(3, 3, "Chapter 3", 3000),
+		docSpine(4, 3, "", 900), // same spine document as chapter 3
+	))
+	if !u.Contiguous {
+		t.Fatalf("Contiguous = false, want true (notes: %v)", u.Notes)
+	}
+	if got := filesOf(u, 3); !slices.Equal(got, []string{ChapterFileName(3), ChapterFileName(4)}) {
+		t.Errorf("chapter 3 files = %v, want its tail folded in", got)
+	}
+}
+
+// TestBuildUniverseQuarantinesATrailingExcerptFromANewSpine is the other half of the
+// rule above: a promo excerpt of the NEXT book is also unlabeled and also trails the
+// last chapter, so the span must not extend on position alone.
+func TestBuildUniverseQuarantinesATrailingExcerptFromANewSpine(t *testing.T) {
+	u := BuildUniverse(manifest(
+		docSpine(1, 1, "Chapter 1", 3000),
+		docSpine(2, 2, "Chapter 2", 3000),
+		docSpine(3, 3, "Chapter 3", 3000),
+		docSpine(4, 4, "", 3500), // its own spine file: another book's opening
+	))
+	if got := chapterNums(u); !slices.Equal(got, []int{1, 2, 3}) {
+		t.Fatalf("chapters = %v, want [1 2 3]", got)
+	}
+	if !u.Suspected {
+		t.Error("Suspected = false; a long unlabeled trailing section must raise the excerpt flag")
+	}
+}
+
+// TestBuildUniverseFoldsAnInterstitialForward: a labeled but unnumbered section
+// between two chapters is story the reader reaches AFTER finishing the one before,
+// so dating its facts to that chapter fires every reveal in it one section early.
+func TestBuildUniverseFoldsAnInterstitialForward(t *testing.T) {
+	u := BuildUniverse(manifest(
+		doc(1, "Chapter One", 3000),
+		doc(2, "Chapter Two", 3000),
+		doc(3, "Interlude", 2000),
+		doc(4, "Chapter Three", 3000),
+		doc(5, "Chapter Four", 3000),
+	))
+	if got := chapterNums(u); !slices.Equal(got, []int{1, 2, 3, 4}) {
+		t.Fatalf("chapters = %v, want [1 2 3 4]", got)
+	}
+	if got := filesOf(u, 3); !slices.Equal(got, []string{ChapterFileName(3), ChapterFileName(4)}) {
+		t.Errorf("chapter 3 files = %v, want the Interlude folded FORWARD into it", got)
+	}
+	for _, c := range u.Chapters {
+		if c.Chapter == 3 && c.Title == "Interlude" {
+			t.Error(`chapter 3 titled "Interlude"; a folded section does not name the chapter it joined`)
+		}
+	}
+}
+
+// TestBuildUniverseShiftsAZeroBasedBook: extract.Contiguous accepts a run starting at
+// 0, but the position model is 1-based and everything downstream reads Chapter == 0
+// as "no chapter" - so a book that numbers its prologue "Chapter 0" would lose it AND
+// sit one position below the reader for the rest of the book.
+func TestBuildUniverseShiftsAZeroBasedBook(t *testing.T) {
+	u := BuildUniverse(manifest(
+		doc(1, "Chapter 0: Before", 3000),
+		doc(2, "Chapter 1", 3000),
+		doc(3, "Chapter 2", 3000),
+		doc(4, "Chapter 3", 3000),
+	))
+	if !u.Contiguous {
+		t.Fatalf("Contiguous = false, want true (notes: %v)", u.Notes)
+	}
+	if got := chapterNums(u); !slices.Equal(got, []int{1, 2, 3, 4}) {
+		t.Fatalf("chapters = %v, want [1 2 3 4]: the prologue is chapter 1", got)
+	}
+	if got := filesOf(u, 1); !slices.Equal(got, []string{ChapterFileName(1)}) {
+		t.Errorf("chapter 1 files = %v, want the chapter-0 section", got)
+	}
+}
+
+// TestBuildUniverseRefusesAnUnevenOrdinalRun: a titled-only book has nothing but its
+// labels, so a divider page the toc named ("ACT I", 2 words, between full scenes) or
+// a story-title separator becomes a chapter of its own and shifts every position
+// after it. Real books in the validation corpus - Romeo and Juliet, The Adventures of
+// Sherlock Holmes - published straight to fact_pass this way. Refusing routes them to
+// the mapping agent, which has each section's opening words and can say what it is.
+func TestBuildUniverseRefusesAnUnevenOrdinalRun(t *testing.T) {
+	u := BuildUniverse(manifest(
+		doc(1, "A Scandal in Bohemia", 5), // a story-title divider page
+		doc(2, "I.", 3400),
+		doc(3, "II.", 4000),
+		doc(4, "The Red-Headed League", 9100),
+		doc(5, "A Case of Identity", 6900),
+	))
+	if u.Contiguous {
+		t.Errorf("Contiguous = true with a 5-word section among thousand-word ones; want the mapping agent")
+	}
+	if len(u.Notes) == 0 {
+		t.Error("no note explaining the refusal; a parked book must say why")
+	}
+}
+
+// TestBuildUniverseAcceptsAnEvenOrdinalRun is the allowed half: sections of the same
+// order of magnitude are believable as one book's chapters and cost no agent round.
+func TestBuildUniverseAcceptsAnEvenOrdinalRun(t *testing.T) {
+	u := BuildUniverse(manifest(
+		doc(1, "The Beginning and Stuff", 3500),
+		doc(2, "The Golden Age of Cannibalism", 6400),
+		doc(3, "The Olympians Bash Some Heads", 6300),
+		doc(4, "Hestia Chooses Bachelor Number Zero", 3400),
+	))
+	if !u.Contiguous {
+		t.Errorf("Contiguous = false for an even run; want no agent round (notes: %v)", u.Notes)
 	}
 }

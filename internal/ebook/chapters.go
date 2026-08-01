@@ -51,9 +51,13 @@ const (
 	// correct under the position model, whose chapter is the logical work chapter
 	// rather than anything printed.
 	SourceOrdinal Source = "ordinal"
-	// SourceContinuation: an unnumbered section BETWEEN two numbered ones, folded
-	// into the preceding chapter (a chapter split across several spine files).
+	// SourceContinuation: an UNLABELED section between two numbered ones, folded into
+	// the preceding chapter (a chapter split across several spine files).
 	SourceContinuation Source = "continuation"
+	// SourceInterstitial: a LABELED but unnumbered section between two numbered ones -
+	// an Interlude, a letter, a "Then"/"Now" divider. Folded into the FOLLOWING
+	// chapter, because the reader reaches it after finishing the one before.
+	SourceInterstitial Source = "interstitial"
 	// SourceAgent: the chapter_mapping agent decided this section's number, because
 	// the labels alone did not yield a usable run.
 	SourceAgent Source = "agent"
@@ -126,6 +130,31 @@ var boilerplateCues = []string{
 // only to EXPLAIN a quarantine, never to decide one: the decision is positional
 // (before the first numbered chapter, after the last), so an unrecognized label at
 // the edges is quarantined just the same.
+// apparatusCues name apparatus that an exact label match cannot catch, because the
+// label carries the book's own words: "Books by Rick Riordan", "List of
+// Illustrations", "About the Author and Illustrator". Matched case-insensitively as
+// substrings, and only at the EDGES of a titled-only book.
+//
+// They matter far more than they look. A numbered book excludes its apparatus by
+// position, off numbers the book itself states; a titled-only book has nothing but
+// these labels to go on, so an untrimmed "Copyright" becomes chapter 1 and shifts
+// every real chapter - which is a wrong spoiler position on every reveal in the book.
+//
+// Prologue, Epilogue, Interlude and Part are deliberately absent: those are story.
+var apparatusCues = []string{
+	"about the author", "about the illustrator", "about the publisher",
+	"books by", "also by", "other books", "more by",
+	"list of illustrations", "list of maps", "list of characters",
+	"table of contents", "title page", "half title",
+	"copyright", "dedication", "acknowledg", "colophon", "imprint",
+	"afterword", "foreword", "preface", "introduction",
+	"newsletter", "reading group", "discussion questions",
+	// Public-domain apparatus, which every Gutenberg-derived epub ends with and which
+	// is long enough (~2,900 words) to read as a chapter on any size test.
+	"project gutenberg", "license", "licence", "transcriber",
+	"appendix", "glossary", "bibliography",
+}
+
 var frontMatterLabels = map[string]bool{
 	"cover": true, "title page": true, "titlepage": true, "contents": true,
 	"table of contents": true, "copyright": true, "dedication": true,
@@ -172,20 +201,37 @@ func BuildUniverse(m *extract.Manifest) Universe {
 		}
 	}
 
-	// Prefer the strict reading. Fall back to including loose ones only when the
-	// book's labels then form a contiguous run - that whole-book agreement is the
-	// evidence a single ambiguous label cannot supply.
+	// Take the ambiguous readings only when they EXTEND the run and the whole book
+	// then agrees - that agreement over a strictly larger set is the evidence a single
+	// ambiguous label cannot supply. Testing "loose is longer" before "strict is
+	// contiguous" is load-bearing: looseNums is a superset of strictNums, so both can
+	// be contiguous at once (a toc that drops its separator on the last two entries
+	// gives strict 1,2,3 and loose 1..5). Preferring strict there would publish the
+	// book's final chapters as back matter, which is silent and unrecoverable.
+	//
+	// When the two are the same length they are the same set, so an equal-length loose
+	// run needs no case of its own.
 	switch {
-	case extract.Contiguous(strictNums):
-		dropLoose(docs)
-		u.Contiguous = true
-	case extract.Contiguous(looseNums):
+	case extract.Contiguous(looseNums) && len(looseNums) > len(strictNums):
 		u.Contiguous = true
 		u.Notes = append(u.Notes, fmt.Sprintf(
 			"chapter numbers came from labels that are ambiguous on their own (e.g. a leading Roman numeral); "+
 				"accepted because all %d form a contiguous run", len(looseNums)))
+	case extract.Contiguous(strictNums):
+		dropLoose(docs)
+		u.Contiguous = true
 	default:
 		dropLoose(docs)
+	}
+
+	// A book that numbers its prologue "Chapter 0" is 0-based, and extract.Contiguous
+	// accepts such a run. The position model is 1-based (0 means prior-book
+	// knowledge), and everything downstream treats Chapter == 0 as "no chapter" - so
+	// without this the prologue is quarantined as front matter, losing its text AND
+	// leaving every later chapter one position below where the reader is.
+	if u.Contiguous && shiftZeroBased(docs) {
+		u.Notes = append(u.Notes, "the book numbers its chapters from 0, so every number was shifted up by one "+
+			"to match the 1-based position model")
 	}
 
 	// With no numbers anywhere, number the story sections in spine order. Only safe
@@ -213,12 +259,57 @@ func BuildUniverse(m *extract.Manifest) Universe {
 	if len(u.Chapters) < minChapters {
 		u.Contiguous = false
 	} else if !numbered {
-		u.Contiguous = true
-		u.Notes = append(u.Notes, fmt.Sprintf(
-			"the toc states no chapter numbers, so the %d story sections were numbered in reading order",
-			len(u.Chapters)))
+		if outlier, median := ordinalSizeOutlier(u.Chapters); outlier > 0 {
+			u.Notes = append(u.Notes, fmt.Sprintf(
+				"the toc states no chapter numbers and section %d is %d words against a median of %d, "+
+					"so it is a divider or apparatus rather than a chapter; numbering it would shift every "+
+					"later position, so the mapping agent decides this book",
+				outlier, u.Chapters[outlier-1].Words, median))
+		} else {
+			u.Contiguous = true
+			u.Notes = append(u.Notes, fmt.Sprintf(
+				"the toc states no chapter numbers, so the %d story sections were numbered in reading order",
+				len(u.Chapters)))
+		}
 	}
 	return u
+}
+
+// ordinalOutlierRatio is how far below the median a titled-only section may sit and
+// still be believable as a chapter of the same book.
+const ordinalOutlierRatio = 10
+
+// ordinalSizeOutlier returns the 1-based position of the first ordinal chapter far
+// too small to be one, with the book's median chapter size, or 0 when the run is even.
+//
+// The ordinal path has nothing but labels to go on, so a divider page the toc named
+// ("Zeus", 74 words, sitting between 6,000-word myths) or apparatus the edge trim did
+// not recognize becomes a chapter of its own and shifts every position after it. Size
+// is the one signal the labels cannot give: real chapters of one book are the same
+// order of magnitude.
+//
+// Refusing is cheap and correct - the book routes to the chapter-mapping agent, which
+// has each section's opening words and can say what it is. Guessing is what costs,
+// because the shifted position is published and nothing downstream re-derives it.
+func ordinalSizeOutlier(chs []Chapter) (position, median int) {
+	if len(chs) < minChapters {
+		return 0, 0
+	}
+	words := make([]int, 0, len(chs))
+	for _, c := range chs {
+		words = append(words, c.Words)
+	}
+	sort.Ints(words)
+	median = words[len(words)/2]
+	if median <= 0 {
+		return 0, 0
+	}
+	for i, c := range chs {
+		if c.Words*ordinalOutlierRatio < median {
+			return i + 1, median
+		}
+	}
+	return 0, median
 }
 
 // dropLoose clears the ambiguous readings, so a manifest never records a number the
@@ -231,6 +322,30 @@ func dropLoose(docs []Doc) {
 	}
 }
 
+// shiftZeroBased renumbers a 0-based run to 1-based, reporting whether it did.
+//
+// A section carrying Source but Chapter 0 is the tell: an unnumbered section has no
+// Source at all, and dropLoose has already cleared the readings that were not
+// accepted, so only labels the book itself numbered are shifted.
+func shiftZeroBased(docs []Doc) bool {
+	zeroBased := false
+	for _, d := range docs {
+		if d.Chapter == 0 && d.Source != "" {
+			zeroBased = true
+			break
+		}
+	}
+	if !zeroBased {
+		return false
+	}
+	for i := range docs {
+		if docs[i].Source != "" {
+			docs[i].Chapter++
+		}
+	}
+	return true
+}
+
 func anyNumbered(docs []Doc) bool {
 	for _, d := range docs {
 		if d.Chapter > 0 {
@@ -240,8 +355,19 @@ func anyNumbered(docs []Doc) bool {
 	return false
 }
 
-// storySpan returns the index of the first and last NUMBERED section. Everything
-// outside that span is apparatus.
+// storySpan returns the index of the first and last section of the story.
+//
+// It starts at the last NUMBERED section, then extends over any unlabeled sections
+// carved out of that SAME spine document - the closing pages of a chapter the toc
+// anchored mid-file, which would otherwise fall outside the span and be thrown away
+// as back matter (silently, since the tail of a chapter is usually too short to
+// trip the excerpt flag).
+//
+// It deliberately does not extend into a NEW spine file. A promo excerpt of the next
+// book is also unlabeled and also trails the last chapter, so admitting one on
+// position alone is exactly the failure quarantineEdges exists to prevent; sharing
+// the last chapter's spine document is what proves a section is its continuation
+// rather than something appended after it.
 func storySpan(docs []Doc) (first, last int) {
 	first, last = -1, -1
 	for i, d := range docs {
@@ -252,7 +378,20 @@ func storySpan(docs []Doc) (first, last int) {
 			last = i
 		}
 	}
+	if first < 0 {
+		return -1, -1
+	}
+	for last+1 < len(docs) && isSpineContinuation(docs[last], docs[last+1]) {
+		last++
+	}
 	return first, last
+}
+
+// isSpineContinuation reports whether next is an unlabeled remainder of the same
+// spine document as prev.
+func isSpineContinuation(prev, next Doc) bool {
+	return next.Chapter == 0 && next.Quarantine == "" &&
+		strings.TrimSpace(next.Label) == "" && next.Spine == prev.Spine
 }
 
 // titledStorySpan guesses the story span for a book whose toc carries labels but no
@@ -281,7 +420,7 @@ func isApparatus(d Doc) bool {
 	if frontMatterLabels[label] {
 		return true
 	}
-	return containsAny(label, excerptCues)
+	return containsAny(label, apparatusCues) || containsAny(label, excerptCues)
 }
 
 // looksLikeExcerpt reports whether a quarantined trailing section is plausibly a
@@ -350,14 +489,24 @@ func quarantineEdges(docs []Doc, first, last int) (suspected bool) {
 	return suspected
 }
 
-// assignOrdinals numbers the story sections 1..N in reading order.
+// assignOrdinals numbers the story sections the toc NAMED 1..N in reading order.
+//
+// Only a labeled section starts a chapter. An unlabeled one is a chapter split
+// across several files, and numbering it too would insert a phantom chapter that
+// shifts every later position by one - the identical physical book is folded
+// correctly whenever its toc happens to number its entries, so numbering here
+// instead would make correctness depend on that accident. foldContinuations
+// attaches them afterwards.
+//
+// titledStorySpan trims unlabeled edges, so docs[first] always carries a label and
+// the run can never start with an unattachable section.
 func assignOrdinals(docs []Doc, first, last int) {
 	if first < 0 {
 		return
 	}
 	n := 0
 	for i := first; i <= last; i++ {
-		if docs[i].Quarantine != "" {
+		if strings.TrimSpace(docs[i].Label) == "" {
 			continue
 		}
 		n++
@@ -365,12 +514,35 @@ func assignOrdinals(docs []Doc, first, last int) {
 	}
 }
 
-// foldContinuations attaches an unnumbered section BETWEEN two numbered ones to the
-// chapter before it: a chapter split across several spine files is common, and its
-// later files carry no toc entry of their own.
+// foldContinuations attaches every unnumbered story section to a numbered one, in
+// the direction that cannot date a fact to a chapter the reader has already passed.
+//
+// An UNLABELED section is a continuation - a chapter split across several files,
+// whose later files carry no toc entry of their own - and belongs to the chapter
+// before it.
+//
+// A LABELED but unnumbered section is an interstitial the toc named: an Interlude, a
+// letter, a "Then"/"Now" divider between numbered chapters. It is its own piece of
+// story sitting AFTER the chapter before it, so folding it backward would attribute
+// its facts to a chapter the reader finishes BEFORE reading it, firing every reveal
+// in it one section early. It folds FORWARD, into the chapter it precedes.
+//
+// The forward pass runs first and anchors only on sections that were already
+// numbered, so a continuation folded by the backward pass can never act as an anchor
+// and drag an interstitial back the way it came.
 func foldContinuations(docs []Doc, first, last int) {
 	if first < 0 {
 		return
+	}
+	next := 0
+	for i := last; i >= first; i-- {
+		switch {
+		case docs[i].Quarantine != "":
+		case docs[i].Chapter > 0:
+			next = docs[i].Chapter
+		case strings.TrimSpace(docs[i].Label) != "" && next > 0:
+			docs[i].Chapter, docs[i].Source = next, SourceInterstitial
+		}
 	}
 	current := 0
 	for i := first; i <= last; i++ {
@@ -405,7 +577,10 @@ func CollectChapters(docs []Doc, titles map[int]string) []Chapter {
 		}
 		c.Files = append(c.Files, d.File)
 		c.Words += d.Words
-		if c.Title == "" && d.Source != SourceContinuation {
+		// Only a section that OPENS a chapter can name it. A folded one - in either
+		// direction - carries its own label ("Interlude"), which is not the title of
+		// the chapter it was attached to.
+		if c.Title == "" && d.Source != SourceContinuation && d.Source != SourceInterstitial {
 			if _, title, _ := extract.ChapterFromLabel(d.Label); title != "" {
 				c.Title = title
 			} else if d.Source == SourceOrdinal {
@@ -473,6 +648,14 @@ func ReparseUniverse(prev Universe) Universe {
 // these names, so the ebook path has no renumbering boundary at all.
 func WriteChapterText(workDir, splitDir string, u Universe) error {
 	dir := filepath.Join(workDir, TextDir)
+	// Replace the layer rather than merging into it. A re-derivation that yields
+	// FEWER chapters (a second mapping round quarantining a section the first kept)
+	// would otherwise leave the old tail behind, and ngramCheck compares the whole
+	// directory - so prose belonging to a chapter that no longer exists would be
+	// reported as near-verbatim overlap the fix loop can never resolve.
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err
 	}
@@ -555,9 +738,24 @@ func readHead(path string, buf []byte) string {
 	if n == 0 && err != nil {
 		return ""
 	}
-	fields := strings.Fields(string(buf[:n]))
+	// The byte cut lands mid-rune roughly two times in three for a 3-byte script, and
+	// strings.Fields keeps the broken remainder (it decodes to RuneError, not to
+	// whitespace), so drop invalid sequences before splitting.
+	fields := strings.Fields(strings.ToValidUTF8(string(buf[:n]), ""))
 	if len(fields) > HeadWords {
 		fields = fields[:HeadWords]
 	}
-	return strings.Join(fields, " ")
+	head := strings.Join(fields, " ")
+	// A script that does not space its words (Chinese, Japanese, Thai) yields a
+	// handful of newline-separated fields for a whole page, so the word cap never
+	// binds and the head becomes ~1300 characters of the book's prose. Cap the runes
+	// too, or "far too little to be a source of prose" holds only for English.
+	if r := []rune(head); len(r) > headRuneCap {
+		head = strings.TrimSpace(string(r[:headRuneCap]))
+	}
+	return head
 }
+
+// headRuneCap bounds a head for a script the word cap cannot measure. Comfortably
+// above HeadWords of English prose (~250 characters), far below any n-gram shingle.
+const headRuneCap = 320

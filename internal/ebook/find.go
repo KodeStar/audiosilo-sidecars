@@ -90,6 +90,14 @@ func Find(ctx context.Context, root string, onProgress func(dirs, found int)) (m
 			}
 			return nil
 		}
+		// A dot file is never a book. macOS writes a "._Book.epub" resource-fork stub
+		// beside every real one on SMB/exFAT shares - exactly the NAS setup this walk
+		// targets - and admitting it would put two "epubs" in the folder, which
+		// annotateEbook refuses to choose between. Every book in the library would
+		// silently fall back to audio.
+		if strings.HasPrefix(d.Name(), ".") {
+			return nil
+		}
 		if IsEpub(d.Name()) {
 			paths = append(paths, p)
 		}
@@ -98,14 +106,19 @@ func Find(ctx context.Context, root string, onProgress func(dirs, found int)) (m
 	if err != nil {
 		return nil, err
 	}
-	return readMetadata(ctx, paths), nil
+	return readMetadata(ctx, paths)
 }
 
 // readMetadata resolves each path's identity over a bounded worker pool.
-func readMetadata(ctx context.Context, paths []string) map[string]Candidate {
+//
+// Cancellation is reported rather than swallowed: the OPF pass is the slow,
+// network-bound half of a scan, so a cancel landing inside it is likely, and
+// returning a silently truncated candidate set with a nil error would make some of
+// the library's epubs simply vanish from an otherwise successful scan result.
+func readMetadata(ctx context.Context, paths []string) (map[string]Candidate, error) {
 	out := make(map[string]Candidate, len(paths))
 	if len(paths) == 0 {
-		return out
+		return out, nil
 	}
 	workers := min(metadataWorkers, len(paths))
 
@@ -134,7 +147,10 @@ func readMetadata(ctx context.Context, paths []string) map[string]Candidate {
 	}
 	close(work)
 	wg.Wait()
-	return out
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // describe reads one epub's OPF identity, degrading to a filename-derived title
