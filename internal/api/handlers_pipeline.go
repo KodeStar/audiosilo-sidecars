@@ -252,6 +252,13 @@ func ebookCandidate(c bookCandidate, roots []string) (kind, ebookPath, errMsg st
 		if ebookPath != "" {
 			return "", "", "ebook_path is only valid with kind \"ebook\""
 		}
+		// An epub can reach here as an AUDIO candidate when discovery could not read
+		// it (DRM, corrupt) and so cleared its kind. Enqueuing that runs ffprobe over
+		// a zip and fails deep in the audio front half; saying so here is the only
+		// place the user gets an answer they can act on.
+		if ebook.IsEpub(c.SourcePath) {
+			return "", "", "this epub could not be read (it may be DRM-protected), so it cannot be processed"
+		}
 		return kind, "", ""
 	}
 	if ebookPath == "" {
@@ -260,10 +267,19 @@ func ebookCandidate(c bookCandidate, roots []string) (kind, ebookPath, errMsg st
 	if !ebook.IsEpub(ebookPath) {
 		return "", "", "ebook_path must name a .epub file"
 	}
-	if ok, err := metaops.PathAllowed(ebookPath, roots); err != nil || !ok {
+	// Persist the RESOLVED path, not the string the caller sent. The allow-list check
+	// resolves symlinks, but extracting re-opens this value minutes or hours later -
+	// so storing the raw string leaves a window in which a symlink that passed the
+	// check can be repointed outside every library root, and the stage would follow
+	// it and feed that file to an agent.
+	resolved, err := metaops.ResolvePath(ebookPath)
+	if err != nil {
 		return "", "", "ebook_path not allowed"
 	}
-	return kind, ebookPath, ""
+	if ok, err := metaops.PathAllowed(resolved, roots); err != nil || !ok {
+		return "", "", "ebook_path not allowed"
+	}
+	return kind, resolved, ""
 }
 
 // workRoot is the daemon's per-book scratch-dir root (<data>/work). The

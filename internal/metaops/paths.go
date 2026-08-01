@@ -33,6 +33,12 @@ func PathAllowed(target string, roots []string) (bool, error) {
 	return false, nil
 }
 
+// ResolvePath is resolvePath, exported for callers that must PERSIST a canonical
+// path rather than merely check one. Storing the raw string a caller supplied
+// leaves a window in which a symlink that passed an allow-list check can be
+// repointed before the path is used.
+func ResolvePath(p string) (string, error) { return resolvePath(p) }
+
 // resolvePath returns the absolute, symlink-evaluated form of p. It falls back to
 // the cleaned absolute path when the target does not yet exist (EvalSymlinks
 // needs an existing path), which is safe because a non-existent path cannot be

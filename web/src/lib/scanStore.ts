@@ -392,6 +392,19 @@ export class ScanStore {
     return this.applyOverride(client, book, overridePayload(book, { hidden: false }), 'keep');
   }
 
+  // forceAudio switches a hybrid candidate (an epub beside an audiobook) between
+  // using the epub's exact text and transcribing the audio. Persisted, because
+  // "the epub here is the wrong edition" is a property of the folder rather than
+  // of one enqueue - the candidate list re-renders from the scan cache, so a
+  // non-persisted choice would vanish on the next poll.
+  forceAudio(
+    client: ApiClient,
+    book: ScannedBook,
+    force: boolean,
+  ): Promise<{ ok: boolean; error?: string }> {
+    return this.applyOverride(client, book, overridePayload(book, { forceAudio: force }), 'keep');
+  }
+
   applyManualMatch(
     client: ApiClient,
     book: ScannedBook,

@@ -10,6 +10,7 @@ import {
   manualWorkId,
   matchProvenanceLabel,
   overridePayload,
+  currentForceAudio,
   parsePos,
   POS_SENTINEL,
   searchCandidates,
@@ -253,6 +254,7 @@ describe('overridePayload', () => {
       source_path: '/root/b',
       hidden: true,
       work_id: 'w9',
+      force_audio: false,
     });
   });
 
@@ -262,6 +264,7 @@ describe('overridePayload', () => {
       source_path: '/root/b',
       hidden: false,
       work_id: '',
+      force_audio: false,
     });
   });
 
@@ -271,6 +274,7 @@ describe('overridePayload', () => {
       source_path: '/root/b',
       hidden: true,
       work_id: 'w1',
+      force_audio: false,
     });
   });
 
@@ -280,6 +284,7 @@ describe('overridePayload', () => {
       source_path: '/root/b',
       hidden: false,
       work_id: '',
+      force_audio: false,
     });
   });
 });
@@ -492,5 +497,55 @@ describe('seriesGapHint', () => {
     const z2 = book({ path: '/z2', series: 'Zed', series_position: '2' });
     const hint = seriesGapHint([b1, b2, z1, z2], new Set(['/s2', '/z2']));
     expect(hint).toEqual(['Saga', 'Zed']);
+  });
+});
+
+describe('ebook candidates', () => {
+  const hybrid = (over: Partial<ScannedBook> = {}): ScannedBook =>
+    ({
+      path: 'b',
+      source_path: '/root/b',
+      title: 'B',
+      audio_files: 1,
+      coverage: { available: false },
+      kind: 'ebook',
+      ebook_path: '/root/b/book.epub',
+      ...over,
+    }) as ScannedBook;
+
+  // Without these two fields the server defaults kind to "audio", so the Library
+  // would enqueue every epub as an audiobook and ffprobe it - the whole ebook
+  // front half unreachable from the UI.
+  it('carries kind and ebook_path so an epub enqueues as an ebook', () => {
+    const c = toCandidate(hybrid());
+    expect(c.kind).toBe('ebook');
+    expect(c.ebook_path).toBe('/root/b/book.epub');
+  });
+
+  it('omits them for an audio book', () => {
+    const c = toCandidate(hybrid({ kind: undefined, ebook_path: undefined }));
+    expect(c.kind).toBeUndefined();
+    expect(c.ebook_path).toBeUndefined();
+  });
+
+  // POST /overrides is a FULL desired-state upsert, so a hide that omitted
+  // force_audio would silently clear it - handing the pipeline an epub the user
+  // had already rejected as the wrong edition.
+  it('preserves a live force_audio through an unrelated hide', () => {
+    const forced = hybrid({ kind: undefined }); // discovery expresses forced audio by clearing kind
+    expect(currentForceAudio(forced)).toBe(true);
+    expect(overridePayload(forced, { hidden: true }).force_audio).toBe(true);
+  });
+
+  it('does not invent force_audio for an ebook-only or plain audio book', () => {
+    expect(currentForceAudio(hybrid({ ebook_path: '/root/b' }))).toBe(false);
+    expect(currentForceAudio(hybrid({ kind: undefined, ebook_path: undefined }))).toBe(false);
+  });
+
+  it('lets the toggle set and clear it explicitly', () => {
+    expect(overridePayload(hybrid(), { forceAudio: true }).force_audio).toBe(true);
+    expect(overridePayload(hybrid({ kind: undefined }), { forceAudio: false }).force_audio).toBe(
+      false,
+    );
   });
 });

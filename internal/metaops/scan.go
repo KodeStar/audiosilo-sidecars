@@ -533,10 +533,14 @@ func (m *ScanManager) applyFinal(id string, res *metascan.Result, overrides map[
 	claimed := map[string]bool{}
 	books := make([]ScannedBook, 0, len(res.Books)+len(epubs))
 	for _, b := range res.Books {
-		sb, bi := convertBook(b, job.path, overrides)
+		sb, _ := convertBook(b, job.path, overrides)
 		annotateEbook(&sb, byDir, claimed, overrides)
+		// The identity is computed AFTER annotation, because annotateEbook may supply
+		// the ISBN the audio tags lacked - and the fingerprint is what the coverage
+		// worker resolves against. Building it first discarded that ISBN for the one
+		// purpose it was harvested for, falling back to a fuzzy title match.
 		books = append(books, sb)
-		job.idents[sb.Path] = bi
+		job.idents[sb.Path] = applyOverride(&sb, overrides)
 	}
 	// Every epub no audiobook claimed becomes a candidate in its own right.
 	for _, sb := range ebookOnlyCandidates(epubs, claimed, job.path) {

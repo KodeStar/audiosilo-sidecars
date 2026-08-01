@@ -78,6 +78,13 @@ export function toCandidate(book: ScannedBook): BookCandidate {
   // Carry narrators through so a later core (add-work) proposal can prefill them
   // (metaissue requires >= 1 narrator). Omit an empty list to keep the payload tidy.
   if (book.narrators && book.narrators.length > 0) candidate.narrators = book.narrators;
+  // Carry the pipeline kind and its epub. The server defaults an absent kind to
+  // "audio", so leaving these off does not fall back gracefully - it enqueues the
+  // epub as an audiobook and runs ffprobe over it.
+  if (book.kind === 'ebook' && book.ebook_path) {
+    candidate.kind = book.kind;
+    candidate.ebook_path = book.ebook_path;
+  }
   const c = book.coverage;
   if (c && c.known && c.work_id) candidate.work_id = c.work_id;
   return candidate;
@@ -257,13 +264,26 @@ export function clearedCoverage(): Coverage {
 // match; changes.hidden === false unhides.
 export function overridePayload(
   book: ScannedBook,
-  changes: { hidden?: boolean; workId?: string },
+  changes: { hidden?: boolean; workId?: string; forceAudio?: boolean },
 ): SetOverrideBody {
   return {
     source_path: book.source_path,
     hidden: changes.hidden ?? book.hidden ?? false,
     work_id: changes.workId ?? manualWorkId(book),
+    // Every dimension must be re-sent because the endpoint is a full desired-state
+    // upsert: an omitted force_audio decodes as false server-side, so hiding or
+    // matching a book would silently drop a persisted "use the audio" choice and
+    // hand the pipeline an epub the user had already rejected.
+    force_audio: changes.forceAudio ?? currentForceAudio(book),
   };
+}
+
+// currentForceAudio reads a book's live force_audio state. There is no dedicated
+// field: discovery expresses it by clearing kind while still reporting the epub,
+// so a candidate that HAS an epub beside an audiobook but is not kind "ebook" is
+// one the user (or the persisted override) told us to transcribe.
+export function currentForceAudio(book: ScannedBook): boolean {
+  return !!book.ebook_path && book.ebook_path !== book.source_path && book.kind !== 'ebook';
 }
 
 // seriesGapHint reports the series for which a selected book skips an earlier

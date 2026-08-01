@@ -805,3 +805,31 @@ func TestCreateBooksEbookKind(t *testing.T) {
 		}
 	}
 }
+
+// TestCreateBooksRejectsAnUnreadableEpubAsAudio: discovery reports an epub it
+// could not parse (DRM, corrupt) with its kind cleared, so the row is selectable
+// and arrives here looking like an audio book whose source_path is a .epub.
+// Enqueuing it runs ffprobe over a zip and fails deep in the audio front half;
+// refusing here is the only place the user gets an actionable answer.
+func TestCreateBooksRejectsAnUnreadableEpubAsAudio(t *testing.T) {
+	root := t.TempDir()
+	env := newPipelineEnv(t, []string{root})
+	token := env.login(t)
+
+	p := filepath.Join(root, "drm.epub")
+	if err := os.WriteFile(p, []byte("not a zip"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"candidates":[{"source_path":"` + p + `","title":"DRM Book"}]}`
+	resp := env.do(t, http.MethodPost, "/api/v1/books", token, body)
+	var cr createBooksResponse
+	_ = json.NewDecoder(resp.Body).Decode(&cr)
+	resp.Body.Close()
+
+	if len(cr.Results) != 1 || cr.Results[0].Created {
+		t.Fatalf("an unreadable epub was enqueued as an audio book: %+v", cr.Results)
+	}
+	if !strings.Contains(cr.Results[0].Error, "could not be read") {
+		t.Errorf("error = %q, want it to explain the epub could not be read", cr.Results[0].Error)
+	}
+}

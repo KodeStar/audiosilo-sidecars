@@ -121,6 +121,11 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
     (b: ScannedBook) => void withBusy(b.path, () => scanStore.hide(client, b)),
     [client, withBusy],
   );
+  const handleToggleSource = useCallback(
+    (b: ScannedBook, force: boolean) =>
+      void withBusy(b.path, () => scanStore.forceAudio(client, b, force)),
+    [client, withBusy],
+  );
   const handleUnhide = useCallback(
     (b: ScannedBook) => void withBusy(b.path, () => scanStore.unhide(client, b)),
     [client, withBusy],
@@ -250,6 +255,7 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
                     onMatch={setMatchTarget}
                     onClearMatch={handleClearMatch}
                     onHide={handleHide}
+                    onToggleSource={handleToggleSource}
                     busy={busyPaths.has(b.path)}
                   />
                 ))}

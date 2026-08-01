@@ -313,8 +313,9 @@ export interface SetOverrideBody {
   hidden: boolean;
   work_id: string;
   // Run the audio pipeline even though an epub is present (a wrong edition, an
-  // abridgement, a bad conversion).
-  force_audio?: boolean;
+  // abridgement, a bad conversion). POST /overrides is a FULL desired-state
+  // upsert, so every caller must send the current value or it is cleared.
+  force_audio: boolean;
 }
 
 // SetOverrideResponse echoes the stored override plus the recomputed coverage when
@@ -364,6 +365,11 @@ export interface BookCandidate {
   // A manual-match work id carried from an override, so the enqueued book keeps
   // the identity the user picked. Omitted when the book has no manual match.
   work_id?: string;
+  // Which pipeline the book runs, and the epub that drives it. Both must be sent
+  // for an ebook: the server defaults an absent kind to "audio", so omitting them
+  // enqueues an epub as an audio book and ffprobes it.
+  kind?: string;
+  ebook_path?: string;
 }
 
 export interface CreateBooksRequest {

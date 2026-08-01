@@ -362,7 +362,12 @@ describe('ScanStore overrides', () => {
     expect(patched?.work_title).toBe('Dune');
     // The POST carried the full desired state.
     const body = (client.setOverride as ReturnType<typeof vi.fn>).mock.calls[0][0];
-    expect(body).toEqual({ source_path: '/root/b1', hidden: false, work_id: 'w1' });
+    expect(body).toEqual({
+      source_path: '/root/b1',
+      hidden: false,
+      work_id: 'w1',
+      force_audio: false,
+    });
   });
 
   it('clearMatch reverts coverage to unknown', async () => {
