@@ -383,6 +383,8 @@ func (e *Executor) Execute(ctx context.Context, book store.Book, stage state.Sta
 		return e.correcting(ctx, book, r)
 	case state.Extracting:
 		return e.extract(ctx, book, r)
+	case state.ChapterMapping:
+		return e.chapterMapping(ctx, book, r)
 	case state.FactPass:
 		return e.factPass(ctx, book, r)
 	case state.Synthesizing:

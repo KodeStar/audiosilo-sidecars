@@ -28,6 +28,13 @@ type Doc struct {
 	Source Source `json:"source,omitempty"`
 	// Quarantine is empty when the section is part of the story, else why it is not.
 	Quarantine string `json:"quarantine,omitempty"`
+	// Head is the section's opening few words, populated by PopulateHeads.
+	//
+	// It is the ONE judgement a toc label cannot support: telling "Acknowledgements"
+	// from chapter one of a DIFFERENT novel when neither is labelled. It is capped at
+	// HeadWords - far below any n-gram shingle - so the mapping agent can recognize
+	// what a section is without the book's prose reaching it.
+	Head string `json:"head,omitempty"`
 }
 
 // Source is how a section's chapter number was decided.
@@ -47,6 +54,9 @@ const (
 	// SourceContinuation: an unnumbered section BETWEEN two numbered ones, folded
 	// into the preceding chapter (a chapter split across several spine files).
 	SourceContinuation Source = "continuation"
+	// SourceAgent: the chapter_mapping agent decided this section's number, because
+	// the labels alone did not yield a usable run.
+	SourceAgent Source = "agent"
 )
 
 // Quarantine reasons.
@@ -390,7 +400,12 @@ func foldContinuations(docs []Doc, first, last int) {
 }
 
 // collectChapters folds the sections into logical chapters, in chapter order.
-func collectChapters(docs []Doc) []Chapter {
+func collectChapters(docs []Doc) []Chapter { return CollectChapters(docs, nil) }
+
+// CollectChapters folds sections into logical chapters in chapter order. titles
+// overrides a chapter's title when the caller has a better one than the labels do
+// (the mapping agent supplies them); a nil map keeps the label-derived titles.
+func CollectChapters(docs []Doc, titles map[int]string) []Chapter {
 	byNum := map[int]*Chapter{}
 	var order []int
 	for _, d := range docs {
@@ -416,9 +431,45 @@ func collectChapters(docs []Doc) []Chapter {
 	sort.Ints(order)
 	out := make([]Chapter, 0, len(order))
 	for _, n := range order {
-		out = append(out, *byNum[n])
+		c := *byNum[n]
+		if t, ok := titles[n]; ok && t != "" {
+			c.Title = t
+		}
+		out = append(out, c)
 	}
 	return out
+}
+
+// ReparseManifest re-derives the chapter universe from a persisted extract
+// manifest, using the CURRENT label vocabulary and without re-reading the epub.
+//
+// It is the free upgrade path: a book parked because an older parser could not
+// read its numbering is recovered by a later one at no cost, the same recovery
+// the audio path gets from ReparseMarkerManifest. Section provenance (label,
+// words, spine, head) is preserved; only the verdicts are recomputed.
+func ReparseManifest(workDir string) (Universe, error) {
+	prev, err := ReadManifest(workDir)
+	if err != nil {
+		return Universe{}, err
+	}
+	docs := make([]extract.DocEntry, 0, len(prev.Docs))
+	for _, d := range prev.Docs {
+		docs = append(docs, extract.DocEntry{
+			Index: d.Index, Spine: d.Spine, File: d.File,
+			Anchor: d.Anchor, Label: d.Label, Words: d.Words,
+		})
+	}
+	u := BuildUniverse(&extract.Manifest{Docs: docs})
+	// Carry the recorded heads across: they were read from the split text, which the
+	// reparse does not touch.
+	heads := make(map[string]string, len(prev.Docs))
+	for _, d := range prev.Docs {
+		heads[d.File] = d.Head
+	}
+	for i := range u.Docs {
+		u.Docs[i].Head = heads[u.Docs[i].File]
+	}
+	return u, nil
 }
 
 // chapterStem is the per-chapter filename stem, matching the audio path's chNNN.
@@ -481,4 +532,26 @@ func ReadManifest(workDir string) (Universe, error) {
 		return Universe{}, fmt.Errorf("parse %s: %w", ManifestName, err)
 	}
 	return u, nil
+}
+
+// HeadWords is how much of a section's opening PopulateHeads records. Deliberately
+// tiny: enough to recognize front matter or another book's first page, far too
+// little to be a source of prose.
+const HeadWords = 40
+
+// PopulateHeads fills each section's Head from the split text on disk. A section
+// that cannot be read is left with an empty Head rather than failing the stage -
+// the mapping agent simply has less to go on for that one.
+func PopulateHeads(u *Universe, splitDir string) {
+	for i := range u.Docs {
+		raw, err := os.ReadFile(filepath.Join(splitDir, filepath.Base(u.Docs[i].File))) //nolint:gosec // both halves derive from the work dir
+		if err != nil {
+			continue
+		}
+		fields := strings.Fields(string(raw))
+		if len(fields) > HeadWords {
+			fields = fields[:HeadWords]
+		}
+		u.Docs[i].Head = strings.Join(fields, " ")
+	}
 }

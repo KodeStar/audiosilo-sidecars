@@ -51,6 +51,9 @@ func (e *Executor) extract(ctx context.Context, book store.Book, r scheduler.Sta
 			fmt.Sprintf("%s (%v)", EbookUnreadableMsg, err))
 	}
 	u := ebook.BuildUniverse(man)
+	// Record each section's opening words BEFORE writing the manifest: chapter_mapping
+	// reads them to tell unlabelled front matter from another book's first page.
+	ebook.PopulateHeads(&u, splitDir)
 	if err := ebook.WriteManifest(book.WorkDir, u); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("extracting: write manifest: %w", err)
 	}
