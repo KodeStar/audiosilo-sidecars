@@ -7,8 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kodestar/audiosilo-sidecars/internal/ebook"
 	"github.com/kodestar/audiosilo-sidecars/internal/events"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
+	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
 
 // TestAutoPurgeOnReachingDone drives advance(Contributing -> Done) with the knob on and
@@ -217,5 +219,49 @@ func TestStartupGCKnobOff(t *testing.T) {
 	}
 	if _, err := os.Stat(chapters); err != nil {
 		t.Error("knob off: startup GC must leave chapters/ intact")
+	}
+}
+
+// TestAutoPurgeOffStillReclaimsEbookSourceText: autoPurge is a disk-space preference
+// for the contribution flow, but an ebook's reclaimed layers hold the book's
+// copyrighted source prose. "Source material never outlives the derivation" is a
+// licensing obligation, so it must not be switchable off - with the knob off an audio
+// book keeps its chapters and an ebook still loses its text.
+func TestAutoPurgeOffStillReclaimsEbookSourceText(t *testing.T) {
+	h := newHarness(t)
+	db := h.openDB(t)
+	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, h.workRoot, false)
+	s.ctx = context.Background()
+	ctx := context.Background()
+
+	b, err := db.CreateBook(ctx, store.NewBook{
+		SourcePath: "/src/ebook-book.epub",
+		WorkDir:    filepath.Join(h.workRoot, "ebook-book"),
+		Title:      "ebook-book",
+		Kind:       string(state.KindEbook),
+		EbookPath:  "/src/ebook-book.epub",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	textDir := filepath.Join(b.WorkDir, ebook.TextDir)
+	if err := os.MkdirAll(textDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(textDir, "ch001.txt"), []byte("the book's own prose"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetBookState(ctx, b.ID, string(state.Contributing), "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	b.State = string(state.Contributing)
+
+	s.advance(ctx, b, state.Contributing, StageResult{})
+
+	if got, _ := db.GetBook(ctx, b.ID); got.State != string(state.Done) {
+		t.Fatalf("state = %q, want done", got.State)
+	}
+	if _, err := os.Stat(textDir); !os.IsNotExist(err) {
+		t.Error("the ebook's source text survived with autoPurge off; that is a licensing obligation, not a preference")
 	}
 }

@@ -261,16 +261,16 @@ func (s *Scheduler) Reconcile(ctx context.Context) error {
 			return err
 		}
 	}
-	if s.autoPurge {
-		// Run the startup GC OFF the dispatch-gating path: purging a large done backlog
-		// serially inside Reconcile would stall the first dispatch pass. Track it on the
-		// WaitGroup so Stop drains it, and let it observe ctx cancellation.
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			s.startupGC(ctx, books)
-		}()
-	}
+	// Run the startup GC OFF the dispatch-gating path: purging a large done backlog
+	// serially inside Reconcile would stall the first dispatch pass. Track it on the
+	// WaitGroup so Stop drains it, and let it observe ctx cancellation. It runs even
+	// with autoPurge off, because it is also what enforces the ebook source-prose
+	// sweep for a book whose own purge never ran; startupGC decides per book.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.startupGC(ctx, books)
+	}()
 	return nil
 }
 
@@ -286,7 +286,15 @@ func (s *Scheduler) startupGC(ctx context.Context, books []store.Book) {
 		if ctx.Err() != nil {
 			return
 		}
-		if !state.IsTerminal(state.State(b.State)) || b.ScratchBytes <= 0 {
+		if !state.IsTerminal(state.State(b.State)) {
+			continue
+		}
+		// The scratch gauge is the cheap filter, but it cannot be trusted to decide an
+		// ebook: extracting and chapter_mapping do not account scratch, so a book can
+		// hold its whole source text while reporting zero. An ebook is therefore always
+		// swept - Purge is idempotent and a no-op once the layers are gone.
+		isEbook := state.ParseKind(b.Kind) == state.KindEbook
+		if !isEbook && (!s.autoPurge || b.ScratchBytes <= 0) {
 			continue
 		}
 		// Reserve the book for the reclaim (mirroring PurgeScratch): a terminal book is
@@ -861,7 +869,11 @@ func (s *Scheduler) advance(ctx context.Context, b store.Book, stage state.State
 	// Auto-purge: a book that just reached done no longer needs its scratch. The worker
 	// already holds this book's in-flight slot, so reclaim WITHOUT reserving (that would
 	// see itself busy). A failure is logged, never fails the stage.
-	if next == state.Done && s.autoPurge {
+	// An EBOOK purges regardless of the flag. autoPurge is a disk-space preference for
+	// the contribution flow, but an ebook's reclaimable layers hold the book's
+	// copyrighted source prose, and "source material never outlives the derivation" is
+	// a licensing obligation rather than a preference - it must not be switchable off.
+	if next == state.Done && (s.autoPurge || state.ParseKind(b.Kind) == state.KindEbook) {
 		s.autoPurgeDone(ctx, b.ID)
 	}
 }
