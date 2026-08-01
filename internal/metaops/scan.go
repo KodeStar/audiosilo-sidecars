@@ -235,9 +235,19 @@ type scanJob struct {
 // verdict would otherwise report a since-contributed work as still "needed"
 // forever - including on a fresh rescan.
 type overridePatch struct {
-	hidden   bool
-	coverage *Coverage // non-nil for a manual match
-	gen      uint64
+	hidden     bool
+	forceAudio bool
+	coverage   *Coverage // non-nil for a manual match
+	gen        uint64
+}
+
+// OverridePatchInput is the live override state ApplyOverride records. It is a
+// struct rather than a widening argument list so the next knob does not grow the
+// signature again - there are already three call sites.
+type OverridePatchInput struct {
+	Hidden     bool
+	ForceAudio bool
+	Coverage   *Coverage
 }
 
 // ScanManager runs and tracks folder-scan jobs, keyed by job id. Jobs are held in
@@ -390,9 +400,11 @@ func (m *ScanManager) List() []ScanJobSummary {
 //
 // The patched coverage is a point-in-time verdict, so it is stamped with a
 // generation and a later resolution outranks it (see overridePatch).
-func (m *ScanManager) ApplyOverride(sourcePath string, hidden bool, cov *Coverage) {
+func (m *ScanManager) ApplyOverride(sourcePath string, in OverridePatchInput) {
 	m.mu.Lock()
-	m.patches[sourcePath] = overridePatch{hidden: hidden, coverage: cov, gen: m.nextGenLocked()}
+	m.patches[sourcePath] = overridePatch{
+		hidden: in.Hidden, forceAudio: in.ForceAudio, coverage: in.Coverage, gen: m.nextGenLocked(),
+	}
 	m.mu.Unlock()
 	m.persistCache()
 }
@@ -640,6 +652,16 @@ func (m *ScanManager) snapshotLocked(job *scanJob) ScanJob {
 		p, patched := m.patches[b.SourcePath]
 		if patched {
 			b.Hidden = p.hidden
+			// A live force_audio must reflect on the NEXT poll, not only after a
+			// rescan: the candidate list re-renders from the cached scan, so a
+			// toggle would otherwise appear to do nothing until the user rescanned.
+			// Only meaningful for a hybrid candidate - an ebook-only book has no
+			// audio to fall back to, so forcing it would enqueue an .epub into
+			// ffprobe.
+			if p.forceAudio && b.Kind == string(state.KindEbook) && b.EbookPath != b.SourcePath {
+				b.Kind = ""
+				b.EbookNote = "an epub is present; using the audio instead"
+			}
 		}
 		switch {
 		case patched && p.coverage != nil && (!resolved || p.gen > rc.gen):

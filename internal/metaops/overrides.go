@@ -35,6 +35,9 @@ type OverrideRequest struct {
 	SourcePath string
 	Hidden     bool
 	WorkID     string
+	// ForceAudio runs the audio pipeline for a candidate whose folder also holds an
+	// epub (a wrong edition, an abridgement, a bad conversion).
+	ForceAudio bool
 }
 
 // OverrideResult is a completed upsert: the persisted row plus the recomputed
@@ -114,6 +117,6 @@ func (s *OverrideService) Upsert(ctx context.Context, req OverrideRequest, roots
 		return OverrideResult{}, err
 	}
 	// Reflect the change on any in-memory scan jobs (cheap read-time overlay).
-	s.scans.ApplyOverride(sp, req.Hidden, cov)
+	s.scans.ApplyOverride(sp, OverridePatchInput{Hidden: req.Hidden, ForceAudio: req.ForceAudio, Coverage: cov})
 	return OverrideResult{Override: stored, Coverage: cov}, nil
 }

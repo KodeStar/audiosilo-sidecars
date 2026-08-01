@@ -147,3 +147,20 @@ func TestEbookOnlyCandidates(t *testing.T) {
 		t.Errorf("unreadable epub = %+v, want no kind and an explanatory note", bad)
 	}
 }
+
+// TestForceAudioPatchIsANoOpForAnEbookOnlyBook is the guard on the one way
+// force_audio could do damage: an ebook-only candidate has no audio to fall back
+// to, so honouring the toggle there would enqueue an .epub into ffprobe.
+func TestForceAudioPatchIsANoOpForAnEbookOnlyBook(t *testing.T) {
+	// An ebook-only candidate: source and ebook path are the same file.
+	sb := ScannedBook{
+		SourcePath: "/lib/a.epub", EbookPath: "/lib/a.epub", Kind: string(state.KindEbook),
+	}
+	byDir := ebook.ByDir(map[string]ebook.Candidate{})
+	ov := map[string]Override{"/lib/a.epub": {ForceAudio: true}}
+	annotateEbook(&sb, byDir, map[string]bool{}, ov)
+
+	if sb.Kind != string(state.KindEbook) {
+		t.Error("force_audio downgraded an ebook-only candidate; there is no audio to run")
+	}
+}

@@ -245,7 +245,7 @@ func TestScanManagerAppliesOverrides(t *testing.T) {
 
 	// A live override reflects at read time on the already-completed job. Live
 	// patches key on the absolute (canonical) source path too.
-	m.ApplyOverride(filepath.Join(canonRoot, "Author/plain"), true, nil)
+	m.ApplyOverride(filepath.Join(canonRoot, "Author/plain"), OverridePatchInput{Hidden: true})
 	job, _ = m.Get(id)
 	for _, b := range job.Books {
 		if b.Path == "Author/plain" && !b.Hidden {
@@ -253,7 +253,7 @@ func TestScanManagerAppliesOverrides(t *testing.T) {
 		}
 	}
 	// Clearing it removes the patch.
-	m.ApplyOverride(filepath.Join(canonRoot, "Author/plain"), false, nil)
+	m.ApplyOverride(filepath.Join(canonRoot, "Author/plain"), OverridePatchInput{Hidden: false})
 	job, _ = m.Get(id)
 	for _, b := range job.Books {
 		if b.Path == "Author/plain" && b.Hidden {
@@ -475,7 +475,7 @@ func TestRescanSupersedesStaleManualCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CoverageForWork: %v", err)
 	}
-	m.ApplyOverride(sourcePath, false, &stale)
+	m.ApplyOverride(sourcePath, OverridePatchInput{Hidden: false, Coverage: &stale})
 
 	// Time passes: the sidecars are contributed and merged upstream.
 	s.work["w-manual"] = workRow{title: "Matched Work", c: true, r: true}
@@ -515,7 +515,7 @@ func TestScanManagerCacheTracksLiveOverrides(t *testing.T) {
 		Available: true, Known: true, MatchedBy: "manual", WorkID: "cached-work",
 		Series: &SeriesRef{Name: "Cached Saga", Position: "4"},
 	}
-	m.ApplyOverride(sourcePath, true, &manual)
+	m.ApplyOverride(sourcePath, OverridePatchInput{Hidden: true, Coverage: &manual})
 
 	restored := NewScanManager(context.Background(), NewClient(""), "", nil, WithScanCache(cachePath))
 	got, ok := restored.Get(id)
@@ -528,7 +528,7 @@ func TestScanManagerCacheTracksLiveOverrides(t *testing.T) {
 
 	// A full-state unhide remains authoritative even though the cached snapshot
 	// recorded the book as hidden.
-	restored.ApplyOverride(sourcePath, false, nil)
+	restored.ApplyOverride(sourcePath, OverridePatchInput{Hidden: false})
 	got, _ = restored.Get(id)
 	if got.Books[0].Hidden {
 		t.Fatalf("unhide did not supersede cached hidden state: %+v", got.Books[0])
