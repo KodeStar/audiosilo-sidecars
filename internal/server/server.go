@@ -190,7 +190,9 @@ func Run(ctx context.Context, opts Options) error {
 		}
 		out := make(map[string]metaops.Override, len(rows))
 		for _, o := range rows {
-			out[o.SourcePath] = metaops.Override{Hidden: o.Hidden, WorkID: o.WorkID, WorkTitle: o.WorkTitle}
+			out[o.SourcePath] = metaops.Override{
+				Hidden: o.Hidden, WorkID: o.WorkID, WorkTitle: o.WorkTitle, ForceAudio: o.ForceAudio,
+			}
 		}
 		return out, nil
 	}

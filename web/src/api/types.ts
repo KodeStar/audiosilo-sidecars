@@ -234,6 +234,16 @@ export interface ScannedBook {
   runtime_min?: number;
   chapters?: number;
   audio_files: number;
+  // Which pipeline this candidate would run: "audio", or "ebook" when an epub
+  // supplies the text.
+  kind?: string;
+  // The .epub that would drive the pipeline. Equal to source_path for an
+  // ebook-only candidate; DIFFERENT when the epub sits beside an audiobook, where
+  // source_path stays the folder (the durable identity, carrying the ASIN).
+  ebook_path?: string;
+  // Explains a discovery decision the user would otherwise find puzzling: an
+  // unreadable epub, or several in one folder where we refuse to guess.
+  ebook_note?: string;
   // Where each field came from ("tag" | "path" | "filename" | "metadata").
   sources?: Record<string, string>;
   coverage: Coverage;
@@ -290,6 +300,7 @@ export interface CreateScanResponse {
 export interface Override {
   source_path: string;
   hidden: boolean;
+  force_audio?: boolean;
   work_id?: string;
   work_title?: string;
   updated_at?: string;
@@ -301,6 +312,9 @@ export interface SetOverrideBody {
   source_path: string;
   hidden: boolean;
   work_id: string;
+  // Run the audio pipeline even though an epub is present (a wrong edition, an
+  // abridgement, a bad conversion).
+  force_audio?: boolean;
 }
 
 // SetOverrideResponse echoes the stored override plus the recomputed coverage when

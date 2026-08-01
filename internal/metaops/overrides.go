@@ -27,6 +27,7 @@ type StoredOverride struct {
 	Hidden     bool
 	WorkID     string
 	WorkTitle  string
+	ForceAudio bool
 	UpdatedAt  string
 }
 
@@ -112,6 +113,7 @@ func (s *OverrideService) Upsert(ctx context.Context, req OverrideRequest, roots
 
 	stored, err := s.persist(ctx, StoredOverride{
 		SourcePath: sp, Hidden: req.Hidden, WorkID: workID, WorkTitle: workTitle,
+		ForceAudio: req.ForceAudio,
 	})
 	if err != nil {
 		return OverrideResult{}, err

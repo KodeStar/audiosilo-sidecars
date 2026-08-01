@@ -190,14 +190,15 @@ func New(d Deps) *API {
 			func(ctx context.Context, ov metaops.StoredOverride) (metaops.StoredOverride, error) {
 				saved, err := d.Store.UpsertOverride(ctx, store.Override{
 					SourcePath: ov.SourcePath, Hidden: ov.Hidden,
-					WorkID: ov.WorkID, WorkTitle: ov.WorkTitle,
+					WorkID: ov.WorkID, WorkTitle: ov.WorkTitle, ForceAudio: ov.ForceAudio,
 				})
 				if err != nil {
 					return metaops.StoredOverride{}, err
 				}
 				return metaops.StoredOverride{
 					SourcePath: saved.SourcePath, Hidden: saved.Hidden,
-					WorkID: saved.WorkID, WorkTitle: saved.WorkTitle, UpdatedAt: saved.UpdatedAt,
+					WorkID: saved.WorkID, WorkTitle: saved.WorkTitle,
+					ForceAudio: saved.ForceAudio, UpdatedAt: saved.UpdatedAt,
 				}, nil
 			})
 	}

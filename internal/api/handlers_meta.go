@@ -31,20 +31,21 @@ type overrideDTO struct {
 	Hidden     bool   `json:"hidden"`
 	WorkID     string `json:"work_id,omitempty"`
 	WorkTitle  string `json:"work_title,omitempty"`
+	ForceAudio bool   `json:"force_audio,omitempty"`
 	UpdatedAt  string `json:"updated_at,omitempty"`
 }
 
 func overrideToDTO(o store.Override) overrideDTO {
 	return overrideDTO{
 		SourcePath: o.SourcePath, Hidden: o.Hidden,
-		WorkID: o.WorkID, WorkTitle: o.WorkTitle, UpdatedAt: o.UpdatedAt,
+		WorkID: o.WorkID, WorkTitle: o.WorkTitle, ForceAudio: o.ForceAudio, UpdatedAt: o.UpdatedAt,
 	}
 }
 
 func storedOverrideToDTO(o metaops.StoredOverride) overrideDTO {
 	return overrideDTO{
 		SourcePath: o.SourcePath, Hidden: o.Hidden,
-		WorkID: o.WorkID, WorkTitle: o.WorkTitle, UpdatedAt: o.UpdatedAt,
+		WorkID: o.WorkID, WorkTitle: o.WorkTitle, ForceAudio: o.ForceAudio, UpdatedAt: o.UpdatedAt,
 	}
 }
 
@@ -71,6 +72,9 @@ type upsertOverrideRequest struct {
 	SourcePath string `json:"source_path"`
 	Hidden     bool   `json:"hidden"`
 	WorkID     string `json:"work_id"`
+	// ForceAudio runs the audio pipeline for a candidate whose folder also holds an
+	// epub (a wrong edition, an abridgement, a bad conversion).
+	ForceAudio bool `json:"force_audio,omitempty"`
 }
 
 type upsertOverrideResponse struct {
@@ -90,6 +94,7 @@ func (a *API) handleUpsertOverride(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := a.overrides.Upsert(r.Context(), metaops.OverrideRequest{
 		SourcePath: req.SourcePath, Hidden: req.Hidden, WorkID: req.WorkID,
+		ForceAudio: req.ForceAudio,
 	}, a.snapshot().LibraryRoots)
 	switch {
 	case errors.Is(err, metaops.ErrNoSourcePath):

@@ -15,6 +15,10 @@ interface CandidateRowProps {
   onClearMatch?: (book: ScannedBook) => void;
   onHide?: (book: ScannedBook) => void;
   onUnhide?: (book: ScannedBook) => void;
+  // Toggles force_audio for a HYBRID candidate (an epub beside an audiobook), so
+  // the audio runs when the epub is the wrong edition or an abridgement. Never
+  // offered for an ebook-only row: there is no audio to fall back to.
+  onToggleSource?: (book: ScannedBook, forceAudio: boolean) => void;
   // Disables this row's actions while one of its overrides is in flight.
   busy?: boolean;
 }
@@ -81,6 +85,7 @@ export const CandidateRow = memo(function CandidateRow({
   onMatch,
   onClearMatch,
   onHide,
+  onToggleSource,
   onUnhide,
   busy = false,
 }: CandidateRowProps) {
@@ -95,6 +100,11 @@ export const CandidateRow = memo(function CandidateRow({
   const chapterText = book.chapters && book.chapters > 0 ? `${book.chapters} ch` : '';
 
   const hidden = !!book.hidden;
+  const isEbook = book.kind === 'ebook';
+  // A HYBRID row has an epub AND an audiobook: source_path is the folder while
+  // ebook_path names the file inside it. Only such a row can fall back to audio.
+  const hybrid = !!book.ebook_path && book.ebook_path !== book.source_path;
+  const forcedAudio = !isEbook && hybrid;
   const pipelineBook = book.pipeline_book;
   const provenance = matchProvenanceLabel(book.coverage);
   const manual = isManualMatch(book.coverage);
@@ -133,7 +143,20 @@ export const CandidateRow = memo(function CandidateRow({
               {pipeline.label}
             </span>
           )}
+          {isEbook && (
+            <span
+              className="inline-flex rounded border border-pink-600/40 bg-pink-600/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-pink-400"
+              title={
+                hybrid
+                  ? 'An epub sits beside this audiobook, so its exact text is used - no transcription needed'
+                  : 'This book is an epub; its text is used directly'
+              }
+            >
+              {hybrid ? 'EPUB + audio' : 'EPUB'}
+            </span>
+          )}
         </div>
+        {book.ebook_note && <div className="mt-0.5 text-xs italic text-dim">{book.ebook_note}</div>}
         {book.subtitle && <div className="text-xs text-dim">{book.subtitle}</div>}
         {authors && <div className="text-xs text-body">{authors}</div>}
         <div className="mt-1 flex flex-wrap items-center gap-1.5">
@@ -164,6 +187,19 @@ export const CandidateRow = memo(function CandidateRow({
       </td>
       <td className="px-3 py-3">
         <div className="flex flex-wrap justify-end gap-1.5">
+          {!hidden && hybrid && onToggleSource && (
+            <RowButton
+              onClick={() => onToggleSource(book, !forcedAudio)}
+              disabled={busy}
+              title={
+                forcedAudio
+                  ? 'Use the epub text instead of transcribing the audio'
+                  : 'Transcribe the audio instead of using the epub (for a wrong edition or an abridgement)'
+              }
+            >
+              {forcedAudio ? 'Use epub' : 'Use audio'}
+            </RowButton>
+          )}
           {hidden ? (
             onUnhide && (
               <RowButton

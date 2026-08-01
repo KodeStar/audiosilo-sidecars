@@ -64,3 +64,57 @@ describe('CandidateRow pipeline presence', () => {
     ).toBeInTheDocument();
   });
 });
+
+describe('epub candidates', () => {
+  const base = {
+    path: 'a',
+    source_path: '/lib/a',
+    title: 'A Book',
+    audio_files: 1,
+    coverage: { available: false } as ScannedBook['coverage'],
+  } as ScannedBook;
+
+  function renderRow(book: ScannedBook, onToggleSource?: (b: ScannedBook, f: boolean) => void) {
+    return render(
+      <table>
+        <tbody>
+          <CandidateRow
+            book={book}
+            checked={false}
+            onToggle={() => {}}
+            onToggleSource={onToggleSource}
+          />
+        </tbody>
+      </table>,
+    );
+  }
+
+  it('badges an ebook-only candidate and offers no audio fallback', () => {
+    renderRow({ ...base, kind: 'ebook', ebook_path: '/lib/a', source_path: '/lib/a' }, () => {});
+    expect(screen.getByText('EPUB')).toBeTruthy();
+    // There is no audio for an ebook-only book, so the toggle must not appear -
+    // using it would enqueue an .epub into ffprobe.
+    expect(screen.queryByText('Use audio')).toBeNull();
+  });
+
+  it('badges a hybrid candidate and offers the audio fallback', () => {
+    const onToggle = vi.fn();
+    renderRow({ ...base, kind: 'ebook', ebook_path: '/lib/a/book.epub' }, onToggle);
+    expect(screen.getByText('EPUB + audio')).toBeTruthy();
+    screen.getByText('Use audio').click();
+    expect(onToggle).toHaveBeenCalledWith(expect.objectContaining({ source_path: '/lib/a' }), true);
+  });
+
+  it('offers the epub back once audio is forced', () => {
+    const onToggle = vi.fn();
+    // force_audio applied: kind cleared, ebook_path still reported.
+    renderRow({ ...base, ebook_path: '/lib/a/book.epub' }, onToggle);
+    screen.getByText('Use epub').click();
+    expect(onToggle).toHaveBeenCalledWith(expect.anything(), false);
+  });
+
+  it('shows the note explaining a skipped epub', () => {
+    renderRow({ ...base, ebook_note: '3 epubs in this folder - none selected' });
+    expect(screen.getByText(/3 epubs in this folder/)).toBeTruthy();
+  });
+});
