@@ -47,12 +47,21 @@ func factsChunkName(from, to int) string { return fmt.Sprintf("facts-ch%d-%d.md"
 // spoken numbers only in fact text), NOT the generic EdgeNote - a chunk keys its headings to
 // audio-file numbers, so it must never be told to renumber to spoken chapters.
 type factPassPromptData struct {
-	Title         string
-	From          int
-	To            int
-	HasInherited  bool
-	ChunkNote     string
+	Title        string
+	From         int
+	To           int
+	HasInherited bool
+	ChunkNote    string
+	// SpellingSheet is empty for an ebook, whose spellings are exact by
+	// construction, which drops the sheet's bullet and its ASR-trust rules.
 	SpellingSheet string
+	// IsEbook swaps the source-specific guidance ONLY. Everything that carries the
+	// spoiler boundary - the chapter range, the heading contract, chapter
+	// attribution, own-words - is outside the conditional and identical for both
+	// kinds, which prompts_test.go asserts so the branches cannot drift.
+	IsEbook bool
+	// TextDir is the staged directory holding this chunk's chapters.
+	TextDir string
 }
 
 // factAssemblePromptData feeds factpass_assemble.md after every independent chunk
@@ -64,6 +73,7 @@ type factAssemblePromptData struct {
 	ChapterCount  int
 	AssembleNote  string
 	SpellingSheet string
+	IsEbook       bool
 }
 
 // factPass is the chunked, resumable fact-extraction pass. Chunks are independent:
@@ -221,12 +231,14 @@ func (e *Executor) factPassChunk(ctx context.Context, book store.Book, r schedul
 		return agentUsage{}, 0, err
 	}
 
+	isEbook := state.ParseKind(book.Kind) == state.KindEbook
+
 	// The spoiler-bounded spelling sheet is what lets the agent trust a proper noun
 	// the ASR may have mangled, so on the audio path it is a hard requirement that
 	// correcting produced. An ebook has exact spellings by construction and never
 	// runs the spelling stages, so there is no sheet and none is wanted.
 	sheet := ""
-	if state.ParseKind(book.Kind) != state.KindEbook {
+	if !isEbook {
 		sheet = spelling.SheetName(chunk.To)
 		sheetSrc := filepath.Join(book.WorkDir, factsDir, sheet)
 		if !fsutil.IsFile(sheetSrc) {
@@ -271,6 +283,8 @@ func (e *Executor) factPassChunk(ctx context.Context, book store.Book, r schedul
 		To:            chunk.To,
 		HasInherited:  hasInherited,
 		ChunkNote:     class.ChunkNote,
+		IsEbook:       isEbook,
+		TextDir:       textDir,
 		SpellingSheet: sheet,
 	}
 	// Capture the NEEDS AUDIO REVIEW count from the successful attempt's facts file so
@@ -359,6 +373,7 @@ func (e *Executor) assembleFacts(ctx context.Context, book store.Book, r schedul
 	}
 	usage, err := e.runAgent(ctx, book, state.FactPass, r, st, "factpass_assemble.md", factAssemblePromptData{
 		Title: book.Title, HasInherited: hasInherited, ChapterCount: class.LogicalCount, AssembleNote: class.AssembleNote, SpellingSheet: finalSpellingSheet,
+		IsEbook: state.ParseKind(book.Kind) == state.KindEbook,
 	}, false, validate)
 	if err != nil {
 		return usage, err

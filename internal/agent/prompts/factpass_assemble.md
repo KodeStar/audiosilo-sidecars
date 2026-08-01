@@ -11,11 +11,11 @@ file as a chapter.
 
 - `facts/facts-ch*.md` - all current-book facts, ordered by chapter in their
   headings. These are the only source for current-book plot claims.
-- `{{.SpellingSheet}}` - the final spoiler-safe spelling sheet. Use verified names
+{{if .SpellingSheet}}- `{{.SpellingSheet}}` - the final spoiler-safe spelling sheet. Use verified names
   exactly. Preserve sanctioned probable names whose notes cite an official source,
   wiki page title, multiple agreeing references, or whose spelling is an ordinary
   English name. Use role labels only for entries explicitly marked unresolved.
-{{if .HasInherited}}- `knowledge-inherited.md` - the previous book's final state.
+{{end}}{{if .HasInherited}}- `knowledge-inherited.md` - the previous book's final state.
   Carry forward only returning cast and still-relevant series threads. Do not
   attribute inherited facts to a current-book chapter.{{end}}
 - `out/` - the only place you may write.
@@ -48,5 +48,5 @@ citations, dialogue, or prose scenes. Target under 2,500 words even for a long b
 omission of trivia is preferable to another cumulative transcript surrogate.
 
 Use fresh words, a neutral reference-guide voice, and hyphens only. If the notes
-conflict or leave a material uncertainty, retain `NEEDS AUDIO REVIEW` rather than
+conflict or leave a material uncertainty, retain `{{if .IsEbook}}an unresolved uncertainty{{else}}NEEDS AUDIO REVIEW{{end}}` rather than
 inventing a resolution.

@@ -90,3 +90,89 @@ func TestAuditPromptsStateTheExactOutputShape(t *testing.T) {
 		}
 	}
 }
+
+// TestFactPassBranchesShareTheSpoilerContract is the guard on a forked prompt.
+//
+// factpass.md carries two source-specific branches, and the temptation is to split
+// it into two templates. That would be the hand-mirrored-contract failure mode: the
+// rules that actually bound spoilers - the chapter range, the one-heading-per-chapter
+// output contract, exact chapter attribution, own-words - would then live in two
+// places and drift silently, and nothing downstream re-derives them.
+//
+// So the branches are conditionals inside ONE file, and this test renders both and
+// asserts every load-bearing sentence appears in each.
+func TestFactPassBranchesShareTheSpoilerContract(t *testing.T) {
+	type data struct {
+		Title         string
+		From          int
+		To            int
+		HasInherited  bool
+		ChunkNote     string
+		SpellingSheet string
+		IsEbook       bool
+		TextDir       string
+	}
+	audio, err := Render("factpass.md", data{
+		Title: "A Book", From: 5, To: 9,
+		SpellingSheet: "facts/spellings-through-ch9.md", TextDir: "transcripts-corrected",
+	})
+	if err != nil {
+		t.Fatalf("render audio: %v", err)
+	}
+	book, err := Render("factpass.md", data{
+		Title: "A Book", From: 5, To: 9, IsEbook: true, TextDir: "ebook-text",
+	})
+	if err != nil {
+		t.Fatalf("render ebook: %v", err)
+	}
+
+	shared := []string{
+		"out/facts-ch5-9.md",                       // the output contract
+		"## Chapter N",                             // the heading contract fact_pass validates
+		"and none outside that range",              // the spoiler scope
+		"Read no chapter beyond 9",                 // the spoiler scope again
+		"Exact chapter attribution",                // what makes a reveal position honest
+		"Write every fact in fresh, concise words", // the own-words rule
+		"Facts only, in neutral reference-guide language",
+		"Hyphens only, never em dashes",
+		"chapters 5 through 9 only",
+		"Do not use the web or your own knowledge of the book",
+	}
+	for _, want := range shared {
+		if !strings.Contains(audio, want) {
+			t.Errorf("audio branch is missing the shared rule %q", want)
+		}
+		if !strings.Contains(book, want) {
+			t.Errorf("ebook branch is missing the shared rule %q", want)
+		}
+	}
+
+	// The source-specific halves must NOT cross over. ASR defensiveness in an ebook
+	// prompt would have the agent replace readable names with role labels.
+	audioOnly := []string{"NEEDS AUDIO REVIEW", "homophones", "ASR transcripts", "spellings-through-ch9.md"}
+	for _, s := range audioOnly {
+		if !strings.Contains(audio, s) {
+			t.Errorf("audio branch lost %q", s)
+		}
+		if strings.Contains(book, s) {
+			t.Errorf("ebook branch wrongly carries the audio rule %q", s)
+		}
+	}
+	ebookOnly := []string{"the book's own text, exactly as published", "never substitute a\nrole label"}
+	for _, s := range ebookOnly {
+		if !strings.Contains(book, s) {
+			t.Errorf("ebook branch is missing %q", s)
+		}
+		if strings.Contains(audio, s) {
+			t.Errorf("audio branch wrongly carries the ebook rule %q", s)
+		}
+	}
+
+	// Each branch names only its own staged directory.
+	if !strings.Contains(audio, "transcripts-corrected/") || strings.Contains(audio, "ebook-text/") {
+		t.Error("audio branch names the wrong text directory")
+	}
+	if !strings.Contains(book, "ebook-text/") || strings.Contains(book, "transcripts-corrected/") {
+		t.Error("ebook branch names the wrong text directory")
+	}
+}
