@@ -57,7 +57,11 @@ Sessions in this repo run a fixed division of labour between models:
 go build ./... && go vet ./... && go test -race ./... && golangci-lint run
 
 # Frontend side (from web/) - Node 24 (export PATH="$HOME/.nvm/versions/node/v24.16.0/bin:$PATH")
-cd web && npx tsc --noEmit && npm run lint && npm run format && npm test
+cd web && npm run typecheck && npm run lint && npm run format && npm test
+# NOT `npx tsc --noEmit`: the root tsconfig is `"files": []` plus project
+# references, and non-build-mode tsc ignores references - so that command checks
+# ZERO files and exits 0 on any error. It let a broken type reach CI, where
+# `npm run build` (tsc -b) caught it.
 
 # Real-UI binary (embeds the built SPA via -tags embedui):
 scripts/build-web.sh          # builds web/, syncs into internal/web/dist, builds bin/

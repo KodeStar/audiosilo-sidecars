@@ -891,9 +891,19 @@ func (s *Scheduler) advance(ctx context.Context, b store.Book, stage state.State
 // autoPurgeDone reclaims a just-completed book's scratch. It re-reads the book (its
 // state is now done, so the shared purge helper skips the reconcile) and calls the
 // no-reserve purge body. A failure is logged, never propagated.
+//
+// It runs UNCANCELLABLE. The book is already recorded as done, so the decision to
+// reclaim has been made and there is nothing left to abandon - while a shutdown
+// landing in the window between that write and this call would otherwise skip the
+// reclaim entirely, because the very first step re-reads the book through ctx. For an
+// ebook that is not a deferred tidy-up: its reclaimed layers are the copyrighted
+// source prose, and leaving them on disk is the outcome the licensing rule forbids.
+// purgeScratchInner already takes the same precaution for its accounting write.
 func (s *Scheduler) autoPurgeDone(ctx context.Context, id int64) {
+	ctx = context.WithoutCancel(ctx)
 	b, err := s.db.GetBook(ctx, id)
 	if err != nil {
+		slog.Warn("auto-purge after done: re-read book failed", "book_id", id, "err", err)
 		return
 	}
 	if !purgeAllowed(b) {

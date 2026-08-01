@@ -265,3 +265,46 @@ func TestAutoPurgeOffStillReclaimsEbookSourceText(t *testing.T) {
 		t.Error("the ebook's source text survived with autoPurge off; that is a licensing obligation, not a preference")
 	}
 }
+
+// TestAutoPurgeDoneSurvivesShutdown: the reclaim must not be skipped because the
+// daemon is stopping. advance records `done` and only then calls autoPurgeDone, so a
+// cancel landing in that window used to abort at the very first step - GetBook
+// through the cancelled context - leaving an ebook's copyrighted source prose on
+// disk. It surfaced as a CI-only failure of the full-machine test, whose scheduler
+// cancel raced the purge on a slower runner.
+func TestAutoPurgeDoneSurvivesShutdown(t *testing.T) {
+	h := newHarness(t)
+	db := h.openDB(t)
+	s := New(db, events.NewHub(64), NewStubExecutor(0, 0), 2, h.workRoot, true)
+	s.ctx = context.Background()
+
+	b, err := db.CreateBook(context.Background(), store.NewBook{
+		SourcePath: "/src/shutdown.epub",
+		WorkDir:    filepath.Join(h.workRoot, "shutdown-book"),
+		Title:      "shutdown-book",
+		Kind:       string(state.KindEbook),
+		EbookPath:  "/src/shutdown.epub",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	textDir := filepath.Join(b.WorkDir, ebook.TextDir)
+	if err := os.MkdirAll(textDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(textDir, "ch001.txt"), []byte("the book's own prose"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetBookState(context.Background(), b.ID, string(state.Done), "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Already cancelled, standing in for a shutdown that beat the reclaim.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s.autoPurgeDone(ctx, b.ID)
+
+	if _, err := os.Stat(textDir); !os.IsNotExist(err) {
+		t.Error("source text survived an auto-purge racing shutdown; the reclaim must not be cancellable")
+	}
+}

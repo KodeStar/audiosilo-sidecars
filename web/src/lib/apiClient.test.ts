@@ -185,7 +185,7 @@ describe('ApiClient', () => {
   it('POSTs an override upsert', async () => {
     const client = pipelineClient();
     fetchMock.mockResolvedValue(jsonResponse(200, { override: {}, coverage: null }));
-    await client.setOverride({ source_path: '/b', hidden: true, work_id: '' });
+    await client.setOverride({ source_path: '/b', hidden: true, work_id: '', force_audio: false });
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe('/api/v1/overrides');
     expect(init.method).toBe('POST');
@@ -193,6 +193,7 @@ describe('ApiClient', () => {
       source_path: '/b',
       hidden: true,
       work_id: '',
+      force_audio: false,
     });
   });
 

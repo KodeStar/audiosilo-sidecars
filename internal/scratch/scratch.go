@@ -198,19 +198,20 @@ func Purge(workRoot, workDir string, kind state.Kind) error {
 	if !ok {
 		return nil // nothing safe to remove
 	}
-	// Before the directories, because a failure here must leave the work dir intact
-	// and retryable rather than half-reclaimed. The extract manifest is a DURABLE the
-	// purge deliberately keeps, but it carries each section's opening words - the only
-	// prose that would otherwise survive the sweep the licensing rule exists for.
-	if kind == state.KindEbook {
-		if err := ebook.StripHeads(wd); err != nil {
-			return err
-		}
-	}
 	for _, a := range artifactsFor(kind) {
 		if err := os.RemoveAll(filepath.Join(wd, a.Dir)); err != nil {
 			return err
 		}
+	}
+	// AFTER the directories, and never in front of them. The extract manifest is a
+	// DURABLE the purge deliberately keeps, but it carries each section's opening
+	// words - the only prose that would otherwise survive the sweep. Stripping it
+	// first would mean a failure here (an unreadable or half-written manifest) aborts
+	// the sweep and leaves the whole book's text on disk, sacrificing megabytes of
+	// prose to protect kilobytes of it. The manifest lives at the work-dir root, so
+	// the sweep cannot affect whether this can run.
+	if kind == state.KindEbook {
+		return ebook.StripHeads(wd)
 	}
 	return nil
 }
