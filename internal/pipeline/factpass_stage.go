@@ -2,6 +2,8 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
+	"github.com/kodestar/audiosilo-sidecars/internal/audio"
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/spelling"
@@ -98,6 +101,22 @@ func (e *Executor) factPass(ctx context.Context, book store.Book, r scheduler.St
 		return scheduler.StageResult{}, fmt.Errorf("fact_pass: %w", err)
 	}
 	noteEdgeExclusions(r, class)
+	// Drop facts derived from a DIFFERENT chapter universe before any of them is
+	// reused. A harvested chunk is named only for its chapter range, and facts/ is
+	// durable - so when a book is re-extracted (a purge rewinds to extracting, and the
+	// mapping agent is not deterministic) a new numbering whose chunk boundaries
+	// happen to land the same way would resume straight onto the old chunk's file.
+	// Every fact in it is then attributed to the wrong chapter, which is the published
+	// spoiler position, and nothing downstream re-derives it: validateSidecars checks
+	// the chapter COUNT, the n-gram check looks for verbatim overlap, and the auditor
+	// sees a set that is internally consistent.
+	dropped, err := discardStaleFacts(book.WorkDir)
+	if err != nil {
+		return scheduler.StageResult{}, fmt.Errorf("fact_pass: %w", err)
+	}
+	if dropped && r.Note != nil {
+		r.Note("the chapter universe changed since the last fact pass, so previously extracted facts were discarded rather than re-attributed to different chapters")
+	}
 	if r.Note != nil {
 		r.Note(fmt.Sprintf("fact pass over %s", countNoun(len(plan.Chunks), "chunk")))
 	}
@@ -270,6 +289,19 @@ func (e *Executor) factPassChunk(ctx context.Context, book store.Book, r schedul
 		rel := filepath.Join(textDir, transcript.TextName(k))
 		src := filepath.Join(book.WorkDir, rel)
 		if !fsutil.IsFile(src) {
+			// On the ebook path this layer is exactly what a scratch purge reclaims, so
+			// a missing chapter is never benign: it means the prose was deleted and the
+			// stage was re-entered without re-extracting. Skipping would hand the agent
+			// a chunk holding a prompt and nothing to read, and validateFactPassChunk
+			// only requires one "## Chapter k" heading per chapter in range - which a
+			// compliant agent emits with nothing in front of it. The fabricated facts
+			// would then be harvested, and the failure would surface two stages later
+			// as an empty n-gram check, after a full fact-pass and synthesis spend.
+			if isEbook {
+				return agentUsage{}, 0, fmt.Errorf(
+					"fact_pass: chapter %d text is missing from %s; the book text was reclaimed, so re-run extracting (Retry after a purge) rather than authoring facts from nothing",
+					k, textDir)
+			}
 			continue // a genuinely absent chapter file is skipped; never reach outside [from,to]
 		}
 		if err := st.CopyFile(src, rel); err != nil {
@@ -422,4 +454,97 @@ func countCompleteChunks(workDir string, plan chunkPlan) int {
 		}
 	}
 	return n
+}
+
+// universeStampName records which chapter universe the facts beside it were
+// extracted from.
+const universeStampName = ".universe"
+
+// discardStaleFacts removes harvested facts that belong to a superseded chapter
+// numbering, reporting whether it removed any.
+//
+// A fact file is named for its chapter RANGE alone (facts-ch1-9.md), and facts/ is
+// durable - it survives a scratch purge and is never reclaimed. So a re-derived
+// universe whose chunk boundaries coincide with the old one resumes onto the previous
+// numbering's files, and every fact in them is silently re-attributed to a chapter it
+// did not come from. The stamp is what makes "same range" mean "same chapters".
+//
+// It fingerprints the manifest's chapter list rather than the chunk plan, because the
+// plan is derived from word budgets and can be identical across two different
+// numberings - which is exactly the case that would otherwise slip through.
+func discardStaleFacts(workDir string) (bool, error) {
+	m, err := audio.ReadManifest(workDir)
+	if err != nil {
+		return false, fmt.Errorf("read manifest for the facts universe stamp: %w", err)
+	}
+	stamp := universeStamp(m)
+	dir := filepath.Join(workDir, factsDir)
+	path := filepath.Join(dir, universeStampName)
+
+	prev, rerr := os.ReadFile(path) //nolint:gosec // path derives from the book's work dir
+	switch {
+	case rerr == nil && string(prev) == stamp:
+		return false, nil
+	case rerr != nil && !os.IsNotExist(rerr):
+		return false, rerr
+	}
+
+	// Only a MISMATCH discards. An unstamped directory is adopted: it belongs to a
+	// book already in flight when this guard shipped, discarding would re-charge it
+	// for the most expensive stage in the pipeline, and the path where a re-derived
+	// numbering is routine - ebook, where a purge forces a re-extract and the mapping
+	// agent is not deterministic - carries the stamp from its first run, so no ebook
+	// facts can be unstamped in the first place.
+	removed := false
+	if rerr == nil {
+		var err error
+		if removed, err = removeFactArtifacts(dir); err != nil {
+			return false, err
+		}
+	}
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return false, err
+	}
+	return removed, fsutil.WriteFileAtomic(path, []byte(stamp), 0o644)
+}
+
+// removeFactArtifacts deletes the fact pass's own output, reporting whether any was
+// there.
+//
+// It removes ONLY what the fact pass wrote. facts/ is shared with the spelling sheets
+// GenerateSheets produced in an earlier stage, and factPassChunk hard-requires them -
+// so clearing the directory wholesale would strip an input the stage cannot run
+// without, on every audio book.
+func removeFactArtifacts(dir string) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	removed := false
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "facts-ch") && name != knowledgeFinalName {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+			return removed, err
+		}
+		removed = true
+	}
+	return removed, nil
+}
+
+// universeStamp fingerprints the chapter universe: the numbers, the sections that
+// make each one up, and their sizes. Any of those moving changes which prose sits
+// under which chapter number.
+func universeStamp(m audio.Manifest) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "v1\n%s\n%d\n", m.Style, len(m.Chapters))
+	for _, c := range m.Chapters {
+		fmt.Fprintf(h, "%d\t%d\t%d\t%d\t%s\n", c.Chapter, c.Words, int(c.Start), int(c.End), c.FilePath)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }

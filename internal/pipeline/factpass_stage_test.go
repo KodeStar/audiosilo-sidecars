@@ -492,3 +492,76 @@ func (r *blockingAgentRunner) Run(ctx context.Context, _ agent.Request) (agent.R
 	<-ctx.Done()
 	return agent.Result{}, ctx.Err()
 }
+
+// TestDiscardStaleFactsKeepsSpellingSheets is the guard on the fix's own blast
+// radius: facts/ is SHARED with the spelling sheets an earlier stage wrote, and
+// factPassChunk hard-requires them. Clearing the directory wholesale would strip
+// every audio book of an input it cannot run without.
+func TestDiscardStaleFactsKeepsSpellingSheets(t *testing.T) {
+	work := t.TempDir()
+	writeManifestFor := func(chapters int) {
+		m := audio.Manifest{Style: audio.StyleEbook, ChapterCount: chapters}
+		for i := 1; i <= chapters; i++ {
+			m.Chapters = append(m.Chapters, audio.Chapter{Chapter: i, Words: 1000 + i})
+		}
+		if err := audio.WriteManifest(work, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dir := filepath.Join(work, factsDir)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	sheet := filepath.Join(dir, "spellings-through-ch9.md")
+	seed := func() {
+		for _, f := range []string{factsChunkName(1, 9), knowledgeFinalName} {
+			if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(sheet, []byte("sheet"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeManifestFor(50)
+	seed()
+	// An unstamped directory is ADOPTED, not discarded: it belongs to a book already
+	// in flight when the guard shipped, and re-running its chunks would re-charge the
+	// most expensive stage in the pipeline for a numbering that has not moved.
+	dropped, err := discardStaleFacts(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped {
+		t.Error("unstamped facts were discarded; an in-flight book must keep its paid work")
+	}
+	if !fsutil.IsFile(filepath.Join(dir, factsChunkName(1, 9))) {
+		t.Error("an in-flight book's completed chunk was discarded on the upgrade")
+	}
+	if !fsutil.IsFile(sheet) {
+		t.Fatal("the spelling sheet was deleted; fact_pass requires it and cannot regenerate it")
+	}
+
+	// Same universe: a resume must keep its paid work.
+	seed()
+	if dropped, err = discardStaleFacts(work); err != nil || dropped {
+		t.Errorf("dropped = %v (err %v) for an unchanged universe; a resume must not re-run paid chunks", dropped, err)
+	}
+	if !fsutil.IsFile(filepath.Join(dir, factsChunkName(1, 9))) {
+		t.Error("a completed chunk was discarded even though the chapters did not move")
+	}
+
+	// A re-derived universe whose chunk ranges coincide: the facts are named the same
+	// but describe different chapters, so they must not be reused.
+	writeManifestFor(49)
+	if dropped, err = discardStaleFacts(work); err != nil || !dropped {
+		t.Errorf("dropped = %v (err %v); facts from a superseded numbering must not be resumed onto", dropped, err)
+	}
+	if fsutil.IsFile(filepath.Join(dir, factsChunkName(1, 9))) {
+		t.Error("facts-ch1-9.md survived a chapter-universe change")
+	}
+	if !fsutil.IsFile(sheet) {
+		t.Error("the spelling sheet was deleted on the stale path")
+	}
+}

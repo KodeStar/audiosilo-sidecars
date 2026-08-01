@@ -599,7 +599,7 @@ func classifyBookEdges(workDir string) (edgeClassification, error) {
 		return edgeClassification{}, fmt.Errorf("edge classify: read manifest (inspect must run first): %w", err)
 	}
 	if m.Style == audio.StyleEbook {
-		return classifyEbookEdges(m), nil
+		return classifyEbookEdges(m)
 	}
 	n := len(m.Chapters)
 	chs := make([]edgeChapter, 0, n)
@@ -703,6 +703,17 @@ func noteEdgeExclusions(r scheduler.StageReport, class edgeClassification) {
 // front matter, the back matter and any suspected cross-book excerpt from the
 // table of contents, then numbered the survivors 1..N - so nothing INSIDE the
 // manifest is non-story, and there is no file-to-chapter offset to explain.
-func classifyEbookEdges(m audio.Manifest) edgeClassification {
-	return edgeClassification{LogicalCount: len(m.Chapters)}
+//
+// The one thing it does check is that there is a universe at all. Every caller
+// treats LogicalCount as authoritative - it caps the positions validateSidecars
+// accepts and it is the chapter count the assemble prompt states - so a manifest
+// with no chapters would quietly publish sidecars bounded at chapter 0. Upstream
+// invariants make that unreachable today (BuildUniverse refuses a run below
+// minChapters, extracting materializes only a contiguous one, validateChapterMap
+// rejects fewer than two chapters), but none of them are enforced at this read.
+func classifyEbookEdges(m audio.Manifest) (edgeClassification, error) {
+	if len(m.Chapters) == 0 {
+		return edgeClassification{}, fmt.Errorf("manifest %s lists no chapters; extracting must record the chapter universe before the authoring stages read it", audio.ManifestName)
+	}
+	return edgeClassification{LogicalCount: len(m.Chapters)}, nil
 }

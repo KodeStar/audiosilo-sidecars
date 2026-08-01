@@ -73,6 +73,13 @@ func (e *Executor) chapterMapping(ctx context.Context, book store.Book, r schedu
 			if err := e.materializeEbookChapters(ctx, book, rebuilt, splitDir, ""); err != nil {
 				return scheduler.StageResult{}, err
 			}
+			// Record the recovered universe too, as the agent branch does. The extract
+			// manifest is what a human reads to see why a book parked and what the
+			// mapping agent is handed on a later round; leaving the superseded draft
+			// there would have it contradict the chapters actually published.
+			if err := ebook.WriteManifest(book.WorkDir, rebuilt); err != nil {
+				return scheduler.StageResult{}, err
+			}
 			if r.Note != nil {
 				r.Note(fmt.Sprintf("deterministic label reparse recovered %s - no agent round needed",
 					countNoun(len(rebuilt.Chapters), "chapter")))
