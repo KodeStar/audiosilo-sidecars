@@ -16,7 +16,10 @@ chapter ({{.ChapterCount}}) is correct; do not fault it.
 - `sidecars/characters.json` and `sidecars/recaps.json` - the post-fix files.
 - `facts/` - chapter-attributed evidence for checking the affected entries.
 - `validation_report.json` - the clean mechanical revalidation report.
-- `out/` - the only place you may write.
+{{if .HasSeriesPrior}}- `series-previously.md` - the published recap of an EARLIER volume in this series
+  (it names which one): the sanctioned source for the `chapter: 0` `scope: "series"`
+  recap, and the ground truth if a prior finding touched it.
+{{end}}- `out/` - the only place you may write.
 
 Do not use the web or model memory. Do not rewrite sidecars.
 

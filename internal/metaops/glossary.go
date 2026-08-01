@@ -179,31 +179,85 @@ func (c *Client) SeriesGlossary(ctx context.Context, workID string) (Glossary, e
 	return g, nil
 }
 
+// seriesEntry is one member of a series listing: the work id and its position in
+// the series ("1", "2.5"). Position is empty when upstream records none.
+type seriesEntry struct {
+	ID  string
+	Pos string
+}
+
+// seriesFeedVal is a cached series listing: the series' own name plus its members
+// in series order. The name is cached because the prior-material fallback resolves
+// a series by SLUGIFYING a local series name and must confirm the guess landed on
+// the right series before trusting its recaps.
+type seriesFeedVal struct {
+	name    string
+	entries []seriesEntry
+}
+
 // seriesWorks fetches a series' member work ids in series order. ok=false is a
 // transport failure or a clean 404.
 func (c *Client) seriesWorks(ctx context.Context, seriesID string) ([]string, bool) {
-	if cached, hit := c.seriesFeed.get(seriesID); hit {
-		return cached, true
+	feed, found, ok := c.seriesListing(ctx, seriesID)
+	if !ok || !found {
+		return nil, false
 	}
+	ids := make([]string, 0, len(feed.entries))
+	for _, e := range feed.entries {
+		ids = append(ids, e.ID)
+	}
+	return ids, true
+}
+
+// seriesListing fetches (and caches) a series' name and members in series order. It
+// mirrors workDetail's tri-state: found=false is a clean 404 (upstream has no such
+// series), ok=false a transport failure. The prior-material walk needs them apart -
+// one is a settled answer it may persist, the other is not.
+func (c *Client) seriesListing(ctx context.Context, seriesID string) (seriesFeedVal, bool, bool) {
+	if cached, hit := c.seriesFeed.get(seriesID); hit {
+		return cached, true, true
+	}
+	// NOTE the shape difference between the two endpoints, which is easy to get
+	// wrong and impossible to notice without a real payload: a member's nested work
+	// here carries `series` as an OBJECT (metaserve's workCard.Series *seriesRef),
+	// while GET /works/{id} carries it as an ARRAY (see workDetail). Decoding this
+	// one as an array fails json.Unmarshal for EVERY real series, which getJSON maps
+	// to a transport failure - so the whole listing, and with it SeriesGlossary,
+	// silently degrades to empty.
 	var res struct {
+		Name  string `json:"name"`
 		Works []struct {
-			Work *struct {
-				ID string `json:"id"`
+			Position string `json:"position"`
+			Work     *struct {
+				ID     string `json:"id"`
+				Series *struct {
+					Position string `json:"position"`
+				} `json:"series"`
 			} `json:"work"`
 		} `json:"works"`
 	}
 	found, ok := c.getJSON(ctx, "/api/v1/series/"+url.PathEscape(seriesID), &res)
-	if !ok || !found {
-		return nil, false
+	if !ok {
+		return seriesFeedVal{}, false, false
 	}
-	ids := make([]string, 0, len(res.Works))
+	if !found {
+		return seriesFeedVal{}, false, true
+	}
+	feed := seriesFeedVal{name: res.Name, entries: make([]seriesEntry, 0, len(res.Works))}
 	for _, e := range res.Works {
-		if e.Work != nil && e.Work.ID != "" {
-			ids = append(ids, e.Work.ID)
+		if e.Work == nil || e.Work.ID == "" {
+			continue
 		}
+		pos := e.Position
+		// The nested work echoes its own membership; it is the fallback when the
+		// listing entry itself records no position.
+		if pos == "" && e.Work.Series != nil {
+			pos = e.Work.Series.Position
+		}
+		feed.entries = append(feed.entries, seriesEntry{ID: e.Work.ID, Pos: pos})
 	}
-	c.seriesFeed.put(seriesID, ids)
-	return ids, true
+	c.seriesFeed.put(seriesID, feed)
+	return feed, true, true
 }
 
 // workCharacterNames returns one work's usable character names and aliases. It

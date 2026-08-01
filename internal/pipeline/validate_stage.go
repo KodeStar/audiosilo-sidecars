@@ -42,7 +42,7 @@ func (e *Executor) validateSidecarsStage(ctx context.Context, book store.Book, r
 		r.Progress(0, 1)
 	}
 	start := time.Now()
-	class, seriesOpener, _, err := e.sidecarStageInputs(ctx, book)
+	in, err := e.sidecarStageInputs(ctx, book)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("validating: %w", err)
 	}
@@ -71,7 +71,7 @@ func (e *Executor) validateSidecarsStage(ctx context.Context, book store.Book, r
 	chars, recs, decodeErrs := decodeForValidation(charsPath, recapsPath)
 	errs = append(errs, decodeErrs...)
 	if chars != nil && recs != nil {
-		structErrs, structWarns := validateSidecars(chars, recs, class.LogicalCount, seriesOpener)
+		structErrs, structWarns := validateSidecars(chars, recs, in.class.LogicalCount, in.seriesOpener)
 		errs = append(errs, structErrs...)
 		warns = append(warns, structWarns...)
 	}

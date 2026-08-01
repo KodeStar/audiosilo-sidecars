@@ -19,8 +19,12 @@ You work in the current directory. It contains ONLY:
 - `validation_report.json` - the mechanical check results (caps, canonical form,
   no-verbatim shingle scan).
 - `facts/` - the private per-chapter fact notes: the ONLY source you may draw new
-  wording from.
-- `out/` - the ONLY place you write output.
+  wording from{{if .HasSeriesPrior}}, except for the earlier book (below){{end}}.
+{{if .HasSeriesPrior}}- `series-previously.md` - the community metadata database's published recap of an
+  EARLIER volume in this series (it names which one; it is not necessarily the
+  volume directly before this book), for the `chapter: 0` `scope: "series"` recap
+  and nothing else. Never use it to add a card, a claim, or a detail about THIS book.
+{{end}}- `out/` - the ONLY place you write output.
 
 Do not use any tool other than reading and writing files in this directory. No
 web access.
@@ -35,6 +39,14 @@ web access.
 - Do NOT introduce new content beyond what the fact notes support. If a finding
   asks for a fact the notes do not contain, remove the affected claim rather than
   invent one.
+- {{if .IsSeriesOpener}}This is a series opener: it must carry NO `chapter: 0` `scope: "series"` recap. If
+  a finding asks for one, that finding is mistaken - leave it out.{{else}}This is book 2+: it carries a `chapter: 0` `scope: "series"` "previously" recap.
+  {{if .HasSeriesPrior}}Write or correct it from `series-previously.md` ALONE - rewrite that material in
+  your own words, never copying a sentence, and never supplement it from your own
+  knowledge of the earlier book. Anything that file does not state, you do not know,
+  so cover the volume it names rather than the whole series so far.{{else}}Write or correct it from the prior-book content of the fact notes alone; if they
+  carry none, keep the recap to what they do establish about events before this book
+  and never fill the gap from your own knowledge of the earlier book.{{end}}{{end}}
 - Keep every synthesis hard rule: fresh own-words prose (an 8-word-shingle check
   will re-run), neutral reference-guide voice, hyphens never em dashes, the length
   caps (description 1500, text 3000, in_short 1500, ending 2000), the reveal /

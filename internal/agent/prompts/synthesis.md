@@ -9,11 +9,12 @@ position past chapter {{.ChapterCount}}.
 
 ## The load-bearing boundary
 
-YOUR ONLY SOURCE MATERIAL is the fact notes. You do NOT have the book text, the
-audio, or the transcripts - this is deliberate: it makes spoiler bounds auditable
-(every fact traces to a noted chapter) and makes verbatim overlap impossible by
-construction. Do not consult wiki pages, catalogue descriptions, or your own
-memory of the book.
+YOUR ONLY SOURCE MATERIAL is the fact notes{{if .HasSeriesPrior}}, plus
+`series-previously.md` for the EARLIER book only{{end}}. You do NOT have the book
+text, the audio, or the transcripts - this is deliberate: it makes spoiler bounds
+auditable (every fact traces to a noted chapter) and makes verbatim overlap
+impossible by construction. Do not consult wiki pages, catalogue descriptions, or
+your own memory of the book.
 
 ## Where you work
 
@@ -27,7 +28,12 @@ You work in the current directory. It contains ONLY:
   probable names when the sheet cites an official source, wiki page title, multiple
   agreeing references, or the spelling is an ordinary English name. Only unresolved
   terms must be replaced by roles.
-- `out/` - the ONLY place you write output.
+{{if .HasSeriesPrior}}- `series-previously.md` - the community metadata database's published recap of an
+  EARLIER volume in this series (it names which one; it is not necessarily the
+  volume directly before this book). It is the only material you have about any
+  earlier book, and it is for the `chapter: 0` series recap and nothing else. Never
+  use it to add a card, a claim, or a detail about THIS book.
+{{end}}- `out/` - the ONLY place you write output.
 
 There are deliberately NO transcripts, manifest, or QA files here. Do not use any
 tool other than reading and writing files in this directory. No web access.
@@ -69,8 +75,15 @@ not in this table and not in the fact notes must not appear in the sidecars.
 
 ## recaps.json
 
-- {{if .IsSeriesOpener}}This is a series opener: include NO `chapter: 0` `scope: "series"` recap.{{else}}Book 2+: include a `chapter: 0` `scope: "series"` "previously" recap grounded
-  in the inherited knowledge sheet - the single most useful recap in a series.{{end}}
+- {{if .IsSeriesOpener}}This is a series opener: include NO `chapter: 0` `scope: "series"` recap.{{else}}Book 2+: include a `chapter: 0` `scope: "series"` "previously" recap - the single
+  most useful recap in a series.
+  {{if .HasSeriesPrior}}Ground it ONLY in `series-previously.md`: rewrite that material in your own
+  words, never copying a sentence, and never supplement it from your own knowledge
+  of the earlier book. Anything that file does not state, you do not know - so cover
+  the volume it names rather than claiming to recap the whole series so far.{{else}}Ground it in the prior-book content of the inherited knowledge sheet. If the
+  sheet carries no prior-book content, write a short recap from what the notes do
+  establish about events before this book and invent nothing - never fill the gap
+  from your own knowledge of the earlier book.{{end}}{{end}}
 - Scale through-points with length and density: normally one every ~5-10 logical
   chapters or 2-4 listening hours, at the natural ACT BREAK candidates in the
   notes. Each entry reveals ONLY facts attributed to chapters at or before its

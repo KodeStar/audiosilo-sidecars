@@ -1251,6 +1251,43 @@ Milestones from the workspace plan; each is shippable.
   is not evidence of spelling. Note the marker-title path helps only sometimes: some
   volumes ship `Chapter 9: Toren`, others a bare `001..027` table.
 
+- **Upstream series-opener round (done):** a book 2+ whose predecessor volume was
+  never processed locally (it is already covered upstream, so nobody re-derives it)
+  deadlocked the audit/fix loop FOREVER: the opener check consulted only the local
+  DB, so the book counted as a series opener - the auditor (reading authoring.md's
+  "Book 2+ has a chapter: 0 series recap" plus the obvious series metadata) demanded
+  the chapter-0 `scope: "series"` "previously" recap every round, while the
+  validator hard-rejected it as an opener error and the retry feedback told the
+  fixer to delete it. Mechanically valid, finding never applied, targeted verifier
+  correctly refusing, round budget burned on every Retry (Jack Reacher 02: 30 audit
+  attempts, ~$122). Two halves now: `metaops.SeriesPriorFor` (on `MetaCoverage`,
+  same non-optional-interface rationale as SeriesGlossary) resolves the book's
+  series (own work first; else a slugged series name - plain and article-stripped
+  candidates - trusted only when the fetched series' name matches) and walks
+  NEAREST-FIRST to the closest earlier covered volume with published recaps
+  (bounded at 6 fetches/30s; stops at a transport failure rather than reaching
+  further back; a chaptered `scope:"series"` entry is never taken as that volume's
+  own final recap). It returns `(prior, definitive, error)`: outages degrade to
+  empty + NON-definitive + nil error - a metadata outage must never park a book OR
+  freeze a wrong answer. Pipeline `seriesStatus` (series_prior.go) owns the opener
+  verdict: a LOCAL predecessor wins (carryover already in facts/); else the
+  upstream prior makes the book a non-opener. The first settled answer - material,
+  or a definitive `{"none":true}` - is persisted to `series_prior.json` and
+  preferred on every later call, so the verdict cannot flip between rounds
+  (either direction mid-loop is poison); readmit clears a NONE-record only (a
+  Retry after contributing the predecessor upstream re-derives; a positive record
+  is never cleared). The material is staged as `series-previously.md` into
+  synthesizing/auditing/fixing/audit-verify as the ONE sanctioned source for the
+  chapter-0 recap - own-words rewrite, and the file + prompts state what it is
+  NOT: not the novel, not evidence about THIS book, and not necessarily the
+  adjacent volume (sparse coverage may reach further back). Wire-shape trap,
+  load-bearing: `/api/v1/series/{id}` nests a member's `work.series` as an
+  OBJECT while `/works/{id}` uses an ARRAY - the first cut decoded the wrong
+  shape, every live listing failed decode (which getJSON reports as a transport
+  failure), and the fakes had drifted so tests stayed green; a verbatim
+  captured-payload decode test now pins the real shape. Do not "fix" the two
+  decodes to match each other.
+
 Still **not built**: signed installers / a friendlier packaged client (a possible
 follow-up per the meta EXTRACTION roadmap); a separately-deployable UI-only image
 (scoped out of M8, deferred). The contributing stage submits sidecars but never

@@ -26,6 +26,10 @@ type synthesisPromptData struct {
 	EdgeNote       string
 	WorkSlug       string
 	IsSeriesOpener bool
+	// HasSeriesPrior reports that series-previously.md was staged, so the prompt may
+	// point at it as the ONE source for the chapter-0 recap. It is false for a
+	// non-opener whose predecessor ran locally (that carryover arrives in facts/).
+	HasSeriesPrior bool
 	VerifiedLedger string
 }
 
@@ -40,11 +44,11 @@ func (e *Executor) synthesize(ctx context.Context, book store.Book, r scheduler.
 	if r.Progress != nil {
 		r.Progress(0, 1)
 	}
-	class, seriesOpener, ledger, err := e.sidecarStageInputs(ctx, book)
+	in, err := e.sidecarStageInputs(ctx, book)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("synthesizing: %w", err)
 	}
-	noteEdgeExclusions(r, class)
+	noteEdgeExclusions(r, in.class)
 
 	st, err := agent.New(book.WorkDir, string(state.Synthesizing), e.stageAttempt(ctx, book, state.Synthesizing))
 	if err != nil {
@@ -52,6 +56,9 @@ func (e *Executor) synthesize(ctx context.Context, book store.Book, r scheduler.
 	}
 	if err := stageAuthoring(st); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("synthesizing: stage authoring.md: %w", err)
+	}
+	if err := stageSeriesPrior(st, in.prior); err != nil {
+		return scheduler.StageResult{}, fmt.Errorf("synthesizing: %w", err)
 	}
 	facts := factsDirPath(book.WorkDir)
 	if !isDir(facts) {
@@ -65,7 +72,7 @@ func (e *Executor) synthesize(ctx context.Context, book store.Book, r scheduler.
 	// tally needs no post-harvest reload (harvest is a straight copy of these files).
 	var cards, recaps, warnings int
 	validate := func(_ agent.Result, s *agent.Staging) error {
-		chars, recs, warns, verr := loadOutSidecars(s.OutDir(), class.LogicalCount, seriesOpener)
+		chars, recs, warns, verr := loadOutSidecars(s.OutDir(), in.class.LogicalCount, in.seriesOpener)
 		if verr != nil {
 			return verr
 		}
@@ -77,11 +84,12 @@ func (e *Executor) synthesize(ctx context.Context, book store.Book, r scheduler.
 		Authors:        authors(book),
 		Series:         book.Series,
 		SeriesPos:      book.SeriesPos,
-		ChapterCount:   class.LogicalCount,
-		EdgeNote:       class.EdgeNote,
+		ChapterCount:   in.class.LogicalCount,
+		EdgeNote:       in.class.EdgeNote,
 		WorkSlug:       workSlug(book),
-		IsSeriesOpener: seriesOpener,
-		VerifiedLedger: ledger,
+		IsSeriesOpener: in.seriesOpener,
+		HasSeriesPrior: in.prior.present(),
+		VerifiedLedger: in.ledger,
 	}
 	usage, err := e.runAgent(ctx, book, state.Synthesizing, r, st, "synthesis.md", data, false, validate)
 	if err != nil {
@@ -105,28 +113,39 @@ func (e *Executor) synthesize(ctx context.Context, book store.Book, r scheduler.
 	return result, nil
 }
 
-// sidecarStageInputs resolves the inputs the sidecar stages share: the edge-chapter
-// classification (the LOGICAL story-chapter count + the EdgeNote for a files-style book
-// with a non-narrative intro/credits file, else the raw count and an empty note; it reads
-// the manifest itself), whether the book opens its series (the chapter-0 recap rule), and
-// the verified-spelling ledger table for the prompts. validating uses only the
-// classification + opener and ignores the ledger. The manifest is deliberately not
+// sidecarInputs are the inputs the sidecar stages (synthesizing, auditing, fixing,
+// validating) share.
+type sidecarInputs struct {
+	// class is the edge-chapter classification: the LOGICAL story-chapter count + the
+	// EdgeNote for a files-style book with a non-narrative intro/credits file, else the
+	// raw count and an empty note.
+	class edgeClassification
+	// seriesOpener drives the chapter-0 "previously" recap rule.
+	seriesOpener bool
+	// ledger is the verified-spelling table for the prompts (validating ignores it).
+	ledger string
+	// prior is the upstream predecessor's published recap material, present only for a
+	// non-opener whose predecessor was never processed locally.
+	prior seriesPrior
+}
+
+// sidecarStageInputs resolves those shared inputs. The manifest is deliberately not
 // returned so no consumer can reach its raw ChapterCount past the logical count. Errors
 // are unprefixed; each stage wraps with its own name.
-func (e *Executor) sidecarStageInputs(ctx context.Context, book store.Book) (edgeClassification, bool, string, error) {
+func (e *Executor) sidecarStageInputs(ctx context.Context, book store.Book) (sidecarInputs, error) {
 	class, err := classifyBookEdges(book.WorkDir)
 	if err != nil {
-		return edgeClassification{}, false, "", err
+		return sidecarInputs{}, err
 	}
-	seriesOpener, err := e.isSeriesOpener(ctx, book)
+	seriesOpener, prior, err := e.seriesStatus(ctx, book)
 	if err != nil {
-		return edgeClassification{}, false, "", fmt.Errorf("series predecessor lookup: %w", err)
+		return sidecarInputs{}, fmt.Errorf("series predecessor lookup: %w", err)
 	}
 	ledger, err := verifiedLedgerTable(book.WorkDir)
 	if err != nil {
-		return edgeClassification{}, false, "", fmt.Errorf("verified ledger: %w", err)
+		return sidecarInputs{}, fmt.Errorf("verified ledger: %w", err)
 	}
-	return class, seriesOpener, ledger, nil
+	return sidecarInputs{class: class, seriesOpener: seriesOpener, ledger: ledger, prior: prior}, nil
 }
 
 // authoringName is the vendored authoring contract staged into every notes-only /

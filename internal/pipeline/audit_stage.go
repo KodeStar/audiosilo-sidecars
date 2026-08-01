@@ -18,6 +18,7 @@ type auditPromptData struct {
 	ChapterCount   int
 	EdgeNote       string
 	IsSeriesOpener bool
+	HasSeriesPrior bool
 	VerifiedLedger string
 }
 
@@ -25,10 +26,11 @@ type auditPromptData struct {
 // Unlike a fresh adversarial audit, this pass checks only the exact FIX findings
 // accepted for one final correction round.
 type auditVerifyPromptData struct {
-	Title        string
-	ChapterCount int
-	EdgeNote     string
-	Round        int
+	Title          string
+	ChapterCount   int
+	EdgeNote       string
+	Round          int
+	HasSeriesPrior bool
 }
 
 // audit runs the independent adversarial auditor over the (canonical) sidecars. It
@@ -67,17 +69,17 @@ func (e *Executor) audit(ctx context.Context, book store.Book, r scheduler.Stage
 		}
 	}
 
-	class, seriesOpener, ledger, err := e.sidecarStageInputs(ctx, book)
+	in, err := e.sidecarStageInputs(ctx, book)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("auditing: %w", err)
 	}
-	noteEdgeExclusions(r, class)
+	noteEdgeExclusions(r, in.class)
 
 	st, err := agent.New(book.WorkDir, string(state.Auditing), e.stageAttempt(ctx, book, state.Auditing))
 	if err != nil {
 		return scheduler.StageResult{}, err
 	}
-	if err := stageAuditInputs(st, book.WorkDir); err != nil {
+	if err := stageAuditInputs(st, book.WorkDir, in.prior); err != nil {
 		return scheduler.StageResult{}, err
 	}
 
@@ -94,10 +96,11 @@ func (e *Executor) audit(ctx context.Context, book store.Book, r scheduler.Stage
 	}
 	data := auditPromptData{
 		Title:          book.Title,
-		ChapterCount:   class.LogicalCount,
-		EdgeNote:       class.EdgeNote,
-		IsSeriesOpener: seriesOpener,
-		VerifiedLedger: ledger,
+		ChapterCount:   in.class.LogicalCount,
+		EdgeNote:       in.class.EdgeNote,
+		IsSeriesOpener: in.seriesOpener,
+		HasSeriesPrior: in.prior.present(),
+		VerifiedLedger: in.ledger,
 	}
 	usage, err := e.runAgent(ctx, book, state.Auditing, r, st, "audit.md", data, false, validate)
 	if err != nil {
@@ -187,15 +190,15 @@ func (e *Executor) auditReentryAccept(ctx context.Context, book store.Book, r sc
 		_ = os.Remove(auditAcceptedPath(book.WorkDir))
 		return scheduler.StageResult{}, false, nil
 	}
-	class, err := classifyBookEdges(book.WorkDir)
+	in, err := e.sidecarStageInputs(ctx, book)
 	if err != nil {
-		return scheduler.StageResult{}, false, fmt.Errorf("auditing: verification classify edges: %w", err)
+		return scheduler.StageResult{}, false, fmt.Errorf("auditing: verification inputs: %w", err)
 	}
 	st, err := agent.New(book.WorkDir, string(state.Auditing)+"-verify", e.stageAttempt(ctx, book, state.Auditing))
 	if err != nil {
 		return scheduler.StageResult{}, false, err
 	}
-	if err := stageAuditInputs(st, book.WorkDir); err != nil {
+	if err := stageAuditInputs(st, book.WorkDir, in.prior); err != nil {
 		return scheduler.StageResult{}, false, err
 	}
 	if err := st.CopyFile(auditAcceptedPath(book.WorkDir), scheduler.AuditAcceptedFile); err != nil {
@@ -211,7 +214,8 @@ func (e *Executor) auditReentryAccept(ctx context.Context, book store.Book, r sc
 		return nil
 	}
 	usage, err := e.runAgent(ctx, book, state.Auditing, r, st, "audit_verify.md", auditVerifyPromptData{
-		Title: book.Title, ChapterCount: class.LogicalCount, EdgeNote: class.EdgeNote, Round: acc.Round,
+		Title: book.Title, ChapterCount: in.class.LogicalCount, EdgeNote: in.class.EdgeNote, Round: acc.Round,
+		HasSeriesPrior: in.prior.present(),
 	}, false, validate)
 	if err != nil {
 		return scheduler.StageResult{}, true, err
@@ -261,11 +265,15 @@ func nonBlockerFindings(rep AuditReport) []AuditFinding {
 }
 
 // stageAuditInputs copies the auditor's fixed input set into the staged dir: the
-// authoring contract, the sidecars under audit, the mechanical validation report, and
-// the fact notes.
-func stageAuditInputs(st *agent.Staging, workDir string) error {
+// authoring contract, the sidecars under audit, the mechanical validation report, the
+// fact notes, and (for a book-2+ whose predecessor is only covered upstream) the
+// predecessor's published recap material.
+func stageAuditInputs(st *agent.Staging, workDir string, prior seriesPrior) error {
 	if err := stageAuthoring(st); err != nil {
 		return fmt.Errorf("auditing: stage authoring.md: %w", err)
+	}
+	if err := stageSeriesPrior(st, prior); err != nil {
+		return fmt.Errorf("auditing: %w", err)
 	}
 	if err := stageSidecars(st, workDir); err != nil {
 		return err

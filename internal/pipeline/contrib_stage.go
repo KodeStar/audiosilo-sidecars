@@ -38,6 +38,15 @@ type MetaCoverage interface {
 	// interface would reintroduce exactly that failure mode - a wrapper or a
 	// signature change would drop the glossary with no error and no stage note.
 	SeriesGlossary(ctx context.Context, workID string) (metaops.Glossary, error)
+	// SeriesPriorFor feeds the sidecar stages' chapter-0 "previously" recap. It lives
+	// on this interface for the same reason SeriesGlossary does: a book whose
+	// predecessor is only covered upstream deadlocked the audit/fix loop forever
+	// (the auditor demanded a chapter-0 series recap the validator rejected), and a
+	// silently droppable optional interface would put that failure back one wrapper
+	// away.
+	// The bool reports whether an EMPTY result is DEFINITIVE (settled) rather than
+	// degraded; the caller may persist only a definitive negative.
+	SeriesPriorFor(ctx context.Context, q metaops.SeriesPriorQuery) (metaops.SeriesPrior, bool, error)
 }
 
 // TokenResolver resolves a GitHub credential for the issue/pr contribution modes.

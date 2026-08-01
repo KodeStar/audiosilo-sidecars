@@ -28,7 +28,15 @@ You work in the current directory. It contains ONLY:
   your own report. The entries under `warnings` are advisory context (for example a
   book-2 recap the mechanical check merely suggests) - weigh them and raise a FIX
   only if you judge one to be a genuine defect; a warning alone does not block a pass.
-- `out/` - the ONLY place you write output.
+{{if .HasSeriesPrior}}- `series-previously.md` - the community metadata database's published recap of an
+  EARLIER volume in this series (it names which one; it is not necessarily the volume
+  directly before this book). It is the sanctioned source for the `chapter: 0`
+  `scope: "series"` recap and the ground truth for checking it: that recap must be an
+  own-words rewrite of this material, never a copied sentence, and must claim nothing
+  this file does not state - including not presenting the named volume as the whole
+  story so far. It is NOT evidence about this book - a claim about THIS book still
+  traces to the fact notes.
+{{end}}- `out/` - the ONLY place you write output.
 
 Do not use any tool other than reading and writing files in this directory. No
 web access. Do NOT rewrite the sidecars - you only report.
