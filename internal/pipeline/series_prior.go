@@ -25,8 +25,19 @@ const seriesPriorStagedName = "series-previously.md"
 // seriesPrior is the persisted shape of metaops.SeriesPrior plus the fetch stamp. The
 // file is the record of a DETERMINATION as much as of its content: its presence is what
 // keeps a book a non-opener across later rounds.
+//
+// A NEGATIVE determination is recorded too (None), so a book with no upstream prior
+// stops re-walking its series on every synthesis / audit / fix / validate entry. Only a
+// DEFINITIVE negative is written - an outage maps to an empty result upstream, and
+// freezing that would pin opener=true, the exact bug class this record exists to fix.
+//
+// Deleting series_prior.json is the manual way to force a fresh determination.
 type seriesPrior struct {
-	WorkID            string   `json:"work_id"`
+	// None marks a recorded "this book has no upstream prior". present() stays false
+	// for it, so the opener verdict is exactly what it would be with no record - only
+	// the repeated lookup is skipped.
+	None              bool     `json:"none,omitempty"`
+	WorkID            string   `json:"work_id,omitempty"`
 	Title             string   `json:"title"`
 	Authors           []string `json:"authors,omitempty"`
 	InShort           string   `json:"in_short,omitempty"`
@@ -38,6 +49,10 @@ type seriesPrior struct {
 
 // present reports whether a predecessor volume was found.
 func (p seriesPrior) present() bool { return strings.TrimSpace(p.WorkID) != "" }
+
+// recorded reports whether this is a usable determination (positive or negative), as
+// opposed to a zero value / truncated file that must be re-derived.
+func (p seriesPrior) recorded() bool { return p.None || p.present() }
 
 // seriesStatus resolves the two series facts the sidecar stages share: whether this
 // book opens its series (an opener must NOT carry a chapter-0 "previously" recap) and,
@@ -86,9 +101,11 @@ func (e *Executor) seriesPriorMaterial(ctx context.Context, book store.Book) (se
 		return prior, nil
 	}
 	if e.meta == nil {
+		// Metadata is disabled. Record nothing: enabling it later must be free to
+		// derive a real answer.
 		return seriesPrior{}, nil
 	}
-	up, err := e.meta.SeriesPriorFor(ctx, metaops.SeriesPriorQuery{
+	up, definitive, err := e.meta.SeriesPriorFor(ctx, metaops.SeriesPriorQuery{
 		WorkID:     book.WorkID,
 		SeriesName: book.Series,
 		SeriesPos:  book.SeriesPos,
@@ -101,7 +118,15 @@ func (e *Executor) seriesPriorMaterial(ctx context.Context, book store.Book) (se
 		return seriesPrior{}, nil
 	}
 	if up.Empty() {
-		return seriesPrior{}, nil
+		if !definitive {
+			// Degraded, not settled: leave no record so the next entry asks again.
+			return seriesPrior{}, nil
+		}
+		none := seriesPrior{None: true, FetchedAt: time.Now().UTC().Format(time.RFC3339)}
+		if err := writeSeriesPrior(path, none); err != nil {
+			return seriesPrior{}, fmt.Errorf("record %s: %w", seriesPriorFile, err)
+		}
+		return none, nil
 	}
 	prior = seriesPrior{
 		WorkID:            up.WorkID,
@@ -119,9 +144,9 @@ func (e *Executor) seriesPriorMaterial(ctx context.Context, book store.Book) (se
 	return prior, nil
 }
 
-// loadSeriesPrior reads the persisted record. ok=false means there is none. A
-// malformed file is a real error: silently treating it as absent would retract the
-// determination it exists to hold.
+// loadSeriesPrior reads the persisted record, positive or negative. ok=false means
+// there is none. A malformed file is a real error: silently treating it as absent
+// would retract the determination it exists to hold.
 func loadSeriesPrior(path string) (seriesPrior, bool, error) {
 	raw, err := os.ReadFile(path) //nolint:gosec // path derives from the book's work dir
 	if err != nil {
@@ -134,7 +159,7 @@ func loadSeriesPrior(path string) (seriesPrior, bool, error) {
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return seriesPrior{}, false, fmt.Errorf("%s: %w", seriesPriorFile, err)
 	}
-	if !p.present() {
+	if !p.recorded() {
 		return seriesPrior{}, false, nil
 	}
 	return p, true, nil

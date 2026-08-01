@@ -198,8 +198,8 @@ type seriesFeedVal struct {
 // seriesWorks fetches a series' member work ids in series order. ok=false is a
 // transport failure or a clean 404.
 func (c *Client) seriesWorks(ctx context.Context, seriesID string) ([]string, bool) {
-	feed, ok := c.seriesListing(ctx, seriesID)
-	if !ok {
+	feed, found, ok := c.seriesListing(ctx, seriesID)
+	if !ok || !found {
 		return nil, false
 	}
 	ids := make([]string, 0, len(feed.entries))
@@ -209,11 +209,13 @@ func (c *Client) seriesWorks(ctx context.Context, seriesID string) ([]string, bo
 	return ids, true
 }
 
-// seriesListing fetches (and caches) a series' name and members in series order.
-// ok=false is a transport failure or a clean 404.
-func (c *Client) seriesListing(ctx context.Context, seriesID string) (seriesFeedVal, bool) {
+// seriesListing fetches (and caches) a series' name and members in series order. It
+// mirrors workDetail's tri-state: found=false is a clean 404 (upstream has no such
+// series), ok=false a transport failure. The prior-material walk needs them apart -
+// one is a settled answer it may persist, the other is not.
+func (c *Client) seriesListing(ctx context.Context, seriesID string) (seriesFeedVal, bool, bool) {
 	if cached, hit := c.seriesFeed.get(seriesID); hit {
-		return cached, true
+		return cached, true, true
 	}
 	var res struct {
 		Name  string `json:"name"`
@@ -228,8 +230,11 @@ func (c *Client) seriesListing(ctx context.Context, seriesID string) (seriesFeed
 		} `json:"works"`
 	}
 	found, ok := c.getJSON(ctx, "/api/v1/series/"+url.PathEscape(seriesID), &res)
-	if !ok || !found {
-		return seriesFeedVal{}, false
+	if !ok {
+		return seriesFeedVal{}, false, false
+	}
+	if !found {
+		return seriesFeedVal{}, false, true
 	}
 	feed := seriesFeedVal{name: res.Name, entries: make([]seriesEntry, 0, len(res.Works))}
 	for _, e := range res.Works {
@@ -245,7 +250,7 @@ func (c *Client) seriesListing(ctx context.Context, seriesID string) (seriesFeed
 		feed.entries = append(feed.entries, seriesEntry{ID: e.Work.ID, Pos: pos})
 	}
 	c.seriesFeed.put(seriesID, feed)
-	return feed, true
+	return feed, true, true
 }
 
 // workCharacterNames returns one work's usable character names and aliases. It

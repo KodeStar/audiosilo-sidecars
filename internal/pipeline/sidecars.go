@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -320,16 +319,6 @@ func slugify(s string) string {
 		}
 	}
 	return strings.Trim(b.String(), "-")
-}
-
-// isSeriesOpener reports whether this book opens its series (so it must NOT carry a
-// chapter-0 "previously" recap). A seriesless book is trivially an opener; otherwise
-// it is an opener when neither a LOCAL predecessor (findSeriesPredecessor, owned by
-// series.go and shared with the spelling/fact-pass carryover discovery) nor an
-// upstream one exists. seriesStatus (series_prior.go) owns both halves.
-func (e *Executor) isSeriesOpener(ctx context.Context, book store.Book) (bool, error) {
-	opener, _, err := e.seriesStatus(ctx, book)
-	return opener, err
 }
 
 // mdFilter selects the .md files under facts/ for staging (the knowledge sheets and

@@ -50,6 +50,7 @@ type metaServer struct {
 	seriesWorks map[string][]string // series id -> member work ids (absent => 404)
 	seriesName  string              // the name every series listing reports (default "S")
 	onWorks     func(id string)     // optional hook, called on each /works/{id} request
+	onSeries    func(id string)     // optional hook, called on each /series/{id} request
 
 	mu       sync.Mutex // guards requests (concurrent coverage workers hit the fake)
 	requests map[string]int
@@ -137,6 +138,11 @@ func (s *metaServer) handler() http.Handler {
 	mux.HandleFunc("/api/v1/series/", func(w http.ResponseWriter, r *http.Request) {
 		s.count("series")
 		id := r.URL.Path[len("/api/v1/series/"):]
+		// onSeries lets a test fail the listing request itself (a transport failure,
+		// as opposed to the clean 404 an absent series gives).
+		if s.onSeries != nil {
+			s.onSeries(id)
+		}
 		ids, ok := s.seriesWorks[id]
 		if !ok {
 			http.NotFound(w, r)

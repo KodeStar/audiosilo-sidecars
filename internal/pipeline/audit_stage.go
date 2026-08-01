@@ -190,19 +190,15 @@ func (e *Executor) auditReentryAccept(ctx context.Context, book store.Book, r sc
 		_ = os.Remove(auditAcceptedPath(book.WorkDir))
 		return scheduler.StageResult{}, false, nil
 	}
-	class, err := classifyBookEdges(book.WorkDir)
+	in, err := e.sidecarStageInputs(ctx, book)
 	if err != nil {
-		return scheduler.StageResult{}, false, fmt.Errorf("auditing: verification classify edges: %w", err)
-	}
-	_, prior, err := e.seriesStatus(ctx, book)
-	if err != nil {
-		return scheduler.StageResult{}, false, fmt.Errorf("auditing: series predecessor lookup: %w", err)
+		return scheduler.StageResult{}, false, fmt.Errorf("auditing: verification inputs: %w", err)
 	}
 	st, err := agent.New(book.WorkDir, string(state.Auditing)+"-verify", e.stageAttempt(ctx, book, state.Auditing))
 	if err != nil {
 		return scheduler.StageResult{}, false, err
 	}
-	if err := stageAuditInputs(st, book.WorkDir, prior); err != nil {
+	if err := stageAuditInputs(st, book.WorkDir, in.prior); err != nil {
 		return scheduler.StageResult{}, false, err
 	}
 	if err := st.CopyFile(auditAcceptedPath(book.WorkDir), scheduler.AuditAcceptedFile); err != nil {
@@ -218,8 +214,8 @@ func (e *Executor) auditReentryAccept(ctx context.Context, book store.Book, r sc
 		return nil
 	}
 	usage, err := e.runAgent(ctx, book, state.Auditing, r, st, "audit_verify.md", auditVerifyPromptData{
-		Title: book.Title, ChapterCount: class.LogicalCount, EdgeNote: class.EdgeNote, Round: acc.Round,
-		HasSeriesPrior: prior.present(),
+		Title: book.Title, ChapterCount: in.class.LogicalCount, EdgeNote: in.class.EdgeNote, Round: acc.Round,
+		HasSeriesPrior: in.prior.present(),
 	}, false, validate)
 	if err != nil {
 		return scheduler.StageResult{}, true, err

@@ -2,6 +2,7 @@ package metaops
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"time"
 
@@ -72,46 +73,73 @@ type SeriesPriorQuery struct {
 // carry no recaps sidecar all yield an empty result and a nil error. A metadata
 // outage must never park a book - the caller persists the first successful result so
 // a later outage cannot retract it.
-func (c *Client) SeriesPriorFor(ctx context.Context, q SeriesPriorQuery) (SeriesPrior, error) {
+//
+// definitive reports whether an EMPTY result is a settled answer ("this book has no
+// upstream prior") rather than a degraded one ("we could not find out"). It lets the
+// caller persist a negative and stop re-walking the series on every stage entry.
+// Settled: no series to resolve, a series that upstream does not have, a listing whose
+// name is not this book's series, this book absent from the listing, and a completed
+// walk in which no candidate published recaps. NOT settled: a disabled client, an
+// unreachable series listing, a transport failure mid-walk, or a spent deadline - all
+// of which are also the paths that must never freeze into a negative. A positive
+// result is always definitive.
+//
+// A maxPriorFetches truncation COUNTS as definitive: the bound is a deliberate policy
+// that volumes further back are no longer useful "previously" material, so "none
+// within the bound" is the final answer, not an incomplete one.
+func (c *Client) SeriesPriorFor(ctx context.Context, q SeriesPriorQuery) (prior SeriesPrior, definitive bool, err error) {
 	if !c.Enabled() {
-		return SeriesPrior{}, nil
+		return SeriesPrior{}, false, nil
 	}
 
 	// One deadline for the whole walk, for the same reason SeriesGlossary has one.
 	ctx, cancel := context.WithTimeout(ctx, priorFetchBudget)
 	defer cancel()
 
-	entries, ok := c.resolveSeriesListing(ctx, q)
+	entries, ok, definitive := c.resolveSeriesListing(ctx, q)
 	if !ok {
-		return SeriesPrior{}, nil
+		return SeriesPrior{}, definitive, nil
 	}
 	candidates := priorCandidates(entries, q)
 	for i, id := range candidates {
-		if i >= maxPriorFetches || ctx.Err() != nil {
-			break
+		if i >= maxPriorFetches {
+			break // a settled answer by policy; see the doc comment
+		}
+		if ctx.Err() != nil {
+			return SeriesPrior{}, false, nil
 		}
 		prior, found, ok := c.priorMaterial(ctx, id)
 		if !ok {
 			// A transport failure means we cannot tell whether THIS volume has recaps.
 			// Walking past it would attach an earlier volume's "previously" to the book,
 			// which is worse than no material at all, so stop and degrade.
-			break
+			return SeriesPrior{}, false, nil
 		}
 		if found {
-			return prior, nil
+			return prior, true, nil
 		}
 	}
-	return SeriesPrior{}, nil
+	return SeriesPrior{}, true, nil
 }
 
 // resolveSeriesListing finds the series this book belongs to and returns its members
-// in series order. ok=false means no series could be resolved (or it was unreachable).
-func (c *Client) resolveSeriesListing(ctx context.Context, q SeriesPriorQuery) ([]seriesEntry, bool) {
+// in series order. ok=false means no series could be resolved; definitive then splits
+// "there is no such series" from "we could not reach it" (see SeriesPriorFor).
+func (c *Client) resolveSeriesListing(ctx context.Context, q SeriesPriorQuery) (entries []seriesEntry, ok, definitive bool) {
+	// reachable stays false once a request fails outright, so a later dead end is
+	// reported as unknown rather than settled.
+	reachable := true
 	if workID := strings.TrimSpace(q.WorkID); workID != "" {
-		work, found, ok := c.workDetail(ctx, workID)
-		if ok && found && work.series != nil && work.series.ID != "" {
-			feed, ok := c.seriesListing(ctx, work.series.ID)
-			return feed.entries, ok
+		work, found, wok := c.workDetail(ctx, workID)
+		switch {
+		case !wok:
+			reachable = false // could not read this book's own work
+		case found && work.series != nil && work.series.ID != "":
+			feed, sfound, sok := c.seriesListing(ctx, work.series.ID)
+			if !sok {
+				return nil, false, false
+			}
+			return feed.entries, sfound, true
 		}
 	}
 
@@ -122,13 +150,18 @@ func (c *Client) resolveSeriesListing(ctx context.Context, q SeriesPriorQuery) (
 	// read off this book.
 	name := strings.TrimSpace(q.SeriesName)
 	if name == "" {
-		return nil, false
+		return nil, false, reachable
 	}
-	feed, ok := c.seriesListing(ctx, seriesSlug(name))
-	if !ok || match.NormalizeSeries(feed.name) != match.NormalizeSeries(name) {
-		return nil, false
+	feed, found, ok := c.seriesListing(ctx, seriesSlug(name))
+	if !ok {
+		return nil, false, false
 	}
-	return feed.entries, true
+	if !found || match.NormalizeSeries(feed.name) != match.NormalizeSeries(name) {
+		// Upstream has no such series, or the slug landed on a different one. Either
+		// way the answer is settled: there is no prior to derive from this name.
+		return nil, false, true
+	}
+	return feed.entries, true, true
 }
 
 // priorCandidates returns the series members that precede this book, NEAREST FIRST.
@@ -144,7 +177,7 @@ func priorCandidates(entries []seriesEntry, q SeriesPriorQuery) []string {
 				out = append(out, e.ID)
 			}
 		}
-		reverse(out)
+		slices.Reverse(out)
 		return out
 	}
 	workID := strings.TrimSpace(q.WorkID)
@@ -153,20 +186,12 @@ func priorCandidates(entries []seriesEntry, q SeriesPriorQuery) []string {
 	}
 	for _, e := range entries {
 		if e.ID == workID {
-			reverse(out)
+			slices.Reverse(out)
 			return out
 		}
 		out = append(out, e.ID)
 	}
 	return nil // this book is not in the listing: no cut point, so no predecessor
-}
-
-// reverse flips a slice in place (the listing is oldest-first; the walk wants the
-// nearest predecessor first).
-func reverse(ids []string) {
-	for i, j := 0, len(ids)-1; i < j; i, j = i+1, j-1 {
-		ids[i], ids[j] = ids[j], ids[i]
-	}
 }
 
 // priorMaterial builds one candidate's SeriesPrior. found=false means the volume

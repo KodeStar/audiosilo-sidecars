@@ -332,7 +332,7 @@ func TestCompareBookSeedsSeriesPredecessor(t *testing.T) {
 		t.Fatalf("predecessor = %+v, found = %v; want %s", pred, found, predecessor)
 	}
 	exe := NewExecutor(Config{DB: db})
-	opener, err := exe.isSeriesOpener(context.Background(), book)
+	opener, _, err := exe.seriesStatus(context.Background(), book)
 	if err != nil {
 		t.Fatal(err)
 	}

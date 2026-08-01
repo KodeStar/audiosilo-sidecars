@@ -44,7 +44,9 @@ type MetaCoverage interface {
 	// (the auditor demanded a chapter-0 series recap the validator rejected), and a
 	// silently droppable optional interface would put that failure back one wrapper
 	// away.
-	SeriesPriorFor(ctx context.Context, q metaops.SeriesPriorQuery) (metaops.SeriesPrior, error)
+	// The bool reports whether an EMPTY result is DEFINITIVE (settled) rather than
+	// degraded; the caller may persist only a definitive negative.
+	SeriesPriorFor(ctx context.Context, q metaops.SeriesPriorQuery) (metaops.SeriesPrior, bool, error)
 }
 
 // TokenResolver resolves a GitHub credential for the issue/pr contribution modes.

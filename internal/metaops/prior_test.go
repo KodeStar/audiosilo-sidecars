@@ -2,6 +2,7 @@ package metaops
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -37,7 +38,7 @@ func jackReacher() *metaServer {
 func TestSeriesPriorForFindsThePredecessor(t *testing.T) {
 	c, _ := newMeta(t, jackReacher())
 
-	p, err := c.SeriesPriorFor(context.Background(), SeriesPriorQuery{
+	p, definitive, err := c.SeriesPriorFor(context.Background(), SeriesPriorQuery{
 		WorkID: "die-trying", SeriesName: "Jack Reacher", SeriesPos: "2",
 	})
 	if err != nil {
@@ -45,6 +46,9 @@ func TestSeriesPriorForFindsThePredecessor(t *testing.T) {
 	}
 	if p.Empty() {
 		t.Fatal("expected the predecessor volume's material")
+	}
+	if !definitive {
+		t.Error("a positive result is always definitive")
 	}
 	if p.WorkID != "killing-floor" || p.Title != "Killing Floor" {
 		t.Errorf("wrong predecessor: %q / %q", p.WorkID, p.Title)
@@ -68,23 +72,27 @@ func TestSeriesPriorForFindsThePredecessor(t *testing.T) {
 func TestSeriesPriorForResolvesBySeriesNameWhenUnmatched(t *testing.T) {
 	c, _ := newMeta(t, jackReacher())
 
-	p, err := c.SeriesPriorFor(context.Background(), SeriesPriorQuery{SeriesName: "Jack Reacher", SeriesPos: "2"})
+	p, definitive, err := c.SeriesPriorFor(context.Background(), SeriesPriorQuery{SeriesName: "Jack Reacher", SeriesPos: "2"})
 	if err != nil {
 		t.Fatalf("SeriesPriorFor: %v", err)
 	}
-	if p.WorkID != "killing-floor" {
-		t.Errorf("work id = %q, want killing-floor", p.WorkID)
+	if p.WorkID != "killing-floor" || !definitive {
+		t.Errorf("work id = %q definitive = %v, want killing-floor/true", p.WorkID, definitive)
 	}
 
 	s := jackReacher()
 	s.seriesName = "A Completely Different Series"
 	c2, _ := newMeta(t, s)
-	p, err = c2.SeriesPriorFor(context.Background(), SeriesPriorQuery{SeriesName: "Jack Reacher", SeriesPos: "2"})
+	p, definitive, err = c2.SeriesPriorFor(context.Background(), SeriesPriorQuery{SeriesName: "Jack Reacher", SeriesPos: "2"})
 	if err != nil {
 		t.Fatalf("SeriesPriorFor: %v", err)
 	}
 	if !p.Empty() {
 		t.Errorf("a slug that landed on another series must not be trusted: %+v", p)
+	}
+	// The listing WAS read and is not this book's series: a settled "no prior".
+	if !definitive {
+		t.Error("a name mismatch on a successfully read listing is a settled answer")
 	}
 }
 
@@ -96,74 +104,144 @@ func TestSeriesPriorForSkipsVolumesWithoutRecaps(t *testing.T) {
 	s.seriesWorks["s"] = []string{"killing-floor", "die-trying", "tripwire"}
 
 	c, _ := newMeta(t, s)
-	p, err := c.SeriesPriorFor(context.Background(), SeriesPriorQuery{
+	p, definitive, err := c.SeriesPriorFor(context.Background(), SeriesPriorQuery{
 		WorkID: "tripwire", SeriesName: "Jack Reacher", SeriesPos: "3",
 	})
 	if err != nil {
 		t.Fatalf("SeriesPriorFor: %v", err)
 	}
 	// die-trying (position 2) has no recaps, so book 1's material is the prior.
-	if p.WorkID != "killing-floor" {
-		t.Errorf("work id = %q, want killing-floor (die-trying publishes no recaps)", p.WorkID)
+	if p.WorkID != "killing-floor" || !definitive {
+		t.Errorf("work id = %q definitive = %v, want killing-floor/true (die-trying publishes no recaps)", p.WorkID, definitive)
 	}
 }
 
 // Every no-data path yields an empty result and a NIL error: a metadata outage must
-// never park a book.
+// never park a book. Each also states whether that emptiness is DEFINITIVE - the
+// caller persists a negative only when it is, so an outage can never freeze into
+// "this book has no prior".
 func TestSeriesPriorForDegradesQuietly(t *testing.T) {
 	ctx := context.Background()
 	q := SeriesPriorQuery{WorkID: "die-trying", SeriesName: "Jack Reacher", SeriesPos: "2"}
 
-	t.Run("disabled client", func(t *testing.T) {
-		p, err := NewClient("").SeriesPriorFor(ctx, q)
-		if err != nil || !p.Empty() {
-			t.Fatalf("prior=%+v err=%v", p, err)
-		}
-	})
-	t.Run("no series at all", func(t *testing.T) {
-		s := jackReacher()
-		s.work["standalone"] = workRow{title: "Standalone"}
-		c, _ := newMeta(t, s)
-		p, err := c.SeriesPriorFor(ctx, SeriesPriorQuery{WorkID: "standalone"})
-		if err != nil || !p.Empty() {
-			t.Fatalf("prior=%+v err=%v", p, err)
-		}
-	})
-	t.Run("no covered predecessor", func(t *testing.T) {
-		c, _ := newMeta(t, jackReacher())
-		// Book 1 is itself the opener: nothing sits below position 1.
-		p, err := c.SeriesPriorFor(ctx, SeriesPriorQuery{
-			WorkID: "killing-floor", SeriesName: "Jack Reacher", SeriesPos: "1",
-		})
-		if err != nil || !p.Empty() {
-			t.Fatalf("prior=%+v err=%v", p, err)
-		}
-	})
-	t.Run("predecessor unreachable", func(t *testing.T) {
-		s := jackReacher()
-		s.onWorks = func(id string) {
-			if id == "killing-floor" {
-				panic(http.ErrAbortHandler) // aborts this response only
+	cases := []struct {
+		name string
+		// client and query under test.
+		build          func(t *testing.T) (*Client, SeriesPriorQuery)
+		wantDefinitive bool
+		why            string
+	}{
+		{
+			name:  "disabled client",
+			build: func(*testing.T) (*Client, SeriesPriorQuery) { return NewClient(""), q },
+			why:   "metadata is off, so nothing was determined",
+		},
+		{
+			name: "work has no series",
+			build: func(t *testing.T) (*Client, SeriesPriorQuery) {
+				s := jackReacher()
+				s.work["standalone"] = workRow{title: "Standalone"}
+				c, _ := newMeta(t, s)
+				return c, SeriesPriorQuery{WorkID: "standalone"}
+			},
+			wantDefinitive: true,
+			why:            "the work was read and has no series: settled",
+		},
+		{
+			name: "no covered predecessor",
+			build: func(t *testing.T) (*Client, SeriesPriorQuery) {
+				c, _ := newMeta(t, jackReacher())
+				// Book 1 is itself the opener: nothing sits below position 1.
+				return c, SeriesPriorQuery{WorkID: "killing-floor", SeriesName: "Jack Reacher", SeriesPos: "1"}
+			},
+			wantDefinitive: true,
+			why:            "the listing was walked to the end: settled",
+		},
+		{
+			name: "series listing 404",
+			build: func(t *testing.T) (*Client, SeriesPriorQuery) {
+				s := jackReacher()
+				s.seriesWorks = map[string][]string{}
+				c, _ := newMeta(t, s)
+				return c, q
+			},
+			wantDefinitive: true,
+			why:            "upstream has no such series: settled",
+		},
+		{
+			name: "predecessor unreachable",
+			build: func(t *testing.T) (*Client, SeriesPriorQuery) {
+				s := jackReacher()
+				s.onWorks = func(id string) {
+					if id == "killing-floor" {
+						panic(http.ErrAbortHandler) // aborts this response only
+					}
+				}
+				c, _ := newMeta(t, s)
+				return c, q
+			},
+			why: "a transport failure leaves the volume unread",
+		},
+		{
+			name: "series listing unreachable",
+			build: func(t *testing.T) (*Client, SeriesPriorQuery) {
+				s := jackReacher()
+				s.onSeries = func(string) { panic(http.ErrAbortHandler) }
+				c, _ := newMeta(t, s)
+				return c, q
+			},
+			why: "the listing itself could not be read",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, query := tc.build(t)
+			p, definitive, err := c.SeriesPriorFor(ctx, query)
+			if err != nil {
+				t.Fatalf("no-data path must not error: %v", err)
 			}
+			if !p.Empty() {
+				t.Fatalf("prior=%+v, want empty", p)
+			}
+			if definitive != tc.wantDefinitive {
+				t.Errorf("definitive = %v, want %v (%s)", definitive, tc.wantDefinitive, tc.why)
+			}
+		})
+	}
+}
+
+// The maxPriorFetches bound is a POLICY (volumes further back are no longer useful
+// "previously" material), so stopping at it is a settled answer the caller may
+// persist, not an incomplete walk it must retry forever.
+func TestSeriesPriorForTruncatedWalkIsDefinitive(t *testing.T) {
+	s := &metaServer{seriesName: "Long Series", work: map[string]workRow{}, seriesWorks: map[string][]string{}}
+	var ids []string
+	for i := 1; i <= maxPriorFetches+3; i++ {
+		id := fmt.Sprintf("w%02d", i)
+		ids = append(ids, id)
+		// Only the very first volume publishes recaps, so it sits past the bound.
+		row := workRow{title: id, seriesName: "Long Series", seriesPos: fmt.Sprint(i)}
+		if i == 1 {
+			row.recaps = []recapRow{{chapter: 10, text: "Book one ends."}}
 		}
-		c, _ := newMeta(t, s)
-		p, err := c.SeriesPriorFor(ctx, q)
-		if err != nil {
-			t.Fatalf("a transport failure must not error: %v", err)
-		}
-		if !p.Empty() {
-			t.Fatalf("prior=%+v", p)
-		}
+		s.work[id] = row
+	}
+	s.seriesWorks["s"] = ids
+	last := ids[len(ids)-1]
+	c, _ := newMeta(t, s)
+
+	p, definitive, err := c.SeriesPriorFor(context.Background(), SeriesPriorQuery{
+		WorkID: last, SeriesName: "Long Series", SeriesPos: fmt.Sprint(len(ids)),
 	})
-	t.Run("series listing 404", func(t *testing.T) {
-		s := jackReacher()
-		s.seriesWorks = map[string][]string{}
-		c, _ := newMeta(t, s)
-		p, err := c.SeriesPriorFor(ctx, q)
-		if err != nil || !p.Empty() {
-			t.Fatalf("prior=%+v err=%v", p, err)
-		}
-	})
+	if err != nil {
+		t.Fatalf("SeriesPriorFor: %v", err)
+	}
+	if !p.Empty() {
+		t.Fatalf("the walk reached past its bound: %+v", p)
+	}
+	if !definitive {
+		t.Error("a bounded walk that found nothing is a settled answer")
+	}
 }
 
 // A transport failure on the IMMEDIATE predecessor stops the walk. Reaching past it
@@ -182,7 +260,7 @@ func TestSeriesPriorForDoesNotWalkPastAnUnreachableVolume(t *testing.T) {
 	}
 	c, _ := newMeta(t, s)
 
-	p, err := c.SeriesPriorFor(context.Background(), SeriesPriorQuery{
+	p, definitive, err := c.SeriesPriorFor(context.Background(), SeriesPriorQuery{
 		WorkID: "running-blind", SeriesName: "Jack Reacher", SeriesPos: "4",
 	})
 	if err != nil {
@@ -190,6 +268,10 @@ func TestSeriesPriorForDoesNotWalkPastAnUnreachableVolume(t *testing.T) {
 	}
 	if !p.Empty() {
 		t.Errorf("walked past an unreachable predecessor to %q", p.WorkID)
+	}
+	// And the stop is NOT a settled answer: the unread volume may well have recaps.
+	if definitive {
+		t.Error("a walk stopped by a transport failure must not be reported as definitive")
 	}
 }
 
