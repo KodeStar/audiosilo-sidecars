@@ -23,6 +23,10 @@ const (
 	priorFetchBudget = 30 * time.Second
 )
 
+// recapScopeSeries is the recaps sidecar's scope value for a "previously, in earlier
+// books" entry (the schema's other value is "book").
+const recapScopeSeries = "series"
+
 // SeriesPrior is the community-published recap material of the NEAREST EARLIER volume
 // in a book's series that has published recaps - the only legitimate source for that
 // book's `chapter: 0` `scope: "series"` "previously" recap when the earlier volumes
@@ -152,38 +156,83 @@ func (c *Client) resolveSeriesListing(ctx context.Context, q SeriesPriorQuery) (
 	if name == "" {
 		return nil, false, reachable
 	}
-	feed, found, ok := c.seriesListing(ctx, seriesSlug(name))
-	if !ok {
-		return nil, false, false
+	for _, slug := range seriesSlugCandidates(name) {
+		feed, found, ok := c.seriesListing(ctx, slug)
+		if !ok {
+			reachable = false
+			continue
+		}
+		if found && match.NormalizeSeries(feed.name) == match.NormalizeSeries(name) {
+			return feed.entries, true, true
+		}
 	}
-	if !found || match.NormalizeSeries(feed.name) != match.NormalizeSeries(name) {
-		// Upstream has no such series, or the slug landed on a different one. Either
-		// way the answer is settled: there is no prior to derive from this name.
-		return nil, false, true
+	// No candidate slug resolved to this book's series. That is settled ONLY if every
+	// request along the way actually completed - a 502 on this book's own work or on a
+	// candidate listing leaves the question open, and reporting it settled would let a
+	// transient outage freeze a permanent "no prior".
+	return nil, false, reachable
+}
+
+// seriesSlugCandidates derives the series ids to try for a scanned series name, in
+// descending confidence and deduped: the plain slug, then the slug of the name with a
+// leading article dropped.
+//
+// The second form is not optional. The NAME check above uses match.NormalizeSeries,
+// which strips leading articles, but the ID has to be guessed BEFORE anything can be
+// fetched - so a book scanned as "The Wandering Inn" guesses the-wandering-inn, 404s
+// against an upstream id of wandering-inn, and the whole fallback is dead for every
+// "The ..." series.
+func seriesSlugCandidates(name string) []string {
+	var out []string
+	add := func(s string) {
+		if s != "" && !slices.Contains(out, s) {
+			out = append(out, s)
+		}
 	}
-	return feed.entries, true, true
+	add(seriesSlug(name))
+	add(seriesSlug(stripLeadingArticle(name)))
+	return out
+}
+
+// stripLeadingArticle drops a leading English article from a series name.
+func stripLeadingArticle(name string) string {
+	name = strings.TrimSpace(name)
+	for _, article := range []string{"the ", "an ", "a "} {
+		if len(name) > len(article) && strings.EqualFold(name[:len(article)], article) {
+			return strings.TrimSpace(name[len(article):])
+		}
+	}
+	return name
 }
 
 // priorCandidates returns the series members that precede this book, NEAREST FIRST.
 //
 // The cut is by series position when the book states a parseable one, and otherwise
-// by this book's index in the listing (the upstream listing is in series order). A
-// book that is in neither has no derivable predecessor.
+// (or when no member states a comparable position) by this book's index in the
+// listing, which upstream returns in series order. A book in neither has no derivable
+// predecessor.
 func priorCandidates(entries []seriesEntry, q SeriesPriorQuery) []string {
-	var out []string
+	workID := strings.TrimSpace(q.WorkID)
 	if pos, ok := parseFloatSeq(q.SeriesPos); ok {
+		var out []string
 		for _, e := range entries {
 			if p, ok := parseFloatSeq(e.Pos); ok && p < pos {
 				out = append(out, e.ID)
 			}
 		}
-		slices.Reverse(out)
-		return out
+		// An EMPTY result here is not an answer, it is an unusable position column:
+		// real listings record omnibus members as ranges ("1-3"), which parseFloatSeq
+		// rejects, so every earlier volume is skipped and the walk never runs. Fall
+		// through to the listing-order cut rather than reporting "no predecessor".
+		if len(out) > 0 || workID == "" {
+			slices.Reverse(out)
+			return out
+		}
 	}
-	workID := strings.TrimSpace(q.WorkID)
 	if workID == "" {
 		return nil
 	}
+	var out []string
 	for _, e := range entries {
 		if e.ID == workID {
 			slices.Reverse(out)
@@ -212,9 +261,14 @@ func (c *Client) priorMaterial(ctx context.Context, workID string) (SeriesPrior,
 		Ending:  strings.TrimSpace(work.ending),
 	}
 	for _, rc := range work.recaps {
-		// Chapter 0 is the predecessor's OWN "previously" recap (its prior volume's
-		// material), never its story; only chaptered entries describe this book's
-		// predecessor.
+		// scope:"series" is that volume's OWN "previously" recap, summarising ITS
+		// predecessors rather than its story - usually at chapter 0, but a long series
+		// can carry a chaptered one. Either way it is the wrong book: staging it as
+		// this volume's final recap would break the promise the staged header makes
+		// about whose story the material describes.
+		if rc.scope == recapScopeSeries {
+			continue
+		}
 		if rc.chapter > p.FinalRecapChapter && strings.TrimSpace(rc.text) != "" {
 			p.FinalRecap = strings.TrimSpace(rc.text)
 			p.FinalRecapChapter = rc.chapter

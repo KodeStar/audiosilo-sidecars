@@ -207,3 +207,51 @@ func TestReadmitRoundCapParkSupersedesCurrentStage(t *testing.T) {
 		t.Errorf("qa_adjudicating successes = %d after readmit, want 0 (round-cap park grants a fresh round)", n)
 	}
 }
+
+// TestRetryClearsARecordedSeriesPriorNegative: the durable "no upstream prior" record
+// keeps a book's series-opener verdict stable across an outage mid-loop, but it must
+// not outlive an explicit Retry - the human retrying may have just contributed the
+// predecessor volume upstream. A POSITIVE record is never touched: retracting one turns
+// the chapter-0 recap already written into a hard validation error, the deadlock the
+// record exists to prevent.
+func TestRetryClearsARecordedSeriesPriorNegative(t *testing.T) {
+	positive := `{"work_id":"killing-floor","title":"Killing Floor","fetched_at":"2026-08-01T00:00:00Z"}`
+	cases := []struct {
+		name     string
+		body     string
+		wantGone bool
+	}{
+		{"negative record", `{"none":true,"fetched_at":"2026-08-01T00:00:00Z"}`, true},
+		{"positive record", positive, false},
+		{"malformed record", `{not json`, false}, // the pipeline reports it loudly; never silently dropped
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			db := h.openDB(t)
+			ctx := context.Background()
+			b := h.addBook(t, db, "priorretry", "", "")
+			if err := db.SetBookState(ctx, b.ID, string(state.Synthesizing), string(state.StatusFailed), "boom", ""); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(b.WorkDir, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(b.WorkDir, SeriesPriorFile)
+			if err := os.WriteFile(path, []byte(tc.body), 0o644); err != nil { //nolint:gosec // test artifact
+				t.Fatal(err)
+			}
+
+			sched := New(db, h.hub, NewStubExecutor(0, 0), 1, h.workRoot, false)
+			if err := sched.Retry(ctx, b.ID); err != nil {
+				t.Fatalf("retry: %v", err)
+			}
+
+			_, err := os.Stat(path)
+			gone := os.IsNotExist(err)
+			if gone != tc.wantGone {
+				t.Errorf("%s removed = %v, want %v", SeriesPriorFile, gone, tc.wantGone)
+			}
+		})
+	}
+}

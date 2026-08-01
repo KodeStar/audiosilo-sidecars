@@ -209,6 +209,41 @@ func TestSeriesPriorNeverRecordsADegradedNegative(t *testing.T) {
 	}
 }
 
+// A negative is durable but not permanent: once scheduler.readmit clears it (a Retry),
+// the next stage entry re-derives against upstream. This is the flip the type comment
+// calls safe - the human retrying may have just contributed the predecessor volume.
+func TestSeriesPriorRederivesAfterTheRecordIsCleared(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+	two := newSeriesBook(t, db, root, "Jack Reacher", "2", false)
+	path := filepath.Join(two.WorkDir, seriesPriorFile)
+
+	meta := &scriptedMeta{definitive: true}
+	if opener, _, err := priorExecutor(t, db, meta).seriesStatus(context.Background(), two); err != nil || !opener {
+		t.Fatalf("first pass: opener=%v err=%v", opener, err)
+	}
+	if !fileExistsT(path) {
+		t.Fatal("no negative was recorded")
+	}
+
+	// What readmit does (its own test covers the removal itself).
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	// Upstream has since gained the predecessor.
+	meta.prior = killingFloor()
+	opener, prior, err := priorExecutor(t, db, meta).seriesStatus(context.Background(), two)
+	if err != nil {
+		t.Fatalf("seriesStatus: %v", err)
+	}
+	if opener || prior.WorkID != "killing-floor" {
+		t.Errorf("opener=%v prior=%+v; a cleared record must be re-derived", opener, prior)
+	}
+	if meta.calls != 2 {
+		t.Errorf("upstream consulted %d times, want 2 (once per determination)", meta.calls)
+	}
+}
+
 // A recorded negative must never be mistaken for prior material: the book stays an
 // opener and stages no series-previously.md.
 func TestSeriesPriorNegativeRecordKeepsTheOpenerVerdict(t *testing.T) {

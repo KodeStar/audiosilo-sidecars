@@ -217,13 +217,20 @@ func (c *Client) seriesListing(ctx context.Context, seriesID string) (seriesFeed
 	if cached, hit := c.seriesFeed.get(seriesID); hit {
 		return cached, true, true
 	}
+	// NOTE the shape difference between the two endpoints, which is easy to get
+	// wrong and impossible to notice without a real payload: a member's nested work
+	// here carries `series` as an OBJECT (metaserve's workCard.Series *seriesRef),
+	// while GET /works/{id} carries it as an ARRAY (see workDetail). Decoding this
+	// one as an array fails json.Unmarshal for EVERY real series, which getJSON maps
+	// to a transport failure - so the whole listing, and with it SeriesGlossary,
+	// silently degrades to empty.
 	var res struct {
 		Name  string `json:"name"`
 		Works []struct {
 			Position string `json:"position"`
 			Work     *struct {
 				ID     string `json:"id"`
-				Series []struct {
+				Series *struct {
 					Position string `json:"position"`
 				} `json:"series"`
 			} `json:"work"`
@@ -244,8 +251,8 @@ func (c *Client) seriesListing(ctx context.Context, seriesID string) (seriesFeed
 		pos := e.Position
 		// The nested work echoes its own membership; it is the fallback when the
 		// listing entry itself records no position.
-		if pos == "" && len(e.Work.Series) > 0 {
-			pos = e.Work.Series[0].Position
+		if pos == "" && e.Work.Series != nil {
+			pos = e.Work.Series.Position
 		}
 		feed.entries = append(feed.entries, seriesEntry{ID: e.Work.ID, Pos: pos})
 	}

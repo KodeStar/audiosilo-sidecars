@@ -12,12 +12,14 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 	"github.com/kodestar/audiosilo-sidecars/internal/metaops"
+	"github.com/kodestar/audiosilo-sidecars/internal/scheduler"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
 
 // seriesPriorFile is the durable record of an earlier series volume's community-published
-// recap material, written into the book's work dir the first time it is obtained.
-const seriesPriorFile = "series_prior.json"
+// recap material, written into the book's work dir the first time it is obtained. The
+// scheduler owns the NAME (readmit clears a negative record); the schema below is ours.
+const seriesPriorFile = scheduler.SeriesPriorFile
 
 // seriesPriorStagedName is the staged file the synthesis/audit/fix agents read it from.
 const seriesPriorStagedName = "series-previously.md"
@@ -31,7 +33,9 @@ const seriesPriorStagedName = "series-previously.md"
 // DEFINITIVE negative is written - an outage maps to an empty result upstream, and
 // freezing that would pin opener=true, the exact bug class this record exists to fix.
 //
-// Deleting series_prior.json is the manual way to force a fresh determination.
+// A negative is NOT permanent: scheduler.readmit clears it (never a positive one), so a
+// Retry re-derives against upstream - the case being a human who has since contributed
+// the predecessor volume. Deleting series_prior.json by hand does the same.
 type seriesPrior struct {
 	// None marks a recorded "this book has no upstream prior". present() stays false
 	// for it, so the opener verdict is exactly what it would be with no record - only

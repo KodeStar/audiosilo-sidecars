@@ -30,9 +30,11 @@ type workRow struct {
 	ending  string
 }
 
-// recapRow is one published chaptered recap on a fake work.
+// recapRow is one published chaptered recap on a fake work. An empty scope emits the
+// schema's ordinary "book" scope.
 type recapRow struct {
 	chapter int
+	scope   string
 	text    string
 }
 
@@ -123,7 +125,11 @@ func (s *metaServer) handler() http.Handler {
 		case len(wk.recaps) > 0:
 			parts := make([]string, 0, len(wk.recaps))
 			for _, rc := range wk.recaps {
-				parts = append(parts, fmt.Sprintf(`{"through":{"chapter":%d},"scope":"book","text":%q}`, rc.chapter, rc.text))
+				scope := rc.scope
+				if scope == "" {
+					scope = "book"
+				}
+				parts = append(parts, fmt.Sprintf(`{"through":{"chapter":%d},"scope":%q,"text":%q}`, rc.chapter, scope, rc.text))
 			}
 			body += `,"recaps":[` + strings.Join(parts, ",") + `]`
 		case wk.r:
@@ -153,10 +159,22 @@ func (s *metaServer) handler() http.Handler {
 			// Each member reports its own series position (the prior walk cuts on it);
 			// a work the fake does not define falls back to "1" as before.
 			pos := "1"
-			if wk, ok := s.work[wid]; ok && wk.seriesPos != "" {
-				pos = wk.seriesPos
+			name := "S"
+			if wk, ok := s.work[wid]; ok {
+				if wk.seriesPos != "" {
+					pos = wk.seriesPos
+				}
+				if wk.seriesName != "" {
+					name = wk.seriesName
+				}
 			}
-			parts = append(parts, `{"position":"`+pos+`","work":{"id":"`+wid+`"}}`)
+			// The nested work mirrors the LIVE shape exactly: metaserve's workCard
+			// carries `series` as an OBJECT here (unlike GET /works/{id}, where it is
+			// an array). A fake that omits the key entirely cannot catch a decode
+			// drift, which is how an array-shaped struct passed every test while
+			// failing against every real series.
+			parts = append(parts, `{"position":"`+pos+`","work":{"id":"`+wid+
+				`","title":"`+wid+`","series":{"id":"`+id+`","name":"`+name+`","position":"`+pos+`"}}}`)
 		}
 		name := s.seriesName
 		if name == "" {

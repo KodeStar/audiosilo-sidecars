@@ -54,6 +54,12 @@ const (
 	AuditAcceptedFile = "audit_accepted.json"
 )
 
+// SeriesPriorFile records the upstream series-predecessor determination for a book.
+// Its NAME lives here for the same reason as the audit artifacts above (readmit
+// clears a recorded NEGATIVE one; see clearSeriesPriorNegative); the pipeline owns
+// its JSON schema.
+const SeriesPriorFile = "series_prior.json"
+
 // Sentinel is the on-disk _done/<stage>.json marker: the CONTENT truth that a
 // stage produced its output. Runs counts real executions (so a test can prove a
 // completed stage was never re-run after a crash), and Result carries the branch

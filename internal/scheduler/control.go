@@ -2,10 +2,12 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/scratch"
 	"github.com/kodestar/audiosilo-sidecars/internal/state"
@@ -128,6 +130,7 @@ func (s *Scheduler) readmit(ctx context.Context, b store.Book) error {
 		_ = os.Remove(filepath.Join(b.WorkDir, AuditRoundsFile))
 		_ = os.Remove(filepath.Join(b.WorkDir, AuditAcceptedFile))
 	}
+	clearSeriesPriorNegative(b.WorkDir)
 	// Clearing the status clears the error, the typed park_code, and any scheduled
 	// retry_at together.
 	if err := s.db.SetBookStatus(ctx, id, string(state.StatusNone), "", ""); err != nil {
@@ -136,6 +139,39 @@ func (s *Scheduler) readmit(ctx context.Context, b store.Book) error {
 	s.publishState(id, b.State, "", "", "", "")
 	s.notify()
 	return nil
+}
+
+// clearSeriesPriorNegative drops a RECORDED-NEGATIVE series-prior determination (a
+// series_prior.json carrying "none": true) so the next stage entry re-derives it.
+//
+// A readmit is exactly the moment "no earlier volume is covered upstream" may have
+// stopped being true - most obviously when the human retrying has just contributed
+// the predecessor themselves. The negative is durable so a metadata outage cannot flip
+// a book back to series-opener mid-loop, but that determinism must not outlive an
+// explicit retry: one extra bounded series walk costs nothing next to a book
+// permanently missing its chapter-0 recap.
+//
+// A POSITIVE record is NEVER removed. Retracting one turns the chapter-0 recap already
+// written into a hard validation error the fixer is told to delete and the auditor
+// demands back - the deadlock this whole mechanism exists to prevent.
+func clearSeriesPriorNegative(workDir string) {
+	path := filepath.Join(workDir, SeriesPriorFile)
+	raw, err := os.ReadFile(path) //nolint:gosec // path derives from the book's work dir
+	if err != nil {
+		return
+	}
+	var rec struct {
+		None   bool   `json:"none"`
+		WorkID string `json:"work_id"`
+	}
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		// Malformed: the pipeline surfaces that loudly on the next entry. Deleting it
+		// here would silently paper over a corrupted determination.
+		return
+	}
+	if rec.None && strings.TrimSpace(rec.WorkID) == "" {
+		_ = os.Remove(path)
+	}
 }
 
 // Cancel stops a book: it interrupts any running stage and marks the book failed

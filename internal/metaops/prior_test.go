@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -32,6 +34,93 @@ func jackReacher() *metaServer {
 		seriesWorks: map[string][]string{
 			"s": {"killing-floor", "die-trying"}, "jack-reacher": {"killing-floor", "die-trying"},
 		},
+	}
+}
+
+// liveSeriesPayload is a VERBATIM (trimmed to two members) capture of
+// GET https://meta.audiosilo.app/api/v1/series/jack-reacher. Nothing about it is
+// normalized: it exists so a struct-vs-wire drift is caught by a real payload rather
+// than by a fake that happens to agree with the struct.
+//
+// The decisive detail is `work.series` being an OBJECT here. It was once decoded as an
+// array, which made json.Unmarshal fail for every real series - reported upward as a
+// transport failure, so the prior lookup never worked and SeriesGlossary silently went
+// empty. Every fake passed, because none of them emitted the key at all.
+const liveSeriesPayload = `{
+ "id": "jack-reacher",
+ "name": "Jack Reacher",
+ "authors": [],
+ "works": [
+  {
+   "position": "1",
+   "work": {
+    "id": "killing-floor",
+    "title": "Killing Floor",
+    "authors": [{"id": "lee-child", "name": "Lee Child"}],
+    "series": {"id": "jack-reacher", "name": "Jack Reacher", "position": "1"},
+    "cover_url": "https://m.media-amazon.com/images/I/41LG8nia4rL.jpg",
+    "added_at": "2026-07-12T23:30:06+01:00"
+   }
+  },
+  {
+   "position": "2",
+   "work": {
+    "id": "die-trying",
+    "title": "Die Trying",
+    "authors": [{"id": "lee-child", "name": "Lee Child"}],
+    "series": {"id": "jack-reacher", "name": "Jack Reacher", "position": "2"},
+    "cover_url": "https://m.media-amazon.com/images/I/51vI4yx97hL.jpg",
+    "added_at": "2026-07-30T14:42:56+01:00"
+   }
+  }
+ ]
+}`
+
+func TestSeriesListingDecodesTheLivePayload(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(liveSeriesPayload))
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.URL)
+
+	feed, found, ok := c.seriesListing(context.Background(), "jack-reacher")
+	if !ok {
+		t.Fatal("the live payload was reported as a TRANSPORT FAILURE: the decode struct " +
+			"does not match the wire (this is what a json.Unmarshal error looks like from here)")
+	}
+	if !found {
+		t.Fatal("found = false for a 200 payload")
+	}
+	if feed.name != "Jack Reacher" {
+		t.Errorf("series name = %q", feed.name)
+	}
+	want := []seriesEntry{{ID: "killing-floor", Pos: "1"}, {ID: "die-trying", Pos: "2"}}
+	if !slices.Equal(feed.entries, want) {
+		t.Errorf("entries = %+v, want %+v", feed.entries, want)
+	}
+
+	// And the glossary path, which reads through the same decode, must see the members.
+	ids, ok := c.seriesWorks(context.Background(), "jack-reacher")
+	if !ok || !slices.Equal(ids, []string{"killing-floor", "die-trying"}) {
+		t.Errorf("seriesWorks = %v ok=%v; a decode drift silently empties SeriesGlossary", ids, ok)
+	}
+}
+
+// The position also survives when only the NESTED work states it (the entry-level
+// key is the primary source; this is the documented fallback).
+func TestSeriesListingFallsBackToTheNestedPosition(t *testing.T) {
+	body := `{"id":"s","name":"S","works":[{"work":{"id":"w1","series":{"id":"s","name":"S","position":"7"}}}]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+
+	feed, _, ok := NewClient(srv.URL).seriesListing(context.Background(), "s")
+	if !ok {
+		t.Fatal("decode failed")
+	}
+	if len(feed.entries) != 1 || feed.entries[0].Pos != "7" {
+		t.Errorf("entries = %+v, want the nested position 7", feed.entries)
 	}
 }
 
@@ -272,6 +361,141 @@ func TestSeriesPriorForDoesNotWalkPastAnUnreachableVolume(t *testing.T) {
 	// And the stop is NOT a settled answer: the unread volume may well have recaps.
 	if definitive {
 		t.Error("a walk stopped by a transport failure must not be reported as definitive")
+	}
+}
+
+// Finding 2's scenario: this book's own /works/{id} 502s AND the slug guess misses.
+// Neither request settled anything, so the dead end must NOT be reported as
+// definitive - a permanent {"none":true} on a transient outage is the exact failure
+// the flag exists to prevent.
+func TestSeriesPriorForUnreadableOwnWorkIsNotDefinitive(t *testing.T) {
+	s := jackReacher()
+	s.onWorks = func(id string) {
+		if id == "die-trying" {
+			panic(http.ErrAbortHandler)
+		}
+	}
+	// The name fallback finds no such series either (the slug guesses both miss).
+	s.seriesWorks = map[string][]string{}
+	c, _ := newMeta(t, s)
+
+	p, definitive, err := c.SeriesPriorFor(context.Background(), SeriesPriorQuery{
+		WorkID: "die-trying", SeriesName: "Jack Reacher", SeriesPos: "2",
+	})
+	if err != nil {
+		t.Fatalf("SeriesPriorFor: %v", err)
+	}
+	if !p.Empty() {
+		t.Fatalf("prior=%+v, want empty", p)
+	}
+	if definitive {
+		t.Error("an unread own-work plus a slug miss is not a settled answer: a transient " +
+			"outage would freeze a permanent negative")
+	}
+}
+
+// Finding 3's scenario: earlier members are listed with OMNIBUS positions ("1-3"),
+// which parseFloatSeq rejects. The position cut then yields nothing, and returning
+// there made the listing-index cut unreachable - a permanent wrong negative.
+func TestSeriesPriorForFallsBackWhenPositionsAreUnparseable(t *testing.T) {
+	s := &metaServer{
+		seriesName: "Omnibus Series",
+		work: map[string]workRow{
+			"omnibus-1-3": {title: "Books 1-3", seriesName: "Omnibus Series", seriesPos: "1-3",
+				recaps: []recapRow{{chapter: 60, text: "The omnibus ends."}}},
+			"book-4": {title: "Book Four", seriesName: "Omnibus Series", seriesPos: "4"},
+		},
+		seriesWorks: map[string][]string{"s": {"omnibus-1-3", "book-4"}},
+	}
+	c, _ := newMeta(t, s)
+
+	p, definitive, err := c.SeriesPriorFor(context.Background(), SeriesPriorQuery{
+		WorkID: "book-4", SeriesName: "Omnibus Series", SeriesPos: "4",
+	})
+	if err != nil {
+		t.Fatalf("SeriesPriorFor: %v", err)
+	}
+	if p.WorkID != "omnibus-1-3" {
+		t.Errorf("work id = %q, want omnibus-1-3 (the listing-order cut must run when no "+
+			"member states a comparable position)", p.WorkID)
+	}
+	if !definitive {
+		t.Error("definitive = false for a completed walk")
+	}
+}
+
+// Finding 4's scenario: match.NormalizeSeries strips leading articles but the ID must
+// be GUESSED before anything is fetched, so "The Wandering Inn" has to try
+// wandering-inn as well as the-wandering-inn or the fallback is dead for every
+// "The ..." series.
+func TestSeriesPriorForTriesBothSlugForms(t *testing.T) {
+	for _, upstreamID := range []string{"the-wandering-inn", "wandering-inn"} {
+		t.Run(upstreamID, func(t *testing.T) {
+			s := &metaServer{
+				seriesName: "The Wandering Inn",
+				work: map[string]workRow{
+					"book-1": {title: "Book One", seriesName: "The Wandering Inn", seriesPos: "1",
+						recaps: []recapRow{{chapter: 12, text: "Erin opens the inn."}}},
+				},
+				seriesWorks: map[string][]string{upstreamID: {"book-1"}},
+			}
+			c, _ := newMeta(t, s)
+
+			// No WorkID: the book was never matched, so only the name can resolve it.
+			p, definitive, err := c.SeriesPriorFor(context.Background(), SeriesPriorQuery{
+				SeriesName: "The Wandering Inn", SeriesPos: "2",
+			})
+			if err != nil {
+				t.Fatalf("SeriesPriorFor: %v", err)
+			}
+			if p.WorkID != "book-1" {
+				t.Errorf("work id = %q, want book-1 (upstream series id %q)", p.WorkID, upstreamID)
+			}
+			if !definitive {
+				t.Error("definitive = false for a resolved series")
+			}
+		})
+	}
+}
+
+// A predecessor's own scope:"series" recap summarises ITS predecessors, not its story.
+// Staging it as that volume's final recap would break the promise the staged header
+// makes about whose story the material describes.
+func TestSeriesPriorForIgnoresTheScopeSeriesRecap(t *testing.T) {
+	s := jackReacher()
+	row := s.work["killing-floor"]
+	// A higher-chaptered series recap would otherwise win on chapter number alone.
+	row.recaps = append(row.recaps, recapRow{chapter: 99, scope: recapScopeSeries,
+		text: "Previously, in the books before this one."})
+	s.work["killing-floor"] = row
+	c, _ := newMeta(t, s)
+
+	p, _, err := c.SeriesPriorFor(context.Background(), SeriesPriorQuery{
+		WorkID: "die-trying", SeriesName: "Jack Reacher", SeriesPos: "2",
+	})
+	if err != nil {
+		t.Fatalf("SeriesPriorFor: %v", err)
+	}
+	if p.FinalRecapChapter != 30 || strings.Contains(p.FinalRecap, "Previously") {
+		t.Errorf("a scope:series recap was staged as the volume's own final recap: chapter %d %q",
+			p.FinalRecapChapter, p.FinalRecap)
+	}
+}
+
+func TestStripLeadingArticle(t *testing.T) {
+	for in, want := range map[string]string{
+		"The Wandering Inn":     "Wandering Inn",
+		"A Deadly Education":    "Deadly Education",
+		"An Ember in the Ashes": "Ember in the Ashes",
+		"the expanse":           "expanse",
+		"Mistborn":              "Mistborn",
+		// Not an article, just a word that starts with one.
+		"Theft of Swords": "Theft of Swords",
+		"A":               "A",
+	} {
+		if got := stripLeadingArticle(in); got != want {
+			t.Errorf("stripLeadingArticle(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
