@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
+	"github.com/kodestar/audiosilo-sidecars/internal/state"
 )
 
 func writeFile(t *testing.T, path string, n int) {
@@ -77,7 +78,7 @@ func TestPurgeRemovesChaptersKeepsDurables(t *testing.T) {
 	writeFile(t, filepath.Join(work, audio.ManifestName), 80)
 	writeFile(t, filepath.Join(work, "transcripts-raw", "ch001.json"), 200)
 
-	if err := Purge(root, work); err != nil {
+	if err := Purge(root, work, state.KindAudio); err != nil {
 		t.Fatalf("Purge: %v", err)
 	}
 	for _, gone := range []string{audio.ChaptersDir, "_runs", "clips", "retranscribe"} {
@@ -98,7 +99,7 @@ func TestPurgeRefusesOutsideRoot(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
 	writeFile(t, filepath.Join(outside, audio.ChaptersDir, "ch001.flac"), 1024)
-	if err := Purge(root, outside); err != nil {
+	if err := Purge(root, outside, state.KindAudio); err != nil {
 		t.Fatalf("Purge: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(outside, audio.ChaptersDir)); err != nil {

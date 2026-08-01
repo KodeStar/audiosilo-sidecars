@@ -192,6 +192,11 @@ func (s *Scheduler) Delete(ctx context.Context, id int64) error {
 // reclaim more scratch (e.g. ASR working files in M3).
 var purgeInvalidatedStages = []state.State{state.Splitting}
 
+// purgeInvalidatedEbookStages is the same idea for an ebook book: the purge removes
+// extracting's output, so its sentinel must go too or a later Retry skips the stage
+// and hands fact_pass an empty text directory.
+var purgeInvalidatedEbookStages = []state.State{state.Extracting}
+
 // PurgeScratch reclaims a book's split chapters/ (the M2 heavy scratch) while
 // keeping its durables (probe.json/manifest.json/transcripts). It is a manual,
 // user-initiated reclaim: allowed only when the book is done, paused, or
@@ -228,13 +233,18 @@ func (s *Scheduler) PurgeScratch(ctx context.Context, id int64) error {
 // book so a later Retry re-runs the invalidated stage. b must carry the book's CURRENT
 // state (its terminal check gates the reconcile).
 func (s *Scheduler) purgeScratchInner(ctx context.Context, b store.Book) error {
-	if err := scratch.Purge(s.workRoot, b.WorkDir); err != nil {
+	kind := state.ParseKind(b.Kind)
+	if err := scratch.Purge(s.workRoot, b.WorkDir, kind); err != nil {
 		return err
 	}
 	// The reclaimed artifacts include a completed stage's output, so drop that
 	// stage's sentinel (and its recorded success) - a later Retry/reconcile must
 	// re-run it rather than skip it and feed the next stage an empty chapters/.
-	for _, st := range purgeInvalidatedStages {
+	invalidated := purgeInvalidatedStages
+	if kind == state.KindEbook {
+		invalidated = purgeInvalidatedEbookStages
+	}
+	for _, st := range invalidated {
 		_ = os.Remove(SentinelPath(b.WorkDir, string(st)))
 	}
 	// Re-account what remains (the durables) in one walk so scratch_bytes reflects

@@ -17,8 +17,10 @@ import (
 
 	"github.com/kodestar/audiosilo-sidecars/internal/agent"
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
+	"github.com/kodestar/audiosilo-sidecars/internal/ebook"
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 	"github.com/kodestar/audiosilo-sidecars/internal/repair"
+	"github.com/kodestar/audiosilo-sidecars/internal/state"
 )
 
 // DirSize returns the total size in bytes of the regular files under path
@@ -86,17 +88,39 @@ func Confined(workRoot, workDir string) (string, bool) {
 // invalidates no sentinel), so a purge can reclaim them freely.
 var reclaimable = []string{audio.ChaptersDir, agent.RunsDir, repair.ClipsDir, repair.RetranscribeDir}
 
+// ebookReclaimable names the layers an EBOOK book reclaims on top of the shared
+// list: the raw split output and the per-chapter text derived from it.
+//
+// They are kind-specific rather than global because the audio path's equivalent
+// layer, transcripts-corrected/, is DURABLE - it is the n-gram source for a later
+// re-validation and the corpus a sequel's spelling carryover copies from. Adding it
+// to the shared list would delete an audio book's corrected transcripts.
+//
+// For an ebook the opposite holds, and not only for disk: this IS the book's
+// copyrighted source prose. The repo's rule is that source material never outlives
+// the derivation, so purging it is required, not an optimization - and it is cheap
+// to regenerate from the epub if a retry needs it.
+var ebookReclaimable = []string{ebook.ExtractDir, ebook.TextDir}
+
 // Purge deletes a book's reclaimable scratch - the split chapters/ directory, the
 // agent staged-context dirs (_runs/), and the tail-clip/re-transcription scratch
 // (clips/, retranscribe/) - while KEEPING the durables (probe.json, manifest.json,
 // transcripts, facts, sidecars). It is a no-op when the work dir is absent. The
 // deletion is confined to workRoot.
-func Purge(workRoot, workDir string) error {
+//
+// kind selects the extra ebook layers (see ebookReclaimable); an empty or unknown
+// kind is treated as audio, so a pre-migration book reclaims exactly what it always
+// did.
+func Purge(workRoot, workDir string, kind state.Kind) error {
 	wd, ok := Confined(workRoot, workDir)
 	if !ok {
 		return nil // nothing safe to remove
 	}
-	for _, dir := range reclaimable {
+	dirs := reclaimable
+	if state.ParseKind(string(kind)) == state.KindEbook {
+		dirs = append(append([]string{}, reclaimable...), ebookReclaimable...)
+	}
+	for _, dir := range dirs {
 		if err := os.RemoveAll(filepath.Join(wd, dir)); err != nil {
 			return err
 		}
