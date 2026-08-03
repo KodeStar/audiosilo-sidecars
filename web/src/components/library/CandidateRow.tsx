@@ -161,6 +161,21 @@ export const CandidateRow = memo(function CandidateRow({
         {book.ebook_note && <div className="mt-0.5 text-xs italic text-dim">{book.ebook_note}</div>}
         {book.subtitle && <div className="text-xs text-dim">{book.subtitle}</div>}
         {authors && <div className="text-xs text-body">{authors}</div>}
+        {/* Where the row actually lives. A generic title ("Jack Reacher Short Story
+            #02") is unidentifiable without it. The max-w is load-bearing: the parent
+            table is auto-layout inside an overflow-x-auto wrapper, so a bare
+            `truncate` (which sets whitespace-nowrap) would make the cell grow to
+            max-content and scroll the table sideways instead of clipping. Capping the
+            div's width bounds the cell's max-content contribution AND gives the
+            ellipsis something to clip against. The absolute path is the tooltip. */}
+        {book.path && (
+          <div
+            className="mt-0.5 max-w-[24rem] truncate font-mono text-[11px] text-dim"
+            title={book.source_path || book.path}
+          >
+            {book.path}
+          </div>
+        )}
         <div className="mt-1 flex flex-wrap items-center gap-1.5">
           {book.asin && <IdentityChip kind="ASIN" value={book.asin} source={book.sources?.asin} />}
           {book.isbn && <IdentityChip kind="ISBN" value={book.isbn} source={book.sources?.isbn} />}

@@ -65,6 +65,26 @@ describe('CandidateRow pipeline presence', () => {
   });
 });
 
+describe('CandidateRow path', () => {
+  it('renders the relative path with the absolute path as its tooltip', () => {
+    renderRow(book());
+
+    const path = screen.getByText('Unintended Cultivator/UC01');
+    expect(path).toHaveAttribute('title', '/library/Unintended Cultivator/UC01');
+    // The cap is what makes `truncate` clip inside an auto-layout table cell -
+    // without it the cell grows to max-content and scrolls the table sideways.
+    expect(path.className).toContain('truncate');
+    expect(path.className).toContain('max-w-');
+  });
+
+  it('renders nothing for a candidate with no path', () => {
+    renderRow(book({ path: '', source_path: '' }));
+
+    expect(screen.queryByTitle('/library/Unintended Cultivator/UC01')).not.toBeInTheDocument();
+    expect(screen.getByText('Unintended Cultivator, Volume One')).toBeInTheDocument();
+  });
+});
+
 describe('epub candidates', () => {
   const base = {
     path: 'a',
