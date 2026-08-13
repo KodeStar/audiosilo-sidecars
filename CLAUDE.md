@@ -717,7 +717,49 @@ internal/
             must never park a book. Coverage resolves
             asin -> isbn -> a fuzzy title-search fallback scored by
             audiosilo-server's pure-stdlib pkg/match (Coverage carries matched_by
-            "asin"|"isbn"|"search"|"manual" + work_title provenance). Scans STREAM:
+            "asin"|"isbn"|"search"|"manual" + work_title provenance). The search
+            fallback walks the ladder.go RETRIEVAL LADDER: over a real 1147-book
+            library the dominant failure was retrieval, not scoring - a decorated
+            shelf title ("Supermage : Rise To Omniscience, Book 1", "Halo:
+            Primordium (Unabridged)", "Artemis Fowl 4 - The Opal Deception")
+            retrieves NOTHING even when the work is indexed under a clean title. The
+            ladder is 9 ordered, de-duplicated query shapes (raw title, punctuation-
+            normalized, CleanTitle, pre-subtitle, post-separator tail, bare trailing
+            volume stripped, title+author, folder leaf, parent folder), the raw title
+            FIRST and ALWAYS (the minimum query length is a floor on the DERIVED
+            rungs only - a book called "It" must still search something) and an early
+            exit at the first rung match.Best accepts, so a book that already
+            resolved still costs one request. Each rung carries its own matchTitle,
+            and the de-duplication key is the WHOLE step: rung 5 and rung 8 can send
+            the same query scored against different titles, and dropping the second
+            deletes the leaf-scored variant that is the point of the rung. The FOLDER
+            LEAF rung queries the tail behind a shelf prefix ("RO07 - Sandqueen") or
+            else the whole leaf name, and is SCORED against that leaf only when the
+            tag title does not contradict it (empty, spells the leaf out, or is a
+            bare shortcode with no real word - leafScorable); a mis-shelved folder
+            naming another book by the same author otherwise mints a confident match,
+            and a search verdict becomes books.work_id, which the contributing stage
+            attaches sidecars to. A wider query also retrieves the right SERIES and
+            the wrong volume - titleTokens drops pure numbers, so book 1's card is a
+            perfect title match for "The Wandering Inn - 7" - so an accept is VETOED
+            when the card's series position disagrees with the volume the book claims
+            (its series-position tag, else a trailing number or "Book N" marker in the
+            title), or when the accepting rung dropped a number the scored title
+            carried and the card states no position at all; the walk then continues.
+            NARRATOR EVIDENCE is not a second pass: the book's narrators ride the
+            match.Query and each card's ride its match.Book, and pkg/match's person
+            gate accepts author<->author, query-author<->card-narrator and
+            query-narrator<->card-author in ONE Best call (a shelf routinely credits
+            the narrator as the author). Coverage.ApplyContributed is
+            the read-time repair of a FROZEN verdict: it is resolved once per scan
+            and cached, so a work this daemon has since contributed kept reporting
+            "needed" - GET /scans folds the contributions table through
+            store.LandedCoverage (merged/already_covered only) and patches a KNOWN
+            verdict additively, and ONLY when the book's work_id agrees with the
+            verdict's (contributions made under another work - a core-flow slug, a
+            later manual match - must not stamp this work's badges); the book view
+            applies the same patch so the two endpoints cannot disagree.
+            verdict additively. Scans STREAM:
             the manager drives pkg/scan's OnProgress/OnBook hooks, books appear
             incrementally (identity provisional until done - the corroborated,
             sorted final list replaces the array), coverage resolves in a bounded
@@ -1145,7 +1187,9 @@ Milestones from the workspace plan; each is shippable.
 - **Post-M8 UX + observability round (done):** first-real-use feedback after the
   v0.1.0 release.
   - **Library tab**: a candidate **search** box (case-insensitive AND-token match
-    over title/authors/series/narrators/asin/isbn) and **series-order sort**
+    over title/authors/series/narrators/asin/isbn plus the book's relative PATH -
+    real libraries encode identity in the folder layout the tags lack) and
+    **series-order sort**
     (grouped by series name, then parsed series position, then title/path) as the
     default candidate order (`web/src/lib/candidates.ts` `searchCandidates`/
     `sortBySeries`, `scanStore` `search`).

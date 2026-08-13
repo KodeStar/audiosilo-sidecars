@@ -246,7 +246,7 @@ func ContributionSummary(rows []Contribution) (status, url string) {
 	if r, ok := firstWithStatus(rows, ContribStatusPROpen); ok {
 		return ContribStatusPROpen, contribURL(r)
 	}
-	if allStatus(rows, ContribStatusMerged, ContribStatusAlreadyCovered) {
+	if allStatus(rows, landedStatuses...) {
 		if r, ok := firstWithStatus(rows, ContribStatusMerged); ok {
 			return ContribStatusMerged, contribURL(r)
 		}
@@ -254,6 +254,36 @@ func ContributionSummary(rows []Contribution) (status, url string) {
 	}
 	// all local, or any mixed remainder: least-committal chip.
 	return ContribStatusLocal, ""
+}
+
+// landedStatuses are the statuses meaning the dimension EXISTS UPSTREAM: this
+// daemon's contribution merged, or upstream already had it when the stage ran.
+// They are two directions on one fact, which is why ContributionSummary folds
+// them onto a single rung and LandedCoverage counts both - one spelling, so a
+// later status can never be added to one reader and forgotten in the other.
+var landedStatuses = []string{ContribStatusMerged, ContribStatusAlreadyCovered}
+
+// LandedCoverage folds a book's contribution rows into the two sidecar dimensions
+// that have landed upstream. Pure, for the same reason ContributionSummary is: the
+// Library scan join calls it per book on every poll and it needs no round-trip,
+// and the rule it encodes is worth testing without a database.
+//
+// Only the two SIDECAR kinds count. A core row is an add-work proposal - merging
+// it creates the work, and says nothing about whether its characters or recaps
+// exist.
+func LandedCoverage(rows []Contribution) (hasCharacters, hasRecaps bool) {
+	for _, r := range rows {
+		if !slices.Contains(landedStatuses, r.Status) {
+			continue
+		}
+		switch r.Kind {
+		case ContribKindCharacters:
+			hasCharacters = true
+		case ContribKindRecaps:
+			hasRecaps = true
+		}
+	}
+	return hasCharacters, hasRecaps
 }
 
 // ContributionNeedsAttention reports whether any contribution row carries a

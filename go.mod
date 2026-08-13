@@ -5,7 +5,7 @@ go 1.25.3
 require (
 	github.com/dlclark/regexp2 v1.12.0
 	github.com/kodestar/audiosilo-meta v0.8.0
-	github.com/kodestar/audiosilo-server v1.11.1-0.20260716193339-91486c3e1819
+	github.com/kodestar/audiosilo-server v1.12.1-0.20260813222639-6a1c4142a8ad
 	github.com/ulikunitz/xz v0.5.15
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/crypto v0.54.0

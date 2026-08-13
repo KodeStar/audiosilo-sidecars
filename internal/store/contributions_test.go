@@ -95,6 +95,60 @@ func TestListBooksWithUnresolvedMergedCore(t *testing.T) {
 	}
 }
 
+// TestLandedCoverage pins the landed-only rule: merged and already_covered count
+// (both mean the dimension exists upstream), every other lifecycle status does
+// not, and a merged CORE row - an add-work proposal, not a sidecar - never
+// claims a dimension. Pure, so it needs no database.
+func TestLandedCoverage(t *testing.T) {
+	row := func(kind, status string) Contribution {
+		return Contribution{Kind: kind, Mode: ContribModeIssue, Status: status}
+	}
+	for _, tc := range []struct {
+		name       string
+		rows       []Contribution
+		chars, rec bool
+	}{
+		{name: "no rows"},
+		{
+			name: "both landed, one merged and one upstream already had",
+			rows: []Contribution{
+				row(ContribKindCharacters, ContribStatusMerged),
+				row(ContribKindRecaps, ContribStatusAlreadyCovered),
+			},
+			chars: true, rec: true,
+		},
+		{
+			name: "in flight and closed land nothing",
+			rows: []Contribution{
+				row(ContribKindCharacters, ContribStatusSubmitted),
+				row(ContribKindRecaps, ContribStatusClosed),
+			},
+		},
+		{
+			name: "a local export is not upstream coverage",
+			rows: []Contribution{
+				row(ContribKindCharacters, ContribStatusLocal),
+				row(ContribKindRecaps, ContribStatusMerged),
+			},
+			rec: true,
+		},
+		{
+			name: "a merged core row claims neither sidecar",
+			rows: []Contribution{
+				row(ContribKindCharacters, ContribStatusPROpen),
+				row(ContribKindCore, ContribStatusMerged),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chars, rec := LandedCoverage(tc.rows)
+			if chars != tc.chars || rec != tc.rec {
+				t.Fatalf("LandedCoverage = (%t, %t), want (%t, %t)", chars, rec, tc.chars, tc.rec)
+			}
+		})
+	}
+}
+
 func TestContributionsCRUDAndUpsert(t *testing.T) {
 	db := open(t)
 	ctx := context.Background()

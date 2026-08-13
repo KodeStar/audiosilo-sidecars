@@ -33,6 +33,12 @@ type pipelineEnv struct {
 	db  *store.DB
 	cfg config.Config
 	hub *events.Hub
+	// scans is the SAME manager the handlers serve from (taken from Deps after the
+	// opts run, so a test that swaps it in still gets the one under test). A test
+	// that stamps a coverage verdict via ApplyOverride must reach this manager -
+	// building a second one silently diverges from the wiring, and the local copies
+	// were passing nil overrides where the env passes storeOverrides(db).
+	scans *metaops.ScanManager
 }
 
 func newPipelineEnv(t *testing.T, libraryRoots []string, opts ...func(*Deps)) *pipelineEnv {
@@ -104,7 +110,78 @@ func newPipelineEnv(t *testing.T, libraryRoots []string, opts ...func(*Deps)) *p
 	env.api = New(deps)
 	env.srv = httptest.NewServer(env.api.Handler())
 	t.Cleanup(env.srv.Close)
-	return &pipelineEnv{testEnv: env, db: db, cfg: cfg, hub: hub}
+	return &pipelineEnv{testEnv: env, db: db, cfg: cfg, hub: hub, scans: deps.Scans}
+}
+
+// makeShelf creates each book folder with one audio file in it - the minimum the
+// folder scanner recognizes as a book.
+func makeShelf(t *testing.T, dirs ...string) {
+	t.Helper()
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "audio.m4b"), []byte("fake"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// canonicalPath resolves a path through the daemon's OWN resolver (an empty
+// allow-list permits any path), so the test keys on exactly the string a book row
+// and a scan candidate carry - on macOS a t.TempDir() lives under a
+// /var -> /private/var symlink, so the raw path never matches.
+func canonicalPath(t *testing.T, path string) string {
+	t.Helper()
+	resolved, ok, err := metaops.AllowedPath(path, nil)
+	if err != nil || !ok {
+		t.Fatalf("resolve %q: ok=%t err=%v", path, ok, err)
+	}
+	return resolved
+}
+
+// getScanJob fetches one snapshot of a scan job, failing the test if the scan
+// errored.
+func getScanJob(t *testing.T, env *pipelineEnv, token, jobID string) metaops.ScanJob {
+	t.Helper()
+	resp := env.do(t, http.MethodGet, "/api/v1/scans/"+jobID, token, "")
+	defer resp.Body.Close()
+	var job metaops.ScanJob
+	_ = json.NewDecoder(resp.Body).Decode(&job)
+	if job.Status == metaops.ScanError {
+		t.Fatalf("scan errored: %s", job.Error)
+	}
+	return job
+}
+
+// scanToDone starts a scan of root and polls until the job completes, returning
+// the finished job (its ID re-fetches it, for a test that reads it again after
+// changing state).
+func scanToDone(t *testing.T, env *pipelineEnv, token, root string) metaops.ScanJob {
+	t.Helper()
+	body, _ := json.Marshal(createScanRequest{Path: root})
+	resp := env.do(t, http.MethodPost, "/api/v1/scans", token, string(body))
+	if resp.StatusCode != http.StatusAccepted {
+		resp.Body.Close()
+		t.Fatalf("create scan = %d, want 202", resp.StatusCode)
+	}
+	var created createScanResponse
+	_ = json.NewDecoder(resp.Body).Decode(&created)
+	resp.Body.Close()
+	if created.JobID == "" {
+		t.Fatal("no job id returned")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		job := getScanJob(t, env, token, created.JobID)
+		if job.Status == metaops.ScanDone {
+			return job
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("scan did not finish")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func TestScanPathAllowListAllowedAndDenied(t *testing.T) {
@@ -118,20 +195,8 @@ func TestScanPathAllowListAllowedAndDenied(t *testing.T) {
 	env := newPipelineEnv(t, []string{root})
 	token := env.login(t)
 
-	// Allowed: inside a configured root -> 202 with a job id.
-	resp := env.do(t, http.MethodPost, "/api/v1/scans", token, `{"path":"`+inside+`"}`)
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("allowed scan = %d, want 202", resp.StatusCode)
-	}
-	var cr createScanResponse
-	_ = json.NewDecoder(resp.Body).Decode(&cr)
-	resp.Body.Close()
-	if cr.JobID == "" {
-		t.Fatal("no job id returned")
-	}
-
 	// Denied: outside every root -> 403.
-	resp = env.do(t, http.MethodPost, "/api/v1/scans", token, `{"path":"`+outside+`"}`)
+	resp := env.do(t, http.MethodPost, "/api/v1/scans", token, `{"path":"`+outside+`"}`)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("outside-root scan = %d, want 403", resp.StatusCode)
 	}
@@ -144,22 +209,8 @@ func TestScanPathAllowListAllowedAndDenied(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// Poll the allowed job to completion.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		r := env.do(t, http.MethodGet, "/api/v1/scans/"+cr.JobID, token, "")
-		var job metaops.ScanJob
-		_ = json.NewDecoder(r.Body).Decode(&job)
-		r.Body.Close()
-		if job.Status == metaops.ScanDone {
-			return
-		}
-		if job.Status == metaops.ScanError {
-			t.Fatalf("scan errored: %s", job.Error)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("scan did not finish")
+	// Allowed: inside a configured root -> 202 with a job id that runs to completion.
+	scanToDone(t, env, token, inside)
 }
 
 func TestScanUnknownJob(t *testing.T) {
@@ -177,33 +228,18 @@ func TestScanMarksBooksAlreadyTrackedByPipeline(t *testing.T) {
 	doneDir := filepath.Join(root, "Author", "Series", "01 - Finished")
 	activeDir := filepath.Join(root, "Author", "Series", "02 - Active")
 	newDir := filepath.Join(root, "Author", "Series", "03 - New")
-	for _, dir := range []string{doneDir, activeDir, newDir} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, "audio.m4b"), []byte("fake"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	canonical := func(path string) string {
-		t.Helper()
-		resolved, err := filepath.EvalSymlinks(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return filepath.Clean(resolved)
-	}
+	makeShelf(t, doneDir, activeDir, newDir)
 
 	env := newPipelineEnv(t, []string{root})
 	done, err := env.db.CreateBook(context.Background(), store.NewBook{
-		SourcePath: canonical(doneDir), WorkDir: filepath.Join(t.TempDir(), "done"),
+		SourcePath: canonicalPath(t, doneDir), WorkDir: filepath.Join(t.TempDir(), "done"),
 		Title: "Finished", State: string(state.Done),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	active, err := env.db.CreateBook(context.Background(), store.NewBook{
-		SourcePath: canonical(activeDir), WorkDir: filepath.Join(t.TempDir(), "active"),
+		SourcePath: canonicalPath(t, activeDir), WorkDir: filepath.Join(t.TempDir(), "active"),
 		Title: "Active", State: string(state.ASR),
 	})
 	if err != nil {
@@ -211,44 +247,104 @@ func TestScanMarksBooksAlreadyTrackedByPipeline(t *testing.T) {
 	}
 
 	token := env.login(t)
-	body, _ := json.Marshal(createScanRequest{Path: root})
-	resp := env.do(t, http.MethodPost, "/api/v1/scans", token, string(body))
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("create scan = %d, want 202", resp.StatusCode)
-	}
-	var created createScanResponse
-	_ = json.NewDecoder(resp.Body).Decode(&created)
-	resp.Body.Close()
+	job := scanToDone(t, env, token, root)
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		resp = env.do(t, http.MethodGet, "/api/v1/scans/"+created.JobID, token, "")
-		var job metaops.ScanJob
-		_ = json.NewDecoder(resp.Body).Decode(&job)
-		resp.Body.Close()
-		if job.Status == metaops.ScanError {
-			t.Fatalf("scan errored: %s", job.Error)
-		}
-		if job.Status != metaops.ScanDone {
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-		byPath := make(map[string]metaops.ScannedBook, len(job.Books))
-		for _, book := range job.Books {
-			byPath[book.SourcePath] = book
-		}
-		if got := byPath[canonical(doneDir)].PipelineBook; got == nil || got.ID != done.ID || got.State != string(state.Done) {
-			t.Fatalf("done pipeline marker = %+v, want book %d done", got, done.ID)
-		}
-		if got := byPath[canonical(activeDir)].PipelineBook; got == nil || got.ID != active.ID || got.State != string(state.ASR) {
-			t.Fatalf("active pipeline marker = %+v, want book %d asr", got, active.ID)
-		}
-		if got := byPath[canonical(newDir)].PipelineBook; got != nil {
-			t.Fatalf("new candidate unexpectedly marked tracked: %+v", got)
-		}
-		return
+	byPath := make(map[string]metaops.ScannedBook, len(job.Books))
+	for _, book := range job.Books {
+		byPath[book.SourcePath] = book
 	}
-	t.Fatal("scan did not finish")
+	if got := byPath[canonicalPath(t, doneDir)].PipelineBook; got == nil || got.ID != done.ID || got.State != string(state.Done) {
+		t.Fatalf("done pipeline marker = %+v, want book %d done", got, done.ID)
+	}
+	if got := byPath[canonicalPath(t, activeDir)].PipelineBook; got == nil || got.ID != active.ID || got.State != string(state.ASR) {
+		t.Fatalf("active pipeline marker = %+v, want book %d asr", got, active.ID)
+	}
+	if got := byPath[canonicalPath(t, newDir)].PipelineBook; got != nil {
+		t.Fatalf("new candidate unexpectedly marked tracked: %+v", got)
+	}
+}
+
+// TestScanCoveragePatchedFromLandedContributions covers the WIRING of the
+// read-time coverage repair: a work this daemon already contributed must not keep
+// reporting its sidecars as needed. The rules themselves are unit-tested (store's
+// LandedCoverage fold, metaops' Coverage.ApplyContributed), so this keeps one
+// candidate per outcome the wiring can get wrong.
+func TestScanCoveragePatchedFromLandedContributions(t *testing.T) {
+	root := t.TempDir()
+	landedDir := filepath.Join(root, "Author", "01 - Landed")
+	otherWorkDir := filepath.Join(root, "Author", "02 - Other work")
+	unknownDir := filepath.Join(root, "Author", "03 - Unknown work")
+	makeShelf(t, landedDir, otherWorkDir, unknownDir)
+
+	env := newPipelineEnv(t, []string{root})
+	ctx := context.Background()
+
+	mkBook := func(dir, title, workID string) store.Book {
+		t.Helper()
+		b, err := env.db.CreateBook(ctx, store.NewBook{
+			SourcePath: canonicalPath(t, dir), WorkDir: filepath.Join(t.TempDir(), title),
+			Title: title, State: string(state.Done),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if workID != "" {
+			if err := env.db.SetBookWorkID(ctx, b.ID, workID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, kind := range []string{store.ContribKindCharacters, store.ContribKindRecaps} {
+			if _, err := env.db.UpsertContribution(ctx, store.Contribution{
+				BookID: b.ID, Kind: kind, Mode: store.ContribModeIssue,
+				Status: store.ContribStatusMerged,
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return b
+	}
+
+	// Every book here contributed both sidecars; what differs is the work they are
+	// attached to, and whether the candidate resolved to a work at all.
+	mkBook(landedDir, "Landed", "work-01 - Landed")
+	mkBook(otherWorkDir, "Other work", "some-other-work")
+	mkBook(unknownDir, "Unknown work", "work-03 - Unknown work")
+
+	token := env.login(t)
+	job := scanToDone(t, env, token, root)
+
+	// Stamp a resolved work onto the first two candidates, the same path a manual
+	// match takes; the third keeps the disabled metadata client's honestly-unknown
+	// verdict. This runs AFTER the scan so it outranks the job's own resolution.
+	for _, dir := range []string{landedDir, otherWorkDir} {
+		env.scans.ApplyOverride(canonicalPath(t, dir), metaops.OverridePatchInput{
+			Coverage: &metaops.Coverage{
+				Available: true, Known: true, WorkID: "work-" + filepath.Base(dir), MatchedBy: "manual",
+			},
+		})
+	}
+
+	byPath := make(map[string]metaops.ScannedBook)
+	for _, book := range getScanJob(t, env, token, job.ID).Books {
+		byPath[book.SourcePath] = book
+	}
+
+	// (a) the contributions were made under the work the candidate resolved to.
+	cov := byPath[canonicalPath(t, landedDir)].Coverage
+	if !cov.HasCharacters || !cov.HasRecaps {
+		t.Errorf("landed coverage = %+v, want both sidecars marked present", cov)
+	}
+	if !cov.Available || !cov.Known || cov.WorkID != "work-01 - Landed" {
+		t.Errorf("landed verdict fields altered: %+v", cov)
+	}
+	// (b) contributed under a DIFFERENT work -> this work's badges stay untouched.
+	if cov := byPath[canonicalPath(t, otherWorkDir)].Coverage; cov.HasCharacters || cov.HasRecaps {
+		t.Errorf("another work's contributions were applied: %+v", cov)
+	}
+	// (c) unknown identity -> never patched, however much landed against the book.
+	if cov := byPath[canonicalPath(t, unknownDir)].Coverage; cov.Known || cov.HasCharacters || cov.HasRecaps {
+		t.Errorf("unknown-work coverage = %+v, want an untouched unknown verdict", cov)
+	}
 }
 
 // TestCreateBooksPersistsNarrators asserts the POST /books candidate's narrators are
@@ -837,5 +933,47 @@ func TestCreateBooksRejectsAnUnreadableEpubAsAudio(t *testing.T) {
 	}
 	if !strings.Contains(cr.Results[0].Error, "could not be read") {
 		t.Errorf("error = %q, want it to explain the epub could not be read", cr.Results[0].Error)
+	}
+}
+
+// TestPatchedCoverage pins the book view's copy of the read-time repair: the same
+// landed-contribution patch the Library scan applies, so the two endpoints cannot
+// tell different stories about one book. An untouched blob is returned byte for
+// byte - re-encoding a document written by another version could drop a field
+// this one does not know about.
+func TestPatchedCoverage(t *testing.T) {
+	const stored = `{"available":true,"known":true,"work_id":"w1","has_characters":false,"has_recaps":false}`
+	merged := []store.Contribution{{
+		Kind: store.ContribKindCharacters, Mode: store.ContribModeIssue,
+		Status: store.ContribStatusMerged,
+	}}
+
+	var cov metaops.Coverage
+	if err := json.Unmarshal(patchedCoverage(json.RawMessage(stored), "w1", merged), &cov); err != nil {
+		t.Fatal(err)
+	}
+	if !cov.HasCharacters || cov.HasRecaps || cov.WorkID != "w1" {
+		t.Fatalf("patched coverage = %+v", cov)
+	}
+
+	// Nothing to apply, a disagreeing work, an unparsable blob and an absent one
+	// all return the input unchanged.
+	for _, tc := range []struct {
+		name   string
+		raw    string
+		workID string
+		rows   []store.Contribution
+	}{
+		{name: "nothing landed", raw: stored, workID: "w1"},
+		{name: "contributed under another work", raw: stored, workID: "w2", rows: merged},
+		{name: "unparsable blob", raw: `{"available":`, workID: "w1", rows: merged},
+		{name: "no stored verdict", raw: "", workID: "w1", rows: merged},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := patchedCoverage(json.RawMessage(tc.raw), tc.workID, tc.rows)
+			if string(got) != tc.raw {
+				t.Fatalf("coverage rewritten: %s -> %s", tc.raw, got)
+			}
+		})
 	}
 }

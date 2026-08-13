@@ -186,14 +186,16 @@ type bookIdent struct {
 // newBookIdent builds a bookIdent and precomputes its fingerprint: a stable
 // string over the resolution inputs, so a worker's verdict is only applied to a
 // book whose identity has not changed since dispatch (corroboration can rewrite
-// a streamed book's series/title/position).
+// a streamed book's series/title/position). The identity's path hints are
+// deliberately absent: they derive from the source path, which is the key this
+// fingerprint is stored under and so cannot change underneath it.
 func newBookIdent(id BookIdentity, workID string) bookIdent {
 	return bookIdent{
 		id:     id,
 		workID: workID,
 		fp: strings.Join([]string{
 			id.ASIN, id.ISBN, id.Title, id.Series, id.SeriesPos,
-			strings.Join(id.Authors, ","), workID,
+			strings.Join(id.Authors, ","), strings.Join(id.Narrators, ","), workID,
 		}, "\x00"),
 	}
 }
@@ -777,16 +779,50 @@ func convertBook(b metascan.Book, root string, overrides map[string]Override) (S
 		ASIN: b.ASIN, ISBN: b.ISBN, RuntimeMin: b.RuntimeMin, Chapters: b.Chapters,
 		AudioFiles: b.AudioFiles, Sources: b.Sources,
 	}
-	id := BookIdentity{
-		ASIN: b.ASIN, ISBN: b.ISBN, Title: b.Title,
-		Authors: b.Authors, Series: b.Series, SeriesPos: b.SeriesPosition,
-	}
 	workID := ""
 	if ov, ok := overrides[sb.SourcePath]; ok {
 		sb.Hidden, sb.ForceAudio = ov.Hidden, ov.ForceAudio
 		workID = ov.WorkID
 	}
-	return sb, newBookIdent(id, workID)
+	return sb, newBookIdent(bookIdentityOf(sb), workID)
+}
+
+// bookIdentityOf derives a candidate's coverage-resolution identity, including
+// the PATH HINTS the metadata query ladder falls back to. A shelf whose tags
+// carry a shortcode title ("RO07") frequently has the real title in the folder
+// leaf and the series in its parent, so the path is evidence, not decoration.
+func bookIdentityOf(sb ScannedBook) BookIdentity {
+	folder, parent := pathHints(sb.SourcePath)
+	return BookIdentity{
+		ASIN: sb.ASIN, ISBN: sb.ISBN, Title: sb.Title,
+		Authors: sb.Authors, Narrators: sb.Narrators,
+		Series: sb.Series, SeriesPos: sb.SeriesPosition,
+		FolderName: folder, ParentDir: parent,
+	}
+}
+
+// pathHints returns the book folder's own name and its parent's - the two path
+// strings the query ladder falls back to. sourcePath is the canonical absolute
+// source path (Start resolves the scan root, and every candidate path is joined
+// onto it), so there is nothing to trim or re-normalize here.
+//
+// An ebook-only candidate's source path is the .epub FILE, so the hints are taken
+// one level up: the folder holding the epub is the book folder, exactly as it is
+// for an audiobook. Reading the filename instead put both hints one level off -
+// the leaf became the file's own name and the parent became the book folder,
+// so the "series name" rung queried a book title.
+func pathHints(sourcePath string) (folder, parent string) {
+	dir := sourcePath
+	if ebook.IsEpub(dir) {
+		dir = filepath.Dir(dir)
+	}
+	folder = filepath.Base(dir)
+	parent = filepath.Base(filepath.Dir(dir))
+	// A book directly under the filesystem root has no parent worth querying.
+	if parent == "." || parent == string(filepath.Separator) {
+		parent = ""
+	}
+	return folder, parent
 }
 
 // noteUsingAudio is the verdict shown when an epub is present but the audio runs
@@ -913,8 +949,5 @@ func applyOverride(sb *ScannedBook, overrides map[string]Override) bookIdent {
 		sb.Hidden, sb.ForceAudio = ov.Hidden, ov.ForceAudio
 		workID = ov.WorkID
 	}
-	return newBookIdent(BookIdentity{
-		ASIN: sb.ASIN, ISBN: sb.ISBN, Title: sb.Title,
-		Authors: sb.Authors, Series: sb.Series, SeriesPos: sb.SeriesPosition,
-	}, workID)
+	return newBookIdent(bookIdentityOf(*sb), workID)
 }

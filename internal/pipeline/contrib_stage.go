@@ -288,6 +288,9 @@ func (e *Executor) lookupByIdentifier(ctx context.Context, book store.Book) (str
 	}
 	// No Title: metaops.CoverageFor skips its fuzzy title-search step, so the verdict
 	// can only be an exact asin/isbn match or a clean miss.
+	// Identifiers ONLY: no title, no path hints. metaops runs its fuzzy ladder when
+	// either is present, and a fuzzy verdict must never decide which work these
+	// sidecars attach to - the wrong work here publishes another book's spoilers.
 	cov, err := e.meta.CoverageFor(ctx, metaops.BookIdentity{ASIN: asin, ISBN: isbn})
 	if err != nil {
 		return "", false

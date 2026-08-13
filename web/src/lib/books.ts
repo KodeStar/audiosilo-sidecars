@@ -182,8 +182,11 @@ export function pruneBookEventCounts(
   return next;
 }
 
-// isDone reports whether a book has reached the terminal state.
-export function isDone(book: BookView): boolean {
+// isDone reports whether a book has reached the terminal state. It takes just the
+// state so the Library tab's scan candidates - which carry a pipeline_book ref,
+// not a full BookView - ask the same question through the same predicate; there
+// is one spelling of what "finished" means.
+export function isDone(book: { state: string }): boolean {
   return book.state === 'done';
 }
 

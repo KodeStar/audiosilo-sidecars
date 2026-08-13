@@ -46,6 +46,12 @@ const SearchLimit = 20
 // cache is a latency optimisation, not a store of record.
 const cacheCap = 2048
 
+// verdictCacheCap is the search-verdict cache's own, larger cap. Its key is
+// effectively one entry per BOOK (title + author + series + path hints), so a
+// large library fills the shared cap mid-scan and starts evicting verdicts it is
+// still using - and every eviction re-walks a whole ladder.
+const verdictCacheCap = 8192
+
 // Coverage is the per-book coverage verdict merged into scan results and stored
 // on a book. It answers the two questions the Library UI asks: is this a known
 // work, and which sidecars does it still need.
@@ -80,6 +86,29 @@ type Coverage struct {
 	Recordings []RecordingRef `json:"-"`
 }
 
+// ApplyContributed patches a coverage verdict with the sidecar dimensions THIS
+// daemon has since contributed. A verdict is resolved once per scan and frozen
+// into the on-disk snapshot, so a work whose sidecars have landed in the meantime
+// keeps reporting them as needed - stale badges, and "exclude already covered"
+// never drops the book, through rescans and restarts alike. The local
+// contribution records are fresher truth than that frozen verdict.
+//
+// Only a KNOWN verdict is patched: with no resolved work the badges honestly say
+// "unknown", and claiming a dimension against an unidentified book would be a
+// guess. The contributions must also have been made under THIS work -
+// contributedWorkID is the work the book is attached to upstream, and an empty
+// one means "not attached yet, so it can only be this one". A book whose work was
+// later resolved differently (the core add-work flow's real slug, or a human's
+// manual match) would otherwise stamp another work's badges green. The patch is
+// additive - it never clears what upstream reported.
+func (c *Coverage) ApplyContributed(contributedWorkID string, hasCharacters, hasRecaps bool) {
+	if !c.Known || (contributedWorkID != "" && contributedWorkID != c.WorkID) {
+		return
+	}
+	c.HasCharacters = c.HasCharacters || hasCharacters
+	c.HasRecaps = c.HasRecaps || hasRecaps
+}
+
 // RecordingRef is the public metadata needed to identify the audiobook edition
 // behind a sidecar extraction.
 type RecordingRef struct {
@@ -97,14 +126,41 @@ type RegionASIN struct {
 }
 
 // BookIdentity is the resolution input for CoverageFor: the identifiers plus the
-// title/author/series a fuzzy fallback needs when no identifier resolves.
+// title/author/series/narrators a fuzzy fallback needs when no identifier
+// resolves, and the two path hints the query ladder falls back to.
 type BookIdentity struct {
-	ASIN      string
-	ISBN      string
-	Title     string
-	Authors   []string
+	ASIN    string
+	ISBN    string
+	Title   string
+	Authors []string
+	// Narrators are the book's local narrator credits. They are match EVIDENCE,
+	// not an identifier: a shelf routinely tags the narrator as the author, and a
+	// work card routinely carries the same person on the other side, which is what
+	// pkg/match's person gate resolves.
+	Narrators []string
 	Series    string
 	SeriesPos string
+	// FolderName / ParentDir are the book folder's own name and its parent's.
+	// Both are optional (empty = no hint) and are used only to widen retrieval
+	// when the tagged title is decorated or a shortcode.
+	FolderName string
+	ParentDir  string
+}
+
+// title is the trimmed tag title and author the primary author credit - the two
+// derivations searchMatch (the verdict key, the match query) and searchLadder
+// (the rung table) both need, spelled once.
+func (id BookIdentity) title() string { return strings.TrimSpace(id.Title) }
+
+func (id BookIdentity) author() string { return firstNonEmpty(id.Authors) }
+
+// searchable reports whether there is anything for the fuzzy fallback to work
+// from: a tag title, or a path hint. The hints count because an untagged book -
+// the case the path rungs exist for - has nothing else, and gating on the title
+// alone left those rungs unreachable for exactly those books.
+func (id BookIdentity) searchable() bool {
+	return id.title() != "" || strings.TrimSpace(id.FolderName) != "" ||
+		strings.TrimSpace(id.ParentDir) != ""
 }
 
 // ttlCache is a small mutex-guarded read-through TTL map shared by the coverage
@@ -115,6 +171,7 @@ type ttlCache[K comparable, V any] struct {
 	mu    sync.Mutex
 	now   func() time.Time
 	ttl   time.Duration
+	cap   int
 	items map[K]ttlEntry[V]
 }
 
@@ -124,7 +181,13 @@ type ttlEntry[V any] struct {
 }
 
 func newTTLCache[K comparable, V any](now func() time.Time, ttl time.Duration) *ttlCache[K, V] {
-	return &ttlCache[K, V]{now: now, ttl: ttl, items: map[K]ttlEntry[V]{}}
+	return newTTLCacheCap[K, V](now, ttl, cacheCap)
+}
+
+// newTTLCacheCap is newTTLCache with an explicit entry cap, for a cache whose
+// working set is bigger than the shared default.
+func newTTLCacheCap[K comparable, V any](now func() time.Time, ttl time.Duration, cap int) *ttlCache[K, V] {
+	return &ttlCache[K, V]{now: now, ttl: ttl, cap: cap, items: map[K]ttlEntry[V]{}}
 }
 
 // get returns the cached value for key if present and still fresh.
@@ -144,7 +207,7 @@ func (c *ttlCache[K, V]) get(key K) (V, bool) {
 func (c *ttlCache[K, V]) put(key K, val V) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, exists := c.items[key]; !exists && len(c.items) >= cacheCap {
+	if _, exists := c.items[key]; !exists && len(c.items) >= c.cap {
 		c.evictLocked()
 	}
 	c.items[key] = ttlEntry[V]{at: c.now(), val: val}
@@ -161,7 +224,7 @@ func (c *ttlCache[K, V]) evictLocked() {
 		}
 	}
 	for k := range c.items {
-		if len(c.items) < cacheCap {
+		if len(c.items) < c.cap {
 			break
 		}
 		delete(c.items, k)
@@ -209,11 +272,15 @@ type SeriesRef struct {
 // WorkSearchResult is one work hit from the /meta/search proxy, flattened to the
 // shape the Library UI's manual-match picker consumes (authors as plain names).
 type WorkSearchResult struct {
-	ID       string     `json:"id"`
-	Title    string     `json:"title"`
-	Authors  []string   `json:"authors"`
-	Series   *SeriesRef `json:"series"`
-	CoverURL string     `json:"cover_url"`
+	ID      string   `json:"id"`
+	Title   string   `json:"title"`
+	Authors []string `json:"authors"`
+	// Narrators are the card's narrator credits, carried because pkg/match's
+	// person gate consults them (a shelf that tags the narrator as the author
+	// still resolves). Additive on the picker's wire shape.
+	Narrators []string   `json:"narrators,omitempty"`
+	Series    *SeriesRef `json:"series"`
+	CoverURL  string     `json:"cover_url"`
 }
 
 // Client is the metadata API client with in-memory TTL caches.
@@ -246,7 +313,7 @@ func NewClient(baseURL string) *Client {
 		http:       &http.Client{Timeout: httpTimeout},
 		lookups:    newTTLCache[string, lookupVal](time.Now, coverageTTL),
 		works:      newTTLCache[string, workVal](time.Now, coverageTTL),
-		searchVerd: newTTLCache[string, searchVal](time.Now, coverageTTL),
+		searchVerd: newTTLCacheCap[string, searchVal](time.Now, coverageTTL, verdictCacheCap),
 		searchFeed: newTTLCache[string, []WorkSearchResult](time.Now, searchProxyTTL),
 		glossaries: newTTLCache[string, Glossary](time.Now, coverageTTL),
 		seriesFeed: newTTLCache[string, []string](time.Now, coverageTTL),
@@ -289,8 +356,8 @@ func (c *Client) CoverageFor(ctx context.Context, id BookIdentity) (Coverage, er
 
 	// 3. Fuzzy title search - the fallback that makes coverage useful for the
 	// common case (a folder scan with no asin/isbn against a DB seeded from the
-	// user's own library). Only attempted when there is a title to match.
-	if strings.TrimSpace(id.Title) != "" {
+	// user's own library). Only attempted when there is something to match on.
+	if id.searchable() {
 		cov, ok := c.searchMatch(ctx, id)
 		if err := ctx.Err(); err != nil {
 			return Coverage{}, err
@@ -331,6 +398,11 @@ func (c *Client) CoverageForWork(ctx context.Context, workID string) (Coverage, 
 // SearchWorks proxies a free-text query to the metadata search endpoint, keeping
 // only work hits and flattening them to the picker DTO. It returns ErrDisabled
 // when unconfigured and a transport error otherwise. Results are cached briefly.
+//
+// An empty result is retried once with the punctuation normalized, for the same
+// reason the ladder's second rung exists: the index does not split on a title's
+// colons or brackets, so pasting a real title ("Halo: Primordium") into the Match
+// modal finds nothing while its bare words are an exact hit.
 func (c *Client) SearchWorks(ctx context.Context, query string, limit int) ([]WorkSearchResult, error) {
 	if !c.Enabled() {
 		return nil, ErrDisabled
@@ -338,6 +410,14 @@ func (c *Client) SearchWorks(ctx context.Context, query string, limit int) ([]Wo
 	res, ok := c.fetchWorkSearch(ctx, query, limit)
 	if !ok {
 		return nil, fmt.Errorf("metadata search failed for %q", query)
+	}
+	if len(res) > 0 {
+		return res, nil
+	}
+	if retry := normalizeQueryPunct(query); retry != "" && retry != strings.TrimSpace(query) {
+		if res, ok := c.fetchWorkSearch(ctx, retry, limit); ok {
+			return res, nil
+		}
 	}
 	return res, nil
 }
@@ -491,38 +571,121 @@ func (c *Client) workDetail(ctx context.Context, workID string) (v workVal, foun
 	return v, true, true
 }
 
-// searchMatch runs (and caches) the fuzzy-match fallback: it searches the DB by
-// title, scores the work candidates with match.Best, and accepts the best only
-// if it clears the threshold. ok=false is a transport failure; otherwise the
-// returned Coverage is either a "search" match or a clean unknown.
+// searchMatch runs (and caches) the fuzzy-match fallback: it walks the retrieval
+// ladder (see searchLadder), scores each query's work candidates with match.Best
+// and accepts the FIRST query that yields an acceptance. ok=false is a transport
+// failure; otherwise the returned Coverage is either a "search" match or a clean
+// unknown.
+//
+// The ladder is retrieval only: matching stays match.Best's decision, so a wider
+// query can surface a work but never lower the bar for accepting it.
 func (c *Client) searchMatch(ctx context.Context, id BookIdentity) (Coverage, bool) {
-	title := strings.TrimSpace(id.Title)
-	author := firstNonEmpty(id.Authors)
+	title, author := id.title(), id.author()
 	// The verdict key includes the series identity (name + position), not just
 	// title+author: match.Best weighs the series/sequence, so two distinct works
 	// that share a title and author but sit in different series (or at different
 	// positions) can resolve to different works - keying on title+author alone
-	// would let one inherit the other's cached verdict.
-	key := match.Normalize(title) + "|" + match.Normalize(author) + "|" +
-		match.NormalizeSeries(id.Series) + "|" + strings.TrimSpace(id.SeriesPos)
+	// would let one inherit the other's cached verdict. The path hints and
+	// narrators join it for the same reason: both steer the ladder, so two books
+	// agreeing on title+author+series can still reach different verdicts.
+	key := strings.Join([]string{
+		match.Normalize(title), match.Normalize(author),
+		match.NormalizeSeries(id.Series), strings.TrimSpace(id.SeriesPos),
+		match.Normalize(id.FolderName), match.Normalize(id.ParentDir),
+		match.Normalize(strings.Join(id.Narrators, " ")),
+	}, "|")
 	if v, hit := c.searchVerd.get(key); hit {
-		if !v.matched {
-			return Coverage{Available: true, Known: false}, true
-		}
-		cov := c.workCoverage(ctx, v.workID, "search", v.workTitle)
-		if cov.Series == nil {
-			cov.Series = cloneSeriesRef(v.series)
-		}
-		return cov, true
+		return c.searchCoverage(ctx, v), true
 	}
 
-	cards, ok := c.fetchWorkSearch(ctx, title, SearchLimit)
-	if !ok {
-		return Coverage{}, false
+	seq, hasSeq := parseFloatSeq(id.SeriesPos)
+	claim := claimedVolume(id)
+	v := searchVal{}
+	for _, step := range searchLadder(id) {
+		cards, ok := c.fetchWorkSearch(ctx, step.query, SearchLimit)
+		if !ok {
+			// A transport failure anywhere in the ladder degrades the whole verdict to
+			// unavailable, exactly as the single-query version did: a partial ladder
+			// cannot tell "this book is unknown" from "the service went away".
+			return Coverage{}, false
+		}
+		if len(cards) == 0 {
+			continue
+		}
+		idx, matched := match.Best(cardBooks(cards), match.Query{
+			Title: step.matchTitle, TitleShort: step.matchTitle, Author: author,
+			// The book's narrator credits ride along: a shelf routinely tags the
+			// NARRATOR as the author (and a card may credit the same person on the
+			// other side), which match.Best's person gate resolves.
+			Narrators: id.Narrators,
+			Series:    id.Series, Sequence: seq, HasSequence: hasSeq,
+		})
+		if !matched {
+			continue
+		}
+		// A wider query can retrieve the right SERIES and the wrong volume, and the
+		// matcher cannot tell: titleTokens drops pure numbers, so the book-1 card
+		// scores a perfect title match against book 7. Reject the accept and keep
+		// walking rather than take it.
+		// The number is "dropped" relative to the text being SCORED, not the tag
+		// title: a rung scoring against the folder leaf has left the tag title's
+		// frame entirely, and the leaf's own digits are what matter there.
+		if contradictsVolume(cards[idx], claim, digitRuns(step.query) < digitRuns(step.matchTitle)) {
+			continue
+		}
+		v = searchVal{
+			matched: true, workID: cards[idx].ID, workTitle: cards[idx].Title,
+			series: cloneSeriesRef(cards[idx].Series),
+		}
+		break
 	}
+	// One verdict per identity covers the WHOLE ladder: an unmatched book must not
+	// re-walk every rung on the next poll.
+	c.searchVerd.put(key, v)
+	return c.searchCoverage(ctx, v), true
+}
+
+// contradictsVolume reports whether an accepted card disagrees with the volume
+// the book claims. A card stating a position must state THIS one. A card stating
+// none is refused only when the accepting rung dropped a number the title carried
+// (numberDropped): that rung is one this daemon never used to send, so refusing
+// it restores the pre-ladder safety instead of trading a miss for a wrong match.
+func contradictsVolume(card WorkSearchResult, claim volumeClaim, numberDropped bool) bool {
+	if !claim.ok {
+		return false
+	}
+	if card.Series != nil {
+		if pos, ok := parseFloatSeq(card.Series.Position); ok {
+			return pos-claim.value > 0.001 || claim.value-pos > 0.001
+		}
+	}
+	return numberDropped && claim.inTitle
+}
+
+// searchCoverage turns a (possibly negative) cached search verdict into the
+// coverage the caller sees, falling back to the card's series when the work
+// detail carries none.
+func (c *Client) searchCoverage(ctx context.Context, v searchVal) Coverage {
+	if !v.matched {
+		return Coverage{Available: true, Known: false}
+	}
+	cov := c.workCoverage(ctx, v.workID, "search", v.workTitle)
+	if cov.Series == nil {
+		cov.Series = cloneSeriesRef(v.series)
+	}
+	return cov
+}
+
+// cardBooks maps search cards onto match.Book candidates (index-aligned). The
+// narrator credits are carried, not dropped: they are half of the matcher's
+// person gate.
+func cardBooks(cards []WorkSearchResult) []match.Book {
 	books := make([]match.Book, len(cards))
 	for i, card := range cards {
-		b := match.Book{Title: card.Title, Author: firstNonEmpty(card.Authors)}
+		b := match.Book{
+			Title: card.Title, Author: firstNonEmpty(card.Authors),
+			Narrators: card.Narrators,
+		}
 		if card.Series != nil {
 			b.Series = card.Series.Name
 			idx, _ := parseFloatSeq(card.Series.Position)
@@ -530,28 +693,7 @@ func (c *Client) searchMatch(ctx context.Context, id BookIdentity) (Coverage, bo
 		}
 		books[i] = b
 	}
-	seq, hasSeq := parseFloatSeq(id.SeriesPos)
-	idx, matched := match.Best(books, match.Query{
-		Title: title, TitleShort: title, Author: author,
-		Series: id.Series, Sequence: seq, HasSequence: hasSeq,
-	})
-
-	v := searchVal{}
-	if matched {
-		v.matched = true
-		v.workID = cards[idx].ID
-		v.workTitle = cards[idx].Title
-		v.series = cloneSeriesRef(cards[idx].Series)
-	}
-	c.searchVerd.put(key, v)
-	if !v.matched {
-		return Coverage{Available: true, Known: false}, true
-	}
-	cov := c.workCoverage(ctx, v.workID, "search", v.workTitle)
-	if cov.Series == nil {
-		cov.Series = cloneSeriesRef(v.series)
-	}
-	return cov, true
+	return books
 }
 
 // fetchWorkSearch runs the search endpoint and returns work-kind hits flattened
@@ -576,6 +718,9 @@ func (c *Client) fetchWorkSearch(ctx context.Context, query string, limit int) (
 			Authors []struct {
 				Name string `json:"name"`
 			} `json:"authors"`
+			Narrators []struct {
+				Name string `json:"name"`
+			} `json:"narrators"`
 			Series *struct {
 				Name     string `json:"name"`
 				Position string `json:"position"`
@@ -597,6 +742,11 @@ func (c *Client) fetchWorkSearch(ctx context.Context, query string, limit int) (
 			for _, a := range r.Authors {
 				if a.Name != "" {
 					w.Authors = append(w.Authors, a.Name)
+				}
+			}
+			for _, n := range r.Narrators {
+				if n.Name != "" {
+					w.Narrators = append(w.Narrators, n.Name)
 				}
 			}
 			if r.Series != nil {
