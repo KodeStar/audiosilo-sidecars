@@ -637,3 +637,45 @@ func TestScanManagerRealScanFixtureStable(t *testing.T) {
 		}
 	}
 }
+
+// TestPathHints pins the two path strings the query ladder falls back to,
+// including the ebook case: an ebook-only candidate's source path is the .epub
+// FILE, and reading its filename left both hints one level off.
+func TestPathHints(t *testing.T) {
+	sep := string(filepath.Separator)
+	for _, tc := range []struct {
+		name           string
+		path           string
+		folder, parent string
+	}{
+		{
+			name:   "audiobook folder",
+			path:   filepath.Join(sep+"lib", "Selkie Myth", "Beneath the Dragoneye Moons", "BDM01 - Oathbound Healer"),
+			folder: "BDM01 - Oathbound Healer", parent: "Beneath the Dragoneye Moons",
+		},
+		{
+			name:   "epub inside its book folder",
+			path:   filepath.Join(sep+"lib", "Series Name", "BDM01 - Title", "book.epub"),
+			folder: "BDM01 - Title", parent: "Series Name",
+		},
+		{
+			// Case-insensitive, like the discovery walk that produced the path.
+			name:   "epub extension is matched case-insensitively",
+			path:   filepath.Join(sep+"lib", "Series Name", "BDM01 - Title", "Book.EPUB"),
+			folder: "BDM01 - Title", parent: "Series Name",
+		},
+		{
+			name:   "a book at the filesystem root has no parent to query",
+			path:   sep + "Lone Book",
+			folder: "Lone Book", parent: "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			folder, parent := pathHints(tc.path)
+			if folder != tc.folder || parent != tc.parent {
+				t.Fatalf("pathHints(%q) = (%q, %q), want (%q, %q)",
+					tc.path, folder, parent, tc.folder, tc.parent)
+			}
+		})
+	}
+}

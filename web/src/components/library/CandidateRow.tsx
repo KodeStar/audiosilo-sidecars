@@ -1,6 +1,11 @@
 import { memo } from 'react';
-import type { ScannedBook } from '@/api/types';
-import { currentForceAudio, isManualMatch, matchProvenanceLabel } from '@/lib/candidates';
+import type { PipelineBookRef, ScannedBook } from '@/api/types';
+import {
+  currentForceAudio,
+  isManualMatch,
+  isPipelineDone,
+  matchProvenanceLabel,
+} from '@/lib/candidates';
 import { stateLabel } from '@/lib/pipelineState';
 import { CoverageBadge } from './CoverageBadge';
 
@@ -110,7 +115,7 @@ export const CandidateRow = memo(function CandidateRow({
   const pipelineBook = book.pipeline_book;
   const provenance = matchProvenanceLabel(book.coverage);
   const manual = isManualMatch(book.coverage);
-  const pipeline = pipelineBook ? pipelinePresence(pipelineBook.state, pipelineBook.status) : null;
+  const pipeline = pipelineBook ? pipelinePresence(pipelineBook) : null;
 
   return (
     <tr
@@ -264,11 +269,13 @@ export const CandidateRow = memo(function CandidateRow({
   );
 });
 
-function pipelinePresence(state: string, status: string): { label: string; className: string } {
-  if (state === 'done') {
+function pipelinePresence(pipelineBook: PipelineBookRef): { label: string; className: string } {
+  // Shared with the Library filter's "already processed" rule, so a finished book
+  // cannot read as Completed here and still count as a candidate there.
+  if (isPipelineDone(pipelineBook)) {
     return { label: 'Completed', className: 'border-success/40 bg-success/10 text-success' };
   }
-  switch (status) {
+  switch (pipelineBook.status) {
     case 'paused':
       return {
         label: 'Paused',

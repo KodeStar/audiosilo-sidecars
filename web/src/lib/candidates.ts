@@ -6,9 +6,11 @@ import type {
   BookCandidate,
   BookCreateResult,
   Coverage,
+  PipelineBookRef,
   ScannedBook,
   SetOverrideBody,
 } from '@/api/types';
+import { isDone } from './books';
 
 // The two expressive-layer dimensions the tool contributes.
 export type CoverageDimension = 'characters' | 'recaps';
@@ -92,16 +94,35 @@ export function toCandidate(book: ScannedBook): BookCandidate {
 
 // filterCandidates applies the visible-set filters. Hidden books are dropped
 // unless includeHidden is set (the "show hidden" toggle). When excludeCovered is
-// true, books that already have both sidecars are dropped. Order is preserved.
+// true, two kinds of book are dropped: one that already has both sidecars
+// upstream (isCovered), and one THIS daemon already ran to completion
+// (isPipelineDone) - the latter's sidecars exist locally whatever the scan's
+// coverage verdict says, so a stale or unknown verdict would otherwise leave a
+// finished book sitting in the candidate list forever. Order is preserved.
+//
+// The default (toggle off) path is untouched: a done book stays visible with its
+// "Completed" badge, which is how the user confirms the work landed.
 export function filterCandidates(
   books: ScannedBook[],
   opts: { excludeCovered: boolean; includeHidden?: boolean },
 ): ScannedBook[] {
   return books.filter((b) => {
     if (b.hidden && !opts.includeHidden) return false;
-    if (opts.excludeCovered && isCovered(b)) return false;
+    if (opts.excludeCovered && (isCovered(b) || isPipelineDone(b.pipeline_book))) return false;
     return true;
   });
+}
+
+// isPipelineDone reports whether this daemon already processed the book to the
+// terminal state. Completion is the pipeline STATE ("done", state.Done in Go);
+// pipeline_book.status carries the exceptional flag instead ('' while running,
+// else paused / needs_attention / failed), so it never reads "done".
+//
+// It delegates to the Running board's isDone rather than re-spelling the
+// comparison, and is exported because CandidateRow's "Completed" badge asks the
+// same question - one predicate, one meaning of finished, across all three.
+export function isPipelineDone(pipelineBook: PipelineBookRef | undefined): boolean {
+  return pipelineBook !== undefined && isDone(pipelineBook);
 }
 
 // hiddenBooks returns just the books the user has hidden (for the "Show hidden
@@ -111,8 +132,14 @@ export function hiddenBooks(books: ScannedBook[]): ScannedBook[] {
 }
 
 // searchHaystack joins a book's searchable text (title, authors, series,
-// narrators, asin, isbn) into one lowercased string. Kept private so both the
-// query build and the match share one field list.
+// narrators, asin, isbn, and the book's relative path) into one lowercased
+// string. Kept private so both the query build and the match share one field
+// list.
+//
+// The PATH is load-bearing, not a convenience: real libraries encode identity in
+// the folder layout ("Selkie Myth/Beneath the Dragoneye Moons/BDM01 - Oathbound
+// Healer") that the files' tags often lack entirely, so without it a search for a
+// term the user can literally see on the row finds nothing.
 function searchHaystack(b: ScannedBook): string {
   return [
     b.title,
@@ -121,6 +148,7 @@ function searchHaystack(b: ScannedBook): string {
     ...(b.narrators ?? []),
     b.asin ?? '',
     b.isbn ?? '',
+    b.path,
   ]
     .join(' ')
     .toLowerCase();
@@ -128,7 +156,8 @@ function searchHaystack(b: ScannedBook): string {
 
 // searchCandidates filters books to those matching a free-text query. The query
 // is trimmed and lowercased, then split on whitespace into tokens; a book matches
-// only when EVERY token appears somewhere in its searchable text (AND semantics).
+// only when EVERY token appears somewhere in its searchable text - title,
+// authors, series, narrators, asin, isbn, and its relative path (AND semantics).
 // A blank query returns the input array unchanged (same reference) so the common
 // no-filter path allocates nothing. Order is preserved.
 export function searchCandidates(books: ScannedBook[], query: string): ScannedBook[] {

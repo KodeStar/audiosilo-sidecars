@@ -97,10 +97,7 @@ func (m *ScanManager) restoreCache() {
 	}
 	for i := range job.books {
 		book := &job.books[i]
-		bi := newBookIdent(BookIdentity{
-			ASIN: book.ASIN, ISBN: book.ISBN, Title: book.Title, Authors: book.Authors,
-			Series: book.Series, SeriesPos: book.SeriesPosition,
-		}, "")
+		bi := newBookIdent(bookIdentityOf(*book), "")
 		job.idents[book.Path] = bi
 		job.dispatched[book.Path] = bi.fp
 

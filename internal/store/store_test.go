@@ -1020,3 +1020,36 @@ func TestCreateBookKindInvariant(t *testing.T) {
 		}
 	}
 }
+
+// TestListBookTrackingCarriesWorkID pins the scan-join projection's work id: the
+// Library scan patches a candidate's coverage from this book's contributions only
+// when the two agree on the work, so a missing column would silently stamp
+// another work's badges.
+func TestListBookTrackingCarriesWorkID(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	attached, err := db.CreateBook(ctx, NewBook{SourcePath: "/t/a", WorkDir: "/w/a", Title: "A"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetBookWorkID(ctx, attached.ID, "work-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateBook(ctx, NewBook{SourcePath: "/t/b", WorkDir: "/w/b", Title: "B"}); err != nil {
+		t.Fatal(err)
+	}
+
+	tracked, err := db.ListBookTracking(ctx)
+	if err != nil {
+		t.Fatalf("ListBookTracking: %v", err)
+	}
+	if got := tracked["/t/a"].WorkID; got != "work-a" {
+		t.Errorf("resolved work id = %q, want work-a", got)
+	}
+	// A book with no resolved work reports "" - which the patch reads as "not
+	// attached yet", not as a disagreement.
+	if got := tracked["/t/b"].WorkID; got != "" {
+		t.Errorf("unresolved work id = %q, want empty", got)
+	}
+}
