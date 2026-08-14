@@ -499,42 +499,39 @@ func humanDuration(d time.Duration) string {
 	return fmt.Sprintf("%dh%dm", h, m)
 }
 
-// asrHeartbeatInterval is how often a long single-chapter transcription touches the open
+// stageHeartbeatInterval is how often a long-running external operation touches the open
 // stage run while the backend churns. TWO supervisor detectors would otherwise kill a
-// healthy but pathologically slow chapter (a whisper decode running many times its audio
-// length): the stale-heartbeat detector (supervisor.stale_heartbeat_minutes) kills a run
-// whose heartbeat has frozen, and the no_progress detector (supervisor.no_progress_minutes)
-// kills a run whose progress_at has frozen. The ASR/retranscribe stages otherwise touch both
-// only BETWEEN chapters (a progress report), so a single slow chapter freezes both mid-chapter.
+// healthy but pathologically slow operation (an ffmpeg split or whisper decode running many
+// times its audio length): the stale-heartbeat detector kills a run whose heartbeat has
+// frozen, and the no_progress detector kills a run whose progress_at has frozen. These
+// stages otherwise touch both only BETWEEN chapters, so one slow chapter freezes both.
 // This ticker calls r.Heartbeat, whose scheduler closure bumps BOTH heartbeat_at AND
 // progress_at (a live decode subprocess tick is genuine progress for these no-mid-output
-// stages - see execute in internal/scheduler), so neither detector kills a live-but-slow
-// chapter. It matches the agent subprocess heartbeat cadence (internal/agent/exec.go). A var
-// so tests can shorten it.
-var asrHeartbeatInterval = 60 * time.Second
+// stages - see execute in internal/scheduler), so neither detector kills live work. It
+// matches the agent subprocess heartbeat cadence (internal/agent/exec.go). A var so tests
+// can shorten it.
+var stageHeartbeatInterval = 60 * time.Second
 
-// asrHeartbeatNoteEvery is how many heartbeat ticks between operator-visible "still
-// transcribing" notes (every third tick, ~3 min): enough for the durable log to show liveness
-// without a line every minute.
-const asrHeartbeatNoteEvery = 3
+// stageHeartbeatNoteEvery is how many heartbeat ticks between operator-visible "still
+// running" notes (every third tick, ~3 min): enough for the durable log to show liveness
+// without a line every minute. It paces the note of ANY stage using the wrapper below -
+// an ASR/retranscribe decode as well as an ffmpeg split.
+const stageHeartbeatNoteEvery = 3
 
-// transcribeWithHeartbeat runs one chapter's backend transcription (fn) while a ticker keeps
-// the open stage run fresh, so neither the supervisor's stale-heartbeat detector NOR its
-// no_progress detector mistakes a healthy but pathologically slow chapter for a stalled run
-// and kills it. Every asrHeartbeatInterval it calls r.Heartbeat (whose scheduler closure
+// runWithStageHeartbeat runs one long external operation while a ticker keeps the open stage
+// run fresh. Every stageHeartbeatInterval it calls r.Heartbeat (whose scheduler closure
 // advances BOTH heartbeat_at and progress_at, since a live decode subprocess tick is genuine
-// progress for these no-mid-output stages) and, every asrHeartbeatNoteEvery ticks, drops a
-// stage note naming the chapter and elapsed time. The
-// ticker stops the moment fn returns and never fires once ctx is cancelled (a clean pause/
-// shutdown teardown selects ctx.Done() and returns), so a cancelled stage emits no trailing
-// heartbeat. label is the stage word ("asr" / "retranscribing").
-func transcribeWithHeartbeat(ctx context.Context, r scheduler.StageReport, label string, chapter int, fn func() error) error {
+// progress for these no-mid-output stages). Every stageHeartbeatNoteEvery ticks it publishes
+// note(elapsed) as a durable stage note - callers only build the message, the r.Note wiring
+// is here. The ticker stops the moment fn returns and never fires once ctx is cancelled, so a
+// cancelled stage emits no trailing heartbeat.
+func runWithStageHeartbeat(ctx context.Context, r scheduler.StageReport, note func(time.Duration) string, fn func() error) error {
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(asrHeartbeatInterval)
+		ticker := time.NewTicker(stageHeartbeatInterval)
 		defer ticker.Stop()
 		start := time.Now()
 		ticks := 0
@@ -549,8 +546,8 @@ func transcribeWithHeartbeat(ctx context.Context, r scheduler.StageReport, label
 				if r.Heartbeat != nil {
 					r.Heartbeat()
 				}
-				if ticks%asrHeartbeatNoteEvery == 0 && r.Note != nil {
-					r.Note(fmt.Sprintf("%s: chapter %d still transcribing (%s elapsed)", label, chapter, humanDuration(time.Since(start))))
+				if ticks%stageHeartbeatNoteEvery == 0 && note != nil && r.Note != nil {
+					r.Note(note(time.Since(start)))
 				}
 			}
 		}
@@ -559,6 +556,14 @@ func transcribeWithHeartbeat(ctx context.Context, r scheduler.StageReport, label
 	close(done)
 	wg.Wait()
 	return err
+}
+
+// transcribeWithHeartbeat specializes the shared heartbeat wrapper with the durable note
+// used by ASR and retranscription stages.
+func transcribeWithHeartbeat(ctx context.Context, r scheduler.StageReport, label string, chapter int, fn func() error) error {
+	return runWithStageHeartbeat(ctx, r, func(elapsed time.Duration) string {
+		return fmt.Sprintf("%s: chapter %d still transcribing (%s elapsed)", label, chapter, humanDuration(elapsed))
+	}, fn)
 }
 
 // countNoun renders a count with a naively pluralized noun for a human note:
@@ -628,29 +633,45 @@ type markerExclusion struct {
 	Reason string  `json:"reason"`
 }
 
-// covers reports whether the exclusion accounts for the whole of an unmapped span. The
-// bound is generous by a second at each end so an agent copying marker boundaries out of
-// probe.json is not tripped by float formatting.
-func (e markerExclusion) covers(s audio.UnmappedSpan) bool {
-	return e.Start <= s.Start+1.0 && e.End >= s.End-1.0
+// exclusionsCover reports whether the union of declared exclusions accounts for an
+// unmapped span. ordered MUST be sorted by Start ascending (undeclaredSpans sorts once
+// for all its spans).
+//
+// UnmappedSpans deliberately coalesces adjacent raw markers into one editorial gap (for
+// example "End Credits, Bloopers"), while the verdict schema asks the agent to describe
+// each excluded marker separately. Requiring one declaration to cover the whole coalesced
+// span would reject that correct, more precise verdict, so declarations are merged in one
+// sweep - with a one-second boundary tolerance at each end, so an agent copying marker
+// boundaries out of probe.json is not tripped by float formatting, and never bridging a
+// real undeclared gap between them.
+func exclusionsCover(s audio.UnmappedSpan, ordered []markerExclusion) bool {
+	coveredTo := s.Start
+	for _, e := range ordered {
+		if e.End < s.Start-1.0 {
+			continue // entirely before the span
+		}
+		if e.Start > coveredTo+1.0 {
+			return false // an undeclared gap (or nothing reaching the span's start)
+		}
+		coveredTo = max(coveredTo, e.End)
+		if coveredTo >= s.End-1.0 {
+			return true
+		}
+	}
+	return false
 }
 
 // undeclaredSpans returns the unmapped spans that are neither short enough to be ordinary
 // non-chapter material nor accounted for by a declared exclusion.
 func undeclaredSpans(spans []audio.UnmappedSpan, excluded []markerExclusion) []audio.UnmappedSpan {
+	ordered := append([]markerExclusion(nil), excluded...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Start < ordered[j].Start })
 	var out []audio.UnmappedSpan
 	for _, s := range spans {
 		if s.Tolerated() {
 			continue
 		}
-		declared := false
-		for _, e := range excluded {
-			if e.covers(s) {
-				declared = true
-				break
-			}
-		}
-		if !declared {
+		if !exclusionsCover(s, ordered) {
 			out = append(out, s)
 		}
 	}

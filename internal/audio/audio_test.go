@@ -1,8 +1,10 @@
 package audio
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kodestar/audiosilo-meta/pkg/scan"
 )
@@ -754,6 +757,310 @@ func TestSplitResumesAfterDeletingOne(t *testing.T) {
 	}
 	if !complete(ch2, m.Chapters[1].Duration) {
 		t.Error("deleted chapter was not restored on resume")
+	}
+}
+
+func TestSplitStagesMarkerSourceOnceAndRemovesItAfterSuccess(t *testing.T) {
+	source, work, m := markerBookFixture(t, 6*1024)
+	dir := t.TempDir()
+	tool := filepath.Join(dir, "ffmpeg-fake")
+	logPath := filepath.Join(dir, "inputs.log")
+	fakeFFmpeg(t, tool, logPath, "")
+	if err := Split(context.Background(), m, work, tool, nil); err != nil {
+		t.Fatal(err)
+	}
+	lines, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged := filepath.Join(work, SplitSourceDir, stagedSourceName+filepath.Ext(source))
+	for i, got := range strings.Fields(string(lines)) {
+		if got != staged {
+			t.Errorf("ffmpeg input %d = %q, want staged source %q", i+1, got, staged)
+		}
+	}
+	// The whole DIRECTORY goes, not just the file: it is what internal/scratch reclaims,
+	// and an empty split-source/ would make HasReclaimable sweep a clean book forever.
+	if _, err := os.Stat(filepath.Join(work, SplitSourceDir)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("staged source dir remains after successful split: %v", err)
+	}
+}
+
+// A fully-resumed split has nothing left to cut, so it must not pay for a copy of a
+// multi-GB source it will never read.
+func TestSplitSkipsStagingWhenEveryChapterIsAlreadySplit(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "remote-book.m4b")
+	if err := os.WriteFile(source, bytes.Repeat([]byte("source"), 1024), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	work := filepath.Join(dir, "work")
+	if err := os.MkdirAll(filepath.Join(work, ChaptersDir), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	m := Manifest{
+		Source: source, Style: StyleMarkers, ChapterCount: 1, Duration: 1,
+		Chapters: []Chapter{{Chapter: 1, Start: 0, End: 1, Duration: 1}},
+	}
+	if err := os.WriteFile(filepath.Join(work, ChaptersDir, ChapterFileName(1)), bytes.Repeat([]byte("f"), minFlacBytes), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Staging is made IMPOSSIBLE rather than merely observed: split-source/ already
+	// exists as a regular file, so any attempt to stage fails loudly at MkdirAll. (The
+	// copy itself cannot be observed after the fact - a successful split removes it.)
+	// The bogus ffmpeg path likewise proves no chapter was cut.
+	if err := os.WriteFile(filepath.Join(work, SplitSourceDir), []byte("staging blocker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Split(context.Background(), m, work, filepath.Join(dir, "no-such-ffmpeg"), nil); err != nil {
+		t.Fatalf("fully-resumed Split did work it had no need to do: %v", err)
+	}
+}
+
+// IsTransientSourceErr lives here because THIS package composes the error prose it
+// matches (encodeFLAC wraps ffmpeg's stderr); internal/pipeline only decides what to do
+// about it. The classifier must stay narrow - every other ffmpeg failure is a hard one.
+func TestIsTransientSourceErrMatchesOnlyTheMountInterruption(t *testing.T) {
+	transient := []error{
+		errors.New("ffmpeg chapter 3: exit status 252: Error opening input: Interrupted system call"),
+		errors.New("interrupted system call"),
+	}
+	for _, err := range transient {
+		if !IsTransientSourceErr(err) {
+			t.Errorf("IsTransientSourceErr(%v) = false, want a retry", err)
+		}
+	}
+	hard := []error{
+		nil,
+		errors.New("ffmpeg chapter 3: exit status 1: Invalid data found when processing input"),
+		errors.New("ffmpeg unavailable; cannot split chapters"),
+	}
+	for _, err := range hard {
+		if IsTransientSourceErr(err) {
+			t.Errorf("IsTransientSourceErr(%v) = true, want a hard failure", err)
+		}
+	}
+}
+
+// fakeFFmpeg writes an executable stand-in for ffmpeg at path. It appends each
+// invocation's -i input to logPath (when non-empty), optionally sleeps, and always
+// produces a plausible output file at the last argument (encodeFLAC's temp path).
+func fakeFFmpeg(t *testing.T, path, logPath, sleepSecs string) {
+	t.Helper()
+	var script strings.Builder
+	script.WriteString("#!/bin/sh\n")
+	if logPath != "" {
+		script.WriteString("prev=''\ninput=''\nfor arg do\n  if [ \"$prev\" = '-i' ]; then input=$arg; fi\n  prev=$arg\ndone\nprintf '%s\\n' \"$input\" >> " + strconv.Quote(logPath) + "\n")
+	}
+	if sleepSecs != "" {
+		script.WriteString("sleep " + sleepSecs + "\n")
+	}
+	script.WriteString("for last do :; done\ndd if=/dev/zero of=\"$last\" bs=256 count=1 2>/dev/null\n")
+	if err := os.WriteFile(path, []byte(script.String()), 0o755); err != nil { //nolint:gosec // executable test fixture
+		t.Fatal(err)
+	}
+}
+
+// markerBookFixture writes a source file of the given size plus a two-chapter
+// markers-style manifest over it, and returns the source path, work dir and manifest.
+func markerBookFixture(t *testing.T, sourceBytes int) (source, work string, m Manifest) {
+	t.Helper()
+	dir := t.TempDir()
+	source = filepath.Join(dir, "remote-book.m4b")
+	if err := os.WriteFile(source, bytes.Repeat([]byte("s"), sourceBytes), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	work = filepath.Join(dir, "work")
+	m = Manifest{
+		Source: source, Style: StyleMarkers, ChapterCount: 2, Duration: 2,
+		Chapters: []Chapter{
+			{Chapter: 1, Start: 0, End: 1, Duration: 1},
+			{Chapter: 2, Start: 1, End: 2, Duration: 1},
+		},
+	}
+	return source, work, m
+}
+
+// A user who finds a corrupt source, replaces the file and hits Retry must get the NEW
+// bytes. Trusting the cache unconditionally split the old ones forever, with nothing in
+// the log to say why the replacement changed nothing.
+func TestStageMarkerSourceRestagesWhenTheSourceWasReplaced(t *testing.T) {
+	source, work, _ := markerBookFixture(t, 4096)
+	first, err := stageMarkerSource(context.Background(), source, work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source, bytes.Repeat([]byte("replacement"), 1024), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	again, err := stageMarkerSource(context.Background(), source, work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != first {
+		t.Fatalf("staged path changed: %q -> %q", first, again)
+	}
+	staged, err := os.ReadFile(again) //nolint:gosec // test artifact under t.TempDir
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(staged) != 11*1024 {
+		t.Errorf("staged copy is %d bytes, want the replaced source's %d - a stale cache splits the old bytes forever", len(staged), 11*1024)
+	}
+}
+
+func TestStageMarkerSourceReusesCompleteCacheWithoutRemoteSource(t *testing.T) {
+	work := t.TempDir()
+	staged := filepath.Join(work, SplitSourceDir, stagedSourceName+".m4b")
+	if err := os.MkdirAll(filepath.Dir(staged), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(staged, []byte("complete staged source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := stageMarkerSource(context.Background(), "/disconnected/book.m4b", work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != staged {
+		t.Fatalf("staged source = %q, want cached %q", got, staged)
+	}
+}
+
+// The offline-retry property the cache exists for: an unreachable source must not
+// invalidate a complete staged copy just because its size cannot be compared.
+func TestStageMarkerSourceReusesCacheWhenTheSourceIsUnreachable(t *testing.T) {
+	work := t.TempDir()
+	staged := filepath.Join(work, SplitSourceDir, stagedSourceName+".m4b")
+	if err := os.MkdirAll(filepath.Dir(staged), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("a complete staged copy of a source whose mount is now offline")
+	if err := os.WriteFile(staged, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := stageMarkerSource(context.Background(), filepath.Join(work, "no-such-mount", "book.m4b"), work)
+	if err != nil {
+		t.Fatalf("unreachable source invalidated a usable cache: %v", err)
+	}
+	if got != staged {
+		t.Fatalf("staged source = %q, want the cached %q", got, staged)
+	}
+	after, err := os.ReadFile(staged) //nolint:gosec // test artifact under t.TempDir
+	if err != nil || !bytes.Equal(after, body) {
+		t.Fatalf("cached copy was rewritten (%v)", err)
+	}
+}
+
+// Staging is an optimization. When it cannot happen at all the book must still split
+// straight from the source - the pre-staging behaviour. A hard failure here made an
+// ENOSPC work-dir volume fail every attempt identically, so Retry could never clear it.
+func TestSplitFallsBackToTheSourceWhenStagingIsImpossible(t *testing.T) {
+	source, work, m := markerBookFixture(t, 4096)
+	if err := os.MkdirAll(work, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	// split-source/ already exists as a regular FILE, so every staging attempt fails at
+	// MkdirAll - the same shape as a copy that cannot be written.
+	if err := os.WriteFile(filepath.Join(work, SplitSourceDir), []byte("staging blocker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "inputs.log")
+	tool := filepath.Join(t.TempDir(), "ffmpeg-fake")
+	fakeFFmpeg(t, tool, logPath, "")
+
+	if err := Split(context.Background(), m, work, tool, nil); err != nil {
+		t.Fatalf("Split failed on an unstageable work dir instead of streaming from the source: %v", err)
+	}
+	for _, ch := range m.Chapters {
+		if !complete(filepath.Join(work, ChaptersDir, ChapterFileName(ch.Chapter)), ch.Duration) {
+			t.Errorf("chapter %d was not split", ch.Chapter)
+		}
+	}
+	lines, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, got := range strings.Fields(string(lines)) {
+		if got != source {
+			t.Errorf("ffmpeg input %d = %q, want the original source %q", i+1, got, source)
+		}
+	}
+}
+
+// A wedged mount leaves ffmpeg blocked forever, and the split stage's heartbeat keeps
+// telling the supervisor the book is healthy, so nothing but this bound ever ends it.
+func TestSplitBoundsEachChapterConversion(t *testing.T) {
+	prevFloor, prevMultiple := splitChapterTimeoutFloor, splitChapterTimeoutMultiple
+	splitChapterTimeoutFloor, splitChapterTimeoutMultiple = 50*time.Millisecond, 0
+	defer func() { splitChapterTimeoutFloor, splitChapterTimeoutMultiple = prevFloor, prevMultiple }()
+
+	_, work, m := markerBookFixture(t, 512)
+	tool := filepath.Join(t.TempDir(), "ffmpeg-wedged")
+	fakeFFmpeg(t, tool, "", "10")
+
+	err := Split(context.Background(), m, work, tool, nil)
+	if err == nil {
+		t.Fatal("a stalled chapter conversion ran to completion, want a bounded failure")
+	}
+	if !strings.Contains(err.Error(), "conversion time bound") {
+		t.Errorf("error = %v, want it to name the bound it exceeded", err)
+	}
+	// A stall is NOT the EINTR shape: retrying it three times just stalls three times.
+	if IsTransientSourceErr(err) {
+		t.Errorf("timeout classified as a transient source error: %v", err)
+	}
+}
+
+// The staging copy runs BEFORE the first progress report, so a stall there is even less
+// visible than one inside ffmpeg. The bound is exercised through a budget already spent
+// when the first read is attempted - the copy itself cannot be stalled from a test.
+func TestStageMarkerSourceBoundsTheCopy(t *testing.T) {
+	prevFloor, prevRate := stagingCopyFloor, stagingCopyBytesPerMinute
+	stagingCopyFloor, stagingCopyBytesPerMinute = time.Nanosecond, 1<<40
+	defer func() { stagingCopyFloor, stagingCopyBytesPerMinute = prevFloor, prevRate }()
+
+	source, work, _ := markerBookFixture(t, 4096)
+	staged, err := stageMarkerSource(context.Background(), source, work)
+	if err == nil {
+		t.Fatalf("staging ignored its time bound (staged %q)", staged)
+	}
+	if !strings.Contains(err.Error(), "time bound") {
+		t.Errorf("error = %v, want it to name the bound it exceeded", err)
+	}
+	// The failed copy leaves nothing to trust: only the atomic rename publishes a cache.
+	if _, serr := os.Stat(filepath.Join(work, SplitSourceDir, stagedSourceName+".m4b")); !errors.Is(serr, os.ErrNotExist) {
+		t.Errorf("a timed-out copy published a staged file: %v", serr)
+	}
+}
+
+// internal/pipeline times the split rate from the FIRST progress report precisely so a
+// multi-GB staging copy is not charged to the learned chapters/sec, which only holds
+// while the baseline report comes AFTER staging.
+func TestSplitReportsTheBaselineAfterStaging(t *testing.T) {
+	_, work, m := markerBookFixture(t, 4096)
+	tool := filepath.Join(t.TempDir(), "ffmpeg-fake")
+	fakeFFmpeg(t, tool, "", "")
+
+	staged := filepath.Join(work, SplitSourceDir, stagedSourceName+".m4b")
+	firstReportStaged := false
+	seen := false
+	err := Split(context.Background(), m, work, tool, func(done, total int) {
+		if seen {
+			return
+		}
+		seen = true
+		_, serr := os.Stat(staged)
+		firstReportStaged = serr == nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !seen {
+		t.Fatal("no progress was reported")
+	}
+	if !firstReportStaged {
+		t.Error("the first progress report preceded staging, so the split rate would include the source copy")
 	}
 }
 

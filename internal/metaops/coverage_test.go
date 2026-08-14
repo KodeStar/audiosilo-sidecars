@@ -26,19 +26,24 @@ type workRow struct {
 // cardRow is one work-kind search hit the fake returns.
 type cardRow struct {
 	id, title, author, seriesName, seriesPos string
+	narrators                                []string
 }
 
 // metaServer is a configurable fake meta.audiosilo.app.
 type metaServer struct {
-	lookup      map[string]string   // asin/isbn -> work id ("" => 404)
-	work        map[string]workRow  // work id -> detail (absent => 404)
-	search      []cardRow           // work hits returned for any /search
+	lookup map[string]string  // asin/isbn -> work id ("" => 404)
+	work   map[string]workRow // work id -> detail (absent => 404)
+	search []cardRow          // work hits returned for any /search
+	// searchBy, when non-nil, makes /search query-sensitive (an unlisted query
+	// returns nothing) - which is what the retrieval ladder is about.
+	searchBy    map[string][]cardRow
 	extra       string              // an extra non-work result line to prove filtering
 	seriesWorks map[string][]string // series id -> member work ids (absent => 404)
 	onWorks     func(id string)     // optional hook, called on each /works/{id} request
 
 	mu       sync.Mutex // guards requests (concurrent coverage workers hit the fake)
 	requests map[string]int
+	queries  []string // every /search q, in the order received
 }
 
 // count records a request to endpoint (concurrency-safe).
@@ -53,6 +58,13 @@ func (s *metaServer) reqCount(endpoint string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.requests[endpoint]
+}
+
+// seenQueries returns the /search queries received, in order.
+func (s *metaServer) seenQueries() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.queries...)
 }
 
 func (s *metaServer) handler() http.Handler {
@@ -117,17 +129,33 @@ func (s *metaServer) handler() http.Handler {
 		}
 		_, _ = w.Write([]byte(`{"id":"` + id + `","name":"S","works":[` + strings.Join(parts, ",") + `]}`))
 	})
-	mux.HandleFunc("/api/v1/search", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/api/v1/search", func(w http.ResponseWriter, r *http.Request) {
 		s.count("search")
+		q := r.URL.Query().Get("q")
+		s.mu.Lock()
+		s.queries = append(s.queries, q)
+		s.mu.Unlock()
+		cards := s.search
+		if s.searchBy != nil {
+			cards = s.searchBy[q]
+		}
 		body := `{"results":[`
-		parts := make([]string, 0, len(s.search)+1)
-		for _, c := range s.search {
+		parts := make([]string, 0, len(cards)+1)
+		for _, c := range cards {
 			series := "null"
 			if c.seriesName != "" {
 				series = `{"id":"s","name":"` + c.seriesName + `","position":"` + c.seriesPos + `"}`
 			}
+			narrators := ""
+			for i, n := range c.narrators {
+				if i > 0 {
+					narrators += ","
+				}
+				narrators += `{"id":"n` + string(rune('a'+i)) + `","name":"` + n + `"}`
+			}
 			parts = append(parts, `{"kind":"work","id":"`+c.id+`","title":"`+c.title+
-				`","authors":[{"id":"p","name":"`+c.author+`"}],"series":`+series+`,"cover_url":"http://x/c.jpg"}`)
+				`","authors":[{"id":"p","name":"`+c.author+`"}],"narrators":[`+narrators+
+				`],"series":`+series+`,"cover_url":"http://x/c.jpg"}`)
 		}
 		if s.extra != "" {
 			parts = append(parts, s.extra)
@@ -274,6 +302,234 @@ func TestSearchVerdictKeyIncludesSeries(t *testing.T) {
 	if !b.Known || b.WorkID != "wB" {
 		t.Fatalf("series Beta should resolve to wB (not inherit wA's cached verdict): %+v", b)
 	}
+}
+
+// wantQueries asserts the exact ordered list of /search queries the fake saw.
+// The order IS the contract: the raw title must go first (a book that already
+// resolved costs one request) and nothing may be sent after the accepting rung.
+func wantQueries(t *testing.T, s *metaServer, want ...string) {
+	t.Helper()
+	got := s.seenQueries()
+	if len(got) != len(want) {
+		t.Fatalf("queries = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("query %d = %q, want %q (all: %q)", i, got[i], want[i], got)
+		}
+	}
+}
+
+// TestSearchLadderPreSubtitleRescue: a decorated shelf title retrieves nothing,
+// while its pre-subtitle segment is an exact hit. It also pins the ladder's
+// order and its early exit - the raw title goes first, and the rungs past the
+// accepting one are never sent.
+func TestSearchLadderPreSubtitleRescue(t *testing.T) {
+	s := &metaServer{
+		work: map[string]workRow{"w-sm": {title: "Supermage", c: true}},
+		searchBy: map[string][]cardRow{
+			"Supermage": {{id: "w-sm", title: "Supermage", author: "Michael Head"}},
+		},
+	}
+	c, _ := newMeta(t, s)
+
+	got, _ := c.CoverageFor(context.Background(), BookIdentity{
+		Title:   "Supermage : Rise To Omniscience, Book 1",
+		Authors: []string{"Michael Head"},
+	})
+	if !got.Known || got.MatchedBy != "search" || got.WorkID != "w-sm" {
+		t.Fatalf("pre-subtitle rescue = %+v", got)
+	}
+	wantQueries(t, s,
+		"Supermage : Rise To Omniscience, Book 1", // 1. raw title
+		"Supermage Rise To Omniscience Book 1",    // 2. punctuation-normalized
+		"Supermage : Rise To Omniscience",         // 3. CleanTitle
+		"Supermage",                               // 4. pre-subtitle - accepted, ladder stops
+	)
+}
+
+// TestSearchLadderPunctuationRescue: "(Unabridged)" + a colon hide a work that
+// the bare words retrieve exactly.
+func TestSearchLadderPunctuationRescue(t *testing.T) {
+	s := &metaServer{
+		work: map[string]workRow{"w-halo": {title: "Halo: Primordium", r: true}},
+		searchBy: map[string][]cardRow{
+			"Halo Primordium": {{id: "w-halo", title: "Halo: Primordium", author: "Greg Bear"}},
+		},
+	}
+	c, _ := newMeta(t, s)
+
+	got, _ := c.CoverageFor(context.Background(), BookIdentity{
+		Title: "Halo: Primordium (Unabridged)", Authors: []string{"Greg Bear"},
+	})
+	if !got.Known || got.WorkID != "w-halo" || !got.HasRecaps {
+		t.Fatalf("punctuation rescue = %+v", got)
+	}
+	wantQueries(t, s, "Halo: Primordium (Unabridged)", "Halo Primordium")
+}
+
+// TestSearchLadderPostSeparatorRescue: a shelf prefix ("Artemis Fowl 4 - ")
+// buries the title; the tail after the last separator is the work.
+func TestSearchLadderPostSeparatorRescue(t *testing.T) {
+	s := &metaServer{
+		work: map[string]workRow{"w-opal": {title: "The Opal Deception"}},
+		searchBy: map[string][]cardRow{
+			"The Opal Deception": {{id: "w-opal", title: "The Opal Deception", author: "Eoin Colfer"}},
+		},
+	}
+	c, _ := newMeta(t, s)
+
+	got, _ := c.CoverageFor(context.Background(), BookIdentity{
+		Title: "Artemis Fowl 4 - The Opal Deception", Authors: []string{"Eoin Colfer"},
+	})
+	if !got.Known || got.WorkID != "w-opal" {
+		t.Fatalf("post-separator rescue = %+v", got)
+	}
+	wantQueries(t, s, "Artemis Fowl 4 - The Opal Deception", "The Opal Deception")
+}
+
+// TestSearchLadderPathHints: the tags carry a shortcode title, but the folder
+// leaf carries the real one. The card is scored against the LEAF, not the
+// shortcode - scoring it against "RO07" would reject the card the rung found.
+func TestSearchLadderPathHints(t *testing.T) {
+	s := &metaServer{
+		work: map[string]workRow{"w-sq": {title: "Sandqueen", c: true, r: true}},
+		searchBy: map[string][]cardRow{
+			"Sandqueen": {{id: "w-sq", title: "Sandqueen", author: "Michael Head"}},
+		},
+	}
+	c, _ := newMeta(t, s)
+
+	got, _ := c.CoverageFor(context.Background(), BookIdentity{
+		Title: "RO07", Authors: []string{"Michael Head"},
+		FolderName: "RO07 - Sandqueen", ParentDir: "Rise to Omniscience",
+	})
+	if !got.Known || got.MatchedBy != "search" || got.WorkID != "w-sq" {
+		t.Fatalf("path-hint rescue = %+v", got)
+	}
+	// The parent-folder rung sits AFTER the leaf rung, so it is never reached.
+	wantQueries(t, s, "RO07", "RO07 Michael Head", "Sandqueen")
+}
+
+// TestSearchNarratorGate covers the author gate's narrator evidence, in both
+// directions, plus the control that keeps it from matching anything.
+func TestSearchNarratorGate(t *testing.T) {
+	// (a) The shelf tags the NARRATOR as the author; the card carries him as a
+	// narrator and the real author alongside.
+	t.Run("query author is a card narrator", func(t *testing.T) {
+		s := &metaServer{
+			work: map[string]workRow{"w-dragon": {title: "How to Break a Dragon's Heart", c: true}},
+			search: []cardRow{{
+				id: "w-dragon", title: "How to Break a Dragon's Heart",
+				author: "Cressida Cowell", narrators: []string{"David Tennant"},
+			}},
+		}
+		c, _ := newMeta(t, s)
+		got, _ := c.CoverageFor(context.Background(), BookIdentity{
+			Title: "How to Break a Dragon's Heart", Authors: []string{"David Tennant"},
+		})
+		if !got.Known || got.MatchedBy != "search" || got.WorkID != "w-dragon" {
+			t.Fatalf("narrator-as-author coverage = %+v", got)
+		}
+	})
+
+	// (b) The reverse: the local narrator credit names the card's AUTHOR (an
+	// author narrating his own book, behind a junk author tag).
+	t.Run("local narrator is a card author", func(t *testing.T) {
+		s := &metaServer{
+			work: map[string]workRow{"w-ll": {title: "Legends and Lattes", r: true}},
+			search: []cardRow{{
+				id: "w-ll", title: "Legends and Lattes", author: "Travis Baldree",
+			}},
+		}
+		c, _ := newMeta(t, s)
+		got, _ := c.CoverageFor(context.Background(), BookIdentity{
+			Title: "Legends and Lattes", Authors: []string{"Audible Studios"},
+			Narrators: []string{"Travis Baldree"},
+		})
+		if !got.Known || got.WorkID != "w-ll" {
+			t.Fatalf("narrator-evidence coverage = %+v", got)
+		}
+	})
+
+	// Control: an exact-title card with no author OR narrator link stays a miss -
+	// the gate widens the evidence, it does not remove it.
+	t.Run("no link is still a miss", func(t *testing.T) {
+		s := &metaServer{
+			work: map[string]workRow{"w-dragon": {title: "How to Break a Dragon's Heart"}},
+			search: []cardRow{{
+				id: "w-dragon", title: "How to Break a Dragon's Heart",
+				author: "Cressida Cowell", narrators: []string{"Other Person"},
+			}},
+		}
+		c, _ := newMeta(t, s)
+		got, _ := c.CoverageFor(context.Background(), BookIdentity{
+			Title: "How to Break a Dragon's Heart", Authors: []string{"David Tennant"},
+		})
+		if !got.Available || got.Known {
+			t.Fatalf("unlinked card = %+v (want available/unknown)", got)
+		}
+	})
+}
+
+// TestSearchLadderExhaustsAndCaches pins the full ladder for a book nothing
+// matches (its order, its de-duplication of rungs that collapse onto each
+// other, and its bounded length) and proves ONE negative verdict covers the
+// whole ladder: the second call issues no request at all.
+func TestSearchLadderExhaustsAndCaches(t *testing.T) {
+	s := &metaServer{searchBy: map[string][]cardRow{}}
+	c, _ := newMeta(t, s)
+	id := BookIdentity{
+		Title:   "Supermage : Rise To Omniscience, Book 1",
+		Authors: []string{"Michael Head"},
+		// Real path hints, so the last two rungs are exercised.
+		FolderName: "RO07 - Sandqueen", ParentDir: "Rise to Omniscience",
+	}
+
+	got, _ := c.CoverageFor(context.Background(), id)
+	if !got.Available || got.Known {
+		t.Fatalf("exhausted ladder = %+v (want available/unknown)", got)
+	}
+	wantQueries(t, s,
+		"Supermage : Rise To Omniscience, Book 1",      // 1. raw title
+		"Supermage Rise To Omniscience Book 1",         // 2. punctuation-normalized
+		"Supermage : Rise To Omniscience",              // 3. CleanTitle (rung 6 collapses onto it)
+		"Supermage",                                    // 4. pre-subtitle
+		"Rise To Omniscience, Book 1",                  // 5. post-separator tail
+		"Supermage : Rise To Omniscience Michael Head", // 7. clean title + author
+		"Sandqueen",           // 8. folder leaf tail
+		"Rise to Omniscience", // 9. parent folder
+	)
+
+	before := s.reqCount("search")
+	got, _ = c.CoverageFor(context.Background(), id)
+	if got.Known {
+		t.Fatalf("cached verdict = %+v", got)
+	}
+	if s.reqCount("search") != before {
+		t.Errorf("negative ladder verdict not cached: %d -> %d", before, s.reqCount("search"))
+	}
+}
+
+// TestSearchLadderShortTitle: a genuinely short real title ("It") must still be
+// asked upstream. Every derived rung is below minQueryLen, so a floor applied to
+// rung 1 too would leave an EMPTY ladder and cache a negative verdict having
+// issued no request at all.
+func TestSearchLadderShortTitle(t *testing.T) {
+	s := &metaServer{
+		work:     map[string]workRow{"w-it": {title: "It", c: true}},
+		searchBy: map[string][]cardRow{"It": {{id: "w-it", title: "It", author: "Stephen King"}}},
+	}
+	c, _ := newMeta(t, s)
+
+	got, _ := c.CoverageFor(context.Background(), BookIdentity{
+		Title: "It", Authors: []string{"Stephen King"},
+	})
+	if !got.Known || got.MatchedBy != "search" || got.WorkID != "w-it" {
+		t.Fatalf("short-title match = %+v", got)
+	}
+	// Exactly one query, and it is the raw title.
+	wantQueries(t, s, "It")
 }
 
 func TestCoverageForWork(t *testing.T) {

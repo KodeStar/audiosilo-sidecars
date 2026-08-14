@@ -179,6 +179,44 @@ describe('filterCandidates', () => {
     );
   });
 
+  it('drops books this daemon already processed to done when excluding', () => {
+    // A book the pipeline finished is never a useful contribution target, however
+    // stale or unknown its scan-time coverage verdict is.
+    const finished = book({
+      path: '/done',
+      coverage: cov({ known: false }),
+      pipeline_book: { id: 7, state: 'done', status: '' },
+    });
+    expect(filterCandidates([finished, partial], { excludeCovered: true })).toEqual([partial]);
+  });
+
+  it('keeps done pipeline books when the toggle is off', () => {
+    const finished = book({
+      path: '/done',
+      pipeline_book: { id: 7, state: 'done', status: '' },
+    });
+    expect(filterCandidates([finished, partial], { excludeCovered: false })).toEqual([
+      finished,
+      partial,
+    ]);
+  });
+
+  it('keeps unfinished pipeline books even when excluding', () => {
+    // status is the exceptional flag, not the completion signal: an active ('')
+    // or parked book has work left to do, so the toggle must not hide it.
+    const active = book({
+      path: '/active',
+      coverage: cov({ known: false }),
+      pipeline_book: { id: 8, state: 'asr', status: '' },
+    });
+    const parked = book({
+      path: '/parked',
+      coverage: cov({ known: false }),
+      pipeline_book: { id: 9, state: 'auditing', status: 'needs_attention' },
+    });
+    expect(filterCandidates([active, parked], { excludeCovered: true })).toEqual([active, parked]);
+  });
+
   it('applies excludeCovered and hidden together', () => {
     const hiddenCovered = book({
       path: '/hc',
@@ -380,6 +418,20 @@ describe('searchCandidates', () => {
 
   it('matches case-insensitively against the title', () => {
     expect(searchCandidates(books, 'dUnE')).toEqual([dune]);
+  });
+
+  it('matches on the folder path, which often carries identity the tags lack', () => {
+    const pathOnly = book({
+      path: 'Selkie Myth/Beneath the Dragoneye Moons/BDM01 - Oathbound Healer',
+      title: 'Oathbound Healer',
+    });
+    const other = book({ path: 'Other/Book', title: 'Other' });
+    const shelf = [pathOnly, other];
+    // "dragoneye" appears ONLY in the path - no tag on this book states it.
+    expect(searchCandidates(shelf, 'dragoneye')).toEqual([pathOnly]);
+    expect(searchCandidates(shelf, 'SELKIE')).toEqual([pathOnly]);
+    // And it composes with the other fields under the AND rule.
+    expect(searchCandidates(shelf, 'bdm01 oathbound')).toEqual([pathOnly]);
   });
 
   it('matches on author, narrator, series, asin, and isbn', () => {

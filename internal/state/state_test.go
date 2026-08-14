@@ -58,6 +58,24 @@ func TestLanesAssigned(t *testing.T) {
 	}
 }
 
+// TestReadsSourcePinsLibrarySourceStages pins the EXACT set of stages that open
+// the original library item. The scheduler serializes exactly these inside the
+// mechanical lane, so a stage silently gaining or losing the flag either wedges an
+// SMB mount with concurrent reads or needlessly serializes work-dir-only work.
+func TestReadsSourcePinsLibrarySourceStages(t *testing.T) {
+	want := map[State]bool{Inspecting: true, Splitting: true, Extracting: true}
+	for _, s := range All() {
+		if got := ReadsSource(s); got != want[s] {
+			t.Errorf("ReadsSource(%q) = %v, want %v", s, got, want[s])
+		}
+		// A source-reading stage must be a mechanical one: the serialization lives in
+		// that lane's filler, so an ASR/agent stage carrying the flag would be ignored.
+		if want[s] && LaneOf(s) != LaneMechanical {
+			t.Errorf("source-reading %q runs in lane %q, want mechanical", s, LaneOf(s))
+		}
+	}
+}
+
 // TestNextStateLegalPerTable drives every state through every branch and asserts
 // the result is a declared successor (or the documented park exception).
 func TestNextStateLegalPerTable(t *testing.T) {

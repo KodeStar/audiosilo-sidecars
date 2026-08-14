@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -267,10 +268,25 @@ func ModelFor(claudeMap, openaiMap map[string]string, backendID, stage string) s
 var rateLimitSignatures = []string{
 	"rate limit",
 	"rate_limit",
-	"429",
 	"overloaded",
 	"usage limit",
 }
+
+// A bare "429" is unsafe here, and it has two distinct false-positive shapes to
+// guard against: CLI stderr carries RFC3339 timestamps whose fractional seconds
+// can contain those digits (2026-08-11T17:14:47.294295Z), and usage JSON carries
+// bare counts that can BE that number ("output_tokens":429). Both are excluded by
+// requiring protocol/error context near the code plus a word boundary after it (a
+// timestamp's digits run on; a token count has no keyword within reach).
+// Misclassifying a rate limit as a generic failure is the expensive direction - it
+// burns the validation retry budget and parks the book with no retry_at instead of
+// the timed self-resume - so the context class is deliberately wide: the separator
+// covers JSON quotes/colons, key underscores, paths and whitespace. The keywords
+// carry no \b so "status_code=429" matches through the "code" alternative (the
+// underscore would otherwise kill the boundary). The pattern is matched against
+// already-lowercased text, so it carries no (?i).
+var rateLimit429Pattern = regexp.MustCompile(
+	`(?:http|status|code|error)["':=_\s./-]{0,6}429\b|\b429\s+(?:too many requests|client error)`)
 
 // isRateLimit reports whether s contains any rate-limit signature (case-insensitive).
 func isRateLimit(s string) bool {
@@ -280,7 +296,7 @@ func isRateLimit(s string) bool {
 			return true
 		}
 	}
-	return false
+	return rateLimit429Pattern.MatchString(low)
 }
 
 // maxDetail bounds how much CLI output rides in an error string, so a runaway CLI

@@ -437,6 +437,117 @@ func TestSplitRejectsNonContiguousManifest(t *testing.T) {
 	}
 }
 
+// TestSplitHeartbeatDuringSlowFFmpeg asserts that one slow chapter conversion remains live
+// between per-chapter progress reports. Without this heartbeat, the supervisor can cancel a
+// healthy ffmpeg process on a slow/network-mounted source before it finishes the chapter.
+func TestSplitHeartbeatDuringSlowFFmpeg(t *testing.T) {
+	prev := stageHeartbeatInterval
+	stageHeartbeatInterval = 5 * time.Millisecond
+	defer func() { stageHeartbeatInterval = prev }()
+
+	work := t.TempDir()
+	writeManifest(t, work, 1)
+	tool := filepath.Join(t.TempDir(), "ffmpeg-slow")
+	fixture := []byte("#!/bin/sh\nfor last do :; done\nsleep 0.05\ndd if=/dev/zero of=\"$last\" bs=256 count=1 2>/dev/null\n")
+	if err := os.WriteFile(tool, fixture, 0o755); err != nil { //nolint:gosec // executable test fixture
+		t.Fatal(err)
+	}
+
+	exe := NewExecutor(Config{FFmpeg: tool, DataDir: t.TempDir(), Fallback: scheduler.NewStubExecutor(0, 0)})
+	var mu sync.Mutex
+	heartbeats := 0
+	var notes []string
+	report := scheduler.StageReport{
+		Heartbeat: func() { mu.Lock(); heartbeats++; mu.Unlock() },
+		Note:      func(msg string) { mu.Lock(); notes = append(notes, msg); mu.Unlock() },
+	}
+	_, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Splitting, report)
+	if err != nil {
+		t.Fatalf("split stage: %v", err)
+	}
+
+	mu.Lock()
+	afterDone := heartbeats
+	gotNotes := append([]string(nil), notes...)
+	mu.Unlock()
+	time.Sleep(20 * stageHeartbeatInterval)
+	mu.Lock()
+	defer mu.Unlock()
+	if heartbeats != afterDone {
+		t.Errorf("heartbeat fired after ffmpeg returned: %d -> %d", afterDone, heartbeats)
+	}
+	if heartbeats < 4 {
+		t.Errorf("heartbeats = %d, want >= 4 during slow ffmpeg", heartbeats)
+	}
+	foundNote := false
+	for _, note := range gotNotes {
+		if strings.Contains(note, "splitting: ffmpeg still running") {
+			foundNote = true
+		}
+	}
+	if !foundNote {
+		t.Errorf("no slow-split liveness note; notes=%v", gotNotes)
+	}
+}
+
+// TestSplitRetriesInterruptedSourceRead covers the transient Nextcloud/FUSE failure seen in
+// production: one EINTR from ffmpeg is retried inside the resumable stage instead of leaving
+// the book Failed for an operator to re-admit.
+func TestSplitRetriesInterruptedSourceRead(t *testing.T) {
+	prev := splitTransientRetryDelay
+	// Long enough to dominate the (millisecond) work this fixture does, so the rate
+	// assertion below can tell backoff from split throughput.
+	splitTransientRetryDelay = 300 * time.Millisecond
+	defer func() { splitTransientRetryDelay = prev }()
+
+	work := t.TempDir()
+	writeManifest(t, work, 1)
+	toolDir := t.TempDir()
+	tool := filepath.Join(toolDir, "ffmpeg-interrupted-once")
+	marker := filepath.Join(toolDir, "attempted")
+	fixture := []byte(fmt.Sprintf("#!/bin/sh\nif [ ! -e %s ]; then\n  touch %s\n  echo 'Error opening input: Interrupted system call' >&2\n  exit 252\nfi\nfor last do :; done\ndd if=/dev/zero of=\"$last\" bs=256 count=1 2>/dev/null\n", strconv.Quote(marker), strconv.Quote(marker)))
+	if err := os.WriteFile(tool, fixture, 0o755); err != nil { //nolint:gosec // executable test fixture
+		t.Fatal(err)
+	}
+
+	var notes []string
+	exe := NewExecutor(Config{FFmpeg: tool, DataDir: t.TempDir(), Fallback: scheduler.NewStubExecutor(0, 0)})
+	started := time.Now()
+	res, err := exe.Execute(context.Background(), store.Book{ID: 1, WorkDir: work}, state.Splitting, scheduler.StageReport{
+		Note: func(msg string) { notes = append(notes, msg) },
+	})
+	wall := time.Since(started)
+	if err != nil {
+		t.Fatalf("split stage did not recover from interrupted source read: %v", err)
+	}
+	// The learned chapters/sec must measure splitting, not waiting: the retry backoff (and
+	// the staging copy before the first progress report) are excluded, exactly as
+	// StageResult.RateSample requires. Without the subtraction the sample would carry the
+	// whole backoff and teach the ETA engine that this machine splits ~3x slower than it does.
+	if res.RateSample == nil {
+		t.Fatal("split recorded no rate sample")
+	}
+	if wall < splitTransientRetryDelay {
+		t.Fatalf("stage returned in %s, less than the one backoff it should have slept", wall)
+	}
+	if res.RateSample.Seconds >= splitTransientRetryDelay.Seconds() {
+		t.Errorf("rate sample = %.3fs over a %s wall clock: the retry backoff was charged to the split rate",
+			res.RateSample.Seconds, wall)
+	}
+	if _, err := os.Stat(filepath.Join(work, audio.ChaptersDir, audio.ChapterFileName(1))); err != nil {
+		t.Fatalf("completed chapter missing after retry: %v", err)
+	}
+	foundRetryNote := false
+	for _, note := range notes {
+		if strings.Contains(note, "source read was interrupted") {
+			foundRetryNote = true
+		}
+	}
+	if !foundRetryNote {
+		t.Errorf("retry was not made visible in stage notes: %v", notes)
+	}
+}
+
 func seedFLACs(t *testing.T, workDir string, n int) {
 	t.Helper()
 	dir := filepath.Join(workDir, audio.ChaptersDir)
@@ -622,9 +733,9 @@ func TestASRStageTranscribeFailureFails(t *testing.T) {
 // and, every few ticks, a "still transcribing" note naming the chapter. The ticker must
 // also stop the moment the transcription returns (no trailing heartbeat).
 func TestASRStageHeartbeatDuringSlowChapter(t *testing.T) {
-	prev := asrHeartbeatInterval
-	asrHeartbeatInterval = 5 * time.Millisecond
-	defer func() { asrHeartbeatInterval = prev }()
+	prev := stageHeartbeatInterval
+	stageHeartbeatInterval = 5 * time.Millisecond
+	defer func() { stageHeartbeatInterval = prev }()
 
 	work := t.TempDir()
 	writeManifest(t, work, 1)
@@ -675,7 +786,7 @@ func TestASRStageHeartbeatDuringSlowChapter(t *testing.T) {
 	mu.Lock()
 	afterDone := heartbeats
 	mu.Unlock()
-	time.Sleep(20 * asrHeartbeatInterval)
+	time.Sleep(20 * stageHeartbeatInterval)
 	mu.Lock()
 	defer mu.Unlock()
 	if heartbeats != afterDone {

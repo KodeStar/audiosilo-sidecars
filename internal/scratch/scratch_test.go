@@ -68,10 +68,14 @@ func TestConfinedAllowedAndDenied(t *testing.T) {
 func TestPurgeRemovesChaptersKeepsDurables(t *testing.T) {
 	root := t.TempDir()
 	work := filepath.Join(root, "book-1")
-	// chapters/, _runs/, clips/, retranscribe/ are reclaimable; probe.json/
-	// manifest.json/transcripts/facts are durable.
+	// chapters/, split-source/, _runs/, clips/, retranscribe/ are reclaimable;
+	// probe.json/manifest.json/transcripts/facts are durable.
 	writeFile(t, filepath.Join(work, audio.ChaptersDir, "ch001.flac"), 1024)
 	writeFile(t, filepath.Join(work, audio.ChaptersDir, "ch002.flac"), 1024)
+	// The staged local copy of the source is the single largest artifact a book can
+	// leave behind (a whole m4b) and only a failed/cancelled split leaves it, so nothing
+	// but a purge ever reclaims it.
+	writeFile(t, filepath.Join(work, audio.SplitSourceDir, "source.m4b"), 4096)
 	writeFile(t, filepath.Join(work, "_runs", "fact_pass-a01", "out", "x.md"), 300)
 	writeFile(t, filepath.Join(work, "clips", "t002.flac"), 400)
 	writeFile(t, filepath.Join(work, "retranscribe", "ch002.json"), 500)
@@ -82,7 +86,7 @@ func TestPurgeRemovesChaptersKeepsDurables(t *testing.T) {
 	if err := Purge(root, work, state.KindAudio); err != nil {
 		t.Fatalf("Purge: %v", err)
 	}
-	for _, gone := range []string{audio.ChaptersDir, "_runs", "clips", "retranscribe"} {
+	for _, gone := range []string{audio.ChaptersDir, audio.SplitSourceDir, "_runs", "clips", "retranscribe"} {
 		if _, err := os.Stat(filepath.Join(work, gone)); !os.IsNotExist(err) {
 			t.Errorf("Purge did not remove reclaimable %s/", gone)
 		}
@@ -91,6 +95,22 @@ func TestPurgeRemovesChaptersKeepsDurables(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(work, keep)); err != nil {
 			t.Errorf("Purge removed a durable it must keep: %s (%v)", keep, err)
 		}
+	}
+}
+
+// A split that failed, was cancelled or parked before cutting a chapter leaves ONLY
+// the staged source copy behind. If the cheap precondition misses it, the startup GC
+// skips the book and a whole m4b-sized copy stays on disk forever.
+func TestHasReclaimableSeesStagedSource(t *testing.T) {
+	root := t.TempDir()
+	work := filepath.Join(root, "book-1")
+	writeFile(t, filepath.Join(work, audio.ManifestName), 80)
+	if HasReclaimable(root, work, state.KindAudio) {
+		t.Fatal("durables alone must not look reclaimable")
+	}
+	writeFile(t, filepath.Join(work, audio.SplitSourceDir, "source.m4b"), 4096)
+	if !HasReclaimable(root, work, state.KindAudio) {
+		t.Error("a staged source copy is not reported reclaimable; nothing else removes it")
 	}
 }
 

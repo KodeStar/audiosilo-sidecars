@@ -1,7 +1,7 @@
 import { memo } from 'react';
 import type { ScannedBook } from '@/api/types';
 import { currentForceAudio, isManualMatch, matchProvenanceLabel } from '@/lib/candidates';
-import { stateLabel } from '@/lib/pipelineState';
+import { isDoneState, stateLabel } from '@/lib/pipelineState';
 import { CoverageBadge } from './CoverageBadge';
 
 interface CandidateRowProps {
@@ -265,7 +265,7 @@ export const CandidateRow = memo(function CandidateRow({
 });
 
 function pipelinePresence(state: string, status: string): { label: string; className: string } {
-  if (state === 'done') {
+  if (isDoneState(state)) {
     return { label: 'Completed', className: 'border-success/40 bg-success/10 text-success' };
   }
   switch (status) {

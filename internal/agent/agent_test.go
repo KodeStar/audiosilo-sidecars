@@ -97,13 +97,30 @@ func TestModelFor(t *testing.T) {
 }
 
 func TestIsRateLimit(t *testing.T) {
-	hits := []string{"Rate Limit exceeded", "error rate_limit", "HTTP 429", "model Overloaded", "monthly usage limit reached"}
+	hits := []string{
+		"Rate Limit exceeded", "error rate_limit", "HTTP 429", "model Overloaded",
+		"monthly usage limit reached",
+		// The 429 pattern needs protocol/error context near the code - any of its
+		// keywords will do, in any casing, across the separator shapes real backends
+		// emit (JSON quotes, an underscored key, a bare space).
+		"upstream returned status code 429", "HTTP status 429", "429 Too Many Requests",
+		`{"status":429}`, "status_code=429",
+		"429 Client Error: Too Many Requests for url",
+	}
 	for _, s := range hits {
 		if !isRateLimit(s) {
 			t.Errorf("isRateLimit(%q) = false, want true", s)
 		}
 	}
-	misses := []string{"all good", "validation failed", "not found"}
+	misses := []string{
+		"all good",
+		"validation failed",
+		"not found",
+		// The two guarded false positives: a timestamp's fractional seconds, and a
+		// usage counter that happens to equal the status code.
+		"2026-08-11T17:14:47.294295Z failed to renew cache TTL",
+		`{"output_tokens":429,"input_tokens":12}`,
+	}
 	for _, s := range misses {
 		if isRateLimit(s) {
 			t.Errorf("isRateLimit(%q) = true, want false", s)

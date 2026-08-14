@@ -2,14 +2,17 @@
 // concurrent lanes. One scheduler goroutine wakes on events, computes eligible
 // (book, stage) pairs, and dispatches them to lane workers:
 //
-//   - Lane A (ASR): one ordinary full-book transcription plus one independent
-//     corrective retranscription. Ordinary ASR is breadth-first across series;
-//     corrective work never waits behind a long-running full-book transcription.
+//   - Lane A (ASR), capacity 1: full-book and corrective transcription share the
+//     MLX worker. Ordinary ASR is breadth-first across series; queued corrective
+//     work takes priority when the worker becomes free.
 //   - Lane B (agent books), capacity config.agent.queue_concurrency: gated by a SERIES LOCK -
 //     only the lowest-position unfinished book of a series may hold an agent slot,
 //     so different series parallelize but a series is authored in order.
 //   - Lane C (mechanical), capacity 2: inspect/split/sanitize/qa/correct/validate/
-//     contribute, running alongside ASR (CPU vs GPU).
+//     contribute, running alongside ASR (CPU vs GPU). Source-reading stages are
+//     serialized inside the lane because concurrent random access through one SMB
+//     share can wedge both kernel calls; local-work-dir stages may still use the
+//     second mechanical slot.
 //
 // SQLite (internal/store) is the scheduling truth; the work-dir _done/<stage>.json
 // sentinels are the content truth. On startup Reconcile squares the two: it
@@ -37,14 +40,14 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
 
-// Lane capacities. Full-book ASR remains serial by validated constraint. A
-// separate single corrective slot lets a targeted retranscription overlap it
-// without allowing two full books (or an unbounded set of repairs) to compete for
-// the transcriber. Mechanical is a small fixed pool; agent capacity is configurable.
+// Lane capacities. All MLX transcription remains serial: on unified-memory Macs,
+// overlapping a full-book decode with corrective retranscription can push the
+// second process into the OOM killer. Mechanical is a small fixed pool; agent
+// capacity is configurable.
 const (
-	asrCapacity          = 1
-	retranscribeCapacity = 1
-	mechCapacity         = 2
+	asrCapacity      = 1
+	mechCapacity     = 2
+	sourceIOCapacity = 1
 )
 
 // tickInterval is a safety re-evaluation cadence in case a wake is ever missed.
@@ -387,17 +390,12 @@ func (s *Scheduler) dispatch() {
 	s.mu.Lock()
 	counts := map[state.Lane]int{}
 	inflightIDs := map[int64]bool{}
-	asrActive := 0
-	retranscribeActive := 0
+	sourceIOActive := 0
 	for id, ib := range s.inflight {
 		counts[ib.lane]++
 		inflightIDs[id] = true
-		if ib.lane == state.LaneASR {
-			if ib.stage == state.Retranscribing {
-				retranscribeActive++
-			} else {
-				asrActive++
-			}
+		if ib.lane == state.LaneMechanical && state.ReadsSource(ib.stage) {
+			sourceIOActive++
 		}
 	}
 	s.mu.Unlock()
@@ -422,38 +420,28 @@ func (s *Scheduler) dispatch() {
 		}
 	}
 
-	// ASR: corrective retranscriptions and ordinary transcription have independent
-	// one-worker slots. Ordinary transcription is breadth-first across series so
-	// each series opens an agent slot before ASR loops back to later books.
+	// ASR is one serial slot, so the lane's ORDER is the whole policy: sortASRLane
+	// puts every corrective retranscription ahead of full-book work, and orders the
+	// rest breadth-first across series so each series opens an agent slot before ASR
+	// loops back to later books. One fill down that sorted slice offers the slot in
+	// exactly that priority.
 	sortASRLane(asr, books)
-	retranscriptions, transcriptions := partitionASR(asr)
 	sortByID(agent)
 	sortByID(mech)
 
 	// fillLane returns how many it dispatched, so counts ends the pass holding the
 	// post-dispatch per-lane occupancy - the exact numbers queue.stats publishes,
 	// with no second scan of the inflight set.
-	counts[state.LaneASR] += s.fillLane(retranscriptions, state.LaneASR, retranscribeCapacity-retranscribeActive)
-	counts[state.LaneASR] += s.fillLane(transcriptions, state.LaneASR, asrCapacity-asrActive)
+	counts[state.LaneASR] += s.fillLane(asr, state.LaneASR, asrCapacity-counts[state.LaneASR])
 	counts[state.LaneAgent] += s.fillLane(agent, state.LaneAgent, s.agentCap-counts[state.LaneAgent])
-	counts[state.LaneMechanical] += s.fillLane(mech, state.LaneMechanical, mechCapacity-counts[state.LaneMechanical])
+	counts[state.LaneMechanical] += s.fillMechanicalLane(
+		mech,
+		mechCapacity-counts[state.LaneMechanical],
+		sourceIOCapacity-sourceIOActive,
+	)
 
 	s.publishQueueStats(books, counts)
 	s.publishETAs(ctx, books)
-}
-
-// partitionASR separates the independently-capacity-limited corrective and
-// full-book queues. candidates has already been sorted, so each partition keeps
-// its desired ordering.
-func partitionASR(candidates []store.Book) (retranscriptions, transcriptions []store.Book) {
-	for _, b := range candidates {
-		if state.State(b.State) == state.Retranscribing {
-			retranscriptions = append(retranscriptions, b)
-		} else {
-			transcriptions = append(transcriptions, b)
-		}
-	}
-	return retranscriptions, transcriptions
 }
 
 func sortASRLane(candidates, allBooks []store.Book) {
@@ -503,9 +491,13 @@ func (s *Scheduler) QueueSnapshot(books []store.Book) map[int64]QueueBook {
 
 // queueSnapshot is the pure half of QueueSnapshot, split out for exact ordering
 // tests. Books through their first full-book ASR form the ASR group; a corrective
-// retranscription rejoins it. Each independently capacity-limited worker has its
-// own bucket, because there is no truthful total order between (for example) the
-// full-book and corrective ASR workers, or the agent and mechanical workers.
+// retranscription rejoins it. Buckets keep corrective and full-book ASR apart even
+// though they now share one serial slot: the board answers "what is this book
+// waiting behind", and a corrective repair jumps the whole full-book queue (see
+// sortASRLane), so merging them into one numbered list would misstate every
+// full-book position. Agent and mechanical work stays in separate buckets for the
+// stronger reason - those workers are genuinely independent, so no truthful total
+// order between them exists at all.
 func queueSnapshot(books []store.Book, inflight map[int64]inflightBook) map[int64]QueueBook {
 	buckets := make(map[string][]store.Book)
 	holders := lockHolders(books)
@@ -662,14 +654,41 @@ func queueBooksPayload(snapshot map[int64]QueueBook) []QueueBook {
 // fillLane dispatches up to free candidates into a lane and returns how many it
 // actually started.
 func (s *Scheduler) fillLane(candidates []store.Book, lane state.Lane, free int) int {
+	return s.fillLaneLimited(candidates, lane, free, nil, 0)
+}
+
+// fillMechanicalLane applies both mechanical capacity limits: at most two total
+// mechanical workers, but at most one worker that opens a library source. Keeping
+// the narrower source-I/O limit here (rather than reducing mechCapacity to one)
+// lets validation, QA, correction, and other work-dir-only stages overlap a slow
+// SMB read without allowing two inspect/split/extract calls to deadlock the mount.
+func (s *Scheduler) fillMechanicalLane(candidates []store.Book, free, sourceFree int) int {
+	return s.fillLaneLimited(candidates, state.LaneMechanical, free, state.ReadsSource, sourceFree)
+}
+
+// fillLaneLimited is the shared filler behind both lane fillers. scarce, when
+// non-nil, marks candidates that also need a narrower sub-resource (the mechanical
+// lane's single library-source slot), of which at most scarceFree may start this
+// pass. A candidate that misses that sub-resource is SKIPPED rather than ending the
+// fill, so work-dir-only stages behind it may still take the remaining lane slot.
+func (s *Scheduler) fillLaneLimited(candidates []store.Book, lane state.Lane, free int,
+	scarce func(state.State) bool, scarceFree int) int {
 	started := 0
 	for _, b := range candidates {
 		if free <= 0 {
 			break
 		}
-		if s.startWorker(b, lane) {
-			free--
-			started++
+		needsScarce := scarce != nil && scarce(state.State(b.State))
+		if needsScarce && scarceFree <= 0 {
+			continue
+		}
+		if !s.startWorker(b, lane) {
+			continue
+		}
+		free--
+		started++
+		if needsScarce {
+			scarceFree--
 		}
 	}
 	return started
@@ -796,16 +815,16 @@ func (s *Scheduler) execute(ctx context.Context, b store.Book, stage state.State
 				"book_id": b.ID, "stage": string(stage), "msg": msg,
 			})
 		},
-		// Heartbeat bumps the open stage run's heartbeat AND progress timestamp. This
-		// closure is consumed ONLY by the ASR/retranscribing heartbeat ticker
-		// (transcribeWithHeartbeat); those stages have no mid-chapter incremental output,
-		// so a live decode subprocess tick IS genuine progress - advancing progress_at (not
-		// just heartbeat_at) keeps the supervisor's no_progress detector from killing a
-		// healthy but pathologically slow chapter (a whisper decode running many times its
-		// audio length) whose progress_at would otherwise freeze until the chapter
-		// completes. The agent-subprocess heartbeat (agent.Request.Heartbeat in
-		// runAgent) stays liveness-only (progress=false) so a stuck agent loop still trips
-		// no_progress.
+		// Heartbeat bumps the open stage run's heartbeat AND progress timestamp. It is
+		// consumed by the tickers the pipeline wraps around stages that emit NO
+		// mid-unit output while a subprocess works (the ASR/retranscribing decode loops
+		// and splitting), where a live subprocess tick IS genuine progress - advancing
+		// progress_at (not just heartbeat_at) keeps the supervisor's no_progress detector
+		// from killing a healthy but pathologically slow unit (a whisper decode running
+		// many times its audio length, or a chapter cut across a slow SMB mount) whose
+		// progress_at would otherwise freeze until that unit completes. The
+		// agent-subprocess heartbeat (agent.Request.Heartbeat in runAgent) stays
+		// liveness-only (progress=false) so a stuck agent loop still trips no_progress.
 		Heartbeat: func() {
 			_ = s.db.TouchOpenStageRun(ctx, b.ID, string(stage), true)
 		},

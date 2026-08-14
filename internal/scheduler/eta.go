@@ -55,8 +55,12 @@ func (s *Scheduler) publishETAs(ctx context.Context, books []store.Book) {
 		perBook[in.ID] = r
 		payload = append(payload, map[string]any{"book_id": in.ID, "eta_seconds": r})
 	}
+	// Every capacity the simulation runs under comes from the dispatcher's own
+	// constants, including the mechanical lane's narrower source-IO sub-cap - the
+	// prediction and the dispatch must share one capacity model.
 	queue := round10(eta.QueueETA(inputs, rates, eta.LaneCaps{
-		ASR: asrCapacity, Mechanical: mechCapacity, Agent: s.agentCap,
+		ASR: asrCapacity, Mechanical: mechCapacity, MechanicalSourceIO: sourceIOCapacity,
+		Agent:            s.agentCap,
 		AgentInvocations: agentInvocationCapacity(s.exec, s.agentCap),
 	}))
 

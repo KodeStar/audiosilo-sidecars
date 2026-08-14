@@ -16,6 +16,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -97,14 +99,24 @@ type RegionASIN struct {
 }
 
 // BookIdentity is the resolution input for CoverageFor: the identifiers plus the
-// title/author/series a fuzzy fallback needs when no identifier resolves.
+// title/author/series/narrators a fuzzy fallback needs when no identifier
+// resolves, and the two path hints the query ladder falls back to.
 type BookIdentity struct {
-	ASIN      string
-	ISBN      string
-	Title     string
-	Authors   []string
+	ASIN    string
+	ISBN    string
+	Title   string
+	Authors []string
+	// Narrators are the book's local narrator credits. They are match EVIDENCE,
+	// not an identifier: a shelf routinely tags the narrator as the author, and a
+	// work card routinely carries the same person on the other side.
+	Narrators []string
 	Series    string
 	SeriesPos string
+	// FolderName / ParentDir are the book folder's own name and its parent's.
+	// Both are optional (empty = no hint) and are used only to widen retrieval
+	// when the tagged title is decorated or a shortcode.
+	FolderName string
+	ParentDir  string
 }
 
 // ttlCache is a small mutex-guarded read-through TTL map shared by the coverage
@@ -209,11 +221,15 @@ type SeriesRef struct {
 // WorkSearchResult is one work hit from the /meta/search proxy, flattened to the
 // shape the Library UI's manual-match picker consumes (authors as plain names).
 type WorkSearchResult struct {
-	ID       string     `json:"id"`
-	Title    string     `json:"title"`
-	Authors  []string   `json:"authors"`
-	Series   *SeriesRef `json:"series"`
-	CoverURL string     `json:"cover_url"`
+	ID      string   `json:"id"`
+	Title   string   `json:"title"`
+	Authors []string `json:"authors"`
+	// Narrators are the card's narrator credits, carried because the fuzzy
+	// fallback's author gate consults them (a shelf that tags the narrator as the
+	// author still resolves). Additive on the picker's wire shape.
+	Narrators []string   `json:"narrators,omitempty"`
+	Series    *SeriesRef `json:"series"`
+	CoverURL  string     `json:"cover_url"`
 }
 
 // Client is the metadata API client with in-memory TTL caches.
@@ -491,10 +507,14 @@ func (c *Client) workDetail(ctx context.Context, workID string) (v workVal, foun
 	return v, true, true
 }
 
-// searchMatch runs (and caches) the fuzzy-match fallback: it searches the DB by
-// title, scores the work candidates with match.Best, and accepts the best only
-// if it clears the threshold. ok=false is a transport failure; otherwise the
-// returned Coverage is either a "search" match or a clean unknown.
+// searchMatch runs (and caches) the fuzzy-match fallback: it walks the retrieval
+// ladder (see searchLadder), scores each query's work candidates with match.Best
+// - plus a narrator-evidence pass - and accepts the FIRST query that yields an
+// acceptance. ok=false is a transport failure; otherwise the returned Coverage
+// is either a "search" match or a clean unknown.
+//
+// The ladder is retrieval only: matching stays match.Best's decision, so a wider
+// query can surface a work but never lower the bar for accepting it.
 func (c *Client) searchMatch(ctx context.Context, id BookIdentity) (Coverage, bool) {
 	title := strings.TrimSpace(id.Title)
 	author := firstNonEmpty(id.Authors)
@@ -502,24 +522,71 @@ func (c *Client) searchMatch(ctx context.Context, id BookIdentity) (Coverage, bo
 	// title+author: match.Best weighs the series/sequence, so two distinct works
 	// that share a title and author but sit in different series (or at different
 	// positions) can resolve to different works - keying on title+author alone
-	// would let one inherit the other's cached verdict.
-	key := match.Normalize(title) + "|" + match.Normalize(author) + "|" +
-		match.NormalizeSeries(id.Series) + "|" + strings.TrimSpace(id.SeriesPos)
+	// would let one inherit the other's cached verdict. The path hints and
+	// narrators join it for the same reason: both steer the ladder, so two books
+	// agreeing on title+author+series can still reach different verdicts.
+	key := strings.Join([]string{
+		match.Normalize(title), match.Normalize(author),
+		match.NormalizeSeries(id.Series), strings.TrimSpace(id.SeriesPos),
+		match.Normalize(id.FolderName), match.Normalize(id.ParentDir),
+		match.Normalize(strings.Join(id.Narrators, " ")),
+	}, "|")
 	if v, hit := c.searchVerd.get(key); hit {
-		if !v.matched {
-			return Coverage{Available: true, Known: false}, true
-		}
-		cov := c.workCoverage(ctx, v.workID, "search", v.workTitle)
-		if cov.Series == nil {
-			cov.Series = cloneSeriesRef(v.series)
-		}
-		return cov, true
+		return c.searchCoverage(ctx, v), true
 	}
 
-	cards, ok := c.fetchWorkSearch(ctx, title, SearchLimit)
-	if !ok {
-		return Coverage{}, false
+	seq, hasSeq := parseFloatSeq(id.SeriesPos)
+	v := searchVal{}
+	for _, step := range searchLadder(id) {
+		cards, ok := c.fetchWorkSearch(ctx, step.query, SearchLimit)
+		if !ok {
+			// A transport failure anywhere in the ladder degrades the whole verdict to
+			// unavailable, exactly as the single-query version did: a partial ladder
+			// cannot tell "this book is unknown" from "the service went away".
+			return Coverage{}, false
+		}
+		if len(cards) == 0 {
+			continue
+		}
+		books := cardBooks(cards)
+		q := match.Query{
+			Title: step.matchTitle, TitleShort: step.matchTitle, Author: author,
+			Series: id.Series, Sequence: seq, HasSequence: hasSeq,
+		}
+		idx, matched := match.Best(books, q)
+		if !matched {
+			idx, matched = bestByNarrator(cards, books, q, id.Narrators)
+		}
+		if matched {
+			v = searchVal{
+				matched: true, workID: cards[idx].ID, workTitle: cards[idx].Title,
+				series: cloneSeriesRef(cards[idx].Series),
+			}
+			break
+		}
 	}
+	// One verdict per identity covers the WHOLE ladder: an unmatched book must not
+	// re-walk every rung on the next poll.
+	c.searchVerd.put(key, v)
+	return c.searchCoverage(ctx, v), true
+}
+
+// searchCoverage turns a (possibly negative) cached search verdict into the
+// coverage the caller sees, falling back to the card's series when the work
+// detail carries none.
+func (c *Client) searchCoverage(ctx context.Context, v searchVal) Coverage {
+	if !v.matched {
+		return Coverage{Available: true, Known: false}
+	}
+	cov := c.workCoverage(ctx, v.workID, "search", v.workTitle)
+	if cov.Series == nil {
+		cov.Series = cloneSeriesRef(v.series)
+	}
+	return cov
+}
+
+// cardBooks maps search cards onto match.Book candidates (index-aligned).
+func cardBooks(cards []WorkSearchResult) []match.Book {
 	books := make([]match.Book, len(cards))
 	for i, card := range cards {
 		b := match.Book{Title: card.Title, Author: firstNonEmpty(card.Authors)}
@@ -530,28 +597,209 @@ func (c *Client) searchMatch(ctx context.Context, id BookIdentity) (Coverage, bo
 		}
 		books[i] = b
 	}
-	seq, hasSeq := parseFloatSeq(id.SeriesPos)
-	idx, matched := match.Best(books, match.Query{
-		Title: title, TitleShort: title, Author: author,
-		Series: id.Series, Sequence: seq, HasSequence: hasSeq,
-	})
+	return books
+}
 
-	v := searchVal{}
-	if matched {
-		v.matched = true
-		v.workID = cards[idx].ID
-		v.workTitle = cards[idx].Title
-		v.series = cloneSeriesRef(cards[idx].Series)
+// ladderStep is one retrieval attempt: the query sent upstream, and the title
+// match.Best scores the returned cards against. The two differ only for a
+// path-derived query, where the folder leaf IS the title the tags failed to
+// carry - scoring such a card against the shortcode title ("RO07") would reject
+// every card the rung retrieved.
+type ladderStep struct{ query, matchTitle string }
+
+// minQueryLen is the shortest query worth sending: below it the FTS index
+// returns noise rather than a book.
+const minQueryLen = 3
+
+// searchLadder builds the ordered, de-duplicated retrieval ladder for a book.
+// The upstream index matches the words it is given, so a decorated shelf title
+// retrieves NOTHING even when the work is present under a clean title - over a
+// real 1147-book library that, not scoring, was the dominant cause of the 510
+// unresolved books. Each rung is one measured failure shape; rung 1 is the raw
+// title, so a book that already resolved still costs exactly one request.
+func searchLadder(id BookIdentity) []ladderStep {
+	title := strings.TrimSpace(id.Title)
+	author := firstNonEmpty(id.Authors)
+	clean := match.CleanTitle(title, id.Series)
+	folderTail := postSeparator(id.FolderName)
+
+	steps := []ladderStep{
+		// 1. Today's behaviour, first: the raw shelf title.
+		{title, title},
+		// 2. Edition/punctuation noise: "Halo: Primordium (Unabridged)" -> "Halo Primordium".
+		{normalizeQueryPunct(title), title},
+		// 3. Series name + "(Book N)" fluff removed by the shared matcher.
+		{clean, title},
+		// 4. Decorated subtitle: "Supermage : Rise To Omniscience, Book 1" -> "Supermage".
+		{preSubtitle(title), title},
+		// 5. Shelf prefix: "Artemis Fowl 4 - The Opal Deception" -> "The Opal Deception".
+		{postSeparator(title), title},
+		// 6. Trailing volume marker: "Vorkosigan Saga 01" -> "Vorkosigan Saga".
+		{stripTrailingVolume(title), title},
+		// 7. The index carries author names too, which disambiguates a one-word
+		//    title that is otherwise buried ("Timeless" -> "Timeless Travis Bagwell").
+		{joinQuery(clean, author), title},
+		// 8. The path leaf when the tag title is a shortcode ("RO07 - Sandqueen").
+		//    Scored against the leaf, because the leaf is the real title here.
+		{folderTail, folderTail},
+		// 9. The parent folder, usually the series name ("Rise to Omniscience").
+		//    Retrieval only - scoring stays on the book's own title so a series
+		//    query cannot resolve to an arbitrary sibling volume.
+		{strings.TrimSpace(id.ParentDir), title},
 	}
-	c.searchVerd.put(key, v)
-	if !v.matched {
-		return Coverage{Available: true, Known: false}, true
+
+	out := make([]ladderStep, 0, len(steps))
+	seen := map[string]bool{}
+	for i, st := range steps {
+		q := strings.TrimSpace(st.query)
+		if q == "" || seen[q] {
+			continue
+		}
+		// The length floor exists to stop DERIVED fragments sending noise queries; it
+		// must not ban a real short title. Rung 1 IS the title, so it is exempt:
+		// otherwise "It" filtered every rung away and searchMatch cached a negative
+		// verdict having never asked upstream at all, where the pre-ladder code always
+		// queried the raw title.
+		if i > 0 && len(q) < minQueryLen {
+			continue
+		}
+		seen[q] = true
+		st.query = q
+		if strings.TrimSpace(st.matchTitle) == "" {
+			st.matchTitle = q
+		}
+		out = append(out, st)
 	}
-	cov := c.workCoverage(ctx, v.workID, "search", v.workTitle)
-	if cov.Series == nil {
-		cov.Series = cloneSeriesRef(v.series)
+	return out
+}
+
+// bracketed matches a parenthetical/bracketed group - "(Unabridged)", "[Dramatized]".
+var bracketed = regexp.MustCompile(`[(\[][^)\]]*[)\]]`)
+
+// trailingVolume matches a volume marker at the very end of a title, with or
+// without its keyword: "Vorkosigan Saga 01", "Cradle Book 3", "Wandering Inn #7".
+var trailingVolume = regexp.MustCompile(`(?i)[\s\-_:,]*(?:book|bk|vol|volume|part|pt|#)?[\s.]*\d+(?:\.\d+)?$`)
+
+// normalizeQueryPunct drops bracketed edition noise and turns title punctuation
+// into spaces, leaving the bare words the index is tokenized on.
+func normalizeQueryPunct(s string) string {
+	s = bracketed.ReplaceAllString(s, " ")
+	s = strings.Map(func(r rune) rune {
+		if r == ':' || r == ',' || r == ';' {
+			return ' '
+		}
+		return r
+	}, s)
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// preSubtitle returns the segment before the first ':' or ',' (the work's own
+// title, ahead of the series/edition decoration). Empty when there is none.
+func preSubtitle(s string) string {
+	i := strings.IndexAny(s, ":,")
+	if i < 0 {
+		return ""
 	}
-	return cov, true
+	return strings.TrimSpace(s[:i])
+}
+
+// postSeparator returns the tail after the LAST " - " or ": " (the work's own
+// title, behind a shelf/series prefix). Empty when there is none.
+func postSeparator(s string) string {
+	sep, at := -1, 0
+	for _, d := range []string{" - ", ": "} {
+		if i := strings.LastIndex(s, d); i > sep {
+			sep, at = i, i+len(d)
+		}
+	}
+	if sep < 0 {
+		return ""
+	}
+	return strings.TrimSpace(s[at:])
+}
+
+// stripTrailingVolume removes a trailing volume marker from a title.
+func stripTrailingVolume(s string) string {
+	return strings.TrimSpace(trailingVolume.ReplaceAllString(s, ""))
+}
+
+// joinQuery joins two query fragments, yielding "" unless both are present.
+func joinQuery(a, b string) string {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return ""
+	}
+	return a + " " + b
+}
+
+// bestByNarrator is the narrator-evidence pass run after match.Best declines a
+// query's cards. Shelves routinely credit the NARRATOR as the author ("How to
+// Break a Dragon's Heart" tagged "David Tennant"), and match.Best's author gate
+// then rejects the correct card outright. When a card's narrators name the
+// query's author - or the book's own narrators name the card's author - the two
+// records are talking about the same recording, so the card's author is
+// substituted into the query and match.Best is re-run over just those cards.
+// Only what match.Best accepts is accepted: title/series scoring is untouched.
+func bestByNarrator(cards []WorkSearchResult, books []match.Book, q match.Query, narrators []string) (int, bool) {
+	var idxs []int          // linked card indices, into cards/books
+	var subset []match.Book // the linked candidates, index-aligned with idxs
+	var authors []string    // their distinct substituted authors, in card order
+	for i, card := range cards {
+		author := firstNonEmpty(card.Authors)
+		if author == "" || !linkedByNarrator(card, q.Author, narrators) {
+			continue
+		}
+		idxs = append(idxs, i)
+		subset = append(subset, books[i])
+		// Deduped at insert (never by iterating a map) so the pass order below stays
+		// deterministic: two authors can both match, and the first card wins.
+		if !slices.Contains(authors, author) {
+			authors = append(authors, author)
+		}
+	}
+	if len(idxs) == 0 {
+		return -1, false
+	}
+	// One pass per DISTINCT substituted author: match.Best takes a single query
+	// author, so linked cards by different authors need their own pass.
+	for _, author := range authors {
+		sub := q
+		sub.Author = author
+		if j, ok := match.Best(subset, sub); ok {
+			return idxs[j], true
+		}
+	}
+	return -1, false
+}
+
+// linkedByNarrator reports narrator evidence tying a card to the book: the query
+// author appears among the card's narrators, or a local narrator appears among
+// the card's authors.
+func linkedByNarrator(card WorkSearchResult, queryAuthor string, narrators []string) bool {
+	for _, n := range card.Narrators {
+		if namesMatch(queryAuthor, n) {
+			return true
+		}
+	}
+	for _, local := range narrators {
+		for _, a := range card.Authors {
+			if namesMatch(local, a) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// namesMatch is pkg/match's tolerant person-name rule (normalize, then equality
+// or containment; an empty side never matches), mirrored here because the
+// matcher keeps it unexported.
+func namesMatch(a, b string) bool {
+	na, nb := match.Normalize(a), match.Normalize(b)
+	if na == "" || nb == "" {
+		return false
+	}
+	return na == nb || strings.Contains(na, nb) || strings.Contains(nb, na)
 }
 
 // fetchWorkSearch runs the search endpoint and returns work-kind hits flattened
@@ -576,6 +824,9 @@ func (c *Client) fetchWorkSearch(ctx context.Context, query string, limit int) (
 			Authors []struct {
 				Name string `json:"name"`
 			} `json:"authors"`
+			Narrators []struct {
+				Name string `json:"name"`
+			} `json:"narrators"`
 			Series *struct {
 				Name     string `json:"name"`
 				Position string `json:"position"`
@@ -597,6 +848,11 @@ func (c *Client) fetchWorkSearch(ctx context.Context, query string, limit int) (
 			for _, a := range r.Authors {
 				if a.Name != "" {
 					w.Authors = append(w.Authors, a.Name)
+				}
+			}
+			for _, n := range r.Narrators {
+				if n.Name != "" {
+					w.Narrators = append(w.Narrators, n.Name)
 				}
 			}
 			if r.Series != nil {

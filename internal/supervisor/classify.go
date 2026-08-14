@@ -15,6 +15,24 @@ import (
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
 
+// processExitGrace covers the normal hand-off between an agent child exiting and the
+// runner durably clearing its process_active flag. The supervisor samples those two
+// events independently; treating that gap as a disappeared worker cancels a
+// successfully completing stage.
+//
+// The window is measured against the open run's HEARTBEAT, which agent stages refresh
+// only once a cadence, so at the moment a child exits the reference is already 0 to one
+// full cadence stale. The grace must therefore exceed that whole cadence plus the time
+// the runner still needs after exit, or it protects only the fraction of exits that
+// happen to land soon after a heartbeat - a 15s window against the 60s cadence let the
+// false incident it was added for fire on roughly three exits in four. The constraint is:
+// stageHeartbeatInterval / the agent runner's heartbeat cadence (60s) + cliPipeWaitDelay
+// (5s, internal/agent) + margin. Raise this if either of those grows.
+//
+// A genuinely lost child stays detectable: nothing refreshes its heartbeat, so the next
+// health tick past the window classifies it.
+var processExitGrace = 90 * time.Second
+
 var (
 	pathPattern  = regexp.MustCompile(`(?:[A-Za-z]:)?[/\\][^\s"']+`)
 	idPattern    = regexp.MustCompile(`\b(?:[0-9a-f]{8,}|\d+)\b`)
@@ -126,7 +144,7 @@ func Classify(s Snapshot, p Policy) []Incident {
 			i.Diagnosis = "database stage is running but the scheduler has no worker"
 			i.Evidence = []string{fmt.Sprintf("stage run %d is open", open.ID)}
 			incidents = append(incidents, i)
-		} else if s.ProcessAlive != nil && !*s.ProcessAlive {
+		} else if s.ProcessAlive != nil && !*s.ProcessAlive && processReferenceAge(s.Now, *open) >= processExitGrace {
 			i := base
 			i.Kind = IncidentMissingProcess
 			i.Diagnosis = "recorded invocation process has disappeared"
@@ -236,6 +254,19 @@ func Classify(s Snapshot, p Policy) []Incident {
 		}
 	}
 	return dedupeIncidents(incidents)
+}
+
+// processReferenceAge measures from the freshest durable evidence that the open run was
+// alive. Heartbeat is preferred; a just-admitted run may only have started_at populated.
+func processReferenceAge(now time.Time, r store.StageRun) time.Duration {
+	reference := parseTime(r.HeartbeatAt)
+	if reference.IsZero() {
+		reference = parseTime(r.StartedAt)
+	}
+	if reference.IsZero() || now.Before(reference) {
+		return 0
+	}
+	return now.Sub(reference)
 }
 
 // classifyParked turns durable needs-attention state into a first-class recovery

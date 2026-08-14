@@ -172,6 +172,23 @@ func TestScanUnknownJob(t *testing.T) {
 	resp.Body.Close()
 }
 
+// canonicalPath resolves a test path exactly as the daemon canonicalizes a scan
+// candidate's source_path (EvalSymlinks + Clean), so a store row keyed here joins
+// the scan result on macOS, where t.TempDir() sits under a /var -> /private/var
+// symlink.
+func canonicalPath(t *testing.T, path string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Clean(resolved)
+}
+
+// TestScanMarksBooksAlreadyTrackedByPipeline also covers the coverage-patch gate's
+// negative side: the metadata client is disabled here, so every candidate's verdict
+// is unknown and nothing is patchable even though two books ARE tracked - the scan
+// must still serve its pipeline markers normally.
 func TestScanMarksBooksAlreadyTrackedByPipeline(t *testing.T) {
 	root := t.TempDir()
 	doneDir := filepath.Join(root, "Author", "Series", "01 - Finished")
@@ -185,25 +202,16 @@ func TestScanMarksBooksAlreadyTrackedByPipeline(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	canonical := func(path string) string {
-		t.Helper()
-		resolved, err := filepath.EvalSymlinks(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return filepath.Clean(resolved)
-	}
-
 	env := newPipelineEnv(t, []string{root})
 	done, err := env.db.CreateBook(context.Background(), store.NewBook{
-		SourcePath: canonical(doneDir), WorkDir: filepath.Join(t.TempDir(), "done"),
+		SourcePath: canonicalPath(t, doneDir), WorkDir: filepath.Join(t.TempDir(), "done"),
 		Title: "Finished", State: string(state.Done),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	active, err := env.db.CreateBook(context.Background(), store.NewBook{
-		SourcePath: canonical(activeDir), WorkDir: filepath.Join(t.TempDir(), "active"),
+		SourcePath: canonicalPath(t, activeDir), WorkDir: filepath.Join(t.TempDir(), "active"),
 		Title: "Active", State: string(state.ASR),
 	})
 	if err != nil {
@@ -237,18 +245,142 @@ func TestScanMarksBooksAlreadyTrackedByPipeline(t *testing.T) {
 		for _, book := range job.Books {
 			byPath[book.SourcePath] = book
 		}
-		if got := byPath[canonical(doneDir)].PipelineBook; got == nil || got.ID != done.ID || got.State != string(state.Done) {
+		if got := byPath[canonicalPath(t, doneDir)].PipelineBook; got == nil || got.ID != done.ID || got.State != string(state.Done) {
 			t.Fatalf("done pipeline marker = %+v, want book %d done", got, done.ID)
 		}
-		if got := byPath[canonical(activeDir)].PipelineBook; got == nil || got.ID != active.ID || got.State != string(state.ASR) {
+		if got := byPath[canonicalPath(t, activeDir)].PipelineBook; got == nil || got.ID != active.ID || got.State != string(state.ASR) {
 			t.Fatalf("active pipeline marker = %+v, want book %d asr", got, active.ID)
 		}
-		if got := byPath[canonical(newDir)].PipelineBook; got != nil {
+		if got := byPath[canonicalPath(t, newDir)].PipelineBook; got != nil {
 			t.Fatalf("new candidate unexpectedly marked tracked: %+v", got)
 		}
 		return
 	}
 	t.Fatal("scan did not finish")
+}
+
+// TestScanCoveragePatchedFromLandedContributions covers the read-time repair of the
+// frozen scan-time coverage verdict: a work this daemon already contributed must not
+// keep reporting its sidecars as needed (stale badges, and "exclude already covered"
+// never drops the book). Only merged/already_covered rows count, and only a
+// known-identity candidate is patched.
+func TestScanCoveragePatchedFromLandedContributions(t *testing.T) {
+	root := t.TempDir()
+	landedDir := filepath.Join(root, "Author", "01 - Landed")
+	inflightDir := filepath.Join(root, "Author", "02 - In flight")
+	unknownDir := filepath.Join(root, "Author", "03 - Unknown work")
+	for _, dir := range []string{landedDir, inflightDir, unknownDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "audio.m4b"), []byte("fake"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The scan manager is built here (rather than taken from newPipelineEnv) so the
+	// test can stamp a known-coverage verdict onto candidates via ApplyOverride - the
+	// same path a manual match uses. The metadata client is disabled in tests, so
+	// every unpatched candidate stays honestly unknown.
+	meta := metaops.NewClient("")
+	scans := metaops.NewScanManager(context.Background(), meta, "", nil)
+	env := newPipelineEnv(t, []string{root}, func(d *Deps) {
+		d.Meta, d.Scans = meta, scans
+	})
+	ctx := context.Background()
+
+	mkBook := func(dir, title string) store.Book {
+		t.Helper()
+		b, err := env.db.CreateBook(ctx, store.NewBook{
+			SourcePath: canonicalPath(t, dir), WorkDir: filepath.Join(t.TempDir(), title),
+			Title: title, State: string(state.Done),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	contribute := func(bookID int64, kind, status string) {
+		t.Helper()
+		if _, err := env.db.UpsertContribution(ctx, store.Contribution{
+			BookID: bookID, Kind: kind, Mode: store.ContribModeIssue, Status: status,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	landed := mkBook(landedDir, "Landed")
+	contribute(landed.ID, store.ContribKindCharacters, store.ContribStatusMerged)
+	contribute(landed.ID, store.ContribKindRecaps, store.ContribStatusAlreadyCovered)
+
+	inflight := mkBook(inflightDir, "In flight")
+	contribute(inflight.ID, store.ContribKindCharacters, store.ContribStatusSubmitted)
+	contribute(inflight.ID, store.ContribKindRecaps, store.ContribStatusClosed)
+
+	unknown := mkBook(unknownDir, "Unknown work")
+	contribute(unknown.ID, store.ContribKindCharacters, store.ContribStatusMerged)
+	contribute(unknown.ID, store.ContribKindRecaps, store.ContribStatusMerged)
+
+	token := env.login(t)
+	body, _ := json.Marshal(createScanRequest{Path: root})
+	resp := env.do(t, http.MethodPost, "/api/v1/scans", token, string(body))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("create scan = %d, want 202", resp.StatusCode)
+	}
+	var created createScanResponse
+	_ = json.NewDecoder(resp.Body).Decode(&created)
+	resp.Body.Close()
+
+	getJob := func() metaops.ScanJob {
+		t.Helper()
+		r := env.do(t, http.MethodGet, "/api/v1/scans/"+created.JobID, token, "")
+		var job metaops.ScanJob
+		_ = json.NewDecoder(r.Body).Decode(&job)
+		r.Body.Close()
+		if job.Status == metaops.ScanError {
+			t.Fatalf("scan errored: %s", job.Error)
+		}
+		return job
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for getJob().Status != metaops.ScanDone {
+		if time.Now().After(deadline) {
+			t.Fatal("scan did not finish")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// A resolved work for the two candidates whose identity is known; the third keeps
+	// the disabled client's unknown verdict.
+	for _, dir := range []string{landedDir, inflightDir} {
+		scans.ApplyOverride(canonicalPath(t, dir), metaops.OverridePatchInput{
+			Coverage: &metaops.Coverage{
+				Available: true, Known: true, WorkID: "work-" + filepath.Base(dir), MatchedBy: "manual",
+			},
+		})
+	}
+
+	byPath := make(map[string]metaops.ScannedBook)
+	for _, book := range getJob().Books {
+		byPath[book.SourcePath] = book
+	}
+
+	// (a) known work, both kinds landed -> both flags patched true.
+	if cov := byPath[canonicalPath(t, landedDir)].Coverage; !cov.HasCharacters || !cov.HasRecaps {
+		t.Errorf("landed coverage = %+v, want both sidecars marked present", cov)
+	}
+	// (b) known work, only open/terminal-without-landing rows -> flags untouched.
+	if cov := byPath[canonicalPath(t, inflightDir)].Coverage; cov.HasCharacters || cov.HasRecaps {
+		t.Errorf("in-flight coverage = %+v, want no sidecars claimed", cov)
+	}
+	// (c) unknown identity -> never patched, however much landed against the book id.
+	if cov := byPath[canonicalPath(t, unknownDir)].Coverage; cov.Known || cov.HasCharacters || cov.HasRecaps {
+		t.Errorf("unknown-work coverage = %+v, want an untouched unknown verdict", cov)
+	}
+	// The patch must not disturb the rest of the verdict.
+	if cov := byPath[canonicalPath(t, landedDir)].Coverage; !cov.Available || !cov.Known || cov.WorkID != "work-01 - Landed" {
+		t.Errorf("landed verdict fields altered: %+v", cov)
+	}
 }
 
 // TestCreateBooksPersistsNarrators asserts the POST /books candidate's narrators are

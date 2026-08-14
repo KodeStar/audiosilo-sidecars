@@ -19,6 +19,12 @@ var errTimeout = errors.New("agent: cli timed out")
 // process is running. It is a package var (not a const) so a test can lower it.
 var heartbeatInterval = 60 * time.Second
 
+// cliPipeWaitDelay bounds os/exec's wait for stdout/stderr copy goroutines after
+// the direct CLI process exits. Agent CLIs may leave a detached helper holding an
+// inherited pipe open; without a bound, Cmd.Wait can hang even though the recorded
+// PID is gone and all requested artifacts are already on disk.
+var cliPipeWaitDelay = 5 * time.Second
+
 // cliSpec fully describes one CLI invocation. Prompt is fed on stdin. Env is the
 // COMPLETE child environment (parent env plus any injected keys); it never appears
 // in argv. Timeout 0 means no timeout.
@@ -64,6 +70,7 @@ func runCLI(ctx context.Context, spec cliSpec) (stdout, stderr string, err error
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
+	cmd.WaitDelay = cliPipeWaitDelay
 	setProcGroup(cmd)
 
 	start := time.Now()
@@ -103,6 +110,12 @@ func runCLI(ctx context.Context, spec cliSpec) (stdout, stderr string, err error
 		case <-beat:
 			spec.heartbeat(time.Since(start))
 		case werr := <-done:
+			// ErrWaitDelay means the direct process exited successfully but an
+			// inherited output pipe remained open until WaitDelay closed it. The
+			// process result is still successful and the captured output is usable.
+			if errors.Is(werr, exec.ErrWaitDelay) {
+				werr = nil
+			}
 			return outBuf.String(), errBuf.String(), werr
 		}
 	}

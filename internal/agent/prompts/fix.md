@@ -50,6 +50,14 @@ web access.
 Use exactly these canonical spellings for every published proper noun:
 
 {{.VerifiedLedger}}
+
+Names in the VERIFIED table are canonical. A proper noun omitted from that table
+may still be published when the fact notes explicitly support it. The
+`Unresolved / do-not-publish-clean` section is the one hard exclusion: NEVER copy
+one of those surface forms into a clean `name`, `aliases`, description, or recap
+merely because an audit suggestion or fact note uses it. Preserve or substitute a
+neutral role label for that figure; fact evidence cannot override an explicit
+unresolved entry.
 {{end}}
 ## Output (only under out/)
 

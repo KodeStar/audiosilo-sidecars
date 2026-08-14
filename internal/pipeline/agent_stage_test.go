@@ -235,6 +235,24 @@ func TestValidateMarkersManifestRejectsUndeclaredNarration(t *testing.T) {
 		t.Errorf("a declared exclusion was still rejected: %v", err)
 	}
 
+	// UnmappedSpans coalesces adjacent excluded markers into one span. The verdict
+	// should retain the more precise per-marker declarations; their gap-free union
+	// covers the span just as surely as one coarse declaration does.
+	adjacent := []markerExclusion{
+		{Title: "Interlude, part 1", Start: 2000, End: 2500, Reason: "preview"},
+		{Title: "Interlude, part 2", Start: 2500, End: 3000, Reason: "preview"},
+	}
+	if err := validateMarkersManifest(write(t), draft, nil, markers, 5000, adjacent); err != nil {
+		t.Errorf("adjacent declarations did not collectively cover the span: %v", err)
+	}
+	withGap := []markerExclusion{
+		{Title: "Interlude, part 1", Start: 2000, End: 2450, Reason: "preview"},
+		{Title: "Interlude, part 2", Start: 2550, End: 3000, Reason: "preview"},
+	}
+	if err := validateMarkersManifest(write(t), draft, nil, markers, 5000, withGap); err == nil {
+		t.Error("declarations with an undeclared gap were accepted")
+	}
+
 	// Credits at the edges never need declaring; they are ordinary non-chapter audio.
 	full := t.TempDir()
 	raw := `{

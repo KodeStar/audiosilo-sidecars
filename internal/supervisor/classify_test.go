@@ -34,10 +34,41 @@ func TestClassifyStaleMissingProcessAndLimits(t *testing.T) {
 func TestClassifyRecordedProcessDisappeared(t *testing.T) {
 	now := time.Now().UTC()
 	alive := false
-	r := store.StageRun{ID: 1, Stage: "auditing", StartedAt: now.Format(time.RFC3339Nano), HeartbeatAt: now.Format(time.RFC3339Nano), ProgressAt: now.Format(time.RFC3339Nano)}
+	old := now.Add(-processExitGrace - time.Second).Format(time.RFC3339Nano)
+	r := store.StageRun{ID: 1, Stage: "auditing", StartedAt: old, HeartbeatAt: old, ProgressAt: old}
 	got := Classify(Snapshot{Now: now, Book: store.Book{ID: 2, BatchID: "b"}, Runs: []store.StageRun{r}, RuntimeActive: true, ProcessAlive: &alive}, Policy{MaxErrorRepeats: 2})
 	if len(got) != 1 || got[0].Kind != IncidentMissingProcess {
 		t.Fatalf("incidents=%+v", got)
+	}
+}
+
+// The grace is measured from a heartbeat that a live agent stage refreshes only once a
+// cadence, so the reference at child exit is routinely most of a cadence old. This pins
+// that a reference just INSIDE the window is still protected - a grace shorter than the
+// cadence it samples would classify this healthy hand-off as a missing process.
+func TestClassifyIgnoresProcessExitCleanupRace(t *testing.T) {
+	now := time.Now().UTC()
+	alive := false
+	stale := now.Add(-processExitGrace + time.Second).Format(time.RFC3339Nano)
+	r := store.StageRun{ID: 1, Stage: "auditing", StartedAt: stale, HeartbeatAt: stale, ProgressAt: stale}
+	got := Classify(Snapshot{Now: now, Book: store.Book{ID: 2, BatchID: "b"}, Runs: []store.StageRun{r}, RuntimeActive: true, ProcessAlive: &alive}, Policy{MaxErrorRepeats: 2})
+	if kinds(got)[IncidentMissingProcess] {
+		t.Fatalf("fresh child-exit cleanup gap classified as missing process: %+v", got)
+	}
+}
+
+// The grace's whole job is to outlast the staleness of the signal it reads. Both
+// numbers live in other packages as unexported vars (internal/pipeline
+// stageHeartbeatInterval and internal/agent's runner cadence, both 60s;
+// internal/agent cliPipeWaitDelay, 5s), so this restates the constraint rather than
+// importing it - a future shrink of the grace fails here instead of silently
+// re-admitting the false missing_process incident.
+func TestProcessExitGraceOutlastsTheHeartbeatCadenceItSamples(t *testing.T) {
+	const heartbeatCadence = 60 * time.Second
+	const pipeWait = 5 * time.Second
+	if processExitGrace <= heartbeatCadence+pipeWait {
+		t.Fatalf("processExitGrace = %s, must exceed the %s heartbeat cadence + %s pipe wait it is measured against",
+			processExitGrace, heartbeatCadence, pipeWait)
 	}
 }
 

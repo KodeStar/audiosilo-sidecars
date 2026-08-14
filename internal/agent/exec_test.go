@@ -98,3 +98,31 @@ func TestRunCLINilHeartbeatOK(t *testing.T) {
 		t.Fatalf("runCLI with nil heartbeat: %v", err)
 	}
 }
+
+// TestRunCLIBoundsInheritedPipeWait covers a detached helper that outlives the
+// direct CLI process while retaining its stdout/stderr descriptors. The direct
+// process succeeded, so runCLI must return successfully after the bounded pipe
+// drain instead of looking like a disappeared worker forever.
+func TestRunCLIBoundsInheritedPipeWait(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX shell and background process")
+	}
+	restore := cliPipeWaitDelay
+	cliPipeWaitDelay = 40 * time.Millisecond
+	t.Cleanup(func() { cliPipeWaitDelay = restore })
+
+	start := time.Now()
+	stdout, _, err := runCLI(context.Background(), cliSpec{
+		path: "/bin/sh",
+		args: []string{"-c", "sleep 5 & printf ready"},
+	})
+	if err != nil {
+		t.Fatalf("runCLI: %v", err)
+	}
+	if stdout != "ready" {
+		t.Fatalf("stdout = %q, want ready", stdout)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("runCLI waited %s for detached helper's inherited pipe", elapsed)
+	}
+}

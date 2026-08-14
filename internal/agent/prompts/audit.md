@@ -58,7 +58,13 @@ web access. Do NOT rewrite the sidecars - you only report.
    dashes; {{if .IsSeriesOpener}}a series opener has NO `chapter: 0` series recap{{else}}book 2+ carries a `chapter: 0` series recap{{end}}; `license` is
    "CC-BY-SA-3.0" and `sources` is `[{"type": "community"}]`.
 6. PROVENANCE: every published proper noun appears in the verified ledger table
-   below, or in the fact notes. A name from neither is a defect.
+   below, OR is explicitly supported in the fact notes. The ledger's
+   `Unresolved / do-not-publish-clean` section is the one hard override: a surface
+   form listed there must NEVER be published as a clean name, even when a fact note
+   repeats that transcription. Use or preserve a neutral role label instead. A fact
+   note can establish a name that the ledger simply does not mention, but it cannot
+   promote a surface form the ledger explicitly marks unresolved. Do not demand that
+   a correct role-named card be renamed to an unresolved surface form.
 {{if .VerifiedLedger}}
 Verified names ledger:
 

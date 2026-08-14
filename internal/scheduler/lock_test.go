@@ -135,20 +135,25 @@ func TestQueueSnapshotSeparatesLiveProcessingFromActualASROrder(t *testing.T) {
 	}
 }
 
-func TestPartitionASRKeepsRetranscriptionIndependentFromFullBookASR(t *testing.T) {
-	candidates := []store.Book{
+// TestSortASRLaneQueuesEveryCorrectiveAheadOfFullBookASR pins the priority half of
+// the single serial ASR slot: corrective retranscription is not merely ahead of the
+// NEXT full-book book, it precedes the whole full-book queue, so a repaired chapter
+// re-enters the QA loop instead of waiting out fresh transcriptions. Within each
+// class the usual order still holds (id among correctives, breadth-first rank among
+// full books).
+func TestSortASRLaneQueuesEveryCorrectiveAheadOfFullBookASR(t *testing.T) {
+	all := []store.Book{
 		bk(9, "A", "3", string(state.Retranscribing)),
 		bk(1, "A", "1", string(state.ASR)),
 		bk(8, "B", "2", string(state.Retranscribing)),
 		bk(2, "B", "1", string(state.ASR)),
 	}
+	candidates := append([]store.Book(nil), all...)
 
-	repairs, fullBooks := partitionASR(candidates)
-	if got, want := bookIDs(repairs), []int64{9, 8}; !slices.Equal(got, want) {
-		t.Fatalf("repairs = %v, want %v", got, want)
-	}
-	if got, want := bookIDs(fullBooks), []int64{1, 2}; !slices.Equal(got, want) {
-		t.Fatalf("full books = %v, want %v", got, want)
+	sortASRLane(candidates, all)
+
+	if got, want := bookIDs(candidates), []int64{8, 9, 1, 2}; !slices.Equal(got, want) {
+		t.Fatalf("ASR lane order = %v, want %v (both correctives before any full book)", got, want)
 	}
 }
 
@@ -162,7 +167,7 @@ func (e *blockingASRExecutor) Execute(ctx context.Context, _ store.Book, stage s
 	return StageResult{}, ctx.Err()
 }
 
-func TestCorrectiveRetranscriptionRunsBesideSerialFullBookASR(t *testing.T) {
+func TestCorrectiveRetranscriptionHasPriorityInSerialASRLane(t *testing.T) {
 	h := newHarness(t)
 	db := h.openDB(t)
 	full := h.addBook(t, db, "full", "A", "1")
@@ -184,27 +189,23 @@ func TestCorrectiveRetranscriptionRunsBesideSerialFullBookASR(t *testing.T) {
 	done := make(chan struct{})
 	go func() { _ = sched.Start(runCtx); close(done) }()
 
-	seen := map[state.State]int{}
-	for range 2 {
-		select {
-		case stage := <-exec.started:
-			seen[stage]++
-		case <-time.After(2 * time.Second):
+	select {
+	case stage := <-exec.started:
+		if stage != state.Retranscribing {
 			cancel()
 			<-done
-			t.Fatal("timed out waiting for full ASR and corrective retranscription to overlap")
+			t.Fatalf("first ASR stage = %s, want corrective retranscription", stage)
 		}
-	}
-	if seen[state.ASR] != 1 || seen[state.Retranscribing] != 1 {
+	case <-time.After(2 * time.Second):
 		cancel()
 		<-done
-		t.Fatalf("concurrent starts = %v, want one full ASR and one retranscription", seen)
+		t.Fatal("timed out waiting for corrective retranscription")
 	}
 	select {
 	case stage := <-exec.started:
 		cancel()
 		<-done
-		t.Fatalf("unexpected third ASR worker started for %s", stage)
+		t.Fatalf("overlapping ASR worker started for %s", stage)
 	case <-time.After(100 * time.Millisecond):
 	}
 

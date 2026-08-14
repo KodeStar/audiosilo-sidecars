@@ -12,10 +12,17 @@ import (
 // configured agent-book concurrency) and passes them in, so eta keeps no private copy
 // that could drift from the scheduler's. Each field is clamped to >= 1 by QueueETA.
 type LaneCaps struct {
-	ASR              int
-	Mechanical       int
-	Agent            int
-	AgentInvocations int
+	ASR        int
+	Mechanical int
+	// MechanicalSourceIO is the NARROWER sub-cap inside the mechanical lane: how many
+	// mechanical workers may open the original library item at once (state.ReadsSource
+	// - inspecting/splitting/extracting). The scheduler serializes those so two reads
+	// cannot deadlock a slow SMB mount, while work-dir-only mechanical stages still
+	// overlap them; modelling the lane as a flat cap made a fresh inspect/split-heavy
+	// batch predict a makespan up to the full lane cap too optimistic.
+	MechanicalSourceIO int
+	Agent              int
+	AgentInvocations   int
 }
 
 // atLeastOne clamps a lane capacity to a minimum of 1, so a zero/negative cap never
@@ -106,9 +113,11 @@ func QueueETA(books []Book, rates map[string]float64, caps LaneCaps) float64 {
 		state.LaneAgent:      atLeastOne(caps.Agent),
 	}
 
+	sourceIOCap := atLeastOne(caps.MechanicalSourceIO)
+
 	now := 0.0
 	for {
-		startWaiting(sim, laneCap, now)
+		startWaiting(sim, laneCap, sourceIOCap, now)
 
 		// Find the earliest running finish; if nothing runs, the queue is drained.
 		next, running := earliestFinish(sim)
@@ -125,9 +134,20 @@ func QueueETA(books []Book, rates map[string]float64, caps LaneCaps) float64 {
 	}
 }
 
+// usesSourceIO reports whether a segment occupies the scarce source-IO slot: a
+// mechanical stage that opens the original library item. It is the SAME predicate
+// the scheduler dispatches on (state.ReadsSource), so the simulation's capacity
+// model cannot drift from the real one.
+func usesSourceIO(seg segment) bool {
+	return seg.lane == state.LaneMechanical && state.ReadsSource(seg.stage)
+}
+
 // startWaiting fills every lane up to capacity with eligible waiting books at time
-// now, mutating sim in place.
-func startWaiting(sim []*simBook, caps map[state.Lane]int, now float64) {
+// now, mutating sim in place. sourceIOFree is the mechanical lane's narrower
+// source-IO sub-cap; a book needing it when none is left is SKIPPED rather than
+// ending the lane's fill, so a work-dir-only mechanical stage behind it still
+// starts - exactly the scheduler's fillLaneLimited rule.
+func startWaiting(sim []*simBook, caps map[state.Lane]int, sourceIOFree int, now float64) {
 	free := map[state.Lane]int{}
 	for lane, capacity := range caps {
 		free[lane] = capacity
@@ -135,6 +155,9 @@ func startWaiting(sim []*simBook, caps map[state.Lane]int, now float64) {
 	for _, sb := range sim {
 		if sb.running {
 			free[sb.cur().lane]--
+			if usesSourceIO(sb.cur()) {
+				sourceIOFree--
+			}
 		}
 	}
 	holders := lockHolders(sim)
@@ -158,9 +181,16 @@ func startWaiting(sim []*simBook, caps map[state.Lane]int, now float64) {
 			if free[lane] <= 0 {
 				break
 			}
+			needsSourceIO := usesSourceIO(sb.cur())
+			if needsSourceIO && sourceIOFree <= 0 {
+				continue
+			}
 			sb.running = true
 			sb.finishAt = now + sb.cur().seconds
 			free[lane]--
+			if needsSourceIO {
+				sourceIOFree--
+			}
 		}
 	}
 }

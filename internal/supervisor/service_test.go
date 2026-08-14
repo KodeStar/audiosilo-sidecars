@@ -368,6 +368,10 @@ func TestSimulatedMultiBookRecoveryAndEscalation(t *testing.T) {
 }
 
 func TestLivenessFailsWhenAnyOfSeveralChildProcessesDisappears(t *testing.T) {
+	previousGrace := processExitGrace
+	processExitGrace = time.Nanosecond
+	defer func() { processExitGrace = previousGrace }()
+
 	ctx := context.Background()
 	db := supervisorDB(t)
 	if err := db.EnsureBatch(ctx, "children", time.Now()); err != nil {
@@ -670,6 +674,21 @@ func TestArtifactStatusIgnoresSentinelRemovedForCurrentStageRerun(t *testing.T) 
 	statuses := artifactStatuses(store.Book{State: "auditing", WorkDir: work}, runs)
 	if len(statuses) != 0 {
 		t.Fatalf("current audit rerun reported its intentionally absent sentinel: %+v", statuses)
+	}
+}
+
+func TestArtifactStatusIgnoresOpenStageDespiteStaleBookSnapshot(t *testing.T) {
+	// Book state and stage-run reads are not one transaction: the scheduler can advance
+	// validating -> auditing between them. The open auditing run is stronger evidence than
+	// the stale book state and makes the intentionally absent prior audit sentinel valid.
+	ok := true
+	runs := []store.StageRun{
+		{ID: 408, Stage: "auditing", FinishedAt: "2026-07-19T09:50:07Z", Ok: &ok},
+		{ID: 411, Stage: "auditing", StartedAt: "2026-07-19T09:52:25Z"},
+	}
+	statuses := artifactStatuses(store.Book{State: "validating", WorkDir: t.TempDir()}, runs)
+	if len(statuses) != 0 {
+		t.Fatalf("open audit with stale book snapshot reported absent sentinel: %+v", statuses)
 	}
 }
 

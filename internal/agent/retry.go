@@ -99,7 +99,7 @@ func RunWithBackoff(ctx context.Context, r Runner, req Request, validate func(Re
 				}
 				delay := backoff[rateLimitRounds]
 				rateLimitRounds++
-				if werr := sleepCtx(ctx, delay); werr != nil {
+				if werr := SleepCtx(ctx, delay); werr != nil {
 					return Result{}, slept, werr
 				}
 				slept += delay
@@ -112,7 +112,7 @@ func RunWithBackoff(ctx context.Context, r Runner, req Request, validate func(Re
 				}
 				delay := notAvailableBackoff[notAvailRetries]
 				notAvailRetries++
-				if werr := sleepCtx(ctx, delay); werr != nil {
+				if werr := SleepCtx(ctx, delay); werr != nil {
 					return Result{}, slept, werr
 				}
 				slept += delay
@@ -140,9 +140,11 @@ func RunWithBackoff(ctx context.Context, r Runner, req Request, validate func(Re
 	}
 }
 
-// sleepCtx waits for d or until ctx is done, whichever first. It uses a timer (not
-// time.Sleep) so a cancelled context returns immediately.
-func sleepCtx(ctx context.Context, d time.Duration) error {
+// SleepCtx waits for d or until ctx is done, whichever first. It uses a timer (not
+// time.Sleep) so a cancelled context returns immediately. Exported because every
+// backoff in the daemon wants exactly this, not a bare time.Sleep: internal/pipeline
+// uses it between split retries.
+func SleepCtx(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {

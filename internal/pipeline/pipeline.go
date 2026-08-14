@@ -500,8 +500,41 @@ func (e *Executor) inspect(ctx context.Context, book store.Book, r scheduler.Sta
 	return result, nil
 }
 
+const splitTransientMaxAttempts = 3
+
+// splitTransientRetryDelay is a var so tests can exercise retry without production sleeps.
+var splitTransientRetryDelay = 2 * time.Second
+
+// splitWithRetries runs the resumable split, retrying in place when the source mount
+// reports the transient interruption audio.IsTransientSourceErr classifies (the
+// classifier lives beside the code that composes the error, so the two cannot drift).
+// Re-calling Split is safe and cheap: completed chapter FLACs are skipped, and the
+// staged local copy of the source survives the failed attempt.
+//
+// It returns the total time spent asleep between attempts so the caller can subtract it
+// from the stage's productive seconds - the same contract the agent runner uses for
+// rate-limit backoff. Backoff is waiting, not work; charging it to the learned
+// chapters/sec rate would make every later book's ETA wrong.
+func splitWithRetries(ctx context.Context, m audio.Manifest, workDir, ffmpeg string, r scheduler.StageReport, progress audio.ProgressFunc) (slept time.Duration, err error) {
+	for attempt := 1; ; attempt++ {
+		err = audio.Split(ctx, m, workDir, ffmpeg, progress)
+		if err == nil || attempt == splitTransientMaxAttempts || !audio.IsTransientSourceErr(err) {
+			return slept, err
+		}
+		if r.Note != nil {
+			r.Note(fmt.Sprintf("splitting: source read was interrupted; retrying resumable split (%d/%d)", attempt+1, splitTransientMaxAttempts))
+		}
+		delay := time.Duration(attempt) * splitTransientRetryDelay
+		if werr := agent.SleepCtx(ctx, delay); werr != nil {
+			return slept, werr
+		}
+		slept += delay
+	}
+}
+
 // split converts each manifest chapter into a mono/16 kHz FLAC, reporting progress
-// per chapter, then writes the stage sentinel.
+// per chapter, then writes the stage sentinel. A narrowly classified transient source-mount
+// interruption is retried in-place; completed chapter FLACs are resumable and are skipped.
 func (e *Executor) split(ctx context.Context, book store.Book, r scheduler.StageReport) (scheduler.StageResult, error) {
 	ffmpeg, _ := e.ensureTools()
 	if ffmpeg == "" {
@@ -520,29 +553,49 @@ func (e *Executor) split(ctx context.Context, book store.Book, r scheduler.Stage
 		return scheduler.StageResult{}, fmt.Errorf("split: manifest is not contiguous - markers_normalizing must run first")
 	}
 	// Capture the resume baseline (first report) and final done so the rate counts only
-	// chapters split THIS run, not any a prior interrupted run already produced. Time the
-	// split loop itself (setup and the manifest read are excluded).
+	// chapters split THIS run, not any a prior interrupted run already produced.
+	//
+	// The productive clock starts at the FIRST progress report, not here, and the retry
+	// backoff is subtracted below - the two exclusions StageResult.RateSample requires.
+	// audio.Split emits that first report AFTER staging the source locally, so a copy of
+	// a multi-GB book off a slow mount (minutes) is setup, not split throughput; the
+	// transient-retry sleeps are waiting, not work. Charging either to the learned
+	// chapters/sec would skew every later book's ETA.
 	firstDone, lastDone := 0, 0
 	haveFirst := false
-	splitStart := time.Now()
-	if err := audio.Split(ctx, manifest, book.WorkDir, ffmpeg, func(done, total int) {
+	var splitStart time.Time
+	progress := func(done, total int) {
 		if !haveFirst {
 			firstDone, haveFirst = done, true
+			splitStart = time.Now()
 		}
 		lastDone = done
 		if r.Progress != nil {
 			r.Progress(done, total)
 		}
-	}); err != nil {
+	}
+	var slept time.Duration
+	err = runWithStageHeartbeat(ctx, r, func(elapsed time.Duration) string {
+		return fmt.Sprintf("splitting: ffmpeg still running (%s elapsed)", humanDuration(elapsed))
+	}, func() error {
+		var serr error
+		slept, serr = splitWithRetries(ctx, manifest, book.WorkDir, ffmpeg, r, progress)
+		return serr
+	})
+	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("split: %w", err)
 	}
 	e.accountScratch(ctx, book)
+	productiveSeconds := 0.0
+	if haveFirst {
+		productiveSeconds = (time.Since(splitStart) - slept).Seconds()
+	}
 	result := scheduler.StageResult{
 		Metrics: metrics(map[string]any{
 			"style":         manifest.Style,
 			"chapter_count": manifest.ChapterCount,
 		}),
-		RateSample: rateSample(lastDone-firstDone, time.Since(splitStart).Seconds()),
+		RateSample: rateSample(lastDone-firstDone, productiveSeconds),
 	}
 	if err := scheduler.WriteSentinel(book.WorkDir, string(state.Splitting), result); err != nil {
 		return scheduler.StageResult{}, err

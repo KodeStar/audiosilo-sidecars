@@ -20,18 +20,23 @@ type harness struct {
 	hub      *events.Hub
 }
 
+// occupancyExecutor records the highest number of stages matching counts that ever
+// ran concurrently, so a capacity test can assert the scheduler's real overlap
+// instead of its bookkeeping. counts selects which stages are measured (agent-lane
+// stages, library-source-reading stages, ...).
 type occupancyExecutor struct {
-	inner *StubExecutor
-	mu    sync.Mutex
-	now   int
-	peak  int
+	inner  *StubExecutor
+	counts func(state.State) bool
+	mu     sync.Mutex
+	now    int
+	high   int
 }
 
 func (e *occupancyExecutor) Execute(ctx context.Context, book store.Book, stage state.State, report StageReport) (StageResult, error) {
-	if state.LaneOf(stage) == state.LaneAgent {
+	if e.counts(stage) {
 		e.mu.Lock()
 		e.now++
-		e.peak = max(e.peak, e.now)
+		e.high = max(e.high, e.now)
 		e.mu.Unlock()
 		defer func() {
 			e.mu.Lock()
@@ -42,10 +47,10 @@ func (e *occupancyExecutor) Execute(ctx context.Context, book store.Book, stage 
 	return e.inner.Execute(ctx, book, stage, report)
 }
 
-func (e *occupancyExecutor) peakAgentBooks() int {
+func (e *occupancyExecutor) peak() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.peak
+	return e.high
 }
 
 func newHarness(t *testing.T) *harness {
@@ -165,13 +170,35 @@ func TestAgentQueueConcurrencyBoundsBooks(t *testing.T) {
 	for i := range 6 {
 		h.addBook(t, db, string(rune('a'+i))+"-book", "", "")
 	}
-	exec := &occupancyExecutor{inner: NewStubExecutor(time.Millisecond, 15*time.Millisecond)}
+	exec := &occupancyExecutor{
+		inner:  NewStubExecutor(time.Millisecond, 15*time.Millisecond),
+		counts: func(st state.State) bool { return state.LaneOf(st) == state.LaneAgent },
+	}
 	books := runUntil(t, db, h.hub, exec, 2, allDone, 15*time.Second)
 	if !allDone(books) {
 		t.Fatal("books did not finish")
 	}
-	if got := exec.peakAgentBooks(); got != 2 {
+	if got := exec.peak(); got != 2 {
 		t.Fatalf("peak agent books=%d, want configured queue_concurrency 2", got)
+	}
+}
+
+func TestMechanicalLaneSerializesLibrarySourceIO(t *testing.T) {
+	h := newHarness(t)
+	db := h.openDB(t)
+	for i := range 6 {
+		h.addBook(t, db, string(rune('a'+i))+"-book", "", "")
+	}
+	exec := &occupancyExecutor{
+		inner:  NewStubExecutor(15*time.Millisecond, time.Millisecond),
+		counts: state.ReadsSource,
+	}
+	books := runUntil(t, db, h.hub, exec, 2, allDone, 15*time.Second)
+	if !allDone(books) {
+		t.Fatal("books did not finish")
+	}
+	if got := exec.peak(); got != 1 {
+		t.Fatalf("peak source-reading mechanical workers=%d, want 1", got)
 	}
 }
 

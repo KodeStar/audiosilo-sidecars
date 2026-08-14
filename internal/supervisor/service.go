@@ -762,6 +762,12 @@ func (s *Service) artifactStatuses(book store.Book, runs []store.StageRun) []Art
 func collectArtifactStatuses(book store.Book, runs []store.StageRun, validate func(string) (bool, string)) []ArtifactStatus {
 	var out []ArtifactStatus
 	seen := map[string]bool{}
+	openStages := map[string]bool{}
+	for _, r := range runs {
+		if r.FinishedAt == "" && r.Ok == nil {
+			openStages[r.Stage] = true
+		}
+	}
 	// ListStageRuns is oldest-first. Walk newest-first so a later successful rerun
 	// owns the diagnostic and a historical run cannot permanently mask a new issue
 	// behind an already-seen incident key.
@@ -775,7 +781,7 @@ func collectArtifactStatuses(book store.Book, runs []store.StageRun, validate fu
 		// book's current state is therefore content-incomplete by definition: its
 		// historical success must not be treated as a broken current artifact while
 		// the rerun is queued or active. Dispatch/reconcile owns rerunning it.
-		if r.Stage == book.State {
+		if r.Stage == book.State || openStages[r.Stage] {
 			seen[r.Stage] = true
 			continue
 		}

@@ -130,7 +130,12 @@ type Def struct {
 	Next     []State
 	Agent    bool // runs in an agent (LLM) lane
 	Terminal bool // no outgoing transitions
-	order    int  // canonical linear position, for reconcile ordering
+	// SourceIO marks a stage that opens the ORIGINAL library item (the audiobook
+	// files or the epub) rather than reading only the per-book work directory. The
+	// scheduler serializes those inside the mechanical lane: concurrent random
+	// access through one SMB share can wedge both kernel calls.
+	SourceIO bool
+	order    int // canonical linear position, for reconcile ordering
 }
 
 // table is the single source of truth for the state machine. order is the
@@ -161,9 +166,9 @@ type Def struct {
 // here costs only this comment.
 var table = map[State]Def{
 	Queued:             {Lane: LaneNone, Next: []State{Extracting, Inspecting}, order: 0},
-	Inspecting:         {Lane: LaneMechanical, Next: []State{MarkersNormalizing, Splitting}, order: 1},
+	Inspecting:         {Lane: LaneMechanical, Next: []State{MarkersNormalizing, Splitting}, SourceIO: true, order: 1},
 	MarkersNormalizing: {Lane: LaneAgent, Next: []State{Splitting}, Agent: true, order: 2},
-	Splitting:          {Lane: LaneMechanical, Next: []State{ASR}, order: 3},
+	Splitting:          {Lane: LaneMechanical, Next: []State{ASR}, SourceIO: true, order: 3},
 	ASR:                {Lane: LaneASR, Next: []State{Sanitizing}, order: 4},
 	Sanitizing:         {Lane: LaneMechanical, Next: []State{QASweep}, order: 5},
 	QASweep:            {Lane: LaneMechanical, Next: []State{QAAdjudicating, SpellingResearch}, order: 6},
@@ -171,7 +176,7 @@ var table = map[State]Def{
 	Retranscribing:     {Lane: LaneASR, Next: []State{QASweep}, order: 8},
 	SpellingResearch:   {Lane: LaneAgent, Next: []State{Correcting}, Agent: true, order: 9},
 	Correcting:         {Lane: LaneMechanical, Next: []State{FactPass}, order: 10},
-	Extracting:         {Lane: LaneMechanical, Next: []State{ChapterMapping, FactPass}, order: 11},
+	Extracting:         {Lane: LaneMechanical, Next: []State{ChapterMapping, FactPass}, SourceIO: true, order: 11},
 	ChapterMapping:     {Lane: LaneAgent, Next: []State{FactPass}, Agent: true, order: 12},
 	FactPass:           {Lane: LaneAgent, Next: []State{Synthesizing}, Agent: true, order: 13},
 	Synthesizing:       {Lane: LaneAgent, Next: []State{Validating}, Agent: true, order: 14},
@@ -202,6 +207,11 @@ func IsStage(s State) bool { return table[s].Lane != LaneNone }
 
 // IsAgent reports whether s runs in the agent lane.
 func IsAgent(s State) bool { return table[s].Agent }
+
+// ReadsSource reports whether s opens the original library item (the source
+// audiobook files or the epub) instead of only the per-book work directory. The
+// scheduler uses it to keep at most one such stage running at a time.
+func ReadsSource(s State) bool { return table[s].SourceIO }
 
 // SupportsAgentFanout reports the stages with a proven isolated fragment/merge
 // contract. Other agent stages remain serial for whole-book consistency.

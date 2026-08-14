@@ -27,6 +27,11 @@ fact evidence. Confirm the offending claim is removed, corrected, or moved behin
 the right spoiler boundary. Also confirm the correction did not introduce a new
 spoiler or unsupported claim in that same entry.
 
+Spelling ledgers under `facts/` are authoritative. A surface form in an
+`Unresolved / do-not-publish-clean` section must NEVER be required as a clean name,
+even if a prior finding or fact note repeats it. A neutral role label is the correct
+resolution for such a figure; do not fail verification for preserving that label.
+
 Write `out/audit.json` in the normal audit shape:
 
 ```

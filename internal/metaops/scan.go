@@ -129,6 +129,41 @@ type PipelineBookRef struct {
 	Status string `json:"status"`
 }
 
+// ContributedLookup reports, for one persisted pipeline book, whether this
+// daemon's characters/recaps contributions have LANDED upstream. It is a plain
+// func seam (the same precedent as the override PersistFunc) so the decision below
+// lives in metaops without metaops importing the store.
+type ContributedLookup func(bookID int64) (characters, recaps bool)
+
+// PatchContributedCoverage repairs each candidate's coverage verdict from what
+// this daemon has already contributed. A scan resolves that verdict ONCE and
+// freezes it into the cached snapshot, so a work whose sidecars have since landed
+// keeps reporting them as needed - stale badges, and "exclude already covered"
+// fails to drop the book. The local contributions record is the authoritative
+// truth about what landed, so the repair happens on read rather than making the
+// user rescan (which the coverage TTL caches would not necessarily fix either).
+//
+// Two rules are load-bearing. A candidate is patched only when it maps to a
+// persisted pipeline book AND its coverage is KNOWN: with no resolved work the
+// badges honestly say "unknown", and claiming a dimension against an unidentified
+// book would be a guess. And only the two has_* flags are ever SET - never
+// cleared, and nothing else in the verdict is touched, because upstream stays the
+// authority on everything else.
+func PatchContributedCoverage(books []ScannedBook, landed ContributedLookup) {
+	if landed == nil {
+		return
+	}
+	for i := range books {
+		ref := books[i].PipelineBook
+		if ref == nil || !books[i].Coverage.Known {
+			continue
+		}
+		characters, recaps := landed(ref.ID)
+		books[i].Coverage.HasCharacters = books[i].Coverage.HasCharacters || characters
+		books[i].Coverage.HasRecaps = books[i].Coverage.HasRecaps || recaps
+	}
+}
+
 // ScanProgress is the fine-grained progress of a scan job. The folder walk drives
 // groups_done/groups_total (one group per directory); coverage resolution drives
 // coverage_done/coverage_total; books_found grows as books stream in. The phase
@@ -186,14 +221,16 @@ type bookIdent struct {
 // newBookIdent builds a bookIdent and precomputes its fingerprint: a stable
 // string over the resolution inputs, so a worker's verdict is only applied to a
 // book whose identity has not changed since dispatch (corroboration can rewrite
-// a streamed book's series/title/position).
+// a streamed book's series/title/position). The identity's path hints are
+// deliberately absent: they derive from the source path, which is the key this
+// fingerprint is stored under and so cannot change underneath it.
 func newBookIdent(id BookIdentity, workID string) bookIdent {
 	return bookIdent{
 		id:     id,
 		workID: workID,
 		fp: strings.Join([]string{
 			id.ASIN, id.ISBN, id.Title, id.Series, id.SeriesPos,
-			strings.Join(id.Authors, ","), workID,
+			strings.Join(id.Authors, ","), strings.Join(id.Narrators, ","), workID,
 		}, "\x00"),
 	}
 }
@@ -777,16 +814,45 @@ func convertBook(b metascan.Book, root string, overrides map[string]Override) (S
 		ASIN: b.ASIN, ISBN: b.ISBN, RuntimeMin: b.RuntimeMin, Chapters: b.Chapters,
 		AudioFiles: b.AudioFiles, Sources: b.Sources,
 	}
-	id := BookIdentity{
-		ASIN: b.ASIN, ISBN: b.ISBN, Title: b.Title,
-		Authors: b.Authors, Series: b.Series, SeriesPos: b.SeriesPosition,
-	}
 	workID := ""
 	if ov, ok := overrides[sb.SourcePath]; ok {
 		sb.Hidden, sb.ForceAudio = ov.Hidden, ov.ForceAudio
 		workID = ov.WorkID
 	}
-	return sb, newBookIdent(id, workID)
+	return sb, newBookIdent(bookIdentityOf(sb), workID)
+}
+
+// bookIdentityOf derives a candidate's coverage-resolution identity, including
+// the PATH HINTS the metadata query ladder falls back to. A shelf whose tags
+// carry a shortcode title ("RO07") frequently has the real title in the folder
+// leaf and the series in its parent, so the path is evidence, not decoration.
+func bookIdentityOf(sb ScannedBook) BookIdentity {
+	folder, parent := pathHints(sb.SourcePath)
+	return BookIdentity{
+		ASIN: sb.ASIN, ISBN: sb.ISBN, Title: sb.Title,
+		Authors: sb.Authors, Narrators: sb.Narrators,
+		Series: sb.Series, SeriesPos: sb.SeriesPosition,
+		FolderName: folder, ParentDir: parent,
+	}
+}
+
+// pathHints returns the book folder's own name and its parent's. An ebook-only
+// candidate's source path is the .epub FILE, so that extension is stripped - the
+// leaf is still the title. A root-level book reports no parent rather than "/".
+func pathHints(sourcePath string) (folder, parent string) {
+	p := strings.TrimSpace(sourcePath)
+	if p == "" {
+		return "", ""
+	}
+	folder = filepath.Base(p)
+	if ebook.IsEpub(folder) {
+		folder = strings.TrimSuffix(folder, filepath.Ext(folder))
+	}
+	parent = filepath.Base(filepath.Dir(p))
+	if parent == "." || parent == string(filepath.Separator) {
+		parent = ""
+	}
+	return folder, parent
 }
 
 // noteUsingAudio is the verdict shown when an epub is present but the audio runs
@@ -913,8 +979,5 @@ func applyOverride(sb *ScannedBook, overrides map[string]Override) bookIdent {
 		sb.Hidden, sb.ForceAudio = ov.Hidden, ov.ForceAudio
 		workID = ov.WorkID
 	}
-	return newBookIdent(BookIdentity{
-		ASIN: sb.ASIN, ISBN: sb.ISBN, Title: sb.Title,
-		Authors: sb.Authors, Series: sb.Series, SeriesPos: sb.SeriesPosition,
-	}, workID)
+	return newBookIdent(bookIdentityOf(*sb), workID)
 }

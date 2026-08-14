@@ -38,6 +38,12 @@ const (
 // and pr_open are the OPEN states the poller advances; merged/closed are terminal;
 // local is an export with no remote lifecycle; already_covered means the dimension
 // already exists upstream so nothing was submitted.
+//
+// merged + already_covered together are the LANDED set: the dimension exists
+// upstream, whether this daemon's contribution was accepted or upstream already had
+// it. Exactly two readers depend on that definition and both spell it with these
+// constants - ContributedKinds' IN list and ContributionSummary's merged rung - so
+// widening the set means editing both.
 const (
 	ContribStatusSubmitted      = "submitted"
 	ContribStatusPROpen         = "pr_open"
@@ -146,6 +152,39 @@ func (db *DB) ContributionsByBook(ctx context.Context) (map[int64][]Contribution
 			return nil, err
 		}
 		out[c.BookID] = append(out[c.BookID], c)
+	}
+	return out, rows.Err()
+}
+
+// ContributedKinds returns, per book id, the set of contribution kinds that are
+// LANDED upstream - status merged (this daemon's contribution was accepted) or
+// already_covered (upstream already had that dimension when the stage ran). It is
+// the local truth the Library scan join uses to repair a candidate's coverage
+// verdict: that verdict is resolved once at scan time and frozen into the cached
+// snapshot, so a book this daemon has since contributed keeps reporting "needed".
+// One query for the whole table (like ContributionsByBook) - the join runs on every
+// scan poll, so a per-book read would be an N+1.
+func (db *DB) ContributedKinds(ctx context.Context) (map[int64]map[string]bool, error) {
+	rows, err := db.sql.QueryContext(ctx,
+		`SELECT book_id, kind FROM contributions WHERE status IN (?, ?)`,
+		ContribStatusMerged, ContribStatusAlreadyCovered)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[int64]map[string]bool{}
+	for rows.Next() {
+		var bookID int64
+		var kind string
+		if err := rows.Scan(&bookID, &kind); err != nil {
+			return nil, err
+		}
+		kinds, ok := out[bookID]
+		if !ok {
+			kinds = map[string]bool{}
+			out[bookID] = kinds
+		}
+		kinds[kind] = true
 	}
 	return out, rows.Err()
 }

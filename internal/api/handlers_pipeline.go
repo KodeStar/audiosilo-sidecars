@@ -81,6 +81,10 @@ func (a *API) handleGetScan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not read queued books")
 		return
 	}
+	// patchable records whether any candidate could actually be repaired below: a
+	// patch needs a tracked book AND a known-identity coverage verdict, and this loop
+	// is where both are already in hand.
+	patchable := false
 	for i := range job.Books {
 		book, exists := tracked[job.Books[i].SourcePath]
 		if !exists {
@@ -88,6 +92,21 @@ func (a *API) handleGetScan(w http.ResponseWriter, r *http.Request) {
 		}
 		job.Books[i].PipelineBook = &metaops.PipelineBookRef{
 			ID: book.ID, State: book.State, Status: book.Status,
+		}
+		patchable = patchable || job.Books[i].Coverage.Known
+	}
+	// Repair each candidate's frozen scan-time coverage from what this daemon has
+	// already contributed (metaops owns that rule). The whole-table read is skipped
+	// when nothing could be patched: this endpoint is polled every ~700ms while the
+	// Library tab is open. A read failure (a transient lock, a shutdown) serves the
+	// scan UNPATCHED rather than 500ing - stale badges beat a broken poll, and this
+	// endpoint answered without touching contributions at all until the patch existed.
+	if patchable {
+		if contributed, err := a.store.ContributedKinds(r.Context()); err == nil {
+			metaops.PatchContributedCoverage(job.Books, func(bookID int64) (bool, bool) {
+				kinds := contributed[bookID]
+				return kinds[store.ContribKindCharacters], kinds[store.ContribKindRecaps]
+			})
 		}
 	}
 	writeJSON(w, http.StatusOK, job)

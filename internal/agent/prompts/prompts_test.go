@@ -91,6 +91,43 @@ func TestAuditPromptsStateTheExactOutputShape(t *testing.T) {
 	}
 }
 
+// unresolvedOverridePrompts are every prompt that can put a proper noun into (or demand
+// one out of) a published sidecar: the auditor, the audit verifier, and the fixer. The
+// ledger's unresolved section is a HARD override for all three, so the rule is stated
+// three times - the same one-contract-many-copies shape the audit.json test above pins.
+// A single dropped copy is silent: the other two keep behaving, and the surviving hole
+// publishes a transcription the pipeline already knows is wrong.
+var unresolvedOverridePrompts = []string{"audit.md", "audit_verify.md", "fix.md"}
+
+// unresolvedLedgerSection is the ledger heading the rule is written against. It is a
+// literal the agents match on, so it must be spelled identically everywhere.
+const unresolvedLedgerSection = "Unresolved / do-not-publish-clean"
+
+func TestUnresolvedLedgerOverrideIsStatedByEveryPromptThatCanPublishAName(t *testing.T) {
+	for _, name := range unresolvedOverridePrompts {
+		b, err := files.ReadFile(name)
+		if err != nil {
+			t.Fatalf("ReadFile(%s): %v", name, err)
+		}
+		body := string(b)
+		at := strings.Index(body, unresolvedLedgerSection)
+		if at < 0 {
+			t.Errorf("%s no longer names the %q ledger section: without it the prompt has no "+
+				"rule against publishing a form the pipeline marked unresolved", name, unresolvedLedgerSection)
+			continue
+		}
+		// The rule must be ABSOLUTE, and NEVER is the word that says so - close enough to the
+		// section name to be part of the same rule, not some unrelated later sentence.
+		const ruleWindow = 300
+		rule := body[at:min(len(body), at+ruleWindow)]
+		if !strings.Contains(rule, "NEVER") {
+			t.Errorf("%s states the %q rule without NEVER: %q - a softened rule is one the agent "+
+				"weighs against a fact note, which is exactly the trade the override forbids",
+				name, unresolvedLedgerSection, rule)
+		}
+	}
+}
+
 // TestFactPassBranchesShareTheSpoilerContract is the guard on a forked prompt.
 //
 // factpass.md carries two source-specific branches, and the temptation is to split

@@ -10,6 +10,7 @@ import type {
   QueueStatsEvent,
   StageProgressEvent,
 } from '@/api/types';
+import { isDoneState } from '@/lib/pipelineState';
 import { MAINLINE_AUDIO, OFF_MAINLINE_AFTER, mainlineFor } from '@/lib/timeline';
 
 // applyBookState patches the matching book's state + lane + status + error +
@@ -184,7 +185,7 @@ export function pruneBookEventCounts(
 
 // isDone reports whether a book has reached the terminal state.
 export function isDone(book: BookView): boolean {
-  return book.state === 'done';
+  return isDoneState(book.state);
 }
 
 // A control action the UI can invoke on a book.

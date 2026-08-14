@@ -1,6 +1,6 @@
 // Package scratch tracks and reclaims the on-disk scratch a book's work dir
-// accumulates. In M2 the heavy artifacts are the split chapter FLACs (and, later,
-// a copied source); the durables (transcripts, facts, sidecars) are kept. It
+// accumulates. The heavy artifacts are the split chapter FLACs and the local copy of
+// the source audio; the durables (transcripts, facts, sidecars) are kept. It
 // exposes disk-usage gauges (per book and daemon-total) and a manual purge of the
 // reclaimable artifacts. Auto-purge and startup GC arrive in M7; for now purge is
 // user-initiated from the UI.
@@ -100,12 +100,19 @@ type artifact struct {
 	Stage state.State
 }
 
-// audioArtifacts are reclaimed for every book: the split chapters/, the agent
-// staged-context dirs under _runs/, and the tail-clip / full-chapter
-// re-transcription scratch. Only chapters/ is a stage INPUT, so only splitting has a
-// sentinel to invalidate.
+// audioArtifacts are reclaimed for every book: the split chapters/, the local copy of
+// the source split-source/, the agent staged-context dirs under _runs/, and the
+// tail-clip / full-chapter re-transcription scratch. Only chapters/ is a stage INPUT,
+// so only splitting has a sentinel to invalidate.
+//
+// split-source/ is listed against splitting too, for the size rather than the
+// sentinel: it is a full copy of the (often multi-GB) source audio, and a split that
+// failed, was cancelled or parked leaves it behind deliberately, so that a retry can
+// resume without the remote mount. Nothing reclaims it if the book never reaches done,
+// so it must be on this table - and it is safe to drop, because Split re-stages it.
 var audioArtifacts = []artifact{
 	{Dir: audio.ChaptersDir, Stage: state.Splitting},
+	{Dir: audio.SplitSourceDir, Stage: state.Splitting},
 	{Dir: agent.RunsDir},
 	{Dir: repair.ClipsDir},
 	{Dir: repair.RetranscribeDir},
@@ -185,9 +192,9 @@ func HasReclaimable(workRoot, workDir string, kind state.Kind) bool {
 	return false
 }
 
-// Purge deletes a book's reclaimable scratch - the split chapters/ directory, the
-// agent staged-context dirs (_runs/), and the tail-clip/re-transcription scratch
-// (clips/, retranscribe/) - while KEEPING the durables (probe.json, manifest.json,
+// Purge deletes a book's reclaimable scratch - the split chapters/ and split-source/
+// directories, the agent staged-context dirs (_runs/), and the
+// tail-clip/re-transcription scratch (clips/, retranscribe/) - while KEEPING the durables (probe.json, manifest.json,
 // transcripts, facts, sidecars). It is a no-op when the work dir is absent. The
 // deletion is confined to workRoot.
 //
