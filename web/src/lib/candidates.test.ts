@@ -7,6 +7,7 @@ import {
   hiddenBooks,
   isCovered,
   isManualMatch,
+  isPipelineDone,
   manualWorkId,
   matchProvenanceLabel,
   overridePayload,
@@ -188,6 +189,14 @@ describe('filterCandidates', () => {
       pipeline_book: { id: 7, state: 'done', status: '' },
     });
     expect(filterCandidates([finished, partial], { excludeCovered: true })).toEqual([partial]);
+  });
+
+  it('shares one done-state predicate with the row badge', () => {
+    // The exported predicate is what CandidateRow's "Completed" badge asks too,
+    // so the filter and the badge cannot disagree about what finished means.
+    expect(isPipelineDone({ id: 1, state: 'done', status: '' })).toBe(true);
+    expect(isPipelineDone({ id: 1, state: 'auditing', status: 'needs_attention' })).toBe(false);
+    expect(isPipelineDone(undefined)).toBe(false);
   });
 
   it('keeps done pipeline books when the toggle is off', () => {

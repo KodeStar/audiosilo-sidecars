@@ -95,76 +95,57 @@ func TestListBooksWithUnresolvedMergedCore(t *testing.T) {
 	}
 }
 
-// TestContributedKinds pins the landed-only rule: merged and already_covered count
-// (both mean the dimension exists upstream), every other lifecycle status does not,
-// and each kind is keyed to its own book.
-func TestContributedKinds(t *testing.T) {
-	db := open(t)
-	ctx := context.Background()
-
-	// A: both sidecars landed - one merged, one that upstream already had.
-	a, _ := db.CreateBook(ctx, NewBook{SourcePath: "/k/a", WorkDir: "/w/a", Title: "A"})
-	mustContribution(t, db, a.ID, ContribKindCharacters, ContribStatusMerged)
-	mustContribution(t, db, a.ID, ContribKindRecaps, ContribStatusAlreadyCovered)
-
-	// B: still in flight (submitted) plus a closed row -> nothing landed.
-	b, _ := db.CreateBook(ctx, NewBook{SourcePath: "/k/b", WorkDir: "/w/b", Title: "B"})
-	mustContribution(t, db, b.ID, ContribKindCharacters, ContribStatusSubmitted)
-	mustContribution(t, db, b.ID, ContribKindRecaps, ContribStatusClosed)
-
-	// C: one merged sidecar and a local export (no remote lifecycle) -> only the
-	// merged kind counts.
-	c, _ := db.CreateBook(ctx, NewBook{SourcePath: "/k/c", WorkDir: "/w/c", Title: "C"})
-	mustContribution(t, db, c.ID, ContribKindCharacters, ContribStatusLocal)
-	mustContribution(t, db, c.ID, ContribKindRecaps, ContribStatusMerged)
-
-	// D: pr_open plus a merged core row - core is an add-work proposal, not a
-	// sidecar, but the query reports kinds verbatim and the caller picks.
-	d, _ := db.CreateBook(ctx, NewBook{SourcePath: "/k/d", WorkDir: "/w/d", Title: "D"})
-	mustContribution(t, db, d.ID, ContribKindCharacters, ContribStatusPROpen)
-	mustContribution(t, db, d.ID, ContribKindCore, ContribStatusMerged)
-
-	// E: no contribution rows at all -> absent from the map entirely.
-	e, _ := db.CreateBook(ctx, NewBook{SourcePath: "/k/e", WorkDir: "/w/e", Title: "E"})
-
-	got, err := db.ContributedKinds(ctx)
-	if err != nil {
-		t.Fatalf("ContributedKinds: %v", err)
+// TestLandedCoverage pins the landed-only rule: merged and already_covered count
+// (both mean the dimension exists upstream), every other lifecycle status does
+// not, and a merged CORE row - an add-work proposal, not a sidecar - never
+// claims a dimension. Pure, so it needs no database.
+func TestLandedCoverage(t *testing.T) {
+	row := func(kind, status string) Contribution {
+		return Contribution{Kind: kind, Mode: ContribModeIssue, Status: status}
 	}
-	want := map[int64]map[string]bool{
-		a.ID: {ContribKindCharacters: true, ContribKindRecaps: true},
-		c.ID: {ContribKindRecaps: true},
-		d.ID: {ContribKindCore: true},
-	}
-	if len(got) != len(want) {
-		t.Fatalf("got %d books, want %d: %+v", len(got), len(want), got)
-	}
-	for bookID, kinds := range want {
-		if len(got[bookID]) != len(kinds) {
-			t.Fatalf("book %d kinds = %+v, want %+v", bookID, got[bookID], kinds)
-		}
-		for kind := range kinds {
-			if !got[bookID][kind] {
-				t.Errorf("book %d missing kind %q", bookID, kind)
+	for _, tc := range []struct {
+		name       string
+		rows       []Contribution
+		chars, rec bool
+	}{
+		{name: "no rows"},
+		{
+			name: "both landed, one merged and one upstream already had",
+			rows: []Contribution{
+				row(ContribKindCharacters, ContribStatusMerged),
+				row(ContribKindRecaps, ContribStatusAlreadyCovered),
+			},
+			chars: true, rec: true,
+		},
+		{
+			name: "in flight and closed land nothing",
+			rows: []Contribution{
+				row(ContribKindCharacters, ContribStatusSubmitted),
+				row(ContribKindRecaps, ContribStatusClosed),
+			},
+		},
+		{
+			name: "a local export is not upstream coverage",
+			rows: []Contribution{
+				row(ContribKindCharacters, ContribStatusLocal),
+				row(ContribKindRecaps, ContribStatusMerged),
+			},
+			rec: true,
+		},
+		{
+			name: "a merged core row claims neither sidecar",
+			rows: []Contribution{
+				row(ContribKindCharacters, ContribStatusPROpen),
+				row(ContribKindCore, ContribStatusMerged),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chars, rec := LandedCoverage(tc.rows)
+			if chars != tc.chars || rec != tc.rec {
+				t.Fatalf("LandedCoverage = (%t, %t), want (%t, %t)", chars, rec, tc.chars, tc.rec)
 			}
-		}
-	}
-	if _, ok := got[b.ID]; ok {
-		t.Errorf("in-flight book %d reported as contributed: %+v", b.ID, got[b.ID])
-	}
-	if _, ok := got[e.ID]; ok {
-		t.Errorf("row-less book %d present in the map", e.ID)
-	}
-}
-
-// mustContribution upserts one contribution row and forces it to status (Upsert
-// writes the status directly, so no lifecycle advance is needed).
-func mustContribution(t *testing.T, db *DB, bookID int64, kind, status string) {
-	t.Helper()
-	if _, err := db.UpsertContribution(context.Background(), Contribution{
-		BookID: bookID, Kind: kind, Mode: ContribModeIssue, Status: status,
-	}); err != nil {
-		t.Fatalf("upsert %s/%s: %v", kind, status, err)
+		})
 	}
 }
 

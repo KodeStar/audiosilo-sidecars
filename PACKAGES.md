@@ -64,15 +64,16 @@ internal/
             already split, removed after success; the DIRECTORY is registered in
             scratch's artifact table so a failed/cancelled split's copy is
             reclaimable; a staging failure DEGRADES to splitting directly from the
-            source - staging is an optimization, never a precondition). Both halves
-            are TIME-BOUNDED so a wedged mount cannot hang invisibly behind the
-            liveness heartbeat: each chapter conversion gets max(10min, 2x its
-            audio duration) and the staging copy max(15min, a size-derived budget)
-            - a bound hit is a loud, non-transient error, mirroring
-            asrChapterDecodeBound -
-            ffmpeg otherwise reopens the same often-SMB-mounted file once per
-            chapter, and enough rapid random-access opens can wedge macOS's SMB
-            client. Pure/tool-driven, no scheduler deps.
+            source - staging is an optimization, never a precondition) - ffmpeg
+            otherwise reopens the same often-SMB-mounted file once per chapter, and
+            enough rapid random-access opens can wedge macOS's SMB client. Both
+            halves are TIME-BOUNDED so a wedged mount cannot hang invisibly behind
+            the liveness heartbeat: each chapter conversion gets max(10min, 2x its
+            audio duration) and the staging copy max(15min, a size-derived budget) -
+            a bound hit is a loud, non-transient error, mirroring
+            asrChapterDecodeBound. IsTransientSourceErr owns the transient
+            FUSE/Nextcloud EINTR shape the pipeline's split retry classifies with.
+            Pure/tool-driven, no scheduler deps.
             chapterFromMarker's vocabulary covers "Chapter N", with the title introduced
             by punctuation, an underscore, or NOTHING BUT WHITESPACE ("Chapter 1
             Suffering from Success", "Chapter 1 (Series Name)", "Chapter_1" - the literal
@@ -226,13 +227,16 @@ internal/
             RateLimitError carries a best-effort ResetAt via ParseResetTime (the
             |<epoch> suffix within (now, now+48h], or "resets at H[:MM] am/pm" as the
             next host-local occurrence). Post-M9 round: isRateLimit no longer
-            treats a bare "429" as a rate limit - RFC3339 fractional seconds
-            contain those digits (".294295Z"), so a timestamped stderr line
-            misclassified a validation failure; the status code now requires
-            protocol/error context (rateLimit429Pattern). runCLI bounds Cmd.Wait
-            with a 5s WaitDelay (cliPipeWaitDelay) so a detached CLI helper
-            holding the inherited stdout/stderr pipe cannot hang a finished
-            stage; ErrWaitDelay after a successful exit is treated as success.
+            treats a bare "429" as a rate limit - RFC3339 fractional seconds and
+            usage counters contain those digits (".294295Z",
+            "output_tokens":429), so a timestamped stderr line misclassified a
+            validation failure; the status code now requires nearby protocol/error
+            context, wide enough for the JSON and status_code=429 shapes the old
+            substring caught. runCLI bounds Cmd.Wait with a 5s WaitDelay
+            (cliPipeWaitDelay) so a detached CLI helper holding the inherited
+            stdout/stderr pipe cannot hang a finished stage; ErrWaitDelay after a
+            successful exit is treated as success. SleepCtx is the shared
+            ctx-aware backoff sleep (pipeline's split retry reuses it).
   benchmark/ private, provider-neutral post-ASR evaluation: allow-listed corpus
             preparation with input digests; fresh per-run work trees and databases;
             stage-specific model/effort routes; the real fact/synthesis/audit/fix
@@ -509,19 +513,22 @@ internal/
             unchanged). runAgent also enforces agent.book_budget_usd (default 75) as a
             preflight: summed stage_runs cost (superseded rows included, so Retry can't
             duck it) >= budget parks ParkBudgetExceeded before spending more.
-            Post-M9 round: the split stage retries a narrowly-classified transient
-            "interrupted system call" from a FUSE/Nextcloud source in-place (3
-            attempts, resumable - completed chapter FLACs are skipped) instead of
-            failing the book, and runs under the shared stage heartbeat
+            Post-M9 round: the split stage retries a transient
+            audio.IsTransientSourceErr in-place (3 attempts, resumable - completed
+            chapter FLACs are skipped; agent.SleepCtx backoff) instead of failing
+            the book, and runs under the shared stage heartbeat
             (runWithStageHeartbeat, the generalization transcribeWithHeartbeat now
             wraps) so the supervisor cannot kill a slow single-chapter ffmpeg
-            conversion between progress reports. validateMarkersManifest's
-            coverage check accepts adjacent per-marker exclusion declarations
-            whose gap-free union covers one coalesced unmapped span
-            (exclusionsCover, same 1s tolerance, never bridging a real undeclared
-            gap) - UnmappedSpans coalesces adjacent markers while the verdict
-            schema asks for per-marker declarations, so requiring one coarse
-            declaration rejected the more precise correct verdict.
+            conversion between progress reports; the split RateSample starts at the
+            first progress report (audio.Split emits it after staging) and
+            subtracts the backoff slept, keeping the staging copy and retry sleeps
+            out of the learned EWMA. validateMarkersManifest's coverage check
+            accepts adjacent per-marker exclusion declarations whose gap-free union
+            covers one coalesced unmapped span (exclusionsCover, same 1s tolerance,
+            never bridging a real undeclared gap) - UnmappedSpans coalesces
+            adjacent markers while the verdict schema asks for per-marker
+            declarations, so requiring one coarse declaration rejected the more
+            precise correct verdict.
   contrib/  M7: everything GitHub-facing for contribution. TokenSource (secrets
             GitHubPAT first, else `gh auth token` - the token NEVER enters argv/logs/
             errors, leak-canary tested), a stdlib REST client (issues/gists/fork/
@@ -563,9 +570,6 @@ internal/
             pr_open|merged|closed|local|already_covered) + books.narrators (JSON
             array like authors, feeds the core add-work proposal);
             ContributionSummary folds rows into the one aggregate chip status.
-            ContributedKinds (one whole-table query, the scan join runs per poll)
-            returns the LANDED kinds per book - merged or already_covered only -
-            the local truth handleGetScan patches frozen scan coverage from.
             Plain tested CRUD; AuthStore adapts it to auth.Store.
             Holds the SCHEDULING truth. The reliability round's 0008 added
             books.retry_at (RFC3339, '' = none; cleared with status, enforced like
@@ -588,7 +592,8 @@ internal/
             and IsParkedWith (the one status+park-code predicate api/contrib share
             instead of hand-rolling it). The post-M9 round added the SourceIO
             Def column + ReadsSource (the stages that open the original library
-            item; the scheduler's mechanical-lane serialization consumes it).
+            item; the scheduler's mechanical-lane serialization and the ETA
+            simulation both consume it).
   eta/      the PURE ETA engine (no I/O, no clock): per-stage unit kinds
             (chapter/chunk/book) + seed rates from the historical extraction metrics,
             EWMA Observe (alpha 0.3), book ETA = rate x remaining units over the
@@ -675,15 +680,14 @@ internal/
             Post-M9 round: a dead recorded process is classified missing only past
             processExitGrace (90s - it is measured against a stage-run heartbeat
             refreshed on a 60s cadence, so the grace must exceed that cadence plus
-            the runner's 5s pipe-wait; a 15s grace failed for ~75% of child exits)
-            from the freshest heartbeat/start - the child's
-            exit and the runner's durable process_active clear are sampled
-            independently, and the gap between them read as a
-            disappeared worker on a successfully completing stage; and
-            collectArtifactStatuses trusts an OPEN stage run over the stale book
-            snapshot (the scheduler can advance the state between the two reads),
-            so an intentionally absent sentinel for an in-flight rerun is not
-            reported broken.
+            the runner's 5s pipe-wait; a 15s draft failed for ~75% of child exits)
+            from the freshest heartbeat/start - the child's exit and the runner's
+            durable process_active clear are sampled independently, and the gap
+            between them read as a disappeared worker on a successfully completing
+            stage; and collectArtifactStatuses trusts an OPEN stage run over the
+            stale book snapshot (the scheduler can advance the state between the
+            two reads), so an intentionally absent sentinel for an in-flight rerun
+            is not reported broken.
   metaops/  meta.audiosilo.app client (coverage/lookup, capped 1h TTL caches,
             graceful degrade) + async folder-scan job manager over audiosilo-meta
             pkg/scan + the library_roots PathAllowed check. glossary.go adds
@@ -699,20 +703,47 @@ internal/
             asin -> isbn -> a fuzzy title-search fallback scored by
             audiosilo-server's pure-stdlib pkg/match (Coverage carries matched_by
             "asin"|"isbn"|"search"|"manual" + work_title provenance). The search
-            fallback walks searchLadder (coverage.go), an ordered de-duplicated
-            9-rung QUERY ladder - raw title first (an already-resolving book still
-            costs one request), then punctuation-normalized / CleanTitle /
-            pre-subtitle / post-separator / trailing-volume-stripped / title+author
-            / the folder-leaf and parent-dir PATH HINTS - because the upstream FTS
-            index matches the words it is given, and over a real 1147-book library
-            RETRIEVAL (not scoring) was the dominant cause of 510 unresolved books.
-            The ladder is retrieval only: match.Best still decides acceptance, with
-            one widening - bestByNarrator substitutes a card's author into the
-            query when narrator evidence links the records (a shelf tagging the
-            narrator as the author, or an author narrating his own book). One
-            cached verdict covers the whole ladder. BookIdentity carries
-            Narrators/FolderName/ParentDir (all in the scan fingerprint).
-            Scans STREAM:
+            fallback walks the ladder.go RETRIEVAL LADDER: over a real 1147-book
+            library the dominant failure was retrieval, not scoring - a decorated
+            shelf title ("Supermage : Rise To Omniscience, Book 1", "Halo:
+            Primordium (Unabridged)", "Artemis Fowl 4 - The Opal Deception")
+            retrieves NOTHING even when the work is indexed under a clean title. The
+            ladder is 9 ordered, de-duplicated query shapes (raw title, punctuation-
+            normalized, CleanTitle, pre-subtitle, post-separator tail, bare trailing
+            volume stripped, title+author, folder leaf, parent folder), the raw title
+            FIRST and ALWAYS (the minimum query length is a floor on the DERIVED
+            rungs only - a book called "It" must still search something) and an early
+            exit at the first rung match.Best accepts, so a book that already
+            resolved still costs one request. Each rung carries its own matchTitle,
+            and the de-duplication key is the WHOLE step: rung 5 and rung 8 can send
+            the same query scored against different titles, and dropping the second
+            deletes the leaf-scored variant that is the point of the rung. The FOLDER
+            LEAF rung queries the tail behind a shelf prefix ("RO07 - Sandqueen") or
+            else the whole leaf name, and is SCORED against that leaf only when the
+            tag title does not contradict it (empty, spells the leaf out, or is a
+            bare shortcode with no real word - leafScorable); a mis-shelved folder
+            naming another book by the same author otherwise mints a confident match,
+            and a search verdict becomes books.work_id, which the contributing stage
+            attaches sidecars to. A wider query also retrieves the right SERIES and
+            the wrong volume - titleTokens drops pure numbers, so book 1's card is a
+            perfect title match for "The Wandering Inn - 7" - so an accept is VETOED
+            when the card's series position disagrees with the volume the book claims
+            (its series-position tag, else a trailing number or "Book N" marker in the
+            title), or when the accepting rung dropped a number the scored title
+            carried and the card states no position at all; the walk then continues.
+            NARRATOR EVIDENCE is not a second pass: the book's narrators ride the
+            match.Query and each card's ride its match.Book, and pkg/match's person
+            gate accepts author<->author, query-author<->card-narrator and
+            query-narrator<->card-author in ONE Best call (a shelf routinely credits
+            the narrator as the author). Coverage.ApplyContributed is
+            the read-time repair of a FROZEN verdict: it is resolved once per scan
+            and cached, so a work this daemon has since contributed kept reporting
+            "needed" - GET /scans folds the contributions table through
+            store.LandedCoverage (merged/already_covered only) and patches a KNOWN
+            verdict additively, and ONLY when the book's work_id agrees with the
+            verdict's (contributions made under another work - a core-flow slug, a
+            later manual match - must not stamp this work's badges); the book view
+            applies the same patch so the two endpoints cannot disagree. Scans STREAM:
             the manager drives pkg/scan's OnProgress/OnBook hooks, books appear
             incrementally (identity provisional until done - the corroborated,
             sorted final list replaces the array), coverage resolves in a bounded
@@ -759,12 +790,7 @@ internal/
             set + readmit), GET /books/{id}/export (zip via injected
             pipeline.ExportArchive), bookView.contribution (aggregate chip) +
             bookDetail.contributions (rows), and the contrib.update SSE event; all
-            new endpoints have allowed + denied auth tests. Post-M9 round:
-            handleGetScan feeds store.ContributedKinds (merged/already_covered
-            rows) through metaops.PatchContributedCoverage - the PATCH POLICY
-            (known-identity gate, set-only flags) lives in metaops, the handler
-            only wires the data - so a work this daemon contributed stops
-            reporting its sidecars as needed.
+            new endpoints have allowed + denied auth tests.
   web/      go:embed of the SPA (build-tag selected) + SPA-fallback static serving
   server/   http.Server wiring, graceful shutdown, the startup banner
 web/          the SPA: Vite + React 19 + TS + Tailwind v4 (npm, Node 24); dist/ is embedded

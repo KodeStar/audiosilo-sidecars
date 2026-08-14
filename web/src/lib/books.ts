@@ -10,7 +10,6 @@ import type {
   QueueStatsEvent,
   StageProgressEvent,
 } from '@/api/types';
-import { isDoneState } from '@/lib/pipelineState';
 import { MAINLINE_AUDIO, OFF_MAINLINE_AFTER, mainlineFor } from '@/lib/timeline';
 
 // applyBookState patches the matching book's state + lane + status + error +
@@ -183,9 +182,12 @@ export function pruneBookEventCounts(
   return next;
 }
 
-// isDone reports whether a book has reached the terminal state.
-export function isDone(book: BookView): boolean {
-  return isDoneState(book.state);
+// isDone reports whether a book has reached the terminal state. It takes just the
+// state so the Library tab's scan candidates - which carry a pipeline_book ref,
+// not a full BookView - ask the same question through the same predicate; there
+// is one spelling of what "finished" means.
+export function isDone(book: { state: string }): boolean {
+  return book.state === 'done';
 }
 
 // A control action the UI can invoke on a book.

@@ -530,7 +530,11 @@ func TestSplitRetriesInterruptedSourceRead(t *testing.T) {
 	if wall < splitTransientRetryDelay {
 		t.Fatalf("stage returned in %s, less than the one backoff it should have slept", wall)
 	}
-	if res.RateSample.Seconds >= splitTransientRetryDelay.Seconds() {
+	// Relative to wall, not an absolute budget: the sample is the productive window
+	// minus the slept backoff, so with the subtraction it can never exceed wall minus
+	// one backoff - however slow a loaded CI machine makes the fixture itself - while
+	// without the subtraction it carries the backoff and lands within a backoff of wall.
+	if res.RateSample.Seconds > (wall - splitTransientRetryDelay).Seconds() {
 		t.Errorf("rate sample = %.3fs over a %s wall clock: the retry backoff was charged to the split rate",
 			res.RateSample.Seconds, wall)
 	}

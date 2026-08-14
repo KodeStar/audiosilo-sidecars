@@ -6,10 +6,11 @@ import type {
   BookCandidate,
   BookCreateResult,
   Coverage,
+  PipelineBookRef,
   ScannedBook,
   SetOverrideBody,
 } from '@/api/types';
-import { isDoneState } from '@/lib/pipelineState';
+import { isDone } from './books';
 
 // The two expressive-layer dimensions the tool contributes.
 export type CoverageDimension = 'characters' | 'recaps';
@@ -107,16 +108,21 @@ export function filterCandidates(
 ): ScannedBook[] {
   return books.filter((b) => {
     if (b.hidden && !opts.includeHidden) return false;
-    if (opts.excludeCovered && (isCovered(b) || isPipelineDone(b))) return false;
+    if (opts.excludeCovered && (isCovered(b) || isPipelineDone(b.pipeline_book))) return false;
     return true;
   });
 }
 
 // isPipelineDone reports whether this daemon already processed the book to the
-// terminal state - the same field (and the shared isDoneState predicate) that
-// CandidateRow's "Completed" badge keys on.
-function isPipelineDone(b: ScannedBook): boolean {
-  return isDoneState(b.pipeline_book?.state);
+// terminal state. Completion is the pipeline STATE ("done", state.Done in Go);
+// pipeline_book.status carries the exceptional flag instead ('' while running,
+// else paused / needs_attention / failed), so it never reads "done".
+//
+// It delegates to the Running board's isDone rather than re-spelling the
+// comparison, and is exported because CandidateRow's "Completed" badge asks the
+// same question - one predicate, one meaning of finished, across all three.
+export function isPipelineDone(pipelineBook: PipelineBookRef | undefined): boolean {
+  return pipelineBook !== undefined && isDone(pipelineBook);
 }
 
 // hiddenBooks returns just the books the user has hidden (for the "Show hidden

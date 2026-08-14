@@ -34,21 +34,6 @@ export const LABELS: Record<string, string> = {
   done: 'Done',
 };
 
-// DONE_STATE is the terminal pipeline state token (state.Done in Go). The status
-// field never carries it - it holds the exceptional flag instead ('' while
-// running, else paused / needs_attention / failed) - so completion is always a
-// STATE test. Deliberately module-private: isDoneState is the single entry point,
-// so no caller can re-implement the comparison.
-const DONE_STATE = 'done';
-
-// isDoneState reports whether a served pipeline state is the terminal one. One
-// predicate so the Running board, the Done board and the Library candidate rows
-// cannot drift on what "finished" means. Accepts undefined for the optional
-// pipeline_book.state a scan candidate carries.
-export function isDoneState(state: string | undefined): boolean {
-  return state === DONE_STATE;
-}
-
 // normalizeLane maps a served lane token to the styling key, treating the empty
 // waypoint lane (and anything unrecognized) as 'none'.
 export function normalizeLane(lane: string): Lane {
@@ -91,7 +76,7 @@ const LANE_CHIP: Record<Lane, string> = {
 // served lane with special cases for the ready and done waypoints. lane is the
 // daemon-provided lane token (bookView.lane); '' waypoints fall back to 'none'.
 export function stateChipClass(state: string, lane: string): string {
-  if (isDoneState(state)) return 'border-success/40 bg-success/10 text-success';
+  if (state === 'done') return 'border-success/40 bg-success/10 text-success';
   if (state === 'ready') return 'border-amber-500/40 bg-amber-500/10 text-amber-300';
   return LANE_CHIP[normalizeLane(lane)];
 }

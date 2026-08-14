@@ -161,6 +161,11 @@ type BookTracking struct {
 	SourcePath string
 	State      string
 	Status     string
+	// WorkID is the upstream work this book's contributions were made under (empty
+	// until one is resolved). The scan join needs it to tell a landed contribution
+	// that belongs to the candidate's matched work from one made under a different
+	// work entirely - a core-flow slug, or a human's later manual match.
+	WorkID string
 }
 
 // NewBook is the input to CreateBook: the identity/metadata fields a caller
@@ -397,11 +402,11 @@ func (db *DB) ListBooks(ctx context.Context) ([]Book, error) {
 }
 
 // ListBookTracking returns every persisted book keyed by its unique source path.
-// It deliberately selects only the four fields the Library scan join needs: scan
+// It deliberately selects only the few fields the Library scan join needs: scan
 // polling can be frequent, and decoding the full authors/coverage JSON for the
 // entire queue on every poll would be wasted work.
 func (db *DB) ListBookTracking(ctx context.Context) (map[string]BookTracking, error) {
-	rows, err := db.sql.QueryContext(ctx, `SELECT id, source_path, state, status FROM books`)
+	rows, err := db.sql.QueryContext(ctx, `SELECT id, source_path, state, status, work_id FROM books`)
 	if err != nil {
 		return nil, err
 	}
@@ -409,7 +414,8 @@ func (db *DB) ListBookTracking(ctx context.Context) (map[string]BookTracking, er
 	out := map[string]BookTracking{}
 	for rows.Next() {
 		var tracked BookTracking
-		if err := rows.Scan(&tracked.ID, &tracked.SourcePath, &tracked.State, &tracked.Status); err != nil {
+		if err := rows.Scan(&tracked.ID, &tracked.SourcePath, &tracked.State, &tracked.Status,
+			&tracked.WorkID); err != nil {
 			return nil, err
 		}
 		out[tracked.SourcePath] = tracked

@@ -70,6 +70,17 @@ func (a *API) handleCreateScan(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, createScanResponse{JobID: jobID})
 }
 
+// anyTracked reports whether any scanned candidate is a book this daemon already
+// has, which is the only case the contribution join can change anything in.
+func anyTracked(books []metaops.ScannedBook, tracked map[string]store.BookTracking) bool {
+	for i := range books {
+		if _, ok := tracked[books[i].SourcePath]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *API) handleGetScan(w http.ResponseWriter, r *http.Request) {
 	job, ok := a.scans.Get(r.PathValue("id"))
 	if !ok {
@@ -81,33 +92,32 @@ func (a *API) handleGetScan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not read queued books")
 		return
 	}
-	// patchable records whether any candidate could actually be repaired below: a
-	// patch needs a tracked book AND a known-identity coverage verdict, and this loop
-	// is where both are already in hand.
-	patchable := false
+	// Nothing to join against until a scanned candidate is actually queued here, and
+	// this endpoint is polled every ~700ms during a scan - so the contributions read
+	// is skipped entirely for the common case of a library with no local books.
+	var contribByBook map[int64][]store.Contribution
+	if anyTracked(job.Books, tracked) {
+		// The contributions table is the local record of what has landed upstream; it
+		// repairs each candidate's frozen scan-time coverage verdict on read, rather
+		// than making the user rescan (see Coverage.ApplyContributed). One query for
+		// the whole table - a per-book read would be an N+1.
+		// Degrade, never fail: the patch is a cosmetic repair of stale badges, and a
+		// transient read error (lock contention, shutdown) must not break the poll
+		// that keeps the whole candidate list on screen. nil rows simply leave every
+		// verdict unpatched until the next tick.
+		contribByBook, _ = a.store.ContributionsByBook(r.Context())
+	}
 	for i := range job.Books {
-		book, exists := tracked[job.Books[i].SourcePath]
+		sb := &job.Books[i]
+		book, exists := tracked[sb.SourcePath]
 		if !exists {
 			continue
 		}
-		job.Books[i].PipelineBook = &metaops.PipelineBookRef{
+		sb.PipelineBook = &metaops.PipelineBookRef{
 			ID: book.ID, State: book.State, Status: book.Status,
 		}
-		patchable = patchable || job.Books[i].Coverage.Known
-	}
-	// Repair each candidate's frozen scan-time coverage from what this daemon has
-	// already contributed (metaops owns that rule). The whole-table read is skipped
-	// when nothing could be patched: this endpoint is polled every ~700ms while the
-	// Library tab is open. A read failure (a transient lock, a shutdown) serves the
-	// scan UNPATCHED rather than 500ing - stale badges beat a broken poll, and this
-	// endpoint answered without touching contributions at all until the patch existed.
-	if patchable {
-		if contributed, err := a.store.ContributedKinds(r.Context()); err == nil {
-			metaops.PatchContributedCoverage(job.Books, func(bookID int64) (bool, bool) {
-				kinds := contributed[bookID]
-				return kinds[store.ContribKindCharacters], kinds[store.ContribKindRecaps]
-			})
-		}
+		chars, recaps := store.LandedCoverage(contribByBook[book.ID])
+		sb.Coverage.ApplyContributed(book.WorkID, chars, recaps)
 	}
 	writeJSON(w, http.StatusOK, job)
 }
@@ -501,7 +511,8 @@ func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64
 		IdentitySources: idsrc, WorkID: b.WorkID,
 		State: b.State, Lane: string(state.LaneOf(state.State(b.State))),
 		QueueGroup: queue.Group, QueueBucket: queue.Bucket, QueuePosition: queue.Position, QueueActive: queue.Active,
-		Status: b.Status, Error: b.Error, ParkCode: b.ParkCode, RetryAt: b.RetryAt, Coverage: b.Coverage,
+		Status: b.Status, Error: b.Error, ParkCode: b.ParkCode, RetryAt: b.RetryAt,
+		Coverage:   patchedCoverage(b.Coverage, b.WorkID, contribRows),
 		ETASeconds: etaSeconds, StartedAt: startedAt,
 		Timing: timing, ActiveAgentInvocations: activeInvocations, MaxAgentsPerBook: maxAgentsPerBook, SeriesBlockedBy: seriesBlockedBy, FanoutSupported: state.SupportsAgentFanout(state.State(b.State)),
 		CurrentWorkUnits: current, CompletedWorkUnits: completed, RemainingWorkUnits: remaining,
@@ -510,6 +521,33 @@ func buildBookView(b store.Book, progress []store.Progress, totalCostUSD float64
 		TotalCostUSD: totalCostUSD, Contribution: contribution,
 		CreatedAt: b.CreatedAt, UpdatedAt: b.UpdatedAt,
 	}
+}
+
+// patchedCoverage folds this daemon's landed contributions into the book's stored
+// coverage blob, so the book view tells the same story the Library scan does (the
+// verdict was frozen when the book was enqueued). It is deliberately conservative:
+// an unreadable or unchanged blob is returned BYTE-IDENTICAL, because re-encoding
+// a document written by another version could silently drop a field this one does
+// not know about.
+func patchedCoverage(raw json.RawMessage, workID string, rows []store.Contribution) json.RawMessage {
+	chars, recaps := store.LandedCoverage(rows)
+	if len(raw) == 0 || (!chars && !recaps) {
+		return raw
+	}
+	var cov metaops.Coverage
+	if err := json.Unmarshal(raw, &cov); err != nil {
+		return raw
+	}
+	hadChars, hadRecaps := cov.HasCharacters, cov.HasRecaps
+	cov.ApplyContributed(workID, chars, recaps)
+	if cov.HasCharacters == hadChars && cov.HasRecaps == hadRecaps {
+		return raw
+	}
+	patched, err := json.Marshal(cov)
+	if err != nil {
+		return raw
+	}
+	return patched
 }
 
 type listBooksResponse struct {

@@ -638,63 +638,44 @@ func TestScanManagerRealScanFixtureStable(t *testing.T) {
 	}
 }
 
-// TestPatchContributedCoverage pins the two rules of the read-time coverage
-// repair: only a candidate with BOTH a persisted pipeline book and a KNOWN
-// verdict is patched (an unidentified book must keep saying "unknown"), and only
-// the two has_* flags are ever set - never cleared, and never any other field.
-func TestPatchContributedCoverage(t *testing.T) {
-	books := []ScannedBook{
-		// 0: known + tracked + both landed.
-		{Path: "landed", PipelineBook: &PipelineBookRef{ID: 1},
-			Coverage: Coverage{Available: true, Known: true, WorkID: "w1", MatchedBy: "asin"}},
-		// 1: known + tracked, only characters landed.
-		{Path: "half", PipelineBook: &PipelineBookRef{ID: 2},
-			Coverage: Coverage{Available: true, Known: true, WorkID: "w2"}},
-		// 2: tracked but NOT known - the gate.
-		{Path: "unknown", PipelineBook: &PipelineBookRef{ID: 3},
-			Coverage: Coverage{Available: true, Known: false}},
-		// 3: known but never enqueued, so there is nothing to look up.
-		{Path: "untracked", Coverage: Coverage{Available: true, Known: true, WorkID: "w4"}},
-		// 4: upstream already had recaps; a lookup miss must not clear the flag.
-		{Path: "preserve", PipelineBook: &PipelineBookRef{ID: 5},
-			Coverage: Coverage{Available: true, Known: true, WorkID: "w5", HasRecaps: true}},
+// TestPathHints pins the two path strings the query ladder falls back to,
+// including the ebook case: an ebook-only candidate's source path is the .epub
+// FILE, and reading its filename left both hints one level off.
+func TestPathHints(t *testing.T) {
+	sep := string(filepath.Separator)
+	for _, tc := range []struct {
+		name           string
+		path           string
+		folder, parent string
+	}{
+		{
+			name:   "audiobook folder",
+			path:   filepath.Join(sep+"lib", "Selkie Myth", "Beneath the Dragoneye Moons", "BDM01 - Oathbound Healer"),
+			folder: "BDM01 - Oathbound Healer", parent: "Beneath the Dragoneye Moons",
+		},
+		{
+			name:   "epub inside its book folder",
+			path:   filepath.Join(sep+"lib", "Series Name", "BDM01 - Title", "book.epub"),
+			folder: "BDM01 - Title", parent: "Series Name",
+		},
+		{
+			// Case-insensitive, like the discovery walk that produced the path.
+			name:   "epub extension is matched case-insensitively",
+			path:   filepath.Join(sep+"lib", "Series Name", "BDM01 - Title", "Book.EPUB"),
+			folder: "BDM01 - Title", parent: "Series Name",
+		},
+		{
+			name:   "a book at the filesystem root has no parent to query",
+			path:   sep + "Lone Book",
+			folder: "Lone Book", parent: "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			folder, parent := pathHints(tc.path)
+			if folder != tc.folder || parent != tc.parent {
+				t.Fatalf("pathHints(%q) = (%q, %q), want (%q, %q)",
+					tc.path, folder, parent, tc.folder, tc.parent)
+			}
+		})
 	}
-	var asked []int64
-	PatchContributedCoverage(books, func(bookID int64) (bool, bool) {
-		asked = append(asked, bookID)
-		switch bookID {
-		case 1:
-			return true, true
-		case 2:
-			return true, false
-		case 3:
-			return true, true // would patch, if the known gate let it through
-		default:
-			return false, false
-		}
-	})
-
-	want := []struct{ chars, recaps bool }{
-		{true, true}, {true, false}, {false, false}, {false, false}, {false, true},
-	}
-	for i, w := range want {
-		if books[i].Coverage.HasCharacters != w.chars || books[i].Coverage.HasRecaps != w.recaps {
-			t.Errorf("book %q: has_characters=%v has_recaps=%v, want %v/%v",
-				books[i].Path, books[i].Coverage.HasCharacters, books[i].Coverage.HasRecaps,
-				w.chars, w.recaps)
-		}
-	}
-	// The gate is a skip, not a discarded answer: an unknown or untracked book is
-	// never even looked up.
-	if len(asked) != 3 || asked[0] != 1 || asked[1] != 2 || asked[2] != 5 {
-		t.Errorf("looked up %v, want [1 2 5]", asked)
-	}
-	// Nothing else in a patched verdict moved.
-	if books[0].Coverage.WorkID != "w1" || books[0].Coverage.MatchedBy != "asin" ||
-		!books[0].Coverage.Available || !books[0].Coverage.Known {
-		t.Errorf("patch touched a non-flag field: %+v", books[0].Coverage)
-	}
-	// A nil lookup is a no-op, not a panic (the handler skips the query when
-	// nothing could be patched).
-	PatchContributedCoverage(books, nil)
 }

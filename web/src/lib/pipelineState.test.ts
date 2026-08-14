@@ -1,24 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import {
-  isDoneState,
-  normalizeLane,
-  stateChipClass,
-  stateLabel,
-  statusBadge,
-} from './pipelineState';
-
-describe('isDoneState', () => {
-  it('is true only for the terminal state token', () => {
-    expect(isDoneState('done')).toBe(true);
-    expect(isDoneState('contributing')).toBe(false);
-    expect(isDoneState('ready')).toBe(false);
-  });
-
-  it('tolerates an absent state (a scan candidate with no pipeline book)', () => {
-    expect(isDoneState(undefined)).toBe(false);
-    expect(isDoneState('')).toBe(false);
-  });
-});
+import { normalizeLane, stateChipClass, stateLabel, statusBadge } from './pipelineState';
 
 describe('normalizeLane', () => {
   it('passes through the real lanes', () => {

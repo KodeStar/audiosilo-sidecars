@@ -38,12 +38,6 @@ const (
 // and pr_open are the OPEN states the poller advances; merged/closed are terminal;
 // local is an export with no remote lifecycle; already_covered means the dimension
 // already exists upstream so nothing was submitted.
-//
-// merged + already_covered together are the LANDED set: the dimension exists
-// upstream, whether this daemon's contribution was accepted or upstream already had
-// it. Exactly two readers depend on that definition and both spell it with these
-// constants - ContributedKinds' IN list and ContributionSummary's merged rung - so
-// widening the set means editing both.
 const (
 	ContribStatusSubmitted      = "submitted"
 	ContribStatusPROpen         = "pr_open"
@@ -156,39 +150,6 @@ func (db *DB) ContributionsByBook(ctx context.Context) (map[int64][]Contribution
 	return out, rows.Err()
 }
 
-// ContributedKinds returns, per book id, the set of contribution kinds that are
-// LANDED upstream - status merged (this daemon's contribution was accepted) or
-// already_covered (upstream already had that dimension when the stage ran). It is
-// the local truth the Library scan join uses to repair a candidate's coverage
-// verdict: that verdict is resolved once at scan time and frozen into the cached
-// snapshot, so a book this daemon has since contributed keeps reporting "needed".
-// One query for the whole table (like ContributionsByBook) - the join runs on every
-// scan poll, so a per-book read would be an N+1.
-func (db *DB) ContributedKinds(ctx context.Context) (map[int64]map[string]bool, error) {
-	rows, err := db.sql.QueryContext(ctx,
-		`SELECT book_id, kind FROM contributions WHERE status IN (?, ?)`,
-		ContribStatusMerged, ContribStatusAlreadyCovered)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	out := map[int64]map[string]bool{}
-	for rows.Next() {
-		var bookID int64
-		var kind string
-		if err := rows.Scan(&bookID, &kind); err != nil {
-			return nil, err
-		}
-		kinds, ok := out[bookID]
-		if !ok {
-			kinds = map[string]bool{}
-			out[bookID] = kinds
-		}
-		kinds[kind] = true
-	}
-	return out, rows.Err()
-}
-
 // ListOpenContributions returns every contribution still in an OPEN state
 // (submitted or pr_open) across all books - the poller's work list. Each row carries
 // its book_id so the poller can advance the book without a second lookup.
@@ -285,7 +246,7 @@ func ContributionSummary(rows []Contribution) (status, url string) {
 	if r, ok := firstWithStatus(rows, ContribStatusPROpen); ok {
 		return ContribStatusPROpen, contribURL(r)
 	}
-	if allStatus(rows, ContribStatusMerged, ContribStatusAlreadyCovered) {
+	if allStatus(rows, landedStatuses...) {
 		if r, ok := firstWithStatus(rows, ContribStatusMerged); ok {
 			return ContribStatusMerged, contribURL(r)
 		}
@@ -293,6 +254,36 @@ func ContributionSummary(rows []Contribution) (status, url string) {
 	}
 	// all local, or any mixed remainder: least-committal chip.
 	return ContribStatusLocal, ""
+}
+
+// landedStatuses are the statuses meaning the dimension EXISTS UPSTREAM: this
+// daemon's contribution merged, or upstream already had it when the stage ran.
+// They are two directions on one fact, which is why ContributionSummary folds
+// them onto a single rung and LandedCoverage counts both - one spelling, so a
+// later status can never be added to one reader and forgotten in the other.
+var landedStatuses = []string{ContribStatusMerged, ContribStatusAlreadyCovered}
+
+// LandedCoverage folds a book's contribution rows into the two sidecar dimensions
+// that have landed upstream. Pure, for the same reason ContributionSummary is: the
+// Library scan join calls it per book on every poll and it needs no round-trip,
+// and the rule it encodes is worth testing without a database.
+//
+// Only the two SIDECAR kinds count. A core row is an add-work proposal - merging
+// it creates the work, and says nothing about whether its characters or recaps
+// exist.
+func LandedCoverage(rows []Contribution) (hasCharacters, hasRecaps bool) {
+	for _, r := range rows {
+		if !slices.Contains(landedStatuses, r.Status) {
+			continue
+		}
+		switch r.Kind {
+		case ContribKindCharacters:
+			hasCharacters = true
+		case ContribKindRecaps:
+			hasRecaps = true
+		}
+	}
+	return hasCharacters, hasRecaps
 }
 
 // ContributionNeedsAttention reports whether any contribution row carries a

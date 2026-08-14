@@ -191,9 +191,12 @@ v0.8.0). Post-milestone rounds followed: UX/observability, spelling-cost,
 reliability (the two bounded loops learned to ACCEPT; availability
 self-resume via retry_at; per-book budget; superseded stage_runs), fact-pass
 cost (bounded map-reduce), canonical-spelling (reference-match pre-pass +
-series glossary), and library-matching + network-source (the metaops search
-retrieval ladder + narrator evidence + path hints; staged local split source,
-source-IO serialization, one serial ASR slot, transient-EINTR retry). The
+series glossary), and library-matching + network-source (the metaops
+ladder.go retrieval ladder + narrator evidence in the SHARED matcher [server
+PR #40] + path hints, 510 unknown -> 45 over the live library; read-time
+contribution folding into frozen scan verdicts; staged local split source,
+source-IO serialization, one serial ASR slot, transient-EINTR retry,
+time-bounded splits). The
 detailed milestone log - what each landed, the live incidents behind the
 invariants, and the verification evidence - lives in [HISTORY.md](HISTORY.md);
 read the entries for any stage or era you are working near.

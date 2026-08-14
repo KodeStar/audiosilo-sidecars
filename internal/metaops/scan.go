@@ -129,41 +129,6 @@ type PipelineBookRef struct {
 	Status string `json:"status"`
 }
 
-// ContributedLookup reports, for one persisted pipeline book, whether this
-// daemon's characters/recaps contributions have LANDED upstream. It is a plain
-// func seam (the same precedent as the override PersistFunc) so the decision below
-// lives in metaops without metaops importing the store.
-type ContributedLookup func(bookID int64) (characters, recaps bool)
-
-// PatchContributedCoverage repairs each candidate's coverage verdict from what
-// this daemon has already contributed. A scan resolves that verdict ONCE and
-// freezes it into the cached snapshot, so a work whose sidecars have since landed
-// keeps reporting them as needed - stale badges, and "exclude already covered"
-// fails to drop the book. The local contributions record is the authoritative
-// truth about what landed, so the repair happens on read rather than making the
-// user rescan (which the coverage TTL caches would not necessarily fix either).
-//
-// Two rules are load-bearing. A candidate is patched only when it maps to a
-// persisted pipeline book AND its coverage is KNOWN: with no resolved work the
-// badges honestly say "unknown", and claiming a dimension against an unidentified
-// book would be a guess. And only the two has_* flags are ever SET - never
-// cleared, and nothing else in the verdict is touched, because upstream stays the
-// authority on everything else.
-func PatchContributedCoverage(books []ScannedBook, landed ContributedLookup) {
-	if landed == nil {
-		return
-	}
-	for i := range books {
-		ref := books[i].PipelineBook
-		if ref == nil || !books[i].Coverage.Known {
-			continue
-		}
-		characters, recaps := landed(ref.ID)
-		books[i].Coverage.HasCharacters = books[i].Coverage.HasCharacters || characters
-		books[i].Coverage.HasRecaps = books[i].Coverage.HasRecaps || recaps
-	}
-}
-
 // ScanProgress is the fine-grained progress of a scan job. The folder walk drives
 // groups_done/groups_total (one group per directory); coverage resolution drives
 // coverage_done/coverage_total; books_found grows as books stream in. The phase
@@ -836,19 +801,24 @@ func bookIdentityOf(sb ScannedBook) BookIdentity {
 	}
 }
 
-// pathHints returns the book folder's own name and its parent's. An ebook-only
-// candidate's source path is the .epub FILE, so that extension is stripped - the
-// leaf is still the title. A root-level book reports no parent rather than "/".
+// pathHints returns the book folder's own name and its parent's - the two path
+// strings the query ladder falls back to. sourcePath is the canonical absolute
+// source path (Start resolves the scan root, and every candidate path is joined
+// onto it), so there is nothing to trim or re-normalize here.
+//
+// An ebook-only candidate's source path is the .epub FILE, so the hints are taken
+// one level up: the folder holding the epub is the book folder, exactly as it is
+// for an audiobook. Reading the filename instead put both hints one level off -
+// the leaf became the file's own name and the parent became the book folder,
+// so the "series name" rung queried a book title.
 func pathHints(sourcePath string) (folder, parent string) {
-	p := strings.TrimSpace(sourcePath)
-	if p == "" {
-		return "", ""
+	dir := sourcePath
+	if ebook.IsEpub(dir) {
+		dir = filepath.Dir(dir)
 	}
-	folder = filepath.Base(p)
-	if ebook.IsEpub(folder) {
-		folder = strings.TrimSuffix(folder, filepath.Ext(folder))
-	}
-	parent = filepath.Base(filepath.Dir(p))
+	folder = filepath.Base(dir)
+	parent = filepath.Base(filepath.Dir(dir))
+	// A book directly under the filesystem root has no parent worth querying.
 	if parent == "." || parent == string(filepath.Separator) {
 		parent = ""
 	}

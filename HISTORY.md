@@ -470,58 +470,70 @@ Milestones from the workspace plan; each is shippable.
   volumes ship `Chapter 9: Toren`, others a bare `001..027` table.
 
 - **Post-M9 library-matching + network-source round (done):** the first drive
-  against a real 1147-book SMB library, in two halves.
+  against a real 1147-book SMB library, in two halves landed as two lines of
+  work (the matching half merged as PR #5; the network-source half followed on
+  main).
   **Matching** - 510 books resolved no coverage, and the dominant cause was
   RETRIEVAL, not scoring: the upstream FTS index matches the words it is given,
-  so a decorated shelf title ("Supermage : Rise To Omniscience, Book 1") retrieves
-  nothing even when the work exists under a clean title. `metaops.searchLadder` is
-  the fix: an ordered, de-duplicated 9-rung query ladder (raw title first so an
-  already-resolving book still costs one request; punctuation-normalized;
-  CleanTitle; pre-subtitle; post-separator; trailing-volume stripped; clean
-  title + author; then the PATH HINTS - folder leaf and parent dir, which carry
-  the identity a shortcode tag like "RO07" lacks). Matching stays `match.Best`'s
-  decision - a wider query can surface a work but never lower the acceptance bar -
-  with one widening: `bestByNarrator` substitutes a card's author into the query
-  when narrator evidence links the records (a shelf that tags the narrator as the
-  author, or an author narrating his own book), because match.Best's author gate
-  otherwise rejects the correct card outright. `BookIdentity` gained
-  Narrators/FolderName/ParentDir (in the scan fingerprint too), one cached verdict
-  covers the whole ladder, and the web candidate search haystack now includes the
-  relative path. The Library scan also patches its frozen scan-time coverage from
-  the local contributions table on read (`store.ContributedKinds` ->
-  `metaops.PatchContributedCoverage`, wired by handleGetScan;
-  merged/already_covered only, known-identity candidates only) so a
-  book this daemon contributed stops reporting "needed", and "exclude already
-  covered" additionally drops books the pipeline itself ran to done.
-  **Network-source reliability** - macOS's SMB client wedges under concurrent or
-  rapid random access, which one 60-chapter marker book can trigger alone. Split
-  now STAGES the source m4b into the work dir first (one sequential copy, atomic
-  rename, reused across a failed split's retry, removed on success) so every
-  per-chapter ffmpeg open is local; a narrowly-classified transient EINTR from a
-  FUSE/Nextcloud source retries the resumable split in-place (3 attempts) instead
-  of failing the book; the split runs under the shared stage heartbeat
-  (`runWithStageHeartbeat`, generalized from the ASR one) so the supervisor no
-  longer kills a slow chapter conversion mid-file. The scheduler serializes
-  source-reading mechanical stages (inspect/split/extract) to one worker
-  (`sourceIOCapacity`) while work-dir-only stages keep the second slot, and the
-  ASR lane's separate corrective slot is GONE: full-book and corrective
-  transcription share the one serial MLX worker (overlapping decodes pushed the
-  second process into the OOM killer on unified-memory Macs), with corrective
-  work taking priority when the slot frees. Supporting fixes: `agent.isRateLimit`
-  no longer treats a bare "429" as a rate limit (RFC3339 fractional seconds
-  contain those digits - a timestamped log line misclassified a validation
-  failure), requiring protocol/error context instead; `runCLI` bounds Cmd.Wait
-  with a 5s WaitDelay so a detached CLI helper holding the inherited stdout pipe
-  cannot hang a finished stage, treating ErrWaitDelay as success; the supervisor
-  grants a 90s `processExitGrace` (it must outlast the 60s stage-run heartbeat
-  cadence it is measured against) before classifying a just-exited child as a
-  disappeared process, and `collectArtifactStatuses` trusts an OPEN stage run over
-  a stale book-state snapshot (the scheduler can advance the state between the two
-  reads). Prompt hardening: audit/audit_verify/fix now state that the ledger's
-  `Unresolved / do-not-publish-clean` section is the one hard override - a fact
-  note can support a name the ledger omits, but can never promote a surface form
-  the ledger explicitly marks unresolved, and preserving a neutral role label is
-  the correct resolution. `validateMarkersManifest` accepts adjacent per-marker
-  exclusion declarations whose gap-free union covers one coalesced unmapped span
-  (`exclusionsCover`) - the verdict schema asks for per-marker declarations, so
-  demanding one coarse declaration rejected the more precise correct verdict.
+  so a decorated shelf title ("Supermage : Rise To Omniscience, Book 1")
+  retrieves nothing even when the work exists under a clean title.
+  `internal/metaops/ladder.go` is the fix: 9 ordered, de-duplicated query
+  shapes per unresolved book (raw title first and ALWAYS - the length floor
+  applies only to DERIVED rungs, so a book called "It" still searches;
+  punctuation-normalized; CleanTitle; pre-subtitle; post-separator tail;
+  trailing-volume stripped; title+author; folder-leaf and parent-dir PATH
+  hints), early exit at the first rung `match.Best` accepts, a
+  leaf-scoring contradiction guard, and a VOLUME VETO so widened retrieval can
+  never accept a sibling volume. Narrator evidence rides `match.Query`/
+  `match.Book` into the SHARED matcher (audiosilo-server matching overhaul,
+  server PR #40, module pin bumped) - shelves that credit the narrator as the
+  author resolve in one Best call, no local mirror of the person-name rule.
+  Replayed over the live library: 510 unknown -> 45 unmatched (91% rescued).
+  Coverage staleness: scan verdicts are frozen at scan time, so books this
+  daemon contributed kept reporting "needed" - GET /scans and the book view
+  fold the contributions table in at read time (`store.LandedCoverage` +
+  `Coverage.ApplyContributed`, gated on work-id agreement so a contribution
+  merged under a different work never stamps another work's badges; the read
+  degrades to unpatched badges on a transient store error rather than breaking
+  the 700ms poll). The Library search matches the relative path, "exclude
+  already covered" also drops books the pipeline itself finished, and the
+  manual-match picker retries punctuation-normalized queries.
+  **Network-source reliability** - macOS's SMB client wedges under concurrent
+  or rapid random access, which one 60-chapter marker book can trigger alone.
+  Split now STAGES the source m4b into the work-dir split-source/ directory
+  (one sequential 4MB-buffered copy, atomic rename, size-freshness-checked
+  reuse across a failed split's retry, skipped when every chapter is already
+  cut, scratch-registered so a failed split's copy is reclaimable, DEGRADES to
+  direct reads when staging fails) so every per-chapter ffmpeg open is local;
+  a narrowly-classified transient EINTR from a FUSE/Nextcloud source
+  (`audio.IsTransientSourceErr`) retries the resumable split in-place; the
+  split runs under the shared stage heartbeat (`runWithStageHeartbeat`,
+  generalized from the ASR one) with both halves TIME-BOUNDED (per-chapter
+  max(10min, 2x audio duration), staging max(15min, size-derived) - mirroring
+  asrChapterDecodeBound) so a wedged mount is a loud failure, not an invisible
+  hang; and the split RateSample excludes staging and backoff. The scheduler
+  serializes source-reading mechanical stages to one worker (the state.Def
+  SourceIO column via `state.ReadsSource`) while work-dir-only stages keep the
+  second mechanical slot, and the ASR lane's separate corrective slot is GONE:
+  full-book and corrective transcription share the one serial MLX worker
+  (overlapping decodes pushed the second process into the OOM killer on
+  unified-memory Macs), corrective work taking priority when the slot frees.
+  The ETA queue simulation models both (`LaneCaps.MechanicalSourceIO`).
+  Supporting fixes: `agent.isRateLimit` no longer treats a bare "429" as a
+  rate limit (RFC3339 fractional seconds and usage counters contain those
+  digits - a timestamped log line misclassified a validation failure) while
+  still catching the JSON/`status_code=429` shapes; `runCLI` bounds Cmd.Wait
+  with a 5s WaitDelay so a detached CLI helper holding the inherited stdout
+  pipe cannot hang a finished stage; the supervisor grants a 90s
+  `processExitGrace` (it must outlast the 60s stage-run heartbeat cadence it
+  is measured against) before classifying a just-exited child as a
+  disappeared process, and `collectArtifactStatuses` trusts an OPEN stage run
+  over a stale book-state snapshot. Prompt hardening: audit/audit_verify/fix
+  now state that the ledger's `Unresolved / do-not-publish-clean` section is
+  the one hard override - a fact note can support a name the ledger omits but
+  can never promote a surface form the ledger explicitly marks unresolved -
+  pinned by a prompts drift-guard test alongside auditJSONPrompts.
+  `validateMarkersManifest` accepts adjacent per-marker exclusion declarations
+  whose gap-free union covers one coalesced unmapped span (`exclusionsCover`).
+  Gate: /simplify (4 angles) and /code-review --fix (8 angles, adversarially
+  verified) applied over the round; full Go and web gates green.

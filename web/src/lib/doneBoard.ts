@@ -7,14 +7,14 @@
 import type { BookView, ContributionRow, ContributionSummary, StageRun } from '@/api/types';
 import { compareByTimestampDesc } from '@/lib/books';
 import { formatDuration } from '@/lib/duration';
-import { isDoneState, stateLabel } from '@/lib/pipelineState';
+import { stateLabel } from '@/lib/pipelineState';
 import { parseTimestamp } from '@/lib/time';
 
 // filterDoneBooks keeps only terminal (done) books and orders them newest-finished
 // first (by updated_at, id-tiebroken). Returns a new array; does not mutate.
 export function filterDoneBooks(books: BookView[]): BookView[] {
   return books
-    .filter((b) => isDoneState(b.state))
+    .filter((b) => b.state === 'done')
     .sort((a, b) => compareByTimestampDesc(a.updated_at, b.updated_at, a.id, b.id));
 }
 

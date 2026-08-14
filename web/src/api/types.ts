@@ -338,6 +338,11 @@ export interface MetaSearchResult {
   id: string;
   title: string;
   authors: string[];
+  // The card's narrator credits, omitted by the daemon when it has none. The
+  // picker does not render them; they are mirrored because the daemon's matcher
+  // gate reads them, and a hand-mirrored wire shape that quietly omits a field
+  // drifts.
+  narrators?: string[];
   series: MetaSearchSeries | null;
   cover_url: string;
 }

@@ -18,8 +18,8 @@ github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs
 github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
 github.com/kodestar/audiosilo-meta v0.8.0 h1:P0OSSDsYiAMFN91SjRTfyNiWT13uNKAuqqEcCHl1Tzk=
 github.com/kodestar/audiosilo-meta v0.8.0/go.mod h1:MHKzPmqvds6NNjWSabMtlsvjHTXSYaQE4EnDEEtOKnY=
-github.com/kodestar/audiosilo-server v1.11.1-0.20260716193339-91486c3e1819 h1:mFR1jLTNQND+QoKMyTpqQAvfaW0pS9YlsRS1zyHF61s=
-github.com/kodestar/audiosilo-server v1.11.1-0.20260716193339-91486c3e1819/go.mod h1:v87mwd3ZYGG6behRUFT9sugkqJtZbUOTqbhg7F2pnPM=
+github.com/kodestar/audiosilo-server v1.12.1-0.20260813222639-6a1c4142a8ad h1:KHuPTBEqY0LszMz29t8ml5W/r7I2E0E57ScEv7I5GRg=
+github.com/kodestar/audiosilo-server v1.12.1-0.20260813222639-6a1c4142a8ad/go.mod h1:v87mwd3ZYGG6behRUFT9sugkqJtZbUOTqbhg7F2pnPM=
 github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
 github.com/ncruces/go-strftime v1.0.0 h1:HMFp8mLCTPp341M/ZnA4qaf7ZlsbTc+miZjCLOFAw7w=
