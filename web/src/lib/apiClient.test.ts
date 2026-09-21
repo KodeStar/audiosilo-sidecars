@@ -197,6 +197,17 @@ describe('ApiClient', () => {
     });
   });
 
+  it('POSTs the acknowledged source paths as new-sighting dismissals', async () => {
+    fetchMock.mockResolvedValue(new Response(null, { status: 204 }));
+    const client = pipelineClient();
+
+    await expect(client.acknowledgeSightings(['/lib/a', '/lib/b'])).resolves.toBeUndefined();
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('/api/v1/library/sightings/acknowledge');
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body as string)).toEqual({ source_paths: ['/lib/a', '/lib/b'] });
+  });
+
   it('GETs meta search with an encoded query', async () => {
     fetchMock.mockResolvedValue(jsonResponse(200, { results: [] }));
     const client = pipelineClient();

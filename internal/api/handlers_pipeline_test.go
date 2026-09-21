@@ -61,7 +61,8 @@ func newPipelineEnv(t *testing.T, libraryRoots []string, opts ...func(*Deps)) *p
 	hub := events.NewHub(64)
 	sched := scheduler.New(db, hub, scheduler.NewStubExecutor(0, 0), 2, t.TempDir(), false)
 	meta := metaops.NewClient(cfg.Metadata.BaseURL)
-	scans := metaops.NewScanManager(context.Background(), meta, "", storeOverrides(db))
+	scans := metaops.NewScanManager(context.Background(), meta, "", storeOverrides(db),
+		metaops.WithSightings(db))
 
 	env := &testEnv{password: pw}
 	deps := Deps{
@@ -976,4 +977,92 @@ func TestPatchedCoverage(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestScanReportsNewBooksAndAcknowledge is the Library "New" view seam: a folder
+// that appeared AFTER the baseline reports is_new, one from the baseline never
+// does, and dismissing a book clears the flag without a rescan. The predicate
+// itself is unit-tested (metaops.ComputeIsNew) - this pins the wiring: the store
+// read, the join order against pipeline_book, and the acknowledge route.
+func TestScanReportsNewBooksAndAcknowledge(t *testing.T) {
+	root := t.TempDir()
+	oldDir := filepath.Join(root, "Author", "01 - Already here")
+	newDir := filepath.Join(root, "Author", "02 - Just appeared")
+	makeShelf(t, oldDir, newDir)
+
+	env := newPipelineEnv(t, []string{root})
+	ctx := context.Background()
+	// The library as it already stood: one baseline sighting, recorded before the
+	// scan runs (exactly what the startup cache seed does).
+	if err := env.db.RecordSightings(ctx, []string{canonicalPath(t, oldDir)}, time.Now().UTC(), true); err != nil {
+		t.Fatalf("seed baseline: %v", err)
+	}
+
+	token := env.login(t)
+	job := scanToDone(t, env, token, root)
+
+	byPath := map[string]metaops.ScannedBook{}
+	for _, b := range job.Books {
+		byPath[b.SourcePath] = b
+	}
+	baselined := byPath[canonicalPath(t, oldDir)]
+	if baselined.IsNew {
+		t.Errorf("baseline candidate reports is_new: %+v", baselined)
+	}
+	if baselined.FirstSeenAt == "" {
+		t.Error("baseline candidate has no first_seen_at")
+	}
+	appeared := byPath[canonicalPath(t, newDir)]
+	if !appeared.IsNew {
+		t.Fatalf("newly-appeared candidate does not report is_new: %+v", appeared)
+	}
+	if appeared.FirstSeenAt == "" {
+		t.Error("new candidate has no first_seen_at")
+	}
+
+	// Dismissing it clears is_new on the very next poll of the SAME job - is_new is
+	// derived at read time, so no rescan is needed.
+	body, _ := json.Marshal(acknowledgeSightingsRequest{SourcePaths: []string{
+		canonicalPath(t, newDir), "/nowhere/at/all",
+	}})
+	resp := env.do(t, http.MethodPost, "/api/v1/library/sightings/acknowledge", token, string(body))
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("acknowledge = %d, want 204", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	after := getScanJob(t, env, token, job.ID)
+	for _, b := range after.Books {
+		if b.IsNew {
+			t.Errorf("candidate %q still reports is_new after being dismissed", b.SourcePath)
+		}
+	}
+}
+
+// TestAcknowledgeSightingsRequiresAuth is the denied half of the acknowledge
+// route (the allowed half is exercised above).
+func TestAcknowledgeSightingsRequiresAuth(t *testing.T) {
+	env := newPipelineEnv(t, nil)
+	resp := env.do(t, http.MethodPost, "/api/v1/library/sightings/acknowledge", "",
+		`{"source_paths":["/lib/a"]}`)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("no-token acknowledge = %d, want 401", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// An authed caller with a malformed body is a 400, not a silent 204.
+	token := env.login(t)
+	resp = env.do(t, http.MethodPost, "/api/v1/library/sightings/acknowledge", token, `{"paths":["/lib/a"]}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("unknown-field body = %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Unwired pipeline (M0-only env) -> 503.
+	m0 := newTestEnv(t)
+	resp = m0.do(t, http.MethodPost, "/api/v1/library/sightings/acknowledge", m0.login(t), `{"source_paths":[]}`)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("unwired acknowledge = %d, want 503", resp.StatusCode)
+	}
+	resp.Body.Close()
 }

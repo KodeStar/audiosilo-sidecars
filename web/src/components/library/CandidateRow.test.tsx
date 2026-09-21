@@ -65,6 +65,40 @@ describe('CandidateRow pipeline presence', () => {
   });
 });
 
+describe('CandidateRow new pill', () => {
+  function renderWithMark(value: ScannedBook, markNew: boolean) {
+    return render(
+      <table>
+        <tbody>
+          <CandidateRow book={value} checked={false} onToggle={vi.fn()} markNew={markNew} />
+        </tbody>
+      </table>,
+    );
+  }
+
+  it('pills a new book in the All view', () => {
+    renderWithMark(book({ is_new: true }), true);
+    expect(screen.getByText('New')).toBeInTheDocument();
+  });
+
+  it('dates the pill tooltip from first_seen_at when the daemon reported one', () => {
+    renderWithMark(book({ is_new: true, first_seen_at: '2026-09-21T10:00:00Z' }), true);
+    expect(screen.getByText('New')).toHaveAttribute(
+      'title',
+      `First seen ${new Date('2026-09-21T10:00:00Z').toLocaleDateString()}`,
+    );
+  });
+
+  it('omits the pill in the New view and for a book that is not new', () => {
+    const { unmount } = renderWithMark(book({ is_new: true }), false);
+    expect(screen.queryByText('New')).not.toBeInTheDocument();
+    unmount();
+
+    renderWithMark(book(), true);
+    expect(screen.queryByText('New')).not.toBeInTheDocument();
+  });
+});
+
 describe('CandidateRow path', () => {
   it('renders the relative path with the absolute path as its tooltip', () => {
     renderRow(book());

@@ -10,6 +10,7 @@ import {
   isPipelineDone,
   manualWorkId,
   matchProvenanceLabel,
+  newBooks,
   overridePayload,
   currentForceAudio,
   parsePos,
@@ -235,6 +236,47 @@ describe('filterCandidates', () => {
     expect(filterCandidates([covered, partial, hiddenCovered], { excludeCovered: true })).toEqual([
       partial,
     ]);
+  });
+
+  it('keeps only server-flagged new books in the new view', () => {
+    const fresh = book({ path: '/new', is_new: true });
+    const seen = book({ path: '/seen', is_new: false });
+    const unflagged = book({ path: '/old' });
+    const all = [fresh, seen, unflagged];
+    expect(filterCandidates(all, { excludeCovered: false, view: 'new' })).toEqual([fresh]);
+    expect(filterCandidates(all, { excludeCovered: false, view: 'all' })).toEqual(all);
+    // An omitted view is the historical behaviour (everything).
+    expect(filterCandidates(all, { excludeCovered: false })).toEqual(all);
+  });
+
+  it('still applies the hidden and excludeCovered rules inside the new view', () => {
+    const newHidden = book({ path: '/nh', is_new: true, hidden: true });
+    const newCovered = book({
+      path: '/nc',
+      is_new: true,
+      coverage: cov({ has_characters: true, has_recaps: true }),
+    });
+    const newPlain = book({ path: '/np', is_new: true });
+    const all = [newHidden, newCovered, newPlain];
+
+    expect(filterCandidates(all, { excludeCovered: false, view: 'new' })).toEqual([
+      newCovered,
+      newPlain,
+    ]);
+    expect(filterCandidates(all, { excludeCovered: true, view: 'new' })).toEqual([newPlain]);
+    expect(
+      filterCandidates(all, { excludeCovered: false, view: 'new', includeHidden: true }),
+    ).toEqual(all);
+  });
+});
+
+describe('newBooks', () => {
+  it('counts only flagged, non-hidden books, order preserved', () => {
+    const fresh = book({ path: '/a', is_new: true });
+    const freshHidden = book({ path: '/b', is_new: true, hidden: true });
+    const seen = book({ path: '/c' });
+    const fresh2 = book({ path: '/d', is_new: true });
+    expect(newBooks([fresh, freshHidden, seen, fresh2])).toEqual([fresh, fresh2]);
   });
 });
 

@@ -537,3 +537,31 @@ Milestones from the workspace plan; each is shippable.
   whose gap-free union covers one coalesced unmapped span (`exclusionsCover`).
   Gate: /simplify (4 angles) and /code-review --fix (8 angles, adversarially
   verified) applied over the round; full Go and web gates green.
+- **Library "New" view round (done, 2026-09-21):** the Library tab shows hundreds
+  of folders, and nothing recorded when any of them appeared - so "what is new
+  since I last looked?" was unanswerable. Migration 0012 adds `library_sightings`
+  (source_path PRIMARY KEY, first_seen_at, last_seen_at, acknowledged_at,
+  baseline), path-keyed with no FK to the rebuildable book index like
+  candidate_overrides, so a sighting survives an enqueue, a delete and a rescan.
+  `metaops.ScanManager` records every candidate of a COMPLETED scan through an
+  injected `SightingRecorder` (`WithSightings`: record + has-any, so the store
+  satisfies it directly and metaops still never imports store), BEFORE the job
+  reports done - a client stops polling at done, so its last poll must already see
+  the flags. Nothing sighting-shaped rides the job snapshot or the scan cache:
+  `first_seen_at` and `is_new` are attached by the API on every read, exactly like
+  `pipeline_book`. The BASELINE rule is the upgrade
+  guard: the first batch ever recorded is stored as baseline and is never new,
+  seeded at startup from the restored scan cache (stamped with the cached job's
+  started_at) and otherwise by the first completed scan - without it an upgrade
+  would report the user's whole library as new on first open. `is_new` is derived
+  at READ time (`metaops.ComputeIsNew(book, baseline, acknowledged)`: not
+  baseline, not acknowledged, no pipeline_book, not hidden; called only for a path
+  that HAS a sighting row, so an unrecorded path is never new) beside the existing
+  pipeline_book join in `GET /scans/{id}`, because three of those four inputs
+  change without a rescan and a stored flag would be stale until the user walked
+  their library again. `POST /api/v1/library/sightings/acknowledge` (204, unknown
+  paths ignored) is the Dismiss action. Web side: scanStore holds a
+  `view: 'new' | 'all'` filter defaulting to `new`, with a Dismiss bulk action
+  over the new endpoint. Gate: Go build/vet/`test -race`/golangci-lint green, with
+  store record/bump/baseline/acknowledge/has tests, a ScanManager recording +
+  cache-seed test, the ComputeIsNew table, and allowed + denied route tests.

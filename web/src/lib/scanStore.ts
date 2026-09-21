@@ -20,7 +20,14 @@ import type {
   ScannedBook,
   SetOverrideBody,
 } from '@/api/types';
-import { clearedCoverage, overridePayload, summarizeTally, tallyResults } from '@/lib/candidates';
+import {
+  clearedCoverage,
+  isNewBook,
+  overridePayload,
+  summarizeTally,
+  tallyResults,
+  type LibraryView,
+} from '@/lib/candidates';
 
 const DEFAULT_POLL_MS = 700;
 
@@ -35,11 +42,15 @@ export interface ScanState {
   job: ScanJob | null;
   scanError: string | null;
   starting: boolean;
+  // The top-level New/All filter. In-memory only (like excludeCovered): it is a
+  // per-visit stance, not a saved preference.
+  view: LibraryView;
   excludeCovered: boolean;
   showHidden: boolean;
   search: string;
   selected: ReadonlySet<string>;
   processing: boolean;
+  dismissing: boolean;
   note: ScanNote | null;
 }
 
@@ -48,6 +59,7 @@ export interface BookPatch {
   hidden?: boolean;
   coverage?: Coverage;
   pipelineBook?: PipelineBookRef;
+  isNew?: boolean;
 }
 
 // mergeBooks applies the optimistic overlay (keyed by absolute source_path, the
@@ -67,6 +79,7 @@ export function mergeBooks(
     return {
       ...b,
       ...(patch.hidden !== undefined ? { hidden: patch.hidden } : {}),
+      ...(patch.isNew !== undefined ? { is_new: patch.isNew } : {}),
       ...(coverage !== undefined ? { coverage } : {}),
       ...(patch.pipelineBook !== undefined ? { pipeline_book: patch.pipelineBook } : {}),
       ...(matchedSeries?.name
@@ -120,11 +133,13 @@ const INITIAL: ScanState = {
   job: null,
   scanError: null,
   starting: false,
+  view: 'new',
   excludeCovered: false,
   showHidden: false,
   search: '',
   selected: new Set(),
   processing: false,
+  dismissing: false,
   note: null,
 };
 
@@ -168,6 +183,10 @@ export class ScanStore {
   }
 
   // --- preferences ---
+
+  setView(v: LibraryView): void {
+    this.set({ view: v });
+  }
 
   setExcludeCovered(v: boolean): void {
     this.set({ excludeCovered: v });
@@ -281,6 +300,7 @@ export class ScanStore {
       starting: false,
       selected: new Set(),
       processing: false,
+      dismissing: false,
       note: null,
     });
   }
@@ -351,8 +371,13 @@ export class ScanStore {
       for (const result of results) {
         if (!result.created || !result.book) continue;
         const current = this.patches.get(result.source_path) ?? {};
+        // Mirror the daemon's ComputeIsNew: a book this daemon holds is never new.
+        // Polling has stopped by now (the scan is done), so without this overlay
+        // the just-queued book would stay in the New view and its count until the
+        // next rescan, while a reload would drop it.
         this.patches.set(result.source_path, {
           ...current,
+          isNew: false,
           pipelineBook: {
             id: result.book.id,
             state: result.book.state,
@@ -380,6 +405,48 @@ export class ScanStore {
       });
       return { started: false };
     }
+  }
+
+  // --- dismissing (acknowledge new sightings) ---
+
+  // acknowledgeNew tells the daemon the given books have been seen, so they stop
+  // reporting is_new. The optimistic half goes through the same overlay the
+  // hide/match patches use (keyed on the absolute source_path), so a poll landing
+  // before the daemon's own view catches up cannot resurrect a dismissed book.
+  // Only books the server flagged is_new are sent - the button is enabled on that
+  // same predicate, and acknowledging anything else would be a no-op write.
+  async acknowledgeNew(client: ApiClient, books: readonly ScannedBook[]): Promise<{ ok: boolean }> {
+    const targets = books.filter(isNewBook);
+    if (targets.length === 0 || this.state.dismissing) return { ok: false };
+    this.set({ dismissing: true, note: null });
+    try {
+      await client.acknowledgeSightings(targets.map((b) => b.source_path));
+    } catch (err) {
+      this.set({
+        dismissing: false,
+        note: {
+          kind: 'error',
+          text: err instanceof ApiError ? err.message : 'Could not dismiss the selected books.',
+        },
+      });
+      return { ok: false };
+    }
+    for (const b of targets) {
+      const current = this.patches.get(b.source_path) ?? {};
+      this.patches.set(b.source_path, { ...current, isNew: false });
+    }
+    const selected = new Set(this.state.selected);
+    for (const b of targets) selected.delete(b.path);
+    this.set({
+      dismissing: false,
+      selected,
+      note: {
+        kind: 'ok',
+        text: `${targets.length} book${targets.length === 1 ? '' : 's'} dismissed.`,
+      },
+    });
+    this.recompute();
+    return { ok: true };
   }
 
   // --- overrides (hide / manual match) ---

@@ -92,7 +92,14 @@ SPA proxies API/SSE calls to it.
 
 The Library page caches its latest successful folder-scan result in the daemon
 data directory, so a daemon restart can restore the book list without walking the
-library again. It is a snapshot: run **Scan** after changing files. UI tabs are
+library again. It is a snapshot: run **Scan** after changing files.
+
+The list opens on its **New** view - the books that have appeared in your library
+since you last looked - with **All** one click away. A book stays new until you
+process it, hide it, or **Dismiss** it, and the daemon records what it finds on
+every completed scan. The library as it already stood the first time this ran is
+the baseline, so upgrading shows an empty New view rather than every folder you
+own. UI tabs are
 deep-linkable and refresh-safe with `?tab=library`, `?tab=running`,
 `?tab=done`, or `?tab=settings`.
 

@@ -24,6 +24,9 @@ interface CandidateRowProps {
   // the audio runs when the epub is the wrong edition or an abridgement. Never
   // offered for an ebook-only row: there is no audio to fall back to.
   onToggleSource?: (book: ScannedBook, forceAudio: boolean) => void;
+  // Shows the "New" pill on a book the server flagged is_new. Set only in the All
+  // view - in the New view every row is new, so the pill would be noise.
+  markNew?: boolean;
   // Disables this row's actions while one of its overrides is in flight.
   busy?: boolean;
 }
@@ -47,6 +50,29 @@ function IdentityChip({
     >
       <span className="text-[9px] font-semibold uppercase tracking-wide text-body">{kind}</span>
       {value}
+    </span>
+  );
+}
+
+// BADGE_CLASS is the one chrome the row's status pills share (New, the pipeline
+// presence, EPUB); each caller adds only its own border/background/text colours.
+const BADGE_CLASS =
+  'inline-flex rounded border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide';
+
+// Badge is a small uppercase status pill, following CoverageBadge's local Pill:
+// one class string, so the three pills cannot drift apart visually.
+function Badge({
+  className,
+  title,
+  children,
+}: {
+  className: string;
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <span title={title} className={BADGE_CLASS + ' ' + className}>
+      {children}
     </span>
   );
 }
@@ -92,6 +118,7 @@ export const CandidateRow = memo(function CandidateRow({
   onHide,
   onToggleSource,
   onUnhide,
+  markNew = false,
   busy = false,
 }: CandidateRowProps) {
   const authors = (book.authors ?? []).join(', ');
@@ -142,17 +169,22 @@ export const CandidateRow = memo(function CandidateRow({
       <td className="px-3 py-3">
         <div className="flex flex-wrap items-center gap-2">
           <span className="font-medium text-hi">{book.title}</span>
+          {markNew && book.is_new && (
+            <Badge className="border-sky-500/40 bg-sky-500/10 text-sky-300" title={newTitle(book)}>
+              New
+            </Badge>
+          )}
           {pipeline && pipelineBook && (
-            <span
-              className={`inline-flex rounded border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${pipeline.className}`}
+            <Badge
+              className={pipeline.className}
               title={`Pipeline book #${pipelineBook.id}: ${stateLabel(pipelineBook.state)}`}
             >
               {pipeline.label}
-            </span>
+            </Badge>
           )}
           {isEbook && (
-            <span
-              className="inline-flex rounded border border-pink-600/40 bg-pink-600/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-pink-400"
+            <Badge
+              className="border-pink-600/40 bg-pink-600/10 text-pink-400"
               title={
                 hybrid
                   ? 'An epub sits beside this audiobook, so its exact text is used - no transcription needed'
@@ -160,7 +192,7 @@ export const CandidateRow = memo(function CandidateRow({
               }
             >
               {hybrid ? 'EPUB + audio' : 'EPUB'}
-            </span>
+            </Badge>
           )}
         </div>
         {book.ebook_note && <div className="mt-0.5 text-xs italic text-dim">{book.ebook_note}</div>}
@@ -268,6 +300,17 @@ export const CandidateRow = memo(function CandidateRow({
     </tr>
   );
 });
+
+// newTitle is the New pill's tooltip. first_seen_at is the whole point of the
+// sightings table, so the pill states the date it names (localised - the value is
+// RFC3339 UTC on the wire); a book recorded before the field existed falls back to
+// the generic wording rather than showing "Invalid Date".
+function newTitle(book: ScannedBook): string {
+  if (book.first_seen_at) {
+    return `First seen ${new Date(book.first_seen_at).toLocaleDateString()}`;
+  }
+  return 'First seen by a recent scan - not yet processed or dismissed';
+}
 
 function pipelinePresence(pipelineBook: PipelineBookRef): { label: string; className: string } {
   // Shared with the Library filter's "already processed" rule, so a finished book

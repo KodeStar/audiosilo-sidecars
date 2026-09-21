@@ -197,7 +197,12 @@ func Run(ctx context.Context, opts Options) error {
 		return out, nil
 	}
 	scanMgr := metaops.NewScanManager(runCtx, metaClient, tools.FFprobe, overrideSrc,
-		metaops.WithScanCache(filepath.Join(opts.DataDir, "library-scan-cache.json")))
+		metaops.WithScanCache(filepath.Join(opts.DataDir, "library-scan-cache.json")),
+		// Library sightings (which folders exist, and since when) are recorded on every
+		// completed scan. The store satisfies metaops' recorder interface directly:
+		// the scan manager only writes rows and asks whether any exist, so no
+		// store-shaped type crosses the seam.
+		metaops.WithSightings(db))
 	workRoot := filepath.Join(opts.DataDir, "work")
 	// One GitHub token source shared by the contributing stage (executor) and the
 	// core-submit/poller service - both resolve the same PAT-then-`gh auth token`

@@ -128,7 +128,7 @@ internal/
   scheduler/  wake-on-event dispatch over three lanes + _done sentinels + crash reconcile
   supervisor/ health-tick babysitter: bounded, capped automatic recovery
   metaops/    meta.audiosilo.app client: coverage/lookup + search ladder, scan jobs,
-              series glossary
+              series glossary, library sightings (injected recorder -> the New view)
   events/     SSE hub (replay, heartbeats, durable sink)
   api/        transport-only HTTP handlers
   web/        go:embed of the SPA (build-tag selected) + SPA-fallback static serving
@@ -149,7 +149,10 @@ scratch, secrets, fsutil, metaops, store, state, scheduler}` (metaops since M7's
 contributing stage, and the spelling stage's series glossary); `agent`/`repair` are
 leaf helpers (no scheduler/store deps; `repair -> qa` for the shared Python-compat
 gram/repr helpers and the shared clip-floor predicate
-`qa.ClipStartInRange`/`qa.ClipStartFloorSec`); `state` is pure. Handlers marshal
+`qa.ClipStartInRange`/`qa.ClipStartFloorSec`); `state` is pure; `metaops` never imports `store` - `server` injects the override
+lookup/persist as adapters and the sightings recorder (`WithSightings`) as the
+store itself (that interface is record + has-any, so nothing store-shaped crosses
+it). Handlers marshal
 DTOs and call into the injected packages; they hold no logic (state transitions
 live in `state`, dispatch in `scheduler`).
 
@@ -196,7 +199,9 @@ ladder.go retrieval ladder + narrator evidence in the SHARED matcher [server
 PR #40] + path hints, 510 unknown -> 45 over the live library; read-time
 contribution folding into frozen scan verdicts; staged local split source,
 source-IO serialization, one serial ASR slot, transient-EINTR retry,
-time-bounded splits). The
+time-bounded splits), and the Library "New" view (library_sightings +
+read-time `is_new`/`first_seen_at`, attached by the API on every read and never
+cached; the first recorded batch is the baseline). The
 detailed milestone log - what each landed, the live incidents behind the
 invariants, and the verification evidence - lives in [HISTORY.md](HISTORY.md);
 read the entries for any stage or era you are working near.

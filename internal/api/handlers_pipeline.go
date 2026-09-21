@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/ebook"
 	"github.com/kodestar/audiosilo-sidecars/internal/metaops"
@@ -92,6 +93,24 @@ func (a *API) handleGetScan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not read queued books")
 		return
 	}
+	// is_new (and the first_seen_at it is derived from) is read here, beside the
+	// pipeline_book join, for the same reason: both depend on state that changes
+	// WITHOUT a rescan (a queued book, a hide, a dismissal), so baking either into
+	// the scan snapshot would serve stale answers until the user walked their
+	// library again.
+	// There is nothing to join against while a scan has produced no candidates yet
+	// (an empty library, or a walk that has not streamed its first book), so the
+	// read is skipped for those. It is NOT skipped for a running scan that already
+	// has provisional books: sightings from the previous scan are what make is_new
+	// meaningful mid-walk, and the table is one small row per library folder.
+	var sightings map[string]store.Sighting
+	if len(job.Books) > 0 {
+		sightings, err = a.store.ListSightings(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not read library sightings")
+			return
+		}
+	}
 	// Nothing to join against until a scanned candidate is actually queued here, and
 	// this endpoint is polled every ~700ms during a scan - so the contributions read
 	// is skipped entirely for the common case of a library with no local books.
@@ -109,15 +128,22 @@ func (a *API) handleGetScan(w http.ResponseWriter, r *http.Request) {
 	}
 	for i := range job.Books {
 		sb := &job.Books[i]
-		book, exists := tracked[sb.SourcePath]
-		if !exists {
-			continue
+		if book, exists := tracked[sb.SourcePath]; exists {
+			sb.PipelineBook = &metaops.PipelineBookRef{
+				ID: book.ID, State: book.State, Status: book.Status,
+			}
+			chars, recaps := store.LandedCoverage(contribByBook[book.ID])
+			sb.Coverage.ApplyContributed(book.WorkID, chars, recaps)
 		}
-		sb.PipelineBook = &metaops.PipelineBookRef{
-			ID: book.ID, State: book.State, Status: book.Status,
+		// AFTER the pipeline_book join: a candidate this daemon already has is never
+		// new, and ComputeIsNew reads that field. A path with NO sighting row is
+		// simply not new - nothing ever recorded that folder (a scan still running, a
+		// recorder failure, or the feature switched off), and "unknown" must not light
+		// up a library-sized list.
+		if s, ok := sightings[sb.SourcePath]; ok {
+			sb.FirstSeenAt = s.FirstSeenAt
+			sb.IsNew = metaops.ComputeIsNew(*sb, s.Baseline, s.AcknowledgedAt != "")
 		}
-		chars, recaps := store.LandedCoverage(contribByBook[book.ID])
-		sb.Coverage.ApplyContributed(book.WorkID, chars, recaps)
 	}
 	writeJSON(w, http.StatusOK, job)
 }
@@ -130,6 +156,28 @@ type listScansResponse struct {
 // lists) so a reloaded UI can reattach to in-flight and just-finished scans.
 func (a *API) handleListScans(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, listScansResponse{Scans: a.scans.List()})
+}
+
+// --- library sightings ---
+
+type acknowledgeSightingsRequest struct {
+	SourcePaths []string `json:"source_paths"`
+}
+
+// handleAcknowledgeSightings dismisses books from the Library tab's New view.
+// Paths are the canonical source paths a scan handed the client; unknown ones are
+// ignored (a folder can disappear, and a stale tab must not fail the whole call),
+// so the only outcomes are 204 and a store failure.
+func (a *API) handleAcknowledgeSightings(w http.ResponseWriter, r *http.Request) {
+	var req acknowledgeSightingsRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if err := a.store.AcknowledgeSightings(r.Context(), req.SourcePaths, time.Now().UTC()); err != nil {
+		writeError(w, http.StatusInternalServerError, "could not acknowledge library sightings")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- books ---

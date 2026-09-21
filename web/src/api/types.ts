@@ -250,6 +250,13 @@ export interface ScannedBook {
   // True when the user has hidden this book from the default candidate list (a
   // persisted daemon-side override). Excluded from the default view; re-showable.
   hidden?: boolean;
+  // When this source_path was first seen by any scan (RFC3339).
+  first_seen_at?: string;
+  // Computed SERVER-SIDE: the book is not part of the upgrade baseline, has not
+  // been acknowledged, has no pipeline_book, and is not hidden. The client filters
+  // on this flag and never re-derives it - the baseline and the acknowledgement
+  // ledger live in the daemon.
+  is_new?: boolean;
   /** The persisted "use the audio, not the epub" override, stated by the server. */
   force_audio?: boolean;
   // Present when this exact canonical source_path is already persisted in the

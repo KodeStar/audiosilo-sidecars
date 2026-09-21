@@ -92,25 +92,50 @@ export function toCandidate(book: ScannedBook): BookCandidate {
   return candidate;
 }
 
-// filterCandidates applies the visible-set filters. Hidden books are dropped
-// unless includeHidden is set (the "show hidden" toggle). When excludeCovered is
-// true, two kinds of book are dropped: one that already has both sidecars
-// upstream (isCovered), and one THIS daemon already ran to completion
-// (isPipelineDone) - the latter's sidecars exist locally whatever the scan's
-// coverage verdict says, so a stale or unknown verdict would otherwise leave a
-// finished book sitting in the candidate list forever. Order is preserved.
+// LibraryView is the Library tab's top-level filter: "new" keeps only the books
+// the daemon flagged as newly seen, "all" is the whole scanned set. The default
+// is "new" - a library scan lists hundreds of folders, but nearly every visit is
+// about the handful that just arrived.
+export type LibraryView = 'new' | 'all';
+
+// filterCandidates applies the visible-set filters. The view filter runs first:
+// "new" keeps only books the SERVER flagged is_new (never re-derived here - the
+// baseline and the acknowledgement ledger live in the daemon). Hidden books are
+// dropped unless includeHidden is set (the "show hidden" toggle). When
+// excludeCovered is true, two kinds of book are dropped: one that already has
+// both sidecars upstream (isCovered), and one THIS daemon already ran to
+// completion (isPipelineDone) - the latter's sidecars exist locally whatever the
+// scan's coverage verdict says, so a stale or unknown verdict would otherwise
+// leave a finished book sitting in the candidate list forever. Order is preserved.
 //
 // The default (toggle off) path is untouched: a done book stays visible with its
 // "Completed" badge, which is how the user confirms the work landed.
 export function filterCandidates(
   books: ScannedBook[],
-  opts: { excludeCovered: boolean; includeHidden?: boolean },
+  opts: { excludeCovered: boolean; includeHidden?: boolean; view?: LibraryView },
 ): ScannedBook[] {
   return books.filter((b) => {
+    if (opts.view === 'new' && !isNewBook(b)) return false;
     if (b.hidden && !opts.includeHidden) return false;
     if (opts.excludeCovered && (isCovered(b) || isPipelineDone(b.pipeline_book))) return false;
     return true;
   });
+}
+
+// isNewBook is THE definition of "new" on the client: the server said so. The
+// baseline and the acknowledgement ledger live in the daemon, so nothing is
+// re-derived here - every caller (the New view, the count, the "Dismiss" button,
+// the store's acknowledge) asks this one predicate, so they cannot disagree about
+// which books the view shows.
+export function isNewBook(b: ScannedBook): boolean {
+  return b.is_new === true;
+}
+
+// newBooks returns the books the server flagged as newly seen and that are not
+// hidden - the count behind the "New (n)" view button. It IS the New view's
+// filter, so the count cannot drift from the rows it labels.
+export function newBooks(books: ScannedBook[]): ScannedBook[] {
+  return filterCandidates(books, { view: 'new', excludeCovered: false });
 }
 
 // isPipelineDone reports whether this daemon already processed the book to the

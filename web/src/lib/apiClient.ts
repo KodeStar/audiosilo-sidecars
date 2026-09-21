@@ -219,6 +219,18 @@ export class ApiClient {
     });
   }
 
+  // --- library: sightings ---
+  // acknowledgeSightings marks the given books as seen, so the daemon stops
+  // reporting them as is_new and the Library tab's "New" view drops them. The
+  // key is the absolute source_path (the same durable identity overrides use).
+  // 204 on success.
+  acknowledgeSightings(sourcePaths: string[]): Promise<void> {
+    return this.request<void>('/api/v1/library/sightings/acknowledge', {
+      method: 'POST',
+      body: { source_paths: sourcePaths },
+    });
+  }
+
   // --- meta search (manual-match lookup) ---
   metaSearch(q: string): Promise<MetaSearchResponse> {
     return this.request<MetaSearchResponse>(`/api/v1/meta/search?q=${encodeURIComponent(q)}`);
