@@ -226,6 +226,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/scans", a.requireAuth(a.requirePipeline(a.handleCreateScan)))
 	mux.HandleFunc("GET /api/v1/scans", a.requireAuth(a.requirePipeline(a.handleListScans)))
 	mux.HandleFunc("GET /api/v1/scans/{id}", a.requireAuth(a.requirePipeline(a.handleGetScan)))
+	mux.HandleFunc("POST /api/v1/library/sightings/acknowledge", a.requireAuth(a.requirePipeline(a.handleAcknowledgeSightings)))
 	mux.HandleFunc("GET /api/v1/overrides", a.requireAuth(a.requirePipeline(a.handleListOverrides)))
 	mux.HandleFunc("POST /api/v1/overrides", a.requireAuth(a.requirePipeline(a.handleUpsertOverride)))
 	// meta/search needs only an authed caller + a configured metadata client (no

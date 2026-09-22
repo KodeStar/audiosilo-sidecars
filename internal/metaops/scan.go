@@ -118,6 +118,16 @@ type ScannedBook struct {
 	// already persisted. It is intentionally absent from ScanManager/cache state:
 	// queue state changes independently of an expensive filesystem scan.
 	PipelineBook *PipelineBookRef `json:"pipeline_book,omitempty"`
+	// FirstSeenAt is when this source path was first observed by a completed scan
+	// (RFC3339 UTC). Like PipelineBook it is attached dynamically by the API from
+	// the sighting store, never cached: the scan snapshot holds no sighting state.
+	// Empty until a scan has recorded the folder.
+	FirstSeenAt string `json:"first_seen_at,omitempty"`
+	// IsNew is the Library tab's "appeared since you last looked" flag. Like
+	// PipelineBook it is attached dynamically by the API (see ComputeIsNew) and is
+	// never cached: it depends on queue state, the hidden flag and the user's
+	// dismissals, all of which change without a rescan.
+	IsNew bool `json:"is_new,omitempty"`
 }
 
 // PipelineBookRef identifies the persisted pipeline book occupying a scanned
@@ -269,10 +279,11 @@ type ScanManager struct {
 	ctx         context.Context //nolint:containedctx // daemon-lifetime ctx for background jobs
 	client      *Client
 	ffprobePath string
-	overrides   OverrideLookup // may be nil (no persisted overrides)
-	scan        scanFunc       // defaults to metascan.Scan
-	cachePath   string         // optional completed-scan snapshot (empty disables persistence)
-	cacheMu     sync.Mutex     // serializes atomic cache writes
+	overrides   OverrideLookup   // may be nil (no persisted overrides)
+	sightings   SightingRecorder // may be nil (new-book tracking disabled)
+	scan        scanFunc         // defaults to metascan.Scan
+	cachePath   string           // optional completed-scan snapshot (empty disables persistence)
+	cacheMu     sync.Mutex       // serializes atomic cache writes
 
 	mu      sync.Mutex
 	seq     int64
@@ -651,8 +662,18 @@ func (m *ScanManager) finishError(id, msg string) {
 }
 
 func (m *ScanManager) finishDone(id string, stats metascan.Stats) {
+	// Record sightings BEFORE the job reports done: a client stops polling once the
+	// job reports done, so the LAST poll it makes must already see first_seen_at and
+	// is_new (the API reads them from the store on every read).
 	m.mu.Lock()
-	if job, ok := m.jobs[id]; ok {
+	job, tracked := m.jobs[id]
+	m.mu.Unlock()
+	if tracked {
+		m.recordJobSightings(job)
+	}
+
+	m.mu.Lock()
+	if tracked {
 		job.status = ScanDone
 		job.phase = "done"
 		st := stats

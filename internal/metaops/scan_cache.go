@@ -119,4 +119,12 @@ func (m *ScanManager) restoreCache() {
 
 	m.seq = 1
 	m.jobs[job.id] = job
+
+	// Seed the sighting table from the restored scan. When nothing has ever been
+	// recorded, this cached library becomes the BASELINE (stamped with the cached
+	// job's started_at): a daemon that is upgraded and restarted, but not re-scanned,
+	// must not report the user's whole library as new the moment they open the tab.
+	// When rows already exist it only bumps last_seen_at, leaving each known path's
+	// first_seen_at as it stood.
+	m.recordJobSightings(job)
 }

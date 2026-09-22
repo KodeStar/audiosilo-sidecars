@@ -577,7 +577,21 @@ internal/
             rows instead of deleting them, splitting the readers: SCHEDULING readers
             (CountStageSuccesses, SucceededStages*) filter superseded=0, MONEY readers
             (SumStageRunCost, StageRunTotals, ListStageRuns) include everything, so
-            round counters reset on Retry but spend history survives.
+            round counters reset on Retry but spend history survives. The Library
+            New-view round's 0012 added library_sightings (source_path PRIMARY KEY,
+            first_seen_at, last_seen_at, acknowledged_at, baseline) - path-keyed
+            like candidate_overrides with no FK to the book index, so a sighting
+            survives an enqueue, a delete and a rescan. RecordSightings is
+            insert-or-bump: a known path keeps its first_seen_at AND its baseline
+            flag (a rescan must never reset when a folder appeared, nor promote a
+            pre-existing book into the New view) and only bumps last_seen_at;
+            AcknowledgeSightings ignores unknown paths, and HasSightings answers
+            the baseline question ("is this the first batch?") without reading the
+            table - that pair IS metaops.SightingRecorder, which the DB satisfies
+            directly (no adapter). Its timestamps are plain
+            RFC3339 seconds (SightingLayout), NOT the store's fixed-width
+            nanosecond layout, because first_seen_at is served verbatim on the
+            wire; all three columns share it, so compares stay chronological.
   state/    per-book pipeline state machine: table-driven states/lanes/transitions,
             CanStart/NextState guards, the audit fix-loop cap. Pure, no I/O. M6 added
             ParkCode (typed park reasons - M7 added contrib_unavailable, core_needed,
@@ -772,7 +786,25 @@ internal/
             whose characters/recaps had since merged kept reporting "needed",
             their badges never went green, and "exclude already covered" never
             dropped them - through rescans AND restarts, since restoreCache
-            re-seeds the patch from the cached snapshot. Deps: stdlib
+            re-seeds the patch from the cached snapshot. LIBRARY SIGHTINGS back
+            the Library tab's New view: a completed scan records every candidate
+            source_path through an INJECTED SightingRecorder (WithSightings). That
+            interface is write-plus-one-question (RecordSightings + HasSightings),
+            nothing store-shaped crosses it, so *store.DB satisfies it DIRECTLY -
+            no adapter, and metaops still never imports store. The recording runs
+            BEFORE the job reports done: a client stops polling at done, so its
+            last poll must already see the flags. NOTHING sighting-shaped rides the
+            job snapshot or the cache - first_seen_at and is_new are attached by
+            the API on every read. The BASELINE rule is the upgrade guard: the
+            first batch ever recorded is stored as baseline (never new), seeded at
+            startup from the restored scan cache (stamped with the cached job's
+            started_at) and otherwise by the first completed scan - without it an
+            upgrade would report the user's entire library as new. is_new itself is
+            NOT stored: ComputeIsNew(book, baseline, acknowledged) is a read-time
+            predicate (not baseline, not acknowledged, no pipeline_book, not
+            hidden) because three of those four change without a rescan; the API
+            calls it only for a path that HAS a sighting row, since a path with
+            none is never new. Deps: stdlib
             HTTP + the meta module + audiosilo-server/pkg/match.
   events/   SSE hub: Publish -> monotonic-id fan-out, ring-buffer replay from
             Last-Event-ID, ephemeral heartbeats, slow-subscriber eviction, optional
@@ -790,7 +822,14 @@ internal/
             set + readmit), GET /books/{id}/export (zip via injected
             pipeline.ExportArchive), bookView.contribution (aggregate chip) +
             bookDetail.contributions (rows), and the contrib.update SSE event; all
-            new endpoints have allowed + denied auth tests.
+            new endpoints have allowed + denied auth tests. The Library New-view
+            round added POST /library/sightings/acknowledge (204; unknown paths
+            ignored) and made GET /scans/{id} attach first_seen_at + is_new beside
+            the pipeline_book join - one store.ListSightings read per poll (skipped
+            entirely for a job with no books, like the anyTracked guard beside it),
+            the predicate itself in metaops.ComputeIsNew (api stays
+            transport-only). The store is the ONLY home of that state: the scan
+            snapshot and its cache carry neither field.
   web/      go:embed of the SPA (build-tag selected) + SPA-fallback static serving
   server/   http.Server wiring, graceful shutdown, the startup banner
 web/          the SPA: Vite + React 19 + TS + Tailwind v4 (npm, Node 24); dist/ is embedded
@@ -817,6 +856,10 @@ web/          the SPA: Vite + React 19 + TS + Tailwind v4 (npm, Node 24); dist/ 
               pipeline_book match stay visible with an In queue/Completed badge but
               have no selection or rematch control; select-all skips them, and a
               successful enqueue patches the row immediately before the next poll.
+              scanStore also holds a `view: 'new' | 'all'` filter DEFAULTING to
+              'new' (over the daemon's per-book is_new flag), with a "Dismiss" bulk
+              action posting the selected source paths to
+              POST /library/sightings/acknowledge.
 scripts/build-web.sh   build the SPA + embed it into bin/ (-tags embedui)
 Dockerfile             multi-stage: node build -> go build (embedui) -> two runtime
                        targets from the SAME shared stages: `runtime` (debian-slim,

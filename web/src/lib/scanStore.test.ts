@@ -456,7 +456,7 @@ describe('ScanStore process', () => {
 
   it('immediately marks a newly created scan row as tracked', async () => {
     const { store } = makeStore();
-    const b1 = scannedBook({ path: '/b1', source_path: '/root/b1' });
+    const b1 = scannedBook({ path: '/b1', source_path: '/root/b1', is_new: true });
     const client = {
       createScan: vi.fn().mockResolvedValue({ job_id: 'j1' }),
       getScan: vi.fn().mockResolvedValue(job({ status: 'done', books: [b1] })),
@@ -490,8 +490,104 @@ describe('ScanStore process', () => {
       state: 'queued',
       status: '',
     });
+    // ...and no longer new: the daemon's ComputeIsNew says a tracked book is never
+    // new, and polling has stopped, so the overlay has to say so itself.
+    expect(store.getSnapshot().job?.books[0].is_new).toBe(false);
     store.toggleOne('/b1', true);
     expect(store.getSnapshot().selected.has('/b1')).toBe(false);
+  });
+});
+
+describe('ScanStore acknowledgeNew', () => {
+  async function withNewBooks() {
+    const { store } = makeStore();
+    const fresh = scannedBook({ path: '/b1', is_new: true });
+    const seen = scannedBook({ path: '/b2' });
+    const client = {
+      createScan: vi.fn().mockResolvedValue({ job_id: 'j1' }),
+      getScan: vi.fn().mockResolvedValue(job({ status: 'done', books: [fresh, seen] })),
+      acknowledgeSightings: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ApiClient;
+    await store.startScan(client, '/root');
+    await flush();
+    return { store, client, fresh, seen };
+  }
+
+  it('acknowledges the new books, clears them from the selection, and unflags them', async () => {
+    const { store, client, fresh } = await withNewBooks();
+    store.toggleOne('/b1', true);
+    store.toggleOne('/b2', true);
+
+    const res = await store.acknowledgeNew(client, [fresh]);
+
+    expect(res).toEqual({ ok: true });
+    expect((client.acknowledgeSightings as ReturnType<typeof vi.fn>).mock.calls[0][0]).toEqual([
+      '/root/b1',
+    ]);
+    expect(store.getSnapshot().job?.books[0].is_new).toBe(false);
+    expect(store.getSnapshot().selected.has('/b1')).toBe(false);
+    // An unrelated selection is untouched.
+    expect(store.getSnapshot().selected.has('/b2')).toBe(true);
+    expect(store.getSnapshot().note).toEqual({ kind: 'ok', text: '1 book dismissed.' });
+    expect(store.getSnapshot().dismissing).toBe(false);
+  });
+
+  it('keeps the unflagged patch across a later poll of the same scan', async () => {
+    const { store, fireNextPoll } = makeStore();
+    const fresh = scannedBook({ path: '/b1', is_new: true });
+    // The daemon keeps reporting is_new until its own view catches up, so the
+    // overlay has to win or a dismissed book reappears on the next tick.
+    const client = {
+      createScan: vi.fn().mockResolvedValue({ job_id: 'j1' }),
+      getScan: vi.fn().mockResolvedValue(job({ status: 'running', books: [fresh] })),
+      acknowledgeSightings: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ApiClient;
+    await store.startScan(client, '/root');
+    await flush();
+
+    await store.acknowledgeNew(client, [fresh]);
+    expect(store.getSnapshot().job?.books[0].is_new).toBe(false);
+
+    fireNextPoll();
+    await flush();
+    expect(store.getSnapshot().job?.books[0].is_new).toBe(false);
+  });
+
+  it('sends nothing when no selected book is new', async () => {
+    const { store, client, seen } = await withNewBooks();
+
+    const res = await store.acknowledgeNew(client, [seen]);
+
+    expect(res).toEqual({ ok: false });
+    expect((client.acknowledgeSightings as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+  });
+
+  it('surfaces a failure as an error note and leaves the flag alone', async () => {
+    const { store, client, fresh } = await withNewBooks();
+    (client.acknowledgeSightings as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new ApiError(500, 'ledger write failed'),
+    );
+    store.toggleOne('/b1', true);
+
+    const res = await store.acknowledgeNew(client, [fresh]);
+
+    expect(res).toEqual({ ok: false });
+    expect(store.getSnapshot().note).toEqual({ kind: 'error', text: 'ledger write failed' });
+    expect(store.getSnapshot().dismissing).toBe(false);
+    expect(store.getSnapshot().job?.books[0].is_new).toBe(true);
+    expect(store.getSnapshot().selected.has('/b1')).toBe(true);
+  });
+
+  it('falls back to a generic message for a non-API error', async () => {
+    const { store, client, fresh } = await withNewBooks();
+    (client.acknowledgeSightings as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('net'));
+
+    await store.acknowledgeNew(client, [fresh]);
+
+    expect(store.getSnapshot().note).toEqual({
+      kind: 'error',
+      text: 'Could not dismiss the selected books.',
+    });
   });
 });
 
@@ -509,6 +605,15 @@ describe('ScanStore selection + preferences', () => {
     expect(store.getSnapshot().selected.has('/c')).toBe(true);
     store.toggleAll(['/a', '/c'], false);
     expect(store.getSnapshot().selected.has('/c')).toBe(false);
+  });
+
+  it('defaults the view to new and tracks the setter', () => {
+    const { store } = makeStore();
+    expect(store.getSnapshot().view).toBe('new');
+    store.setView('all');
+    expect(store.getSnapshot().view).toBe('all');
+    store.reset();
+    expect(store.getSnapshot().view).toBe('new');
   });
 
   it('tracks the toggle preferences', () => {

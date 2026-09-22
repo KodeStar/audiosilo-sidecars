@@ -4,10 +4,13 @@ import type { MetaSearchResult, ScanJob, ScannedBook } from '@/api/types';
 import {
   filterCandidates,
   hiddenBooks,
+  isNewBook,
+  newBooks,
   searchCandidates,
   seriesGapHint,
   sortBySeries,
   toCandidate,
+  type LibraryView,
 } from '@/lib/candidates';
 import { scanStore, useScanStore } from '@/lib/scanStore';
 import { runningScanDetail } from '@/lib/scanStatus';
@@ -32,11 +35,13 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
     job,
     scanError,
     starting,
+    view,
     excludeCovered,
     showHidden,
     search,
     selected,
     processing,
+    dismissing,
     note,
   } = state;
 
@@ -66,14 +71,18 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
   );
 
   const books = useMemo<ScannedBook[]>(() => job?.books ?? [], [job]);
-  // The visible list: exclude-covered filter -> free-text search -> series order.
+  // The visible list: New/All view -> exclude-covered filter -> free-text search ->
+  // series order.
   const visible = useMemo(
-    () => sortBySeries(searchCandidates(filterCandidates(books, { excludeCovered }), search)),
-    [books, excludeCovered, search],
+    () => sortBySeries(searchCandidates(filterCandidates(books, { excludeCovered, view }), search)),
+    [books, excludeCovered, view, search],
   );
   // The full hidden set (drives the "Show hidden (n)" count + the toolbar totals),
   // and its search-narrowed, series-ordered slice for the dimmed hidden section.
   const hidden = useMemo(() => hiddenBooks(books), [books]);
+  // The view-button counts are deliberately unfiltered by search/exclude-covered:
+  // they describe the two views themselves, not the current slice of one.
+  const newCount = useMemo(() => newBooks(books).length, [books]);
   const hiddenVisible = useMemo(
     () => sortBySeries(searchCandidates(hidden, search)),
     [hidden, search],
@@ -83,6 +92,9 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
     [visible, selected],
   );
   const selectableVisible = useMemo(() => visible.filter((b) => !b.pipeline_book), [visible]);
+  // Only new books can be dismissed, so the button reflects what the request would
+  // actually carry (in the New view that is the whole selection).
+  const selectedNew = useMemo(() => selectedVisible.filter(isNewBook), [selectedVisible]);
   const satisfiedPaths = useMemo(() => {
     const paths = new Set(selectedVisible.map((b) => b.path));
     for (const b of visible) {
@@ -151,9 +163,17 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
     if (outcome.started) onProcessed();
   }
 
+  async function handleDismiss() {
+    if (selectedNew.length === 0 || dismissing) return;
+    await scanStore.acknowledgeNew(client, selectedNew);
+  }
+
   const scanning = job?.status === 'running' || starting;
   const hasResults = books.length > 0;
   const running = job?.status === 'running';
+  // Only claim "nothing new" once the scan finished - mid-scan the daemon has not
+  // reported every folder yet, so an empty New view is not yet a verdict.
+  const noNewBooks = view === 'new' && newCount === 0 && job?.status === 'done';
 
   return (
     <div className="flex flex-col gap-6">
@@ -195,6 +215,9 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
       {hasResults && (
         <div className="flex flex-col gap-3">
           <Toolbar
+            view={view}
+            onViewChange={(v) => scanStore.setView(v)}
+            newCount={newCount}
             visibleCount={visible.length}
             totalCount={books.length - hidden.length}
             hiddenCount={hidden.length}
@@ -219,49 +242,56 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
             </p>
           )}
 
-          <div className="overflow-x-auto rounded-xl border border-edge bg-surface">
-            <table className="w-full text-left text-sm">
-              <thead className="text-xs uppercase tracking-wide text-dim">
-                <tr>
-                  <th className="px-3 py-2 font-medium">
-                    <input
-                      type="checkbox"
-                      checked={allVisibleSelected}
-                      onChange={(e) =>
-                        scanStore.toggleAll(
-                          selectableVisible.map((b) => b.path),
-                          e.target.checked,
-                        )
-                      }
-                      disabled={selectableVisible.length === 0}
-                      aria-label="Select all visible books"
-                      className="h-4 w-4 accent-pink-600 disabled:cursor-not-allowed disabled:opacity-40"
+          {noNewBooks ? (
+            <div className="rounded-xl border border-edge bg-surface p-6 text-sm text-dim">
+              No new books since your last scan. Switch to All to see the whole library.
+            </div>
+          ) : (
+            <div className="overflow-x-auto rounded-xl border border-edge bg-surface">
+              <table className="w-full text-left text-sm">
+                <thead className="text-xs uppercase tracking-wide text-dim">
+                  <tr>
+                    <th className="px-3 py-2 font-medium">
+                      <input
+                        type="checkbox"
+                        checked={allVisibleSelected}
+                        onChange={(e) =>
+                          scanStore.toggleAll(
+                            selectableVisible.map((b) => b.path),
+                            e.target.checked,
+                          )
+                        }
+                        disabled={selectableVisible.length === 0}
+                        aria-label="Select all visible books"
+                        className="h-4 w-4 accent-pink-600 disabled:cursor-not-allowed disabled:opacity-40"
+                      />
+                    </th>
+                    <th className="px-3 py-2 font-medium">Book</th>
+                    <th className="px-3 py-2 font-medium">Series</th>
+                    <th className="px-3 py-2 font-medium">Length</th>
+                    <th className="px-3 py-2 font-medium">Coverage</th>
+                    <th className="px-3 py-2 text-right font-medium">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {visible.map((b) => (
+                    <CandidateRow
+                      key={b.path}
+                      book={b}
+                      checked={!b.pipeline_book && selected.has(b.path)}
+                      onToggle={handleToggle}
+                      onMatch={setMatchTarget}
+                      onClearMatch={handleClearMatch}
+                      onHide={handleHide}
+                      onToggleSource={handleToggleSource}
+                      markNew={view === 'all'}
+                      busy={busyPaths.has(b.path)}
                     />
-                  </th>
-                  <th className="px-3 py-2 font-medium">Book</th>
-                  <th className="px-3 py-2 font-medium">Series</th>
-                  <th className="px-3 py-2 font-medium">Length</th>
-                  <th className="px-3 py-2 font-medium">Coverage</th>
-                  <th className="px-3 py-2 text-right font-medium">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {visible.map((b) => (
-                  <CandidateRow
-                    key={b.path}
-                    book={b}
-                    checked={!b.pipeline_book && selected.has(b.path)}
-                    onToggle={handleToggle}
-                    onMatch={setMatchTarget}
-                    onClearMatch={handleClearMatch}
-                    onHide={handleHide}
-                    onToggleSource={handleToggleSource}
-                    busy={busyPaths.has(b.path)}
-                  />
-                ))}
-              </tbody>
-            </table>
-          </div>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
 
           {showHidden && hiddenVisible.length > 0 && (
             <div className="flex flex-col gap-2">
@@ -287,7 +317,16 @@ export function LibraryPanel({ client, onProcessed }: LibraryPanelProps) {
             </div>
           )}
 
-          <div className="flex items-center justify-end">
+          <div className="flex items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => void handleDismiss()}
+              disabled={selectedNew.length === 0 || dismissing}
+              title="Mark the selected books as seen so they drop out of the New view"
+              className="rounded-md border border-edge bg-raised px-4 py-2 text-sm font-medium text-body transition-colors hover:bg-edge disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {dismissing ? 'Dismissing...' : 'Dismiss'}
+            </button>
             <button
               type="button"
               onClick={handleProcess}
@@ -396,6 +435,9 @@ function ScanProgressLine({ job }: { job: ScanJob }) {
 }
 
 interface ToolbarProps {
+  view: LibraryView;
+  onViewChange: (v: LibraryView) => void;
+  newCount: number;
   visibleCount: number;
   totalCount: number;
   hiddenCount: number;
@@ -408,6 +450,9 @@ interface ToolbarProps {
 }
 
 function Toolbar({
+  view,
+  onViewChange,
+  newCount,
   visibleCount,
   totalCount,
   hiddenCount,
@@ -420,9 +465,23 @@ function Toolbar({
 }: ToolbarProps) {
   return (
     <div className="flex flex-wrap items-center justify-between gap-3">
-      <span className="text-sm text-dim">
-        Showing {visibleCount} of {totalCount}
-      </span>
+      <div className="flex flex-wrap items-center gap-3">
+        <div
+          role="group"
+          aria-label="Library view"
+          className="inline-flex rounded-md border border-edge bg-raised p-0.5"
+        >
+          <ViewButton active={view === 'new'} onClick={() => onViewChange('new')}>
+            New ({newCount})
+          </ViewButton>
+          <ViewButton active={view === 'all'} onClick={() => onViewChange('all')}>
+            All ({totalCount})
+          </ViewButton>
+        </div>
+        <span className="text-sm text-dim">
+          Showing {visibleCount} of {totalCount}
+        </span>
+      </div>
       <div className="flex flex-wrap items-center gap-4">
         <input
           type="search"
@@ -452,5 +511,31 @@ function Toolbar({
         </label>
       </div>
     </div>
+  );
+}
+
+// One segment of the New/All control. aria-pressed carries the selected state so
+// the pair reads as a two-option toggle rather than two unrelated buttons.
+function ViewButton({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={
+        'rounded px-3 py-1 text-sm font-medium transition-colors ' +
+        (active ? 'bg-pink-600 text-white' : 'text-body hover:bg-edge')
+      }
+    >
+      {children}
+    </button>
   );
 }
