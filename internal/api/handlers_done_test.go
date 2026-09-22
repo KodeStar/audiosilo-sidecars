@@ -18,7 +18,7 @@ const doneTestCharacters = `{
   "characters": [
     {"id": "logen-ninefingers", "name": "Logen Ninefingers", "role": "protagonist", "reveal": {"chapter": 1}, "description": "A feared Northman warrior."}
   ],
-  "license": "CC-BY-SA-3.0",
+  "license": "CC-BY-SA-4.0",
   "sources": [{"type": "community"}]
 }`
 
@@ -29,7 +29,7 @@ const doneTestRecaps = `{
   ],
   "in_short": "The first book of the First Law trilogy.",
   "ending": "The pieces are set for war.",
-  "license": "CC-BY-SA-3.0",
+  "license": "CC-BY-SA-4.0",
   "sources": [{"type": "community"}]
 }`
 

@@ -87,7 +87,7 @@ not in this table and not in the fact notes must not appear in the sidecars.
 
 Write `out/characters.json` and `out/recaps.json` in the sidecar shapes shown in
 authoring.md. In both files set `work` to `"{{.WorkSlug}}"`, `license` to
-`"CC-BY-SA-3.0"`, and `sources` to `[{"type": "community"}]`.
+`"CC-BY-SA-4.0"`, and `sources` to `[{"type": "community"}]`.
 
 ## Hard rules
 

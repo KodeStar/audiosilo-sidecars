@@ -29,7 +29,7 @@ const (
 	recapsFileName        = "recaps.json"
 	validationReportName  = "validation_report.json"
 	auditReportName       = "audit.json"
-	sidecarLicenseContent = "CC-BY-SA-3.0"
+	sidecarLicenseContent = "CC-BY-SA-4.0"
 	sourceTypeCommunity   = "community"
 )
 

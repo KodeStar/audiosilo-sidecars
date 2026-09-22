@@ -26,7 +26,7 @@ const sampleCharacters = `{
     {"id": "logen-ninefingers", "name": "Logen Ninefingers", "aliases": ["The Bloody-Nine"], "role": "protagonist", "reveal": {"chapter": 1}, "description": "A feared Northman warrior.", "xref": {"wikidata": "Q123"}},
     {"id": "glokta", "name": "Sand dan Glokta", "role": "supporting", "reveal": {"chapter": 2}, "description": "A crippled inquisitor."}
   ],
-  "license": "CC-BY-SA-3.0",
+  "license": "CC-BY-SA-4.0",
   "sources": [{"type": "community"}]
 }`
 
@@ -38,7 +38,7 @@ const sampleRecaps = `{
   ],
   "in_short": "The first book of the First Law trilogy.",
   "ending": "The pieces are set for war.",
-  "license": "CC-BY-SA-3.0",
+  "license": "CC-BY-SA-4.0",
   "sources": [{"type": "community"}]
 }`
 
@@ -47,7 +47,7 @@ const sampleRecapsNoSummary = `{
   "recaps": [
     {"through": {"chapter": 1}, "text": "Logen escapes the Shanka."}
   ],
-  "license": "CC-BY-SA-3.0",
+  "license": "CC-BY-SA-4.0",
   "sources": [{"type": "community"}]
 }`
 

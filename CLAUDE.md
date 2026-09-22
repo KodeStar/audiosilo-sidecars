@@ -25,7 +25,7 @@ It is a **client tool, not a server**: it reads the public meta.audiosilo.app AP
 holds no community data of its own.
 
 Module path: `github.com/kodestar/audiosilo-sidecars`. Code is **AGPL-3.0**
-(matching audiosilo-server/meta). The sidecars it produces are CC BY-SA 3.0 (the
+(matching audiosilo-server/meta). The sidecars it produces are CC BY-SA 4.0 (the
 meta repo's content license) - never fabricated, own-words only; the copyright
 rules in audiosilo-meta's AUTHORING.md / LICENSING.md are load-bearing for the
 pipeline milestones.
@@ -189,8 +189,9 @@ every remaining stage real; M6 Done board + richer Running board + ETA engine
 + typed park reasons; M7 contribution (issue/PR/local, needs-core flow,
 poller, auto-purge); M8 packaging (GoReleaser binaries + GHCR CPU/CUDA
 images); M9 ebook input (an EPUB is a first-class source - extracting ->
-[chapter_mapping] -> the unchanged authoring tail; depends on audiosilo-meta
-v0.8.0). Post-milestone rounds followed: UX/observability, spelling-cost,
+[chapter_mapping] -> the unchanged authoring tail; needs audiosilo-meta
+v0.8.0 or newer, and v0.8.0 is what go.mod still pins - see the license
+caveat below). Post-milestone rounds followed: UX/observability, spelling-cost,
 reliability (the two bounded loops learned to ACCEPT; availability
 self-resume via retry_at; per-book budget; superseded stage_runs), fact-pass
 cost (bounded map-reduce), canonical-spelling (reference-match pre-pass +
@@ -212,6 +213,19 @@ Operative caveats surviving from that history:
   sentinel on resume - delete + re-enqueue such books. Books parked at the
   pre-M5 `markers_normalizing`/`qa_adjudicating` are safe (those parks wrote
   no sentinel).
+- **The audiosilo-meta module pin is stuck at v0.8.0.** The community layer
+  moved to **CC BY-SA 4.0** upstream (audiosilo-meta 4a06b1a1, first tagged in
+  v0.13.0), and this tool now emits `"license": "CC-BY-SA-4.0"`. The module
+  itself cannot be bumped past v0.8.0: from v0.9.0 on, audiosilo-meta's `data/`
+  tree is ~1.6 GB, over the go command's 500 MiB module-zip ceiling, so
+  `go get github.com/kodestar/audiosilo-meta@v0.13.0+` fails with "module source
+  tree too large". That is harmless for the sidecar contract - v0.8.0's
+  `characters.schema.json` / `recaps.schema.json` are byte-identical to
+  v0.15.0's, only `common.schema.json`'s license enum moved - but it means the
+  drift guard in `internal/pipeline/schema_drift_test.go` tolerates ONE known
+  mismatch (the license) and pins 4.0 in a separate test. Unblocking it needs an
+  upstream change (a nested `data/go.mod` so the data tree leaves the module zip)
+  plus a new tag.
 - **whisper.cpp binaries ship on their own cadence** (`whisper-binaries.yml`,
   a separate release `toolfetch` consumes; publish first, then bump
   `toolfetch.WhisperCLIReleaseTag`) - never couple them into

@@ -21,7 +21,7 @@ or API key).
 > [CLAUDE.md](CLAUDE.md) for the roadmap.
 
 This is the seventh repository in the AudioSilo workspace. Code is licensed
-**AGPL-3.0** (see [LICENSE](LICENSE)); the sidecars it produces are CC BY-SA 3.0,
+**AGPL-3.0** (see [LICENSE](LICENSE)); the sidecars it produces are CC BY-SA 4.0,
 the content license of the metadata database.
 
 ## Install

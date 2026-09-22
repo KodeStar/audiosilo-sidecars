@@ -565,3 +565,37 @@ Milestones from the workspace plan; each is shippable.
   over the new endpoint. Gate: Go build/vet/`test -race`/golangci-lint green, with
   store record/bump/baseline/acknowledge/has tests, a ScanManager recording +
   cache-seed test, the ComputeIsNew table, and allowed + denied route tests.
+
+- **License: the community layer to CC BY-SA 4.0 (2026-09-22).**
+  KodeStar/audiosilo-meta-community relicensed the community layer to **CC
+  BY-SA 4.0** upstream (audiosilo-meta commit 4a06b1a1, 2026-08-21, first
+  tagged in v0.13.0), and its intake bot began rejecting every submission from
+  this tool with `characters: /license: value must be 'CC-BY-SA-4.0'`. Every
+  license string this repo emits or teaches moved to 4.0 in one pass: the
+  `sidecarLicenseContent` constant the local validator enforces on both sidecar
+  files, the contributing stage's PR body, `contrib`'s `itemCCBySALicense`
+  checkbox text (re-verified byte-for-byte against
+  `.github/ISSUE_TEMPLATE/add-characters.yml` / `add-recaps.yml`, along with
+  the other item labels the composer mirrors - all still exact), the four
+  embedded agent prompts (authoring/synthesis/audit/fix), the compose/roundtrip
+  goldens and the done-board fixtures, and README/CLAUDE.
+  **The go.mod pin could NOT follow.** No tag carrying the 4.0 enum is
+  consumable as a Go module: from v0.9.0 on, audiosilo-meta's `data/` tree is
+  ~1.6 GB, over the go command's 500 MiB module-zip ceiling, so
+  `go get github.com/kodestar/audiosilo-meta@v0.13.0` (or any later tag) fails
+  with "module source tree too large" from both the proxy and direct. v0.8.0
+  stays pinned, which is safe for the sidecar contract: v0.8.0's
+  `characters.schema.json` and `recaps.schema.json` are byte-identical to
+  v0.15.0's, so no new or renamed required field exists - `common.schema.json`'s
+  `license_content` enum is the ONLY sidecar-relevant change (its other
+  additions, a `libex-import` source type and the `genre`/`genre_list` defs, are
+  core-record vocabulary this tool does not emit). Consequence for the drift
+  guard: `TestSidecarConstantsMatchUpstreamSchema` still asserts hard equality
+  for the caps, role/scope enums and QID pattern, but the license branch now
+  tolerates exactly one known-stale value (`stalePinLicenseContent`) and fails
+  on anything else, and a new `TestSidecarLicenseIsTheCommunityLayerValue` pins
+  the emitted string to 4.0 so a silent revert cannot ship. Two
+  `validateSidecars` cases assert the retired 3.0 value is rejected on
+  characters.json AND recaps.json. Unblocking the pin is an upstream job: give
+  audiosilo-meta a nested `data/go.mod` so the data tree drops out of the module
+  zip, then tag. Gate: full Go gate green; no web changes.

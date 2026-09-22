@@ -5,7 +5,7 @@ This guide covers the **expressive layer** of the database: community-authored
 **character** entries and **recaps** ("story so far" summaries). It is separate
 from CONTRIBUTING.md, which covers the factual CC0 core
 (works, recordings, people, series). Read LICENSING.md first -
-this layer is **CC BY-SA 3.0**, not CC0, and it carries real copyright
+this layer is **CC BY-SA 4.0**, not CC0, and it carries real copyright
 obligations the core does not.
 
 If you are filling out a whole series, do the CC0 core first (the works,
@@ -29,7 +29,7 @@ data/works/<shard>/<work-slug>/recaps.json       # position-keyed "story so far"
 
 `<shard>` is the first two characters of the **work** slug (the same shard the
 `work.json` is under). Each file carries `work` (the parent work slug, which
-must equal the directory), `license` (**must** be `"CC-BY-SA-3.0"`), and
+must equal the directory), `license` (**must** be `"CC-BY-SA-4.0"`), and
 `sources`.
 
 ### characters.json
@@ -37,7 +37,7 @@ must equal the directory), `license` (**must** be `"CC-BY-SA-3.0"`), and
 ```json
 {
   "work": "a-deadly-education",
-  "license": "CC-BY-SA-3.0",
+  "license": "CC-BY-SA-4.0",
   "sources": [{ "type": "community" }],
   "characters": [
     {
@@ -76,7 +76,7 @@ must equal the directory), `license` (**must** be `"CC-BY-SA-3.0"`), and
 ```json
 {
   "work": "the-last-graduate",
-  "license": "CC-BY-SA-3.0",
+  "license": "CC-BY-SA-4.0",
   "sources": [{ "type": "community" }],
   "in_short": "The whole book in one paragraph, ending included, for someone about to start the next one.",
   "ending": "How the book closes: where every major player stands, and which threads stay open.",
@@ -188,7 +188,7 @@ style:
 
 ## Format and validation
 
-- `license` is `"CC-BY-SA-3.0"` and `sources` is `[{ "type": "community" }]`
+- `license` is `"CC-BY-SA-4.0"` and `sources` is `[{ "type": "community" }]`
   (add `ref`/`imported_at` if a specific source applies).
 - The gate is: canonical formatting (sorted keys, 2-space) and schema +
   integrity + uniqueness checks, which enforce valid JSON Schema, `work` matches
@@ -199,7 +199,7 @@ style:
 
 - [ ] The work, its recording(s), author, and narrator already exist and validate.
 - [ ] `work` equals the directory slug; file is under the work's shard.
-- [ ] `license` is `"CC-BY-SA-3.0"`; `sources` present.
+- [ ] `license` is `"CC-BY-SA-4.0"`; `sources` present.
 - [ ] Every character has an `id` (unique in file), `name`, and `reveal`.
 - [ ] Descriptions/texts are your own words, within the caps, and accurate
       (character at most 1500, recap `text` at most 3000, `in_short` at most 1500, `ending` at most 2000).
