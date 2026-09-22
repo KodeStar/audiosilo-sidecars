@@ -52,6 +52,15 @@ func TestValidateSidecars(t *testing.T) {
 		}},
 		{name: "bad work slug", opener: true, mutate: func(c *model.Characters, _ *model.Recaps) { c.Work = "Not A Slug" }, wantErr: "kebab-case slug"},
 		{name: "bad license", opener: true, mutate: func(c *model.Characters, _ *model.Recaps) { c.License = "CC0-1.0" }, wantErr: "license must be"},
+		// The retired share-alike value: the community intake rejects it outright
+		// ("characters: /license: value must be 'CC-BY-SA-4.0'"), so the local
+		// validator must catch it first, on BOTH sidecar files.
+		{name: "retired 3.0 license on characters", opener: true, mutate: func(c *model.Characters, _ *model.Recaps) {
+			c.License = "CC-BY-SA-3.0"
+		}, wantErr: `characters.json: license must be "CC-BY-SA-4.0"`},
+		{name: "retired 3.0 license on recaps", opener: true, mutate: func(_ *model.Characters, r *model.Recaps) {
+			r.License = "CC-BY-SA-3.0"
+		}, wantErr: `recaps.json: license must be "CC-BY-SA-4.0"`},
 		{name: "no sources", opener: true, mutate: func(c *model.Characters, _ *model.Recaps) { c.Sources = nil }, wantErr: "sources must be exactly"},
 		{name: "wrong source type", opener: true, mutate: func(c *model.Characters, _ *model.Recaps) { c.Sources = []model.Source{{Type: "wiki"}} }, wantErr: "sources must be exactly"},
 		{name: "no characters", opener: true, mutate: func(c *model.Characters, _ *model.Recaps) { c.Characters = nil }, wantErr: "at least one character"},

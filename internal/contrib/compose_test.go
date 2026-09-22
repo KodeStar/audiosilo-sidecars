@@ -10,7 +10,7 @@ import (
 const fence = "```"
 
 func TestCharactersIssueGolden(t *testing.T) {
-	payload := `{"work":"a-deadly-education","characters":[{"id":"el","name":"El","reveal":{"chapter":1},"description":"A sardonic student."}],"license":"CC-BY-SA-3.0","sources":[{"type":"community"}]}`
+	payload := `{"work":"a-deadly-education","characters":[{"id":"el","name":"El","reveal":{"chapter":1},"description":"A sardonic student."}],"license":"CC-BY-SA-4.0","sources":[{"type":"community"}]}`
 	title, body, labels := CharactersIssue("a-deadly-education", []byte(payload), "")
 
 	if title != "[characters] a-deadly-education" {
@@ -24,7 +24,7 @@ func TestCharactersIssueGolden(t *testing.T) {
 		"### The characters.json file\n\n" + fence + "json\n" + payload + "\n" + fence + "\n\n" +
 		"### Own words\n\n- [x] Every description is my own words - no verbatim or near-verbatim text from the book, its jacket copy, or any wiki.\n\n" +
 		"### Neutral voice\n\n- [x] The entries use a neutral reference-guide voice - no jokes, editorializing, profanity, or value judgements.\n\n" +
-		"### License\n\n- [x] I license this contribution under CC BY-SA 3.0, and I have the right to do so.\n\n"
+		"### License\n\n- [x] I license this contribution under CC BY-SA 4.0, and I have the right to do so.\n\n"
 	if body != want {
 		t.Fatalf("body mismatch:\n--- got ---\n%s\n--- want ---\n%s", body, want)
 	}
@@ -43,7 +43,7 @@ func TestCharactersIssueGistLink(t *testing.T) {
 }
 
 func TestRecapsIssueGolden(t *testing.T) {
-	payload := `{"work":"a-deadly-education","recaps":[{"through":{"chapter":1},"text":"So far, the school has been introduced."}],"license":"CC-BY-SA-3.0","sources":[{"type":"community"}]}`
+	payload := `{"work":"a-deadly-education","recaps":[{"through":{"chapter":1},"text":"So far, the school has been introduced."}],"license":"CC-BY-SA-4.0","sources":[{"type":"community"}]}`
 	title, body, labels := RecapsIssue("a-deadly-education", []byte(payload), "")
 
 	if title != "[recaps] a-deadly-education" {
@@ -57,7 +57,7 @@ func TestRecapsIssueGolden(t *testing.T) {
 		"### The recaps.json file\n\n" + fence + "json\n" + payload + "\n" + fence + "\n\n" +
 		"### Own words\n\n- [x] Every recap is my own words - no verbatim or near-verbatim text from the book, its jacket copy, or any wiki - and stays within the length caps.\n\n" +
 		"### Neutral voice\n\n- [x] The recaps use a neutral reference-guide voice - no jokes, editorializing, profanity, or value judgements - and the final entry states the actual ending.\n\n" +
-		"### License\n\n- [x] I license this contribution under CC BY-SA 3.0, and I have the right to do so.\n\n"
+		"### License\n\n- [x] I license this contribution under CC BY-SA 4.0, and I have the right to do so.\n\n"
 	if body != want {
 		t.Fatalf("body mismatch:\n--- got ---\n%s\n--- want ---\n%s", body, want)
 	}

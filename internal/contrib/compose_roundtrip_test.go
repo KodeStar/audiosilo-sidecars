@@ -27,8 +27,8 @@ func TestComposeRoundTrip(t *testing.T) {
 		t.Skipf("AUDIOSILO_META_DIR does not look like a meta checkout: %v", err)
 	}
 
-	charactersPayload := `{"work":"existing-work","characters":[{"id":"alice","name":"Alice","reveal":{"chapter":1},"description":"A brave adventurer introduced early in the book."}],"license":"CC-BY-SA-3.0","sources":[{"type":"community"}]}`
-	recapsPayload := `{"work":"existing-work","recaps":[{"through":{"chapter":1},"text":"So far, the opening chapter has set the scene and the adventure is under way."}],"license":"CC-BY-SA-3.0","sources":[{"type":"community"}]}`
+	charactersPayload := `{"work":"existing-work","characters":[{"id":"alice","name":"Alice","reveal":{"chapter":1},"description":"A brave adventurer introduced early in the book."}],"license":"CC-BY-SA-4.0","sources":[{"type":"community"}]}`
+	recapsPayload := `{"work":"existing-work","recaps":[{"through":{"chapter":1},"text":"So far, the opening chapter has set the scene and the adventure is under way."}],"license":"CC-BY-SA-4.0","sources":[{"type":"community"}]}`
 
 	t.Run("characters", func(t *testing.T) {
 		_, body, _ := CharactersIssue("existing-work", []byte(charactersPayload), "")

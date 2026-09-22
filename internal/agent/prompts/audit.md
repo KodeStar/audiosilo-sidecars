@@ -56,7 +56,7 @@ web access. Do NOT rewrite the sidecars - you only report.
 5. CONTRACT: neutral voice; caps (description 1500, text 3000, in_short 1500,
    ending 2000); the final recap states the ending plainly, never a tease; no em
    dashes; {{if .IsSeriesOpener}}a series opener has NO `chapter: 0` series recap{{else}}book 2+ carries a `chapter: 0` series recap{{end}}; `license` is
-   "CC-BY-SA-3.0" and `sources` is `[{"type": "community"}]`.
+   "CC-BY-SA-4.0" and `sources` is `[{"type": "community"}]`.
 6. PROVENANCE: every published proper noun appears in the verified ledger table
    below, OR is explicitly supported in the fact notes. The ledger's
    `Unresolved / do-not-publish-clean` section is the one hard override: a surface

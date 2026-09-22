@@ -65,7 +65,7 @@ const (
 	itemNeutralCharacters  = "The entries use a neutral reference-guide voice - no jokes, editorializing, profanity, or value judgements."
 	itemOwnWordsRecaps     = "Every recap is my own words - no verbatim or near-verbatim text from the book, its jacket copy, or any wiki - and stays within the length caps."
 	itemNeutralRecaps      = "The recaps use a neutral reference-guide voice - no jokes, editorializing, profanity, or value judgements - and the final entry states the actual ending."
-	itemCCBySALicense      = "I license this contribution under CC BY-SA 3.0, and I have the right to do so."
+	itemCCBySALicense      = "I license this contribution under CC BY-SA 4.0, and I have the right to do so."
 	itemFactualData        = "This submission is factual data (no publisher blurb or copyrighted description)."
 	itemCC0Dedication      = "I dedicate this contribution to the public domain under CC0-1.0, and I have the right to do so."
 )

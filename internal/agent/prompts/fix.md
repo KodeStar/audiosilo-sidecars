@@ -38,7 +38,7 @@ web access.
 - Keep every synthesis hard rule: fresh own-words prose (an 8-word-shingle check
   will re-run), neutral reference-guide voice, hyphens never em dashes, the length
   caps (description 1500, text 3000, in_short 1500, ending 2000), the reveal /
-  through spoiler bounds, and `license` "CC-BY-SA-3.0" with `sources`
+  through spoiler bounds, and `license` "CC-BY-SA-4.0" with `sources`
   `[{"type": "community"}]`.
 - Identity transitions need temporal cards when the connection is learned later:
   keep the early-name card free of all future names and aliases, then use a separate
