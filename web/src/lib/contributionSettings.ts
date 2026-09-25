@@ -11,7 +11,7 @@ import { parseIntOrNaN } from '@/lib/formNumbers';
 export const CONTRIBUTION_MODES: { value: string; label: string }[] = [
   { value: 'issue', label: 'Issue (intake bot composes the PR)' },
   { value: 'pr', label: 'Pull request (direct)' },
-  { value: 'local', label: 'Local export only' },
+  { value: 'local', label: 'Local export only (one sidecar file per kind)' },
 ];
 
 // ContributionFormState is the editable form model. pollMinutes is a raw input
@@ -19,7 +19,8 @@ export const CONTRIBUTION_MODES: { value: string; label: string }[] = [
 // validation functions parse it.
 export interface ContributionFormState {
   mode: string;
-  repo: string;
+  coreRepo: string;
+  communityRepo: string;
   autoPurge: boolean;
   pollMinutes: string;
 }
@@ -28,7 +29,8 @@ export interface ContributionFormState {
 export function contributionConfigToForm(cfg: ContributionConfig): ContributionFormState {
   return {
     mode: cfg.mode,
-    repo: cfg.repo,
+    coreRepo: cfg.core_repo,
+    communityRepo: cfg.community_repo,
     autoPurge: cfg.auto_purge,
     pollMinutes: String(cfg.poll_minutes),
   };
@@ -39,7 +41,8 @@ export function contributionConfigToForm(cfg: ContributionConfig): ContributionF
 export function contributionFormToUpdate(form: ContributionFormState): ContributionUpdate {
   return {
     mode: form.mode,
-    repo: form.repo.trim(),
+    core_repo: form.coreRepo.trim(),
+    community_repo: form.communityRepo.trim(),
     auto_purge: form.autoPurge,
     poll_minutes: parseIntOrNaN(form.pollMinutes),
   };
@@ -50,10 +53,13 @@ export function contributionFormToUpdate(form: ContributionFormState): Contribut
 // owner/name shape, mode enum, poll interval) and its 400 message wins on any
 // disagreement.
 export function validateContributionForm(form: ContributionFormState): string | null {
-  const repo = form.repo.trim();
   // owner/name: a single slash, no spaces, non-empty halves.
-  if (!/^[^/\s]+\/[^/\s]+$/.test(repo)) {
-    return 'Repository must be in owner/name form (e.g. KodeStar/audiosilo-meta).';
+  const ownerName = /^[^/\s]+\/[^/\s]+$/;
+  if (!ownerName.test(form.coreRepo.trim())) {
+    return 'Core repository must be in owner/name form (e.g. KodeStar/audiosilo-meta).';
+  }
+  if (!ownerName.test(form.communityRepo.trim())) {
+    return 'Community repository must be in owner/name form (e.g. KodeStar/audiosilo-meta-community).';
   }
   const p = parseIntOrNaN(form.pollMinutes);
   if (!Number.isInteger(p) || p < 1) {

@@ -26,6 +26,27 @@ const ContribNoteIntakePRStale = "intake PR overdue - review the GitHub issue"
 // GitHub drops the requested routing label from a newly created intake issue.
 const ContribNoteLabelsMissingPrefix = "labels missing"
 
+// Intake-verdict notes. The metadata repositories' intake bot answers a submission
+// it cannot turn into a pull request with a verdict label (data:needs-human,
+// data:invalid, data:duplicate) and a comment; the poller surfaces that verdict as
+// the LAST segment of the row's note, headed by ContribNoteIntakeVerdictPrefix, so
+// a later verdict (or the intake PR appearing after all) replaces it cleanly.
+//
+// needs-human and invalid keep the row submitted (the issue stays open and an edit
+// re-runs the bot) and are actionable; duplicate is recorded already_covered - the
+// work or sidecar is upstream already, done by someone else, not an error.
+const (
+	ContribNoteIntakeVerdictPrefix = "intake verdict: "
+	ContribNoteIntakeNeedsHuman    = ContribNoteIntakeVerdictPrefix + "needs a maintainer"
+	ContribNoteIntakeInvalid       = ContribNoteIntakeVerdictPrefix + "invalid"
+	ContribNoteIntakeDuplicate     = ContribNoteIntakeVerdictPrefix + "already in the database"
+)
+
+// ContribNoteCoreSlugUnresolvedPrefix heads the note the poller records on a merged
+// core row whose pull request did not name exactly one new work (none, or several):
+// it never guesses, so the book waits for a human to set its work.
+const ContribNoteCoreSlugUnresolvedPrefix = "work slug not learned from the merged PR"
+
 // Contribution mode values (how the artifact was contributed). Mirrors
 // config.ContributionConfig.Mode.
 const (
@@ -205,6 +226,42 @@ func (db *DB) ListBooksWithUnresolvedMergedCore(ctx context.Context) ([]Book, er
 	return out, rows.Err()
 }
 
+// parkCodeCorePending mirrors state.ParkCorePending (the store keeps its opaque-string
+// decoupling from internal/state, as statusNeedsAttention does).
+const parkCodeCorePending = "core_pending"
+
+// ListBooksAwaitingRelease returns the books parked core_pending that already carry a
+// work_id and a merged kind=core row: the add-work PR merged and the poller learned
+// the new work's slug, but the published catalogue did not hold it yet when last
+// checked. The poller re-checks each one and re-admits it once the work is live
+// (the release gate: contributing a sidecar keyed by a slug no data release holds
+// yet is refused by the community intake).
+func (db *DB) ListBooksAwaitingRelease(ctx context.Context) ([]Book, error) {
+	rows, err := db.sql.QueryContext(ctx,
+		`SELECT `+bookCols+` FROM books b
+		 WHERE b.work_id IS NOT NULL AND b.work_id != ''
+		   AND b.status = ? AND b.park_code = ?
+		   AND EXISTS (
+		     SELECT 1 FROM contributions c
+		     WHERE c.book_id = b.id AND c.kind = ? AND c.status = ?
+		   )
+		 ORDER BY b.id`,
+		statusNeedsAttention, parkCodeCorePending, ContribKindCore, ContribStatusMerged)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []Book
+	for rows.Next() {
+		b, err := scanBook(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
 // SetContributionStatus advances a contribution row's lifecycle: the poller uses it to
 // record the discovered intake PR (prNumber/prURL) and move the status through
 // pr_open/merged/closed, with an optional note. It bumps updated_at.
@@ -290,9 +347,14 @@ func LandedCoverage(rows []Contribution) (hasCharacters, hasRecaps bool) {
 // machine-recognized actionable note. Informational audit notes stay neutral.
 func ContributionNeedsAttention(rows []Contribution) bool {
 	for _, row := range rows {
-		if row.Status == ContribStatusSubmitted &&
-			(strings.Contains(row.Note, ContribNoteIntakePRStale) || strings.Contains(row.Note, ContribNoteLabelsMissingPrefix)) {
-			return true
+		if row.Status != ContribStatusSubmitted {
+			continue
+		}
+		for _, marker := range []string{ContribNoteIntakePRStale, ContribNoteLabelsMissingPrefix,
+			ContribNoteIntakeNeedsHuman, ContribNoteIntakeInvalid} {
+			if strings.Contains(row.Note, marker) {
+				return true
+			}
 		}
 	}
 	return false

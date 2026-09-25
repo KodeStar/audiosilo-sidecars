@@ -2,9 +2,9 @@ package contrib
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -191,68 +191,6 @@ func TestMergeUpstream(t *testing.T) {
 	}
 }
 
-func TestPutContents(t *testing.T) {
-	const contentsPath = "/repos/tester/audiosilo-meta/contents/data/works/aa/a-work/characters.json"
-
-	// Create path: the file does not exist on the branch (GET 404), so PUT carries no sha.
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == contentsPath:
-			if got := r.URL.Query().Get("ref"); got != "sidecars/x-1" {
-				t.Fatalf("ref = %q, want sidecars/x-1", got)
-			}
-			w.WriteHeader(http.StatusNotFound)
-		case r.Method == http.MethodPut && r.URL.Path == contentsPath:
-			body := readJSON(t, r)
-			dec, err := base64.StdEncoding.DecodeString(body["content"].(string))
-			if err != nil {
-				t.Fatalf("content not base64: %v", err)
-			}
-			if string(dec) != `{"work":"a-work"}` {
-				t.Fatalf("decoded content = %q", dec)
-			}
-			if body["branch"] != "sidecars/x-1" {
-				t.Fatalf("branch = %v", body["branch"])
-			}
-			if _, ok := body["sha"]; ok {
-				t.Fatalf("a create over a missing path must not carry a sha: %v", body)
-			}
-			w.WriteHeader(http.StatusCreated)
-			io.WriteString(w, `{"content":{"sha":"abc"}}`)
-		default:
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-	})
-	if err := c.PutContents(context.Background(), "tester/audiosilo-meta", "sidecars/x-1",
-		contentsPath[len("/repos/tester/audiosilo-meta/contents/"):], "add characters", []byte(`{"work":"a-work"}`)); err != nil {
-		t.Fatalf("PutContents (create): %v", err)
-	}
-
-	// Update path (resume): the file already exists (GET returns its sha), so the PUT must
-	// carry that sha - otherwise GitHub 422s the create-over-existing-path.
-	c2 := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			io.WriteString(w, `{"sha":"existing-sha"}`)
-		case http.MethodPut:
-			body := readJSON(t, r)
-			if body["sha"] != "existing-sha" {
-				t.Fatalf("an update over an existing path must carry its sha, got %v", body["sha"])
-			}
-			w.WriteHeader(http.StatusOK)
-			io.WriteString(w, `{}`)
-		default:
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-	})
-	if err := c2.PutContents(context.Background(), "tester/audiosilo-meta", "sidecars/x-1",
-		contentsPath[len("/repos/tester/audiosilo-meta/contents/"):], "update", []byte(`{"work":"a-work"}`)); err != nil {
-		t.Fatalf("PutContents (update): %v", err)
-	}
-}
-
-// TestBranchRef: an existing branch returns its sha + exists=true; a 404 returns
-// exists=false with no error (a resume then reuses/creates as appropriate).
 func TestBranchRef(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -362,14 +300,29 @@ func TestGetPullMerged(t *testing.T) {
 		if r.URL.Path != "/repos/"+testRepo+"/pulls/123" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
-		io.WriteString(w, `{"number":123,"html_url":"u","state":"closed","merged":true}`)
+		io.WriteString(w, `{"number":123,"html_url":"u","state":"closed","merged":true,"merge_commit_sha":"m3rg3"}`)
 	})
 	pr, err := c.GetPull(context.Background(), testRepo, 123)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !pr.Merged || pr.State != "closed" {
+	if !pr.Merged || pr.State != "closed" || pr.MergeCommitSHA != "m3rg3" {
 		t.Fatalf("pr = %+v", pr)
+	}
+}
+
+// TestGetPullOpenHidesTestMergeSHA: an OPEN PR's merge_commit_sha is GitHub's
+// test-merge commit, not a commit on the base branch, so it is not surfaced.
+func TestGetPullOpenHidesTestMergeSHA(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"number":1,"html_url":"u","state":"open","merged":false,"merge_commit_sha":"test-merge"}`)
+	})
+	pr, err := c.GetPull(context.Background(), testRepo, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pr.MergeCommitSHA != "" {
+		t.Fatalf("open PR merge sha = %q, want empty", pr.MergeCommitSHA)
 	}
 }
 
@@ -378,14 +331,223 @@ func TestPullFiles(t *testing.T) {
 		if r.URL.Path != "/repos/"+testRepo+"/pulls/123/files" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
-		io.WriteString(w, `[{"filename":"data/works/th/the-book/work.json"},{"filename":"data/people/au/author.json"}]`)
+		if r.URL.Query().Get("page") != "1" {
+			t.Fatalf("page = %q, want 1 (a short page ends the listing)", r.URL.Query().Get("page"))
+		}
+		io.WriteString(w, `[{"filename":"data/works/c/cat.json","status":"modified"},`+
+			`{"filename":"data/works/c/dog.json","status":"renamed","previous_filename":"data/works/c/cow.json"}]`)
 	})
 	files, err := c.PullFiles(context.Background(), testRepo, 123)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) != 2 || files[0] != "data/works/th/the-book/work.json" {
-		t.Fatalf("files = %v", files)
+	want := []PullFile{
+		{Filename: "data/works/c/cat.json", Status: "modified"},
+		{Filename: "data/works/c/dog.json", Status: "renamed", PreviousFilename: "data/works/c/cow.json"},
+	}
+	if len(files) != 2 || files[0] != want[0] || files[1] != want[1] {
+		t.Fatalf("files = %+v", files)
+	}
+}
+
+// TestPullFilesPaginates: a full page of 100 asks for the next one.
+func TestPullFilesPaginates(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("page") {
+		case "1":
+			var b strings.Builder
+			b.WriteString("[")
+			for i := range 100 {
+				if i > 0 {
+					b.WriteString(",")
+				}
+				fmt.Fprintf(&b, `{"filename":"f%d.json","status":"added"}`, i)
+			}
+			b.WriteString("]")
+			io.WriteString(w, b.String())
+		case "2":
+			io.WriteString(w, `[{"filename":"last.json","status":"added"}]`)
+		default:
+			t.Fatalf("unexpected page %q", r.URL.Query().Get("page"))
+		}
+	})
+	files, err := c.PullFiles(context.Background(), testRepo, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 101 || files[100].Filename != "last.json" {
+		t.Fatalf("files = %d, last = %+v", len(files), files[len(files)-1])
+	}
+}
+
+func TestFileAt(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Accept") != "application/vnd.github.raw+json" {
+			t.Fatalf("Accept = %q, want the raw media type", r.Header.Get("Accept"))
+		}
+		if r.URL.Query().Get("ref") != "abc123" {
+			t.Fatalf("ref = %q", r.URL.Query().Get("ref"))
+		}
+		switch r.URL.Path {
+		case "/repos/" + testRepo + "/contents/data/works/0/0.json":
+			io.WriteString(w, `{"entries":{}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	got, found, err := c.FileAt(context.Background(), testRepo, "data/works/0/0.json", "abc123")
+	if err != nil || !found || string(got) != `{"entries":{}}` {
+		t.Fatalf("FileAt = %q found=%v err=%v", got, found, err)
+	}
+	_, found, err = c.FileAt(context.Background(), testRepo, "data/works/0/gone.json", "abc123")
+	if err != nil || found {
+		t.Fatalf("missing file: found=%v err=%v, want found=false and no error", found, err)
+	}
+}
+
+func TestGetCommitAndDefaultBranch(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/" + testRepo + "/git/commits/c1":
+			io.WriteString(w, `{"sha":"c1","tree":{"sha":"t1"},"parents":[{"sha":"p1"},{"sha":"p2"}]}`)
+		case "/repos/" + testRepo:
+			io.WriteString(w, `{"full_name":"x","default_branch":"trunk"}`)
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	})
+	cm, err := c.GetCommit(context.Background(), testRepo, "c1")
+	if err != nil || cm.TreeSHA != "t1" || len(cm.Parents) != 2 || cm.Parents[0] != "p1" {
+		t.Fatalf("commit = %+v err=%v", cm, err)
+	}
+	br, err := c.DefaultBranch(context.Background(), testRepo)
+	if err != nil || br != "trunk" {
+		t.Fatalf("default branch = %q err=%v", br, err)
+	}
+}
+
+// TestCommitFiles: one commit through the git data API - a blob per written file, a
+// tree over the parent's tree carrying a NULL sha for a deleted path (the only way
+// the trees API removes a file), and a commit whose only parent is the parent.
+func TestCommitFiles(t *testing.T) {
+	var treeBody map[string]any
+	var commitBody map[string]any
+	blobs := 0
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/f/r/git/commits/base":
+			io.WriteString(w, `{"sha":"base","tree":{"sha":"basetree"},"parents":[]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/f/r/git/blobs":
+			body := readJSON(t, r)
+			if body["encoding"] != "base64" {
+				t.Fatalf("blob encoding = %v", body["encoding"])
+			}
+			blobs++
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, `{"sha":"blob%d"}`, blobs)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/f/r/git/trees":
+			treeBody = readJSON(t, r)
+			w.WriteHeader(http.StatusCreated)
+			io.WriteString(w, `{"sha":"newtree"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/f/r/git/commits":
+			commitBody = readJSON(t, r)
+			w.WriteHeader(http.StatusCreated)
+			io.WriteString(w, `{"sha":"newcommit"}`)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	})
+	sha, err := c.CommitFiles(context.Background(), "f/r", "base", "msg",
+		map[string][]byte{"data/b.json": []byte("b"), "data/a.json": []byte("a")}, []string{"data/old.json"})
+	if err != nil || sha != "newcommit" {
+		t.Fatalf("CommitFiles = %q, %v", sha, err)
+	}
+	if blobs != 2 || treeBody["base_tree"] != "basetree" {
+		t.Fatalf("blobs=%d tree=%v", blobs, treeBody)
+	}
+	entries := treeBody["tree"].([]any)
+	if len(entries) != 3 {
+		t.Fatalf("tree entries = %v", entries)
+	}
+	first := entries[0].(map[string]any)
+	last := entries[2].(map[string]any)
+	if first["path"] != "data/a.json" || first["sha"] != "blob1" {
+		t.Fatalf("first entry = %v (want the sorted, blobbed a.json)", first)
+	}
+	if last["path"] != "data/old.json" || last["sha"] != nil {
+		t.Fatalf("deletion entry = %v, want a null sha", last)
+	}
+	if v, ok := last["sha"]; !ok || v != nil {
+		t.Fatalf("deletion must carry an explicit null sha: %v", last)
+	}
+	parents := commitBody["parents"].([]any)
+	if commitBody["tree"] != "newtree" || len(parents) != 1 || parents[0] != "base" {
+		t.Fatalf("commit body = %v", commitBody)
+	}
+}
+
+func TestUpdateRef(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch || r.URL.Path != "/repos/f/r/git/refs/heads/sidecars/x-1" {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		body := readJSON(t, r)
+		if body["sha"] != "s" || body["force"] != true {
+			t.Fatalf("body = %v", body)
+		}
+		io.WriteString(w, `{}`)
+	})
+	if err := c.UpdateRef(context.Background(), "f/r", "sidecars/x-1", "s"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTarballFollowsRedirectAndCaps: the tarball endpoint 302s to an archive host;
+// the stream is handed to fn, and a body over the cap fails the read rather than
+// being truncated silently.
+func TestTarballFollowsRedirectAndCaps(t *testing.T) {
+	var srvURL string
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/f/r/tarball/abc":
+			http.Redirect(w, r, srvURL+"/archive", http.StatusFound)
+		case "/archive":
+			io.WriteString(w, "0123456789")
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	srvURL = c.baseURL
+	var got []byte
+	if err := c.Tarball(context.Background(), "f/r", "abc", 10, func(r io.Reader) error {
+		var err error
+		got, err = io.ReadAll(r)
+		return err
+	}); err != nil || string(got) != "0123456789" {
+		t.Fatalf("Tarball = %q, %v", got, err)
+	}
+	err := c.Tarball(context.Background(), "f/r", "abc", 9, func(r io.Reader) error {
+		_, err := io.ReadAll(r)
+		return err
+	})
+	if !errors.Is(err, errTooLarge) {
+		t.Fatalf("over-cap tarball err = %v, want errTooLarge", err)
+	}
+	if err := c.Tarball(context.Background(), "f/r", "missing", 10, func(io.Reader) error { return nil }); err == nil {
+		t.Fatal("a 404 tarball must error")
+	}
+}
+
+func TestIssueComments(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/"+testRepo+"/issues/7/comments" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		io.WriteString(w, `[{"body":"first","user":{"login":"a"}},{"body":"second","user":{"login":"github-actions[bot]"}}]`)
+	})
+	got, err := c.IssueComments(context.Background(), testRepo, 7)
+	if err != nil || len(got) != 2 || got[1].Body != "second" || got[1].Author != "github-actions[bot]" {
+		t.Fatalf("comments = %+v err=%v", got, err)
 	}
 }
 

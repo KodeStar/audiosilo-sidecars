@@ -94,10 +94,18 @@ const (
 
 // Contribution section defaults.
 const (
-	DefaultContributionMode        = ContributionModeIssue
-	DefaultContributionRepo        = "KodeStar/audiosilo-meta"
-	DefaultContributionAutoPurge   = true
-	DefaultContributionPollMinutes = 10
+	DefaultContributionMode = ContributionModeIssue
+	// DefaultContributionCoreRepo is the CC0 core of the metadata database: works,
+	// recordings, people and series. Add-work proposals (a book whose work does not
+	// exist upstream yet) go here.
+	DefaultContributionCoreRepo = "KodeStar/audiosilo-meta"
+	// DefaultContributionCommunityRepo holds the CC BY-SA community layer (the
+	// characters/recaps sidecars) since the 2026-08-21 community-repo split. The
+	// core repository's intake bot REFUSES a sidecar submission, so the sidecars
+	// must be sent here.
+	DefaultContributionCommunityRepo = "KodeStar/audiosilo-meta-community"
+	DefaultContributionAutoPurge     = true
+	DefaultContributionPollMinutes   = 10
 	// DefaultContributionAPIBaseURL is the GitHub REST API root the contributing
 	// stage and intake poller talk to. Overridable (config/env) for tests (point at
 	// an httptest fake) and GitHub Enterprise (a self-hosted API host).
@@ -224,16 +232,26 @@ type SupervisorConfig struct {
 }
 
 // ContributionConfig controls the contributing stage + the intake poller (M7). Mode
-// selects how a book's sidecars are published; Repo is the upstream meta repository
-// (owner/name); AutoPurge reclaims a book's scratch once it reaches done; PollMinutes
-// is the interval at which open contributions are polled for their intake-PR status.
+// selects how a book's sidecars are published; CoreRepo and CommunityRepo are the
+// two upstream repositories (owner/name) the metadata database is split across;
+// AutoPurge reclaims a book's scratch once it reaches done; PollMinutes is the
+// interval at which open contributions are polled for their intake-PR status.
 //
 // Changing any contribution field takes effect only on a daemon RESTART (the stage
 // and poller are wired once at startup, like asr.backend and agent.*), unlike
 // cors_origins which the API re-reads live per request.
 type ContributionConfig struct {
-	Mode        string `yaml:"mode"`         // "issue" | "pr" | "local"
-	Repo        string `yaml:"repo"`         // upstream meta repo, owner/name
+	Mode string `yaml:"mode"` // "issue" | "pr" | "local"
+	// CoreRepo receives add-work proposals (the CC0 core: works/people/series).
+	CoreRepo string `yaml:"core_repo"`
+	// CommunityRepo receives the characters/recaps sidecars (the CC BY-SA layer).
+	CommunityRepo string `yaml:"community_repo"`
+	// Repo is the LEGACY single-repository setting, from before the metadata
+	// database was split in two. It is read for compatibility only: Load folds it
+	// into CoreRepo (its one still-valid meaning - sidecars never belonged in the
+	// core repository after the split) with a deprecation notice, and clears it, so
+	// the next Save writes core_repo instead. Nothing reads it after Load.
+	Repo        string `yaml:"repo,omitempty"`
 	AutoPurge   bool   `yaml:"auto_purge"`   // purge scratch when a book reaches done
 	PollMinutes int    `yaml:"poll_minutes"` // open-contribution poll interval (>= 1)
 	// APIBaseURL is the GitHub REST API root (absolute http(s) URL). Empty defaults
@@ -300,7 +318,16 @@ type Config struct {
 	Supervisor SupervisorConfig `yaml:"supervisor"`
 	// Contribution configures the contributing stage + intake poller (M7).
 	Contribution ContributionConfig `yaml:"contribution"`
+
+	// deprecations are the one-time notices Load collected about deprecated
+	// settings it honoured (e.g. the legacy contribution.repo). Unexported, so it
+	// never reaches config.yaml; the server logs them once at startup.
+	deprecations []string
 }
+
+// Deprecations returns the notices Load collected about deprecated settings it
+// honoured, for the caller to log once. Empty for a config that uses none.
+func (c Config) Deprecations() []string { return append([]string(nil), c.deprecations...) }
 
 // Default returns a Config with secure defaults.
 func Default() Config {
@@ -337,11 +364,12 @@ func Default() Config {
 			OverallBatchBudgetUSD: DefaultSupervisorBatchBudgetUSD,
 		},
 		Contribution: ContributionConfig{
-			Mode:        DefaultContributionMode,
-			Repo:        DefaultContributionRepo,
-			AutoPurge:   DefaultContributionAutoPurge,
-			PollMinutes: DefaultContributionPollMinutes,
-			APIBaseURL:  DefaultContributionAPIBaseURL,
+			Mode:          DefaultContributionMode,
+			CoreRepo:      DefaultContributionCoreRepo,
+			CommunityRepo: DefaultContributionCommunityRepo,
+			AutoPurge:     DefaultContributionAutoPurge,
+			PollMinutes:   DefaultContributionPollMinutes,
+			APIBaseURL:    DefaultContributionAPIBaseURL,
 		},
 	}
 }
@@ -376,6 +404,12 @@ func Load(dataDir string) (Config, error) {
 			QueueConcurrency *int `yaml:"queue_concurrency"`
 			MaxAgentsPerBook *int `yaml:"max_agents_per_book"`
 		} `yaml:"agent"`
+		// Contribution.CoreRepo is presence-probed for the same reason: Default()
+		// seeds core_repo, so only the file can say whether a legacy `repo:` was
+		// written alongside an explicit core_repo (which then wins) or alone.
+		Contribution struct {
+			CoreRepo *string `yaml:"core_repo"`
+		} `yaml:"contribution"`
 	}
 	switch {
 	case err == nil:
@@ -410,6 +444,7 @@ func Load(dataDir string) (Config, error) {
 			cfg.Agent.Concurrency = 0
 		}
 	}
+	foldLegacyContributionRepo(&cfg, capacityKeys.Contribution.CoreRepo != nil, "config.yaml contribution.repo")
 	applyEnv(&cfg)
 	if cfg.Agent.TimeoutMinutes == 0 {
 		cfg.Agent.TimeoutMinutes = DefaultTimeoutMinutes
@@ -443,8 +478,11 @@ func Load(dataDir string) (Config, error) {
 	if strings.TrimSpace(cfg.Contribution.Mode) == "" {
 		cfg.Contribution.Mode = DefaultContributionMode
 	}
-	if strings.TrimSpace(cfg.Contribution.Repo) == "" {
-		cfg.Contribution.Repo = DefaultContributionRepo
+	if strings.TrimSpace(cfg.Contribution.CoreRepo) == "" {
+		cfg.Contribution.CoreRepo = DefaultContributionCoreRepo
+	}
+	if strings.TrimSpace(cfg.Contribution.CommunityRepo) == "" {
+		cfg.Contribution.CommunityRepo = DefaultContributionCommunityRepo
 	}
 	if cfg.Contribution.PollMinutes == 0 {
 		cfg.Contribution.PollMinutes = DefaultContributionPollMinutes
@@ -562,8 +600,16 @@ func applyEnv(cfg *Config) {
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_MODE"); ok {
 		cfg.Contribution.Mode = strings.TrimSpace(v)
 	}
+	_, coreEnv := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_CORE_REPO")
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_CORE_REPO"); ok {
+		cfg.Contribution.CoreRepo = strings.TrimSpace(v)
+	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_REPO"); ok {
 		cfg.Contribution.Repo = strings.TrimSpace(v)
+		foldLegacyContributionRepo(cfg, coreEnv, "AUDIOSILO_SIDECARS_CONTRIBUTION_REPO")
+	}
+	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_COMMUNITY_REPO"); ok {
+		cfg.Contribution.CommunityRepo = strings.TrimSpace(v)
 	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_AUTO_PURGE"); ok {
 		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
@@ -578,6 +624,34 @@ func applyEnv(cfg *Config) {
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_API_BASE_URL"); ok {
 		cfg.Contribution.APIBaseURL = strings.TrimSpace(v)
 	}
+}
+
+// foldLegacyContributionRepo honours the pre-split `contribution.repo` setting.
+//
+// Before the metadata database was split, one repository took every contribution.
+// Since 2026-08-21 the characters/recaps sidecars belong in the community
+// repository and the core repository's intake bot refuses them, so the legacy
+// value keeps the ONE meaning still valid for it - the core repository add-work
+// proposals go to - and never reroutes the sidecars. An explicit core_repo from
+// the same source wins (explicitCore). Either way the legacy field is cleared,
+// so a later Save writes core_repo and the notice is not repeated. source names
+// where the setting came from, for the deprecation notice.
+func foldLegacyContributionRepo(cfg *Config, explicitCore bool, source string) {
+	legacy := strings.TrimSpace(cfg.Contribution.Repo)
+	cfg.Contribution.Repo = ""
+	if legacy == "" {
+		return
+	}
+	if explicitCore {
+		cfg.deprecations = append(cfg.deprecations, fmt.Sprintf(
+			"%s is deprecated and ignored (contribution.core_repo is also set); remove it", source))
+		return
+	}
+	cfg.Contribution.CoreRepo = legacy
+	cfg.deprecations = append(cfg.deprecations, fmt.Sprintf(
+		"%s is deprecated: %q is used as contribution.core_repo (add-work proposals); "+
+			"characters/recaps go to contribution.community_repo (default %s)",
+		source, legacy, DefaultContributionCommunityRepo))
 }
 
 // splitList parses a comma-separated env value into a trimmed, non-empty slice.
@@ -762,7 +836,10 @@ func (c Config) Validate() error {
 		return fmt.Errorf("contribution.mode %q must be %q, %q, or %q",
 			c.Contribution.Mode, ContributionModeIssue, ContributionModePR, ContributionModeLocal)
 	}
-	if err := validateRepo(c.Contribution.Repo); err != nil {
+	if err := validateRepo("contribution.core_repo", c.Contribution.CoreRepo); err != nil {
+		return err
+	}
+	if err := validateRepo("contribution.community_repo", c.Contribution.CommunityRepo); err != nil {
 		return err
 	}
 	if c.Contribution.PollMinutes < 1 {
@@ -777,13 +854,13 @@ func (c Config) Validate() error {
 
 // validateRepo enforces the GitHub owner/name shape: exactly one slash, both parts
 // non-empty, and no whitespace anywhere (it is interpolated into REST paths).
-func validateRepo(repo string) error {
+func validateRepo(field, repo string) error {
 	if strings.ContainsAny(repo, " \t\r\n") {
-		return fmt.Errorf("contribution.repo %q must not contain whitespace", repo)
+		return fmt.Errorf("%s %q must not contain whitespace", field, repo)
 	}
 	parts := strings.Split(repo, "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return fmt.Errorf("contribution.repo %q must be owner/name", repo)
+		return fmt.Errorf("%s %q must be owner/name", field, repo)
 	}
 	return nil
 }

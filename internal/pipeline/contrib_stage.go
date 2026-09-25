@@ -74,6 +74,10 @@ const (
 	// CorePendingMsg parks a book whose core proposal has been submitted: it waits for
 	// the intake PR to merge, after which the poller resolves the slug and re-admits it.
 	CorePendingMsg = "the work proposal has been submitted - waiting for the metadata PR to merge; the book resumes automatically"
+	// CoreDuplicateMsg parks a book whose add-work proposal the intake bot answered as
+	// a duplicate: the work IS in the catalogue, but no exact identifier resolves this
+	// book to it, so a human picks it (Set work).
+	CoreDuplicateMsg = "the work proposal was answered as a duplicate - the work is already on AudioSilo Meta; set this book's work to it to continue"
 )
 
 // Contributing-stage work-dir layout + provenance constants.
@@ -95,9 +99,11 @@ type contribArtifact struct {
 }
 
 // contribute is the M7 contributing stage: it reconciles the validated sidecars'
-// placeholder work slug to the real meta.audiosilo.app work and publishes them to
-// KodeStar/audiosilo-meta per the configured mode (issue / pr / local), then writes
-// its sentinel. The flow mirrors M7-DESIGN.md ("The contributing stage") step by step.
+// placeholder work slug to the real meta.audiosilo.app work and publishes them to the
+// metadata database's COMMUNITY repository (contribution.community_repo, default
+// KodeStar/audiosilo-meta-community - the CC BY-SA layer's home since the 2026-08-21
+// split; the core repository's intake bot refuses a sidecar) per the configured mode
+// (issue / pr / local), then writes its sentinel. The flow mirrors M7-DESIGN.md ("The contributing stage") step by step.
 //
 // Parks (all Retry-re-admittable) replace a hard failure for a human-fixable
 // precondition: no GitHub credential (issue/pr) parks ParkContribUnavailable; a work
@@ -211,18 +217,28 @@ func (e *Executor) resolveWorkSlug(ctx context.Context, book store.Book) (slug, 
 	// is a stale match (fall through to lookup); a disabled service can't verify, so
 	// trust the recorded match; any other error is transient.
 	if id := strings.TrimSpace(book.WorkID); id != "" {
-		_, verr := e.metaCoverageForWork(ctx, id)
+		cov, verr := e.metaCoverageForWork(ctx, id)
 		switch {
 		case verr == nil:
+			// The catalogue answers a slug a merge has RETIRED under its survivor
+			// (metaops follows the 301); attach to - and remember - the live one.
+			if live := cov.WorkID; live != "" && live != id && model.ValidSlug(live) {
+				if e.db != nil {
+					_ = e.db.SetBookWorkID(context.WithoutCancel(ctx), book.ID, live)
+				}
+				return live, "", nil, nil
+			}
 			return id, "", nil, nil
 		case errors.Is(verr, metaops.ErrWorkNotFound):
 			// A 404 normally means a stale manual match - fall through to identifier
 			// lookup. BUT when this book's core add-work row is merged, book.WorkID came
-			// from that merged intake PR's files; the upstream data release just has not
-			// rebuilt to include the new work yet, so trust the slug rather than
-			// re-parking needs-core (which would loop forever).
+			// from that merged intake PR: the work exists in the repository, and no
+			// published data release holds it yet. The community intake verifies a
+			// sidecar's key against the newest release, so contributing now would be
+			// refused there - wait (the release gate). The poller re-checks every tick
+			// and re-admits the book once the work is live.
 			if e.hasMergedCoreRow(ctx, book.ID) {
-				return id, "", nil, nil
+				return "", "", scheduler.ParkWithCode(state.ParkCorePending, contrib.ReleaseWaitMsg), nil
 			}
 			// stale manual match - fall through to identifier lookup
 		case errors.Is(verr, metaops.ErrDisabled):
@@ -252,9 +268,9 @@ func (e *Executor) resolveWorkSlug(ctx context.Context, book store.Book) (slug, 
 }
 
 // hasMergedCoreRow reports whether the book has a kind=core contribution row in the
-// merged state (its add-work intake PR merged). When it does, book.WorkID was resolved
-// from that PR's files and is trustworthy even before the upstream data release rebuilds
-// to include the new work - so a CoverageForWork 404 must not re-park the book.
+// merged state (its add-work intake PR merged). When it does, book.WorkID was learned
+// from that PR's pack files, so a CoverageForWork 404 means "not released yet", not
+// "stale" - the book waits for the release rather than re-parking needs-core.
 func (e *Executor) hasMergedCoreRow(ctx context.Context, bookID int64) bool {
 	for _, r := range e.bookContributions(ctx, bookID) {
 		if r.Kind == store.ContribKindCore && r.Status == store.ContribStatusMerged {
@@ -320,6 +336,14 @@ func (e *Executor) needsCore(ctx context.Context, book store.Book) (park, err er
 				// A proposal is in flight (merged-but-work_id-empty is the poller race:
 				// the asin/isbn lookup above was the one re-check; keep waiting).
 				return scheduler.ParkWithCode(state.ParkCorePending, CorePendingMsg), nil
+			case store.ContribStatusAlreadyCovered:
+				// The intake bot answered the proposal as a duplicate: the work exists,
+				// but the identifier lookup above did not reach it, so a human sets it.
+				// A fresh proposal would only be answered duplicate again.
+				if err := e.writeCoreProposal(book); err != nil {
+					return nil, fmt.Errorf("contributing: write core proposal: %w", err)
+				}
+				return scheduler.ParkWithCode(state.ParkCoreNeeded, CoreDuplicateMsg), nil
 			}
 		}
 	}
@@ -470,12 +494,12 @@ func (e *Executor) submitIssue(ctx context.Context, book store.Book, slug string
 			}
 			title, body, labels = composeIssue(a.kind, slug, payload, raws[file])
 		}
-		issue, ierr := cli.CreateIssue(ctx, e.contribRepo, title, body, labels)
+		issue, ierr := cli.CreateIssue(ctx, e.contribCommunityRepo, title, body, labels)
 		if ierr != nil {
 			return ierr
 		}
 		note := ""
-		if got, gerr := cli.GetIssue(ctx, e.contribRepo, issue.Number); gerr == nil {
+		if got, gerr := cli.GetIssue(ctx, e.contribCommunityRepo, issue.Number); gerr == nil {
 			if !labelStuck(got.Labels, routingLabel(a.kind)) {
 				note = fmt.Sprintf("%s - a maintainer must apply %s for intake to run", store.ContribNoteLabelsMissingPrefix, routingLabel(a.kind))
 			}
@@ -487,11 +511,20 @@ func (e *Executor) submitIssue(ctx context.Context, book store.Book, slug string
 	return nil
 }
 
-// submitPR forks the meta repo, branches sidecars/<slug>-<bookID>, commits each
-// uncovered sidecar at its canonical data/works/<shard>/<slug>/ path, and opens ONE
-// pull request that both dimension rows share. Covered dimensions are recorded
-// already_covered; a resume where every uncovered dimension already has a URL is a
-// no-op.
+// submitPR opens ONE direct pull request on the community repository carrying every
+// uncovered sidecar, as a correct PACK edit: the fork's community data tree is read
+// at its default branch, each sidecar is placed as a member of the work's
+// works-community entry through audiosilo-meta's own pkg/pack (placement, due splits,
+// canonical rendering) and validated with its pkg/check, and exactly the pack files
+// that changed are committed as one commit on sidecars/<slug>-<bookID>. Covered
+// dimensions are recorded already_covered.
+//
+// It never opens a broken PR: a dimension whose member the entry already carries
+// (replacing a sidecar is the maintainers' call), and every dimension when the PR
+// cannot be prepared (the tree does not validate, a GitHub call fails), goes through
+// the intake-issue path instead, with a row note saying why. A rate limit, a missing
+// credential and a cancelled context still propagate - those are retried, not
+// rerouted. A resume that finds its PR already open reuses it.
 func (e *Executor) submitPR(ctx context.Context, book store.Book, slug string, artifacts []contribArtifact, auditNote string) error {
 	cli, err := e.contribClient(ctx)
 	if err != nil {
@@ -516,69 +549,152 @@ func (e *Executor) submitPR(ctx context.Context, book store.Book, slug string, a
 		return nil
 	}
 
-	fork, err := cli.EnsureFork(ctx, e.contribRepo)
-	if err != nil {
-		return err
-	}
-	branch := fmt.Sprintf("sidecars/%s-%d", slug, book.ID)
-	// Crash-resume idempotency: a prior run may have created the branch (and even the
-	// files/PR) but persisted no rows. Reuse an existing branch instead of re-creating it
-	// (CreateRef 422s "reference already exists").
-	_, branchExists, berr := cli.BranchRef(ctx, fork, branch)
-	if berr != nil {
-		return berr
-	}
-	if !branchExists {
-		_ = cli.MergeUpstream(ctx, fork, "main") // best-effort fast-forward
-		sha, serr := cli.BranchSHA(ctx, fork, "main")
-		if serr != nil {
-			return serr
+	pr, placed, refused, perr := e.openSidecarPR(ctx, cli, book, slug, toSubmit)
+	if perr != nil {
+		if !fallbackToIssue(ctx, perr) {
+			return perr
 		}
-		if err := cli.CreateRef(ctx, fork, "refs/heads/"+branch, sha); err != nil {
-			return err
-		}
+		note := "direct PR not opened (" + shortErr(perr) + ") - submitted as an intake issue instead"
+		return e.submitIssue(ctx, book, slug, toSubmit, joinNotes(note, auditNote))
 	}
-	shard := contrib.LegacyShard(slug)
-	for _, a := range toSubmit {
-		content, rerr := os.ReadFile(a.path) //nolint:gosec // path derives from the book's work dir
-		if rerr != nil {
-			return rerr
-		}
-		file := fileNameFor(a.kind)
-		path := fmt.Sprintf("data/works/%s/%s/%s", shard, slug, file)
-		// PutContents supplies the existing blob sha when the file is already on the branch
-		// (a resumed run), so a re-commit updates rather than 422ing on a create.
-		if err := cli.PutContents(ctx, fork, branch, path, "Add "+file+" for "+slug, content); err != nil {
-			return err
-		}
-	}
-	head := contrib.OwnerOf(fork) + ":" + branch
-	// Reuse an already-open PR for this head (a prior run opened it) instead of 422ing.
-	pr, prExists, ferr := cli.FindOpenPRByHead(ctx, e.contribRepo, head)
-	if ferr != nil {
-		return ferr
-	}
-	if !prExists {
-		pr, err = cli.CreatePull(ctx, e.contribRepo, head, "main", "Add sidecars for "+slug, prBody(book, slug, toSubmit))
-		if err != nil {
-			return err
-		}
-	}
-	for _, a := range toSubmit {
+	for _, a := range placed {
 		if err := e.upsertRow(ctx, book.ID, a.kind, store.ContribModePR, pr.Number, pr.URL, store.ContribStatusSubmitted, auditNote); err != nil {
+			return err
+		}
+	}
+	for _, r := range refused {
+		if err := e.submitIssue(ctx, book, slug, []contribArtifact{r.artifact}, joinNotes(r.reason+"; submitted as an intake issue instead", auditNote)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// submitLocal exports each uncovered sidecar into <exportRoot>/works/<shard>/<slug>/
-// in repo layout, recording a local row (with placeholderNote when the slug is a
-// title-derived placeholder). No network, no credential.
+// refusedArtifact is a dimension the pack edit would not place, and why.
+type refusedArtifact struct {
+	artifact contribArtifact
+	reason   string
+}
+
+// openSidecarPR prepares, commits and opens (or, on a resume, finds) the sidecar pull
+// request. placed are the dimensions the PR carries; refused are the ones it could not
+// place (the member already exists), for the caller to route through the issue path.
+// A nil PR with no error means nothing was placed.
+func (e *Executor) openSidecarPR(ctx context.Context, cli *contrib.Client, book store.Book, slug string, toSubmit []contribArtifact) (contrib.PR, []contribArtifact, []refusedArtifact, error) {
+	upstream := e.contribCommunityRepo
+	fork, err := cli.EnsureFork(ctx, upstream)
+	if err != nil {
+		return contrib.PR{}, nil, nil, err
+	}
+	branch := fmt.Sprintf("sidecars/%s-%d", slug, book.ID)
+	head := contrib.OwnerOf(fork) + ":" + branch
+	// Crash-resume idempotency: a prior run may have opened the PR but persisted no
+	// rows. Reuse it rather than rebuilding the branch under an open PR.
+	if pr, open, ferr := cli.FindOpenPRByHead(ctx, upstream, head); ferr != nil {
+		return contrib.PR{}, nil, nil, ferr
+	} else if open {
+		return pr, toSubmit, nil, nil
+	}
+
+	base, err := cli.DefaultBranch(ctx, upstream)
+	if err != nil {
+		return contrib.PR{}, nil, nil, err
+	}
+	_ = cli.MergeUpstream(ctx, fork, base) // best-effort fast-forward of the fork
+	baseSHA, err := cli.BranchSHA(ctx, fork, base)
+	if err != nil {
+		return contrib.PR{}, nil, nil, err
+	}
+
+	members := make([]contrib.SidecarMember, 0, len(toSubmit))
+	byMember := map[string]contribArtifact{}
+	for _, a := range toSubmit {
+		content, rerr := os.ReadFile(a.path) //nolint:gosec // path derives from the book's work dir
+		if rerr != nil {
+			return contrib.PR{}, nil, nil, rerr
+		}
+		members = append(members, contrib.SidecarMember{Member: a.kind, Content: content})
+		byMember[a.kind] = a
+	}
+	edit, err := contrib.PrepareCommunityEdit(ctx, cli, fork, baseSHA, slug, members)
+	if err != nil {
+		return contrib.PR{}, nil, nil, err
+	}
+	var placed []contribArtifact
+	for _, m := range edit.Applied {
+		placed = append(placed, byMember[m])
+	}
+	var refused []refusedArtifact
+	for _, a := range toSubmit {
+		if reason, ok := edit.Refused[a.kind]; ok {
+			refused = append(refused, refusedArtifact{artifact: a, reason: reason})
+		}
+	}
+	if len(placed) == 0 {
+		return contrib.PR{}, nil, refused, nil
+	}
+	if !edit.Changed() {
+		return contrib.PR{}, nil, nil, errors.New("the pack edit changed no file")
+	}
+
+	commit, err := cli.CommitFiles(ctx, fork, baseSHA, "Add "+strings.Join(edit.Applied, " + ")+" for "+slug, edit.Files, edit.Deleted)
+	if err != nil {
+		return contrib.PR{}, nil, nil, err
+	}
+	// The branch is always ONE commit on a fresh base: a leftover branch from a run
+	// that died before opening its PR is force-moved rather than stacked on.
+	_, branchExists, berr := cli.BranchRef(ctx, fork, branch)
+	if berr != nil {
+		return contrib.PR{}, nil, nil, berr
+	}
+	if branchExists {
+		err = cli.UpdateRef(ctx, fork, branch, commit)
+	} else {
+		err = cli.CreateRef(ctx, fork, "refs/heads/"+branch, commit)
+	}
+	if err != nil {
+		return contrib.PR{}, nil, nil, err
+	}
+	pr, err := cli.CreatePull(ctx, upstream, head, base, "Add sidecars for "+slug, prBody(book, slug, edit))
+	if err != nil {
+		return contrib.PR{}, nil, nil, err
+	}
+	return pr, placed, refused, nil
+}
+
+// fallbackToIssue reports whether a PR-mode failure should be rerouted through the
+// intake-issue path. A cancelled context, a rate limit and a park (no credential)
+// are not failures of THIS path - they are retried as they always were.
+func fallbackToIssue(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	var rl *contrib.RateLimitError
+	var pe *scheduler.ParkError
+	return !errors.As(err, &rl) && !errors.As(err, &pe) &&
+		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+}
+
+// shortErr renders an error for a row note, bounded (it rides to the UI).
+func shortErr(err error) string {
+	const limit = 200
+	msg := err.Error()
+	if len(msg) > limit {
+		msg = msg[:limit] + "..."
+	}
+	return msg
+}
+
+// submitLocal exports each uncovered sidecar as <exportRoot>/<slug>/<characters|
+// recaps>.json - the bare sidecar FILE, exactly what an intake-issue attachment (or a
+// pasted payload) takes, so a local export can be contributed later by hand. There is
+// no repository layout to mirror: upstream stores sidecars as members of range-packed
+// entries in the community repository, which only its tooling writes. The row is
+// recorded local (with placeholderNote when the slug is a title-derived placeholder).
+// No network, no credential.
 func (e *Executor) submitLocal(ctx context.Context, book store.Book, slug string, artifacts []contribArtifact, placeholderNote, auditNote string) error {
-	shard := contrib.LegacyShard(slug)
 	// WriteFileAtomic MkdirAlls the destination parent, so no explicit MkdirAll here.
-	destDir := filepath.Join(e.exportRoot, "works", shard, slug)
+	destDir := filepath.Join(e.exportRoot, slug)
 	existing := e.bookContributions(ctx, book.ID)
 	for _, a := range artifacts {
 		// Settled first: a settled local/covered row from a prior run stays authoritative
@@ -655,7 +771,7 @@ func (e *Executor) upsertRow(ctx context.Context, bookID int64, kind, mode strin
 		return nil
 	}
 	_, err := e.db.UpsertContribution(context.WithoutCancel(ctx), store.Contribution{
-		BookID: bookID, Kind: kind, Mode: mode, Repo: e.contribRepo,
+		BookID: bookID, Kind: kind, Mode: mode, Repo: e.contribCommunityRepo,
 		Number: number, URL: url, Status: status, Note: note,
 	})
 	if err != nil {
@@ -853,15 +969,30 @@ func labelStuck(got []string, want string) bool {
 	return slices.Contains(got, want)
 }
 
-// prBody composes the PR description (the files, the CC BY-SA statement, the book
-// title). No commit/PR trailers (workspace convention).
-func prBody(book store.Book, slug string, artifacts []contribArtifact) string {
+// prBody composes the PR description: the entry key, the pack files the edit
+// writes or removes, the members it places, the CC BY-SA statement and the book
+// title. No commit/PR trailers (workspace convention).
+func prBody(book store.Book, slug string, edit contrib.CommunityEdit) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Community sidecars for **%s** (`%s`).\n\n", book.Title, slug)
-	b.WriteString("Files:\n")
-	for _, a := range artifacts {
-		fmt.Fprintf(&b, "- `data/works/%s/%s/%s`\n", contrib.LegacyShard(slug), slug, fileNameFor(a.kind))
+	fmt.Fprintf(&b, "Entry: `%s` in the works-community family", slug)
+	if edit.Pack != "" {
+		fmt.Fprintf(&b, " (`%s`)", edit.Pack)
 	}
+	fmt.Fprintf(&b, ", members: %s.\n\n", strings.Join(edit.Applied, ", "))
+	b.WriteString("Pack files:\n")
+	paths := make([]string, 0, len(edit.Files))
+	for p := range edit.Files {
+		paths = append(paths, p)
+	}
+	slices.Sort(paths)
+	for _, p := range paths {
+		fmt.Fprintf(&b, "- `%s`\n", p)
+	}
+	for _, p := range edit.Deleted {
+		fmt.Fprintf(&b, "- `%s` (removed)\n", p)
+	}
+	b.WriteString("\nWritten through audiosilo-meta's pkg/pack and validated with its pkg/check (community profile).\n")
 	b.WriteString("\nLicensed under CC BY-SA 4.0. Own-words, spoiler-gated; generated by audiosilo-sidecars.\n")
 	return b.String()
 }

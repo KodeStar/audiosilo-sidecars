@@ -305,7 +305,7 @@ export class ApiClient {
     });
   }
 
-  // exportSidecars fetches the book's sidecars as a zip (repo layout) with an authed
+  // exportSidecars fetches the book's sidecar files as a zip (<slug>/<kind>.json) with an authed
   // request - request() parses JSON, so this reads the raw Blob and the download
   // filename from Content-Disposition itself. 404 (ApiError) when the book has no
   // sidecars; the caller disables the Download control on it.

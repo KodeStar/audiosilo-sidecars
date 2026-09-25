@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/pricing"
@@ -353,8 +354,19 @@ func TestContributionDefaults(t *testing.T) {
 	if cfg.Contribution.Mode != DefaultContributionMode {
 		t.Errorf("mode = %q, want %q", cfg.Contribution.Mode, DefaultContributionMode)
 	}
-	if cfg.Contribution.Repo != DefaultContributionRepo {
-		t.Errorf("repo = %q, want %q", cfg.Contribution.Repo, DefaultContributionRepo)
+	if DefaultContributionCoreRepo != "KodeStar/audiosilo-meta" || DefaultContributionCommunityRepo != "KodeStar/audiosilo-meta-community" {
+		t.Errorf("default repos = %q / %q", DefaultContributionCoreRepo, DefaultContributionCommunityRepo)
+	}
+	if cfg.Contribution.CoreRepo != DefaultContributionCoreRepo {
+		t.Errorf("core_repo = %q, want %q", cfg.Contribution.CoreRepo, DefaultContributionCoreRepo)
+	}
+	// The sidecars belong in the community repository since the 2026-08-21 split;
+	// the core repository's intake bot refuses them.
+	if cfg.Contribution.CommunityRepo != DefaultContributionCommunityRepo {
+		t.Errorf("community_repo = %q, want %q", cfg.Contribution.CommunityRepo, DefaultContributionCommunityRepo)
+	}
+	if cfg.Contribution.Repo != "" {
+		t.Errorf("legacy repo = %q, want empty (never seeded)", cfg.Contribution.Repo)
 	}
 	if !cfg.Contribution.AutoPurge {
 		t.Error("auto_purge should default to true")
@@ -372,17 +384,22 @@ func TestContributionDefaults(t *testing.T) {
 
 func TestContributionValidation(t *testing.T) {
 	bad := map[string]func(*Config){
-		"bad mode":         func(c *Config) { c.Contribution.Mode = "email" },
-		"repo no slash":    func(c *Config) { c.Contribution.Repo = "audiosilo-meta" },
-		"repo empty owner": func(c *Config) { c.Contribution.Repo = "/audiosilo-meta" },
-		"repo empty name":  func(c *Config) { c.Contribution.Repo = "KodeStar/" },
-		"repo two slashes": func(c *Config) { c.Contribution.Repo = "a/b/c" },
-		"repo whitespace":  func(c *Config) { c.Contribution.Repo = "Kode Star/meta" },
-		"poll zero":        func(c *Config) { c.Contribution.PollMinutes = 0 },
-		"poll negative":    func(c *Config) { c.Contribution.PollMinutes = -3 },
-		"api base not url": func(c *Config) { c.Contribution.APIBaseURL = "not-a-url" },
-		"api base ftp":     func(c *Config) { c.Contribution.APIBaseURL = "ftp://api.example" },
-		"api base no host": func(c *Config) { c.Contribution.APIBaseURL = "https://" },
+		"bad mode":              func(c *Config) { c.Contribution.Mode = "email" },
+		"core no slash":         func(c *Config) { c.Contribution.CoreRepo = "audiosilo-meta" },
+		"core empty owner":      func(c *Config) { c.Contribution.CoreRepo = "/audiosilo-meta" },
+		"core empty name":       func(c *Config) { c.Contribution.CoreRepo = "KodeStar/" },
+		"core two slashes":      func(c *Config) { c.Contribution.CoreRepo = "a/b/c" },
+		"core whitespace":       func(c *Config) { c.Contribution.CoreRepo = "Kode Star/meta" },
+		"core empty":            func(c *Config) { c.Contribution.CoreRepo = "" },
+		"community no slash":    func(c *Config) { c.Contribution.CommunityRepo = "audiosilo-meta-community" },
+		"community two slashes": func(c *Config) { c.Contribution.CommunityRepo = "a/b/c" },
+		"community whitespace":  func(c *Config) { c.Contribution.CommunityRepo = "Kode Star/c" },
+		"community empty":       func(c *Config) { c.Contribution.CommunityRepo = "" },
+		"poll zero":             func(c *Config) { c.Contribution.PollMinutes = 0 },
+		"poll negative":         func(c *Config) { c.Contribution.PollMinutes = -3 },
+		"api base not url":      func(c *Config) { c.Contribution.APIBaseURL = "not-a-url" },
+		"api base ftp":          func(c *Config) { c.Contribution.APIBaseURL = "ftp://api.example" },
+		"api base no host":      func(c *Config) { c.Contribution.APIBaseURL = "https://" },
 	}
 	for name, mutate := range bad {
 		t.Run(name, func(t *testing.T) {
@@ -397,7 +414,8 @@ func TestContributionValidation(t *testing.T) {
 	// enterprise-style api base URL.
 	good := Default()
 	good.Contribution.Mode = ContributionModePR
-	good.Contribution.Repo = "acme/meta"
+	good.Contribution.CoreRepo = "acme/meta"
+	good.Contribution.CommunityRepo = "acme/meta-community"
 	good.Contribution.PollMinutes = 1
 	good.Contribution.APIBaseURL = "https://github.acme.com/api/v3"
 	if err := good.Validate(); err != nil {
@@ -410,7 +428,8 @@ func TestContributionEnvOverridesAndRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	in := Default()
 	in.Contribution.Mode = ContributionModePR
-	in.Contribution.Repo = "acme/meta"
+	in.Contribution.CoreRepo = "acme/meta"
+	in.Contribution.CommunityRepo = "acme/meta-community"
 	in.Contribution.AutoPurge = false
 	in.Contribution.PollMinutes = 30
 	in.Contribution.APIBaseURL = "https://github.acme.com/api/v3"
@@ -421,7 +440,8 @@ func TestContributionEnvOverridesAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if out.Contribution.Mode != ContributionModePR || out.Contribution.Repo != "acme/meta" ||
+	if out.Contribution.Mode != ContributionModePR || out.Contribution.CoreRepo != "acme/meta" ||
+		out.Contribution.CommunityRepo != "acme/meta-community" ||
 		out.Contribution.AutoPurge || out.Contribution.PollMinutes != 30 ||
 		out.Contribution.APIBaseURL != "https://github.acme.com/api/v3" {
 		t.Errorf("round-trip = %+v", out.Contribution)
@@ -430,7 +450,8 @@ func TestContributionEnvOverridesAndRoundTrip(t *testing.T) {
 	// Env overrides take precedence, including auto_purge=false and a new interval.
 	envDir := t.TempDir()
 	t.Setenv("AUDIOSILO_SIDECARS_CONTRIBUTION_MODE", "local")
-	t.Setenv("AUDIOSILO_SIDECARS_CONTRIBUTION_REPO", "org/repo")
+	t.Setenv("AUDIOSILO_SIDECARS_CONTRIBUTION_CORE_REPO", "org/repo")
+	t.Setenv("AUDIOSILO_SIDECARS_CONTRIBUTION_COMMUNITY_REPO", "org/community")
 	t.Setenv("AUDIOSILO_SIDECARS_CONTRIBUTION_AUTO_PURGE", "false")
 	t.Setenv("AUDIOSILO_SIDECARS_CONTRIBUTION_POLL_MINUTES", "25")
 	t.Setenv("AUDIOSILO_SIDECARS_CONTRIBUTION_API_BASE_URL", "http://127.0.0.1:9999")
@@ -438,7 +459,8 @@ func TestContributionEnvOverridesAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load env: %v", err)
 	}
-	if cfg.Contribution.Mode != "local" || cfg.Contribution.Repo != "org/repo" ||
+	if cfg.Contribution.Mode != "local" || cfg.Contribution.CoreRepo != "org/repo" ||
+		cfg.Contribution.CommunityRepo != "org/community" ||
 		cfg.Contribution.AutoPurge || cfg.Contribution.PollMinutes != 25 ||
 		cfg.Contribution.APIBaseURL != "http://127.0.0.1:9999" {
 		t.Errorf("env overrides = %+v", cfg.Contribution)
@@ -451,7 +473,8 @@ func TestContributionNormalizesEmpty(t *testing.T) {
 	dir := t.TempDir()
 	in := Default()
 	in.Contribution.Mode = ""
-	in.Contribution.Repo = ""
+	in.Contribution.CoreRepo = ""
+	in.Contribution.CommunityRepo = ""
 	in.Contribution.PollMinutes = 0
 	in.Contribution.APIBaseURL = ""
 	if err := Save(dir, in); err != nil {
@@ -462,10 +485,113 @@ func TestContributionNormalizesEmpty(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	if cfg.Contribution.Mode != DefaultContributionMode ||
-		cfg.Contribution.Repo != DefaultContributionRepo ||
+		cfg.Contribution.CoreRepo != DefaultContributionCoreRepo ||
+		cfg.Contribution.CommunityRepo != DefaultContributionCommunityRepo ||
 		cfg.Contribution.PollMinutes != DefaultContributionPollMinutes ||
 		cfg.Contribution.APIBaseURL != DefaultContributionAPIBaseURL {
 		t.Errorf("normalization = %+v", cfg.Contribution)
+	}
+}
+
+// TestContributionLegacyRepoFile: a config.yaml written before the metadata database
+// was split carries one `repo:` (every saved config did - Save wrote the default).
+// It keeps working as the CORE repository, its one still-valid meaning, never as the
+// sidecar target; Load says so once and a later Save drops the legacy key.
+func TestContributionLegacyRepoFile(t *testing.T) {
+	dir := t.TempDir()
+	legacy := "contribution:\n  mode: issue\n  repo: acme/meta\n"
+	if err := os.WriteFile(filepath.Join(dir, FileName), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Contribution.CoreRepo != "acme/meta" {
+		t.Errorf("core_repo = %q, want the legacy repo acme/meta", cfg.Contribution.CoreRepo)
+	}
+	if cfg.Contribution.CommunityRepo != DefaultContributionCommunityRepo {
+		t.Errorf("community_repo = %q, want the default (the legacy repo must not reroute sidecars)", cfg.Contribution.CommunityRepo)
+	}
+	if cfg.Contribution.Repo != "" {
+		t.Errorf("legacy repo = %q, want cleared after the fold", cfg.Contribution.Repo)
+	}
+	deps := cfg.Deprecations()
+	if len(deps) != 1 || !strings.Contains(deps[0], "contribution.repo") || !strings.Contains(deps[0], "core_repo") {
+		t.Fatalf("deprecations = %q, want one notice naming contribution.repo -> core_repo", deps)
+	}
+
+	// Saving writes core_repo and no repo key, so the next Load is notice-free.
+	if err := Save(dir, cfg); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(dir, FileName))
+	if strings.Contains(string(raw), "\n    repo:") || !strings.Contains(string(raw), "core_repo: acme/meta") {
+		t.Errorf("saved config still carries the legacy key or lost core_repo:\n%s", raw)
+	}
+	again, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again.Deprecations()) != 0 || again.Contribution.CoreRepo != "acme/meta" {
+		t.Errorf("reload = %+v deprecations=%q", again.Contribution, again.Deprecations())
+	}
+}
+
+// TestContributionLegacyRepoLosesToExplicitCore: a file carrying both keys keeps the
+// explicit core_repo; the legacy key is ignored (and noted).
+func TestContributionLegacyRepoLosesToExplicitCore(t *testing.T) {
+	dir := t.TempDir()
+	both := "contribution:\n  repo: old/meta\n  core_repo: new/meta\n"
+	if err := os.WriteFile(filepath.Join(dir, FileName), []byte(both), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Contribution.CoreRepo != "new/meta" {
+		t.Errorf("core_repo = %q, want the explicit new/meta", cfg.Contribution.CoreRepo)
+	}
+	if deps := cfg.Deprecations(); len(deps) != 1 || !strings.Contains(deps[0], "ignored") {
+		t.Errorf("deprecations = %q, want one 'ignored' notice", deps)
+	}
+}
+
+// TestContributionLegacyRepoEnv: the legacy AUDIOSILO_SIDECARS_CONTRIBUTION_REPO
+// env var sets the core repository (with a notice) unless the new core env var is
+// also set, which wins.
+func TestContributionLegacyRepoEnv(t *testing.T) {
+	t.Setenv("AUDIOSILO_SIDECARS_CONTRIBUTION_REPO", "env/meta")
+	cfg, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Contribution.CoreRepo != "env/meta" || cfg.Contribution.CommunityRepo != DefaultContributionCommunityRepo {
+		t.Errorf("contribution = %+v, want core=env/meta and the default community repo", cfg.Contribution)
+	}
+	if deps := cfg.Deprecations(); len(deps) != 1 || !strings.Contains(deps[0], "AUDIOSILO_SIDECARS_CONTRIBUTION_REPO") {
+		t.Errorf("deprecations = %q", deps)
+	}
+
+	t.Setenv("AUDIOSILO_SIDECARS_CONTRIBUTION_CORE_REPO", "env/core")
+	cfg, err = Load(t.TempDir())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Contribution.CoreRepo != "env/core" {
+		t.Errorf("core_repo = %q, want the explicit env/core", cfg.Contribution.CoreRepo)
+	}
+}
+
+// TestContributionNoDeprecationsByDefault: a fresh or modern config reports none.
+func TestContributionNoDeprecationsByDefault(t *testing.T) {
+	cfg, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Deprecations()) != 0 {
+		t.Errorf("deprecations = %q, want none", cfg.Deprecations())
 	}
 }
 

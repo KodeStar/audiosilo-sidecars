@@ -20,8 +20,9 @@ interface ContributionSettingsFormProps {
 type Feedback = { kind: 'ok' | 'error'; text: string } | null;
 
 // ContributionSettingsForm edits how the contributing stage publishes a book's
-// sidecars (issue / PR / local), the target repo, auto-purge, and the intake poll
-// interval, saving the whole contribution envelope via PUT /settings. Changes are
+// sidecars (issue / PR / local), the two target repositories (core for add-work
+// proposals, community for the sidecars), auto-purge, and the intake poll interval,
+// saving the whole contribution envelope via PUT /settings. Changes are
 // restart-to-apply, so a successful save shows that note.
 export function ContributionSettingsForm({ client, initial }: ContributionSettingsFormProps) {
   const [form, setForm] = useState<ContributionFormState>(() => contributionConfigToForm(initial));
@@ -88,15 +89,34 @@ export function ContributionSettingsForm({ client, initial }: ContributionSettin
         </Field>
       </div>
 
-      <Field label="Repository (owner/name)" htmlFor="contrib-repo">
+      <Field label="Community repository (owner/name)" htmlFor="contrib-community-repo">
         <input
-          id="contrib-repo"
+          id="contrib-community-repo"
           type="text"
-          value={form.repo}
-          onChange={(e) => set('repo', e.target.value)}
-          placeholder="KodeStar/audiosilo-meta"
+          value={form.communityRepo}
+          onChange={(e) => set('communityRepo', e.target.value)}
+          placeholder="KodeStar/audiosilo-meta-community"
+          aria-describedby="contrib-community-repo-hint"
           className="w-full max-w-md rounded-md border border-edge bg-raised px-3 py-2 text-body placeholder:text-dim"
         />
+        <p id="contrib-community-repo-hint" className="max-w-prose text-xs text-dim">
+          Receives the characters and recaps sidecars (the CC BY-SA layer).
+        </p>
+      </Field>
+
+      <Field label="Core repository (owner/name)" htmlFor="contrib-core-repo">
+        <input
+          id="contrib-core-repo"
+          type="text"
+          value={form.coreRepo}
+          onChange={(e) => set('coreRepo', e.target.value)}
+          placeholder="KodeStar/audiosilo-meta"
+          aria-describedby="contrib-core-repo-hint"
+          className="w-full max-w-md rounded-md border border-edge bg-raised px-3 py-2 text-body placeholder:text-dim"
+        />
+        <p id="contrib-core-repo-hint" className="max-w-prose text-xs text-dim">
+          Receives add-work proposals, for a book whose work is not on AudioSilo Meta yet.
+        </p>
       </Field>
 
       <label className="flex w-max items-center gap-2 text-sm text-body">

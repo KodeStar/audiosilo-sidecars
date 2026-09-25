@@ -17,7 +17,8 @@ const agent: AgentConfig = {
 
 const initial: ContributionConfig = {
   mode: 'issue',
-  repo: 'KodeStar/audiosilo-meta',
+  core_repo: 'KodeStar/audiosilo-meta',
+  community_repo: 'KodeStar/audiosilo-meta-community',
   auto_purge: true,
   poll_minutes: 10,
 };
@@ -44,7 +45,15 @@ describe('ContributionSettingsForm', () => {
   it('renders the current contribution settings', () => {
     const client = { updateSettings: vi.fn() } as unknown as ApiClient;
     render(<ContributionSettingsForm client={client} initial={initial} />);
-    expect(screen.getByLabelText('Repository (owner/name)')).toHaveValue('KodeStar/audiosilo-meta');
+    // Both halves of the split database, each labelled with what it receives.
+    expect(screen.getByLabelText('Core repository (owner/name)')).toHaveValue(
+      'KodeStar/audiosilo-meta',
+    );
+    expect(screen.getByLabelText('Community repository (owner/name)')).toHaveValue(
+      'KodeStar/audiosilo-meta-community',
+    );
+    expect(screen.getByText(/characters and recaps sidecars/i)).toBeInTheDocument();
+    expect(screen.getByText(/add-work proposals/i)).toBeInTheDocument();
     expect(screen.getByLabelText('Poll interval (minutes)')).toHaveValue(10);
     expect(screen.getByLabelText('Auto-purge scratch when a book reaches done')).toBeChecked();
   });
@@ -54,9 +63,9 @@ describe('ContributionSettingsForm', () => {
     const client = { updateSettings } as unknown as ApiClient;
     render(<ContributionSettingsForm client={client} initial={initial} />);
 
-    const repo = screen.getByLabelText('Repository (owner/name)');
-    await userEvent.clear(repo);
-    await userEvent.type(repo, 'someone/other-repo');
+    const community = screen.getByLabelText('Community repository (owner/name)');
+    await userEvent.clear(community);
+    await userEvent.type(community, 'someone/other-community');
 
     const poll = screen.getByLabelText('Poll interval (minutes)');
     await userEvent.clear(poll);
@@ -68,7 +77,8 @@ describe('ContributionSettingsForm', () => {
     expect(updateSettings).toHaveBeenCalledWith({
       contribution: {
         mode: 'issue',
-        repo: 'someone/other-repo',
+        core_repo: 'KodeStar/audiosilo-meta',
+        community_repo: 'someone/other-community',
         auto_purge: true,
         poll_minutes: 15,
       },
@@ -78,13 +88,15 @@ describe('ContributionSettingsForm', () => {
 
   it('surfaces the server 400 message on a rejected save', async () => {
     const client = {
-      updateSettings: vi.fn().mockRejectedValue(new ApiError(400, 'contribution.repo is invalid')),
+      updateSettings: vi
+        .fn()
+        .mockRejectedValue(new ApiError(400, 'contribution.community_repo is invalid')),
     } as unknown as ApiClient;
     render(<ContributionSettingsForm client={client} initial={initial} />);
 
     await userEvent.click(screen.getByRole('button', { name: /save contribution settings/i }));
 
-    expect(await screen.findByText(/contribution.repo is invalid/i)).toBeInTheDocument();
+    expect(await screen.findByText(/contribution.community_repo is invalid/i)).toBeInTheDocument();
   });
 
   it('blocks a sub-1 poll interval client-side without calling the API', async () => {

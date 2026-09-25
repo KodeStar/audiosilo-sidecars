@@ -95,6 +95,60 @@ func TestListBooksWithUnresolvedMergedCore(t *testing.T) {
 	}
 }
 
+// TestListBooksAwaitingRelease pins the release gate's work list: parked core_pending
+// WITH a work id AND a merged core row; anything missing one of the three is out.
+func TestListBooksAwaitingRelease(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	mk := func(name string, park bool, workID string, merged bool) Book {
+		b, err := db.CreateBook(ctx, NewBook{SourcePath: "/u/" + name, WorkDir: "/w/" + name, Title: name})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if merged {
+			mustMergedCore(t, db, b.ID)
+		}
+		if workID != "" {
+			if err := db.SetBookWorkID(ctx, b.ID, workID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if park {
+			if err := db.SetBookState(ctx, b.ID, "contributing", statusNeedsAttention, "waiting", parkCodeCorePending); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return b
+	}
+	want := mk("want", true, "the-work", true)
+	mk("not-parked", false, "the-work", true)
+	mk("no-work", true, "", true)
+	mk("not-merged", true, "the-work", false)
+
+	got, err := db.ListBooksAwaitingRelease(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != want.ID {
+		t.Fatalf("got %d books (first %+v), want only %d", len(got), got, want.ID)
+	}
+}
+
+// TestContributionNeedsAttentionVerdicts: needs-human and invalid intake verdicts on
+// an open (submitted) row are attention states; a duplicate is done, not attention.
+func TestContributionNeedsAttentionVerdicts(t *testing.T) {
+	for note, want := range map[string]bool{
+		ContribNoteIntakeNeedsHuman + " - x": true,
+		ContribNoteIntakeInvalid:             true,
+		ContribNoteIntakeDuplicate:           false,
+		"audit converged":                    false,
+	} {
+		if got := ContributionNeedsAttention([]Contribution{{Status: ContribStatusSubmitted, Note: note}}); got != want {
+			t.Errorf("note %q attention = %v, want %v", note, got, want)
+		}
+	}
+}
+
 // TestLandedCoverage pins the landed-only rule: merged and already_covered count
 // (both mean the dimension exists upstream), every other lifecycle status does
 // not, and a merged CORE row - an add-work proposal, not a sidecar - never

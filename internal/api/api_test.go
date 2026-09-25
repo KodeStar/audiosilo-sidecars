@@ -456,7 +456,8 @@ func TestSettingsContributionGET(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 	if view.Contribution.Mode != config.DefaultContributionMode ||
-		view.Contribution.Repo != config.DefaultContributionRepo ||
+		view.Contribution.CoreRepo != config.DefaultContributionCoreRepo ||
+		view.Contribution.CommunityRepo != config.DefaultContributionCommunityRepo ||
 		!view.Contribution.AutoPurge ||
 		view.Contribution.PollMinutes != config.DefaultContributionPollMinutes {
 		t.Errorf("contribution view = %+v", view.Contribution)
@@ -469,7 +470,7 @@ func TestSettingsContributionPUT(t *testing.T) {
 	env := newTestEnv(t)
 	token := env.login(t)
 
-	body := `{"contribution":{"mode":"pr","repo":"acme/meta","auto_purge":false,"poll_minutes":20}}`
+	body := `{"contribution":{"mode":"pr","core_repo":"acme/meta","community_repo":"acme/meta-community","auto_purge":false,"poll_minutes":20}}`
 	resp := env.do(t, http.MethodPut, "/api/v1/settings", token, body)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("put contribution = %d, want 200", resp.StatusCode)
@@ -479,7 +480,8 @@ func TestSettingsContributionPUT(t *testing.T) {
 	if env.saved == nil {
 		t.Fatal("config not persisted")
 	}
-	if env.saved.Contribution.Mode != "pr" || env.saved.Contribution.Repo != "acme/meta" ||
+	if env.saved.Contribution.Mode != "pr" || env.saved.Contribution.CoreRepo != "acme/meta" ||
+		env.saved.Contribution.CommunityRepo != "acme/meta-community" ||
 		env.saved.Contribution.AutoPurge || env.saved.Contribution.PollMinutes != 20 {
 		t.Errorf("saved contribution = %+v", env.saved.Contribution)
 	}
@@ -489,8 +491,36 @@ func TestSettingsContributionPUT(t *testing.T) {
 	if err := json.Unmarshal([]byte(readAll(t, resp)), &view); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if view.Contribution.Mode != "pr" || view.Contribution.AutoPurge {
+	if view.Contribution.Mode != "pr" || view.Contribution.AutoPurge ||
+		view.Contribution.CoreRepo != "acme/meta" || view.Contribution.CommunityRepo != "acme/meta-community" {
 		t.Errorf("GET after PUT = %+v", view.Contribution)
+	}
+}
+
+// TestSettingsContributionPUTLegacyRepo: an older client's single `repo` field is
+// still accepted with its one still-valid meaning, the CORE repository - it never
+// reroutes the sidecars - and an explicit core_repo in the same update wins.
+func TestSettingsContributionPUTLegacyRepo(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.login(t)
+
+	resp := env.do(t, http.MethodPut, "/api/v1/settings", token, `{"contribution":{"repo":"acme/meta"}}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("legacy repo PUT = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+	if env.saved == nil || env.saved.Contribution.CoreRepo != "acme/meta" ||
+		env.saved.Contribution.CommunityRepo != config.DefaultContributionCommunityRepo {
+		t.Fatalf("saved = %+v, want core=acme/meta and the default community repo", env.saved)
+	}
+
+	resp = env.do(t, http.MethodPut, "/api/v1/settings", token, `{"contribution":{"repo":"old/one","core_repo":"new/one"}}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("both fields PUT = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+	if env.saved.Contribution.CoreRepo != "new/one" {
+		t.Fatalf("core_repo = %q, want the explicit new/one", env.saved.Contribution.CoreRepo)
 	}
 }
 
@@ -508,12 +538,17 @@ func TestSettingsContributionPUTRejectsInvalid(t *testing.T) {
 		t.Errorf("400 body missing validation message: %s", body)
 	}
 
-	resp = env.do(t, http.MethodPut, "/api/v1/settings", token, `{"contribution":{"repo":"noslash"}}`)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("bad repo = %d, want 400", resp.StatusCode)
-	}
-	if body := readAll(t, resp); !strings.Contains(body, "contribution.repo") {
-		t.Errorf("400 body missing validation message: %s", body)
+	for field, body := range map[string]string{
+		"contribution.core_repo":      `{"contribution":{"core_repo":"noslash"}}`,
+		"contribution.community_repo": `{"contribution":{"community_repo":"a/b/c"}}`,
+	} {
+		resp = env.do(t, http.MethodPut, "/api/v1/settings", token, body)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("bad %s = %d, want 400", field, resp.StatusCode)
+		}
+		if got := readAll(t, resp); !strings.Contains(got, field) {
+			t.Errorf("400 body missing %s validation message: %s", field, got)
+		}
 	}
 
 	if env.saved != nil {

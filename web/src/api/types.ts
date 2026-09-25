@@ -110,11 +110,14 @@ export interface AgentConfig {
 
 // ContributionConfig mirrors the Go settings `contribution` view (M7): how the
 // contributing stage publishes a book's sidecars and how the intake poller runs.
-// mode is issue | pr | local; repo is owner/name; auto_purge reclaims scratch when
-// a book reaches done; poll_minutes is the open-contribution poll interval.
+// mode is issue | pr | local; the metadata database is split across two owner/name
+// repositories - core_repo takes add-work proposals (the CC0 core), community_repo
+// the characters/recaps sidecars (the CC BY-SA layer); auto_purge reclaims scratch
+// when a book reaches done; poll_minutes is the open-contribution poll interval.
 export interface ContributionConfig {
   mode: string;
-  repo: string;
+  core_repo: string;
+  community_repo: string;
   auto_purge: boolean;
   poll_minutes: number;
 }
@@ -142,7 +145,8 @@ export interface Settings {
 // persisted but only take effect on a daemon RESTART.
 export interface ContributionUpdate {
   mode?: string;
-  repo?: string;
+  core_repo?: string;
+  community_repo?: string;
   auto_purge?: boolean;
   poll_minutes?: number;
 }

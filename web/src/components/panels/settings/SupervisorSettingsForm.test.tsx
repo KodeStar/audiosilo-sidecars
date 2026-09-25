@@ -27,7 +27,13 @@ function settings(supervisor: SupervisorConfig): Settings {
       claude_models: {},
       openai_models: {},
     },
-    contribution: { mode: 'issue', repo: 'owner/repo', auto_purge: true, poll_minutes: 10 },
+    contribution: {
+      mode: 'issue',
+      core_repo: 'owner/repo',
+      community_repo: 'owner/community',
+      auto_purge: true,
+      poll_minutes: 10,
+    },
     supervisor,
   };
 }

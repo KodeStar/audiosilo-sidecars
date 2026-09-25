@@ -43,11 +43,15 @@ type Issue struct {
 }
 
 // PR is the subset of a GitHub pull request the contribution flow needs.
+// MergeCommitSHA is the commit a merge left on the base branch (set once the PR
+// merged, in every merge mode): the poller diffs its first parent against it to
+// learn which work a merged add-work PR created.
 type PR struct {
-	Number int
-	URL    string
-	State  string
-	Merged bool
+	Number         int
+	URL            string
+	State          string
+	Merged         bool
+	MergeCommitSHA string
 }
 
 // APIError is an unexpected (non-success) GitHub HTTP response. It carries the
@@ -97,6 +101,12 @@ func NewClient(baseURL, token string) *Client {
 // non-want status becomes an *APIError. want lists the acceptable status codes
 // (empty = any 2xx).
 func (c *Client) request(ctx context.Context, method, path string, body any, want ...int) ([]byte, http.Header, error) {
+	return c.requestAccept(ctx, "", method, path, body, want...)
+}
+
+// requestAccept is request with an explicit Accept media type ("" = the default
+// application/vnd.github+json), for the endpoints that answer raw bytes.
+func (c *Client) requestAccept(ctx context.Context, accept, method, path string, body any, want ...int) ([]byte, http.Header, error) {
 	var payload []byte
 	if body != nil {
 		var err error
@@ -108,7 +118,7 @@ func (c *Client) request(ctx context.Context, method, path string, body any, wan
 
 	var lastErr error
 	for attempt := range 2 {
-		respBody, header, status, err := c.doOnce(ctx, method, path, payload)
+		respBody, header, status, err := c.doOnce(ctx, accept, method, path, payload)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -128,7 +138,7 @@ func (c *Client) request(ctx context.Context, method, path string, body any, wan
 }
 
 // doOnce issues a single HTTP request and reads the (bounded) response body.
-func (c *Client) doOnce(ctx context.Context, method, path string, payload []byte) ([]byte, http.Header, int, error) {
+func (c *Client) doOnce(ctx context.Context, accept, method, path string, payload []byte) ([]byte, http.Header, int, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 
@@ -141,6 +151,9 @@ func (c *Client) doOnce(ctx context.Context, method, path string, payload []byte
 		return nil, nil, 0, fmt.Errorf("contrib: new request: %w", err)
 	}
 	c.setHeaders(req, payload != nil)
+	if accept != "" {
+		req.Header.Set("Accept", accept)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -231,21 +244,28 @@ func (r issueResp) toIssue() Issue {
 }
 
 type pullResp struct {
-	Number   int     `json:"number"`
-	HTMLURL  string  `json:"html_url"`
-	State    string  `json:"state"`
-	Merged   bool    `json:"merged"`
-	MergedAt *string `json:"merged_at"`
+	Number         int     `json:"number"`
+	HTMLURL        string  `json:"html_url"`
+	State          string  `json:"state"`
+	Merged         bool    `json:"merged"`
+	MergedAt       *string `json:"merged_at"`
+	MergeCommitSHA string  `json:"merge_commit_sha"`
 }
 
 func (r pullResp) toPR() PR {
-	return PR{
+	pr := PR{
 		Number: r.Number,
 		URL:    r.HTMLURL,
 		State:  r.State,
 		// The list endpoint omits `merged`, so fall back to merged_at != null.
 		Merged: r.Merged || r.MergedAt != nil,
 	}
+	// merge_commit_sha is GitHub's test-merge commit while a PR is open; it only
+	// names the commit on the base branch once the PR has merged.
+	if pr.Merged {
+		pr.MergeCommitSHA = r.MergeCommitSHA
+	}
+	return pr
 }
 
 // --- methods ---
@@ -419,49 +439,6 @@ func (c *Client) CreateRef(ctx context.Context, repo, ref, sha string) error {
 	return err
 }
 
-// PutContents creates or updates a file on branch at path with content (which is
-// base64-encoded for the API). It first reads the file's existing blob sha on the
-// branch and supplies it when present, so a resumed run (the file was committed on a
-// prior attempt) UPDATES the file rather than 422ing on a create-over-existing-path; a
-// 404 means the file is new and it is created without a sha.
-func (c *Client) PutContents(ctx context.Context, repo, branch, path, message string, content []byte) error {
-	sha, err := c.contentSHA(ctx, repo, branch, path)
-	if err != nil {
-		return err
-	}
-	reqBody := map[string]string{
-		"message": message,
-		"content": base64.StdEncoding.EncodeToString(content),
-		"branch":  branch,
-	}
-	if sha != "" {
-		reqBody["sha"] = sha
-	}
-	_, _, err = c.request(ctx, http.MethodPut, "/repos/"+repo+"/contents/"+path, reqBody, http.StatusOK, http.StatusCreated)
-	return err
-}
-
-// contentSHA returns the blob sha of a file on a branch, or "" when the file does not
-// exist there (a 404). Any other error propagates.
-func (c *Client) contentSHA(ctx context.Context, repo, branch, path string) (string, error) {
-	respBody, _, err := c.request(ctx, http.MethodGet,
-		"/repos/"+repo+"/contents/"+path+"?ref="+url.QueryEscape(branch), nil, http.StatusOK)
-	if err != nil {
-		var apiErr *APIError
-		if errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound {
-			return "", nil
-		}
-		return "", err
-	}
-	var r struct {
-		SHA string `json:"sha"`
-	}
-	if err := json.Unmarshal(respBody, &r); err != nil {
-		return "", fmt.Errorf("contrib: decode contents: %w", err)
-	}
-	return r.SHA, nil
-}
-
 // CreatePull opens a pull request from head into base on repo.
 func (c *Client) CreatePull(ctx context.Context, repo, head, base, title, body string) (PR, error) {
 	reqBody := map[string]string{"title": title, "head": head, "base": base, "body": body}
@@ -508,22 +485,286 @@ func (c *Client) GetPull(ctx context.Context, repo string, number int) (PR, erro
 	return r.toPR(), nil
 }
 
-// PullFiles returns the file paths a pull request touches (used to read the real
-// work slug out of a merged core PR's created work.json path).
-func (c *Client) PullFiles(ctx context.Context, repo string, number int) ([]string, error) {
-	respBody, _, err := c.request(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/pulls/%d/files?per_page=100", repo, number), nil, http.StatusOK)
+// PullFile is one file a pull request touches. Status is GitHub's
+// added|removed|modified|renamed|copied|changed|unchanged; PreviousFilename is set
+// for a rename (a pack REBIND renames the file, since a pack's bound is its name).
+type PullFile struct {
+	Filename         string
+	Status           string
+	PreviousFilename string
+}
+
+// maxPullFilePages bounds PullFiles' pagination: GitHub itself lists at most 3000
+// files per pull request (30 pages of 100).
+const maxPullFilePages = 30
+
+// PullFiles returns the files a pull request touches (used to learn the real work
+// slug a merged core PR created, from the pack files it changed).
+func (c *Client) PullFiles(ctx context.Context, repo string, number int) ([]PullFile, error) {
+	var out []PullFile
+	for page := 1; page <= maxPullFilePages; page++ {
+		respBody, _, err := c.request(ctx, http.MethodGet,
+			fmt.Sprintf("/repos/%s/pulls/%d/files?per_page=100&page=%d", repo, number, page), nil, http.StatusOK)
+		if err != nil {
+			return nil, err
+		}
+		var files []struct {
+			Filename         string `json:"filename"`
+			Status           string `json:"status"`
+			PreviousFilename string `json:"previous_filename"`
+		}
+		if err := json.Unmarshal(respBody, &files); err != nil {
+			return nil, fmt.Errorf("contrib: decode pull files: %w", err)
+		}
+		for _, f := range files {
+			out = append(out, PullFile{Filename: f.Filename, Status: f.Status, PreviousFilename: f.PreviousFilename})
+		}
+		if len(files) < 100 {
+			break
+		}
+	}
+	return out, nil
+}
+
+// FileAt reads a file's raw bytes at ref (a commit sha or branch). found is false
+// for a 404 - the file does not exist at that revision - with a nil error. The raw
+// media type is used so files over the contents API's 1 MB JSON limit still read.
+func (c *Client) FileAt(ctx context.Context, repo, path, ref string) (content []byte, found bool, err error) {
+	respBody, _, rerr := c.requestAccept(ctx, "application/vnd.github.raw+json", http.MethodGet,
+		"/repos/"+repo+"/contents/"+escapePath(path)+"?ref="+url.QueryEscape(ref), nil, http.StatusOK)
+	if rerr != nil {
+		var apiErr *APIError
+		if errors.As(rerr, &apiErr) && apiErr.Status == http.StatusNotFound {
+			return nil, false, nil
+		}
+		return nil, false, rerr
+	}
+	return respBody, true, nil
+}
+
+// escapePath escapes each segment of a slash-separated repository path.
+func escapePath(p string) string {
+	segs := strings.Split(p, "/")
+	for i, s := range segs {
+		segs[i] = url.PathEscape(s)
+	}
+	return strings.Join(segs, "/")
+}
+
+// Commit is the subset of a git commit object the contribution flow needs.
+type Commit struct {
+	SHA     string
+	TreeSHA string
+	Parents []string
+}
+
+// GetCommit reads a git commit object (its tree and parents).
+func (c *Client) GetCommit(ctx context.Context, repo, sha string) (Commit, error) {
+	respBody, _, err := c.request(ctx, http.MethodGet, "/repos/"+repo+"/git/commits/"+url.PathEscape(sha), nil, http.StatusOK)
 	if err != nil {
-		return nil, err
+		return Commit{}, err
 	}
-	var files []struct {
-		Filename string `json:"filename"`
+	var r struct {
+		SHA  string `json:"sha"`
+		Tree struct {
+			SHA string `json:"sha"`
+		} `json:"tree"`
+		Parents []struct {
+			SHA string `json:"sha"`
+		} `json:"parents"`
 	}
-	if err := json.Unmarshal(respBody, &files); err != nil {
-		return nil, fmt.Errorf("contrib: decode pull files: %w", err)
+	if err := json.Unmarshal(respBody, &r); err != nil {
+		return Commit{}, fmt.Errorf("contrib: decode commit: %w", err)
 	}
-	out := make([]string, 0, len(files))
-	for _, f := range files {
-		out = append(out, f.Filename)
+	out := Commit{SHA: r.SHA, TreeSHA: r.Tree.SHA}
+	for _, p := range r.Parents {
+		out.Parents = append(out.Parents, p.SHA)
+	}
+	return out, nil
+}
+
+// DefaultBranch returns a repository's default branch name.
+func (c *Client) DefaultBranch(ctx context.Context, repo string) (string, error) {
+	respBody, _, err := c.request(ctx, http.MethodGet, "/repos/"+repo, nil, http.StatusOK)
+	if err != nil {
+		return "", err
+	}
+	var r struct {
+		DefaultBranch string `json:"default_branch"`
+	}
+	if err := json.Unmarshal(respBody, &r); err != nil {
+		return "", fmt.Errorf("contrib: decode repo: %w", err)
+	}
+	if r.DefaultBranch == "" {
+		return "", errors.New("contrib: repo response missing default_branch")
+	}
+	return r.DefaultBranch, nil
+}
+
+// CommitFiles writes ONE commit on top of parent in repo through the git data API:
+// a blob per written file, a tree over parent's tree (a deleted path is an entry
+// with a null sha), and a commit whose only parent is parent. It returns the new
+// commit's sha; moving a branch onto it is the caller's (CreateRef / UpdateRef).
+// Paths are repository-relative. One commit rather than a contents-API call per
+// file, so a pack split (files added, one removed) lands atomically.
+func (c *Client) CommitFiles(ctx context.Context, repo, parent, message string, files map[string][]byte, deleted []string) (string, error) {
+	base, err := c.GetCommit(ctx, repo, parent)
+	if err != nil {
+		return "", err
+	}
+	paths := make([]string, 0, len(files))
+	for p := range files {
+		paths = append(paths, p)
+	}
+	slices.Sort(paths)
+	type treeEntry struct {
+		Path string  `json:"path"`
+		Mode string  `json:"mode"`
+		Type string  `json:"type"`
+		SHA  *string `json:"sha"`
+	}
+	entries := make([]treeEntry, 0, len(files)+len(deleted))
+	for _, p := range paths {
+		blobBody := map[string]string{"content": base64.StdEncoding.EncodeToString(files[p]), "encoding": "base64"}
+		respBody, _, err := c.request(ctx, http.MethodPost, "/repos/"+repo+"/git/blobs", blobBody, http.StatusCreated)
+		if err != nil {
+			return "", err
+		}
+		var blob struct {
+			SHA string `json:"sha"`
+		}
+		if err := json.Unmarshal(respBody, &blob); err != nil || blob.SHA == "" {
+			return "", fmt.Errorf("contrib: decode blob for %s: %v", p, err)
+		}
+		sha := blob.SHA
+		entries = append(entries, treeEntry{Path: p, Mode: "100644", Type: "blob", SHA: &sha})
+	}
+	for _, p := range deleted {
+		entries = append(entries, treeEntry{Path: p, Mode: "100644", Type: "blob", SHA: nil})
+	}
+	respBody, _, err := c.request(ctx, http.MethodPost, "/repos/"+repo+"/git/trees",
+		map[string]any{"base_tree": base.TreeSHA, "tree": entries}, http.StatusCreated)
+	if err != nil {
+		return "", err
+	}
+	var tree struct {
+		SHA string `json:"sha"`
+	}
+	if err := json.Unmarshal(respBody, &tree); err != nil || tree.SHA == "" {
+		return "", fmt.Errorf("contrib: decode tree: %v", err)
+	}
+	respBody, _, err = c.request(ctx, http.MethodPost, "/repos/"+repo+"/git/commits",
+		map[string]any{"message": message, "tree": tree.SHA, "parents": []string{parent}}, http.StatusCreated)
+	if err != nil {
+		return "", err
+	}
+	var commit struct {
+		SHA string `json:"sha"`
+	}
+	if err := json.Unmarshal(respBody, &commit); err != nil || commit.SHA == "" {
+		return "", fmt.Errorf("contrib: decode commit: %v", err)
+	}
+	return commit.SHA, nil
+}
+
+// UpdateRef force-moves an existing branch to sha (a resumed PR-mode submit
+// rebuilds its one commit on a fresh base rather than stacking on a stale one).
+func (c *Client) UpdateRef(ctx context.Context, repo, branch, sha string) error {
+	_, _, err := c.request(ctx, http.MethodPatch, "/repos/"+repo+"/git/refs/heads/"+branch,
+		map[string]any{"sha": sha, "force": true}, http.StatusOK)
+	return err
+}
+
+// tarballTimeout bounds a repository tarball download - far longer than one REST
+// call, since the archive is megabytes.
+const tarballTimeout = 5 * time.Minute
+
+// Tarball streams repo's gzipped tarball at ref to fn. GitHub answers with a
+// redirect to its archive host, which the client follows (net/http drops the
+// Authorization header on the cross-host hop). The body is capped at maxBytes; a
+// longer archive fails fn's read rather than being read whole.
+func (c *Client) Tarball(ctx context.Context, repo, ref string, maxBytes int64, fn func(io.Reader) error) error {
+	reqCtx, cancel := context.WithTimeout(ctx, tarballTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, c.baseURL+"/repos/"+repo+"/tarball/"+url.PathEscape(ref), nil)
+	if err != nil {
+		return fmt.Errorf("contrib: new request: %w", err)
+	}
+	c.setHeaders(req, false)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("contrib: GET tarball %s@%s: %w", repo, ref, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+		if rl := rateLimitError(resp.StatusCode, resp.Header, body); rl != nil {
+			return rl
+		}
+		return newAPIError(resp.StatusCode, body)
+	}
+	return fn(&cappedReader{r: resp.Body, left: maxBytes})
+}
+
+// errTooLarge is returned by a cappedReader once its cap is exceeded.
+var errTooLarge = errors.New("contrib: download exceeds its size cap")
+
+// cappedReader fails (rather than silently truncating, as io.LimitReader would)
+// once more than left bytes have been read.
+type cappedReader struct {
+	r    io.Reader
+	left int64
+}
+
+func (c *cappedReader) Read(p []byte) (int, error) {
+	if c.left < 0 {
+		return 0, errTooLarge
+	}
+	if int64(len(p)) > c.left+1 {
+		p = p[:c.left+1]
+	}
+	n, err := c.r.Read(p)
+	c.left -= int64(n)
+	if c.left < 0 {
+		return n, errTooLarge
+	}
+	return n, err
+}
+
+// IssueComment is one comment on an issue.
+type IssueComment struct {
+	Body   string
+	Author string
+}
+
+// maxCommentPages bounds IssueComments' pagination.
+const maxCommentPages = 10
+
+// IssueComments lists an issue's comments, oldest first (the intake poller reads
+// the bot's latest verdict comment from it).
+func (c *Client) IssueComments(ctx context.Context, repo string, number int) ([]IssueComment, error) {
+	var out []IssueComment
+	for page := 1; page <= maxCommentPages; page++ {
+		respBody, _, err := c.request(ctx, http.MethodGet,
+			fmt.Sprintf("/repos/%s/issues/%d/comments?per_page=100&page=%d", repo, number, page), nil, http.StatusOK)
+		if err != nil {
+			return nil, err
+		}
+		var list []struct {
+			Body string `json:"body"`
+			User struct {
+				Login string `json:"login"`
+			} `json:"user"`
+		}
+		if err := json.Unmarshal(respBody, &list); err != nil {
+			return nil, fmt.Errorf("contrib: decode comments: %w", err)
+		}
+		for _, cm := range list {
+			out = append(out, IssueComment{Body: cm.Body, Author: cm.User.Login})
+		}
+		if len(list) < 100 {
+			break
+		}
 	}
 	return out, nil
 }

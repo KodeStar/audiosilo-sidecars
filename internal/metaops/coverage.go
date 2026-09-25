@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kodestar/audiosilo-meta/pkg/model"
 	"github.com/kodestar/audiosilo-server/pkg/match"
 )
 
@@ -238,6 +239,11 @@ type lookupVal struct {
 }
 
 type workVal struct {
+	// id is the slug the API answered under. It differs from the id asked for when
+	// the asked-for slug has been RETIRED by a merge: meta answers a tombstoned slug
+	// with a 301 to the surviving one, which the HTTP client follows, so the body
+	// names the survivor.
+	id         string
 	title      string
 	series     *SeriesRef
 	recordings []RecordingRef
@@ -376,6 +382,10 @@ func (c *Client) CoverageFor(ctx context.Context, id BookIdentity) (Coverage, er
 // the coverage path it distinguishes a clean miss (ErrWorkNotFound) from a
 // transport failure, so the API can map a stale id to a 4xx and a down upstream
 // to a 502. The verdict carries MatchedBy "manual" and the work title.
+//
+// WorkID is the LIVE slug: a slug a data-quality merge has retired is answered
+// with a 301 to its survivor, and the verdict names the survivor so a caller
+// adopts it rather than attaching sidecars to a tombstoned key.
 func (c *Client) CoverageForWork(ctx context.Context, workID string) (Coverage, error) {
 	if !c.Enabled() {
 		return Coverage{}, ErrDisabled
@@ -388,7 +398,7 @@ func (c *Client) CoverageForWork(ctx context.Context, workID string) (Coverage, 
 		return Coverage{}, ErrWorkNotFound
 	}
 	return Coverage{
-		Available: true, Known: true, WorkID: workID,
+		Available: true, Known: true, WorkID: liveWorkID(workID, v.id),
 		MatchedBy: "manual", WorkTitle: v.title, Series: cloneSeriesRef(v.series),
 		HasCharacters: v.hasChars, HasRecaps: v.hasRecap,
 		Recordings: cloneRecordingRefs(v.recordings),
@@ -438,6 +448,15 @@ func (c *Client) workCoverage(ctx context.Context, workID, matchedBy, workTitle 
 		cov.Recordings = cloneRecordingRefs(v.recordings)
 	}
 	return cov
+}
+
+// liveWorkID is the slug a work detail answered under when it is a valid slug,
+// else the id that was asked for (an older server, or a body with no id).
+func liveWorkID(asked, answered string) string {
+	if answered != "" && model.ValidSlug(answered) {
+		return answered
+	}
+	return asked
 }
 
 func cloneSeriesRef(s *SeriesRef) *SeriesRef {
@@ -524,6 +543,7 @@ func (c *Client) workDetail(ctx context.Context, workID string) (v workVal, foun
 		return cached, true, true
 	}
 	var res struct {
+		ID     string      `json:"id"`
 		Title  string      `json:"title"`
 		Series []SeriesRef `json:"series"`
 		// Characters carries the names too, not just presence: SeriesGlossary needs
@@ -552,7 +572,7 @@ func (c *Client) workDetail(ctx context.Context, workID string) (v workVal, foun
 	if !f {
 		return workVal{}, false, true
 	}
-	v = workVal{title: res.Title, hasChars: len(res.Characters) > 0, hasRecap: len(res.Recaps) > 0}
+	v = workVal{id: res.ID, title: res.Title, hasChars: len(res.Characters) > 0, hasRecap: len(res.Recaps) > 0}
 	if len(res.Series) > 0 {
 		v.series = cloneSeriesRef(&res.Series[0])
 	}

@@ -119,7 +119,7 @@ export const DoneRow = memo(function DoneRow({
             title={
               download === 'missing'
                 ? 'This book has no sidecar files to export'
-                : 'Download the sidecars as a zip (repo layout)'
+                : 'Download the sidecar files as a zip (one characters.json / recaps.json per work)'
             }
             className="rounded-md border border-edge px-3 py-1.5 text-xs font-medium text-body transition-colors hover:border-pink-600 hover:text-hi disabled:cursor-not-allowed disabled:opacity-50"
           >

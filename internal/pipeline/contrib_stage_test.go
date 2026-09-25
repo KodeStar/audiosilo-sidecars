@@ -1,8 +1,11 @@
 package pipeline
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +19,7 @@ import (
 
 	"github.com/kodestar/audiosilo-meta/pkg/canonical"
 	"github.com/kodestar/audiosilo-meta/pkg/model"
+	"github.com/kodestar/audiosilo-meta/pkg/pack"
 
 	"github.com/kodestar/audiosilo-sidecars/internal/audio"
 	"github.com/kodestar/audiosilo-sidecars/internal/contrib"
@@ -43,13 +47,17 @@ func (f fakeTokenResolver) Resolve(context.Context) (string, string, error) {
 
 // createdIssue records an issue the fake GitHub server was asked to open.
 type createdIssue struct {
+	repo   string // owner/name the issue was opened on
 	number int
 	title  string
 	body   string
 	labels []string
 }
 
-// fakeGitHub stands in for api.github.com for the contribution client.
+// fakeGitHub stands in for api.github.com for the contribution client. Its
+// community repository (testCommunityRepo, forked as testFork) serves a real
+// works-community data tree as its tarball, and the git data API calls a PR-mode
+// submit makes are recorded so a test can read back exactly what was committed.
 type fakeGitHub struct {
 	t   *testing.T
 	srv *httptest.Server
@@ -58,20 +66,84 @@ type fakeGitHub struct {
 	issues      []createdIssue
 	gists       int
 	forks       int
-	puts        []string        // contents paths PUT (also the "file exists" set for GET contents)
 	pulls       int             // POST /pulls count (a resume must not add another)
+	pullBodies  []string        // PR bodies, in order
 	refs        int             // POST /git/refs count (a resume must not re-create the branch)
+	refUpdates  int             // PATCH /git/refs count (a leftover branch is force-moved)
 	branches    map[string]bool // branches created on the fork
 	openPRHeads map[string]int  // open PR head -> number
 	dropLabels  bool            // GET issue omits the routing labels (non-collaborator drop)
 	rateLimit   bool            // creation calls return a 403 rate-limit
+	tarballFail bool            // the tarball endpoint 500s (PR preparation fails)
+
+	// community is the fork's community data tree at its default branch: repo-relative
+	// path -> content. The tarball is built from it.
+	community map[string][]byte
+	blobs     map[string][]byte // blob sha -> content
+	committed map[string][]byte // repo-relative path -> content, from the last tree
+	deleted   []string          // repo-relative paths the last tree removed
 }
 
+const (
+	testCommunityRepo = "KodeStar/audiosilo-meta-community"
+	testFork          = "tester/audiosilo-meta-community"
+)
+
 func newFakeGitHub(t *testing.T) *fakeGitHub {
-	g := &fakeGitHub{t: t, branches: map[string]bool{}, openPRHeads: map[string]int{}}
+	g := &fakeGitHub{t: t, branches: map[string]bool{}, openPRHeads: map[string]int{},
+		community: map[string][]byte{}, blobs: map[string][]byte{}}
 	g.srv = httptest.NewServer(http.HandlerFunc(g.handle))
 	t.Cleanup(g.srv.Close)
 	return g
+}
+
+// seedCommunity fills the fake's community tree with a valid works-community family
+// holding a characters member for each given work (written through pkg/pack, exactly
+// as upstream's tooling would lay it out).
+func (g *fakeGitHub) seedCommunity(works ...string) {
+	g.t.Helper()
+	dir := filepath.Join(g.t.TempDir(), "data")
+	st, err := pack.OpenProfile(dir, pack.ProfileCommunity)
+	if err != nil {
+		g.t.Fatal(err)
+	}
+	for _, w := range works {
+		chars := baseChars("x")
+		chars.Work = w
+		chars.Sources = contributionSources("audible:B0")
+		raw, _ := json.Marshal(chars)
+		entry, _ := json.Marshal(map[string]json.RawMessage{"characters": raw})
+		if err := st.Upsert(pack.FamilyWorksCommunity, w, entry); err != nil {
+			g.t.Fatal(err)
+		}
+	}
+	written, err := st.Flush()
+	if err != nil {
+		g.t.Fatal(err)
+	}
+	for _, rel := range written.Wrote {
+		b, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(rel)))
+		if err != nil {
+			g.t.Fatal(err)
+		}
+		g.community["data/"+rel] = b
+	}
+}
+
+// tarball renders the community tree as GitHub's archive does: gzip, one top-level
+// "<owner>-<repo>-<sha>/" directory.
+func (g *fakeGitHub) tarball() []byte {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for p, content := range g.community {
+		_ = tw.WriteHeader(&tar.Header{Name: "tester-audiosilo-meta-community-deadbeef/" + p, Mode: 0o644,
+			Size: int64(len(content)), Typeflag: tar.TypeReg})
+		_, _ = tw.Write(content)
+	}
+	_ = tw.Close()
+	_ = gz.Close()
+	return buf.Bytes()
 }
 
 func (g *fakeGitHub) handle(w http.ResponseWriter, r *http.Request) {
@@ -96,7 +168,8 @@ func (g *fakeGitHub) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		g.decode(r, &req)
 		num := len(g.issues) + 1
-		g.issues = append(g.issues, createdIssue{number: num, title: req.Title, body: req.Body, labels: req.Labels})
+		repo := strings.TrimSuffix(strings.TrimPrefix(path, "/repos/"), "/issues")
+		g.issues = append(g.issues, createdIssue{repo: repo, number: num, title: req.Title, body: req.Body, labels: req.Labels})
 		g.writeIssue(w, http.StatusCreated, num, req.Labels)
 
 	case r.Method == http.MethodGet && strings.Contains(path, "/issues/"):
@@ -119,13 +192,20 @@ func (g *fakeGitHub) handle(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 
-	case r.Method == http.MethodPost && strings.HasSuffix(path, "/forks"):
+	case r.Method == http.MethodPost && path == "/repos/"+testCommunityRepo+"/forks":
 		g.forks++
-		g.writeJSON(w, http.StatusAccepted, map[string]string{"full_name": "tester/audiosilo-meta"})
-	case r.Method == http.MethodGet && path == "/repos/tester/audiosilo-meta":
-		g.writeJSON(w, http.StatusOK, map[string]string{"full_name": "tester/audiosilo-meta"})
+		g.writeJSON(w, http.StatusAccepted, map[string]string{"full_name": testFork})
+	case r.Method == http.MethodGet && (path == "/repos/"+testFork || path == "/repos/"+testCommunityRepo):
+		g.writeJSON(w, http.StatusOK, map[string]string{"full_name": testFork, "default_branch": "main"})
 	case r.Method == http.MethodPost && strings.HasSuffix(path, "/merge-upstream"):
 		g.writeJSON(w, http.StatusOK, map[string]string{})
+	case r.Method == http.MethodGet && path == "/repos/"+testFork+"/tarball/deadbeef":
+		if g.tarballFail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-gzip")
+		_, _ = w.Write(g.tarball())
 	case r.Method == http.MethodGet && strings.Contains(path, "/git/ref/heads/"):
 		branch := strings.SplitN(path, "/git/ref/heads/", 2)[1]
 		if branch == "main" || g.branches[branch] {
@@ -133,24 +213,58 @@ func (g *fakeGitHub) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.WriteHeader(http.StatusNotFound) // BranchRef: branch not created yet
+	case r.Method == http.MethodGet && path == "/repos/"+testFork+"/git/commits/deadbeef":
+		g.writeJSON(w, http.StatusOK, map[string]any{"sha": "deadbeef", "tree": map[string]string{"sha": "basetree"}})
+	case r.Method == http.MethodPost && path == "/repos/"+testFork+"/git/blobs":
+		var req struct {
+			Content string `json:"content"`
+		}
+		g.decode(r, &req)
+		raw, err := base64.StdEncoding.DecodeString(req.Content)
+		if err != nil {
+			g.t.Errorf("blob not base64: %v", err)
+		}
+		sha := fmt.Sprintf("blob%d", len(g.blobs)+1)
+		g.blobs[sha] = raw
+		g.writeJSON(w, http.StatusCreated, map[string]string{"sha": sha})
+	case r.Method == http.MethodPost && path == "/repos/"+testFork+"/git/trees":
+		var req struct {
+			BaseTree string `json:"base_tree"`
+			Tree     []struct {
+				Path string  `json:"path"`
+				SHA  *string `json:"sha"`
+			} `json:"tree"`
+		}
+		g.decode(r, &req)
+		if req.BaseTree != "basetree" {
+			g.t.Errorf("tree base = %q, want basetree", req.BaseTree)
+		}
+		g.committed, g.deleted = map[string][]byte{}, nil
+		for _, e := range req.Tree {
+			if e.SHA == nil {
+				g.deleted = append(g.deleted, e.Path)
+				continue
+			}
+			g.committed[e.Path] = g.blobs[*e.SHA]
+		}
+		g.writeJSON(w, http.StatusCreated, map[string]string{"sha": "newtree"})
+	case r.Method == http.MethodPost && path == "/repos/"+testFork+"/git/commits":
+		g.writeJSON(w, http.StatusCreated, map[string]string{"sha": "newcommit"})
 	case r.Method == http.MethodPost && strings.HasSuffix(path, "/git/refs"):
 		var req struct {
 			Ref string `json:"ref"`
+			SHA string `json:"sha"`
 		}
 		g.decode(r, &req)
+		if req.SHA != "newcommit" {
+			g.t.Errorf("branch created at %q, want the new commit", req.SHA)
+		}
 		g.refs++
 		g.branches[strings.TrimPrefix(req.Ref, "refs/heads/")] = true
 		g.writeJSON(w, http.StatusCreated, map[string]string{"ref": req.Ref})
-	case r.Method == http.MethodGet && strings.Contains(path, "/contents/"):
-		file := strings.SplitN(path, "/contents/", 2)[1]
-		if contains(g.puts, file) {
-			g.writeJSON(w, http.StatusOK, map[string]string{"sha": "blob-sha"}) // file exists -> update
-			return
-		}
-		w.WriteHeader(http.StatusNotFound) // contentSHA: file not present -> create
-	case r.Method == http.MethodPut && strings.Contains(path, "/contents/"):
-		g.puts = append(g.puts, strings.SplitN(path, "/contents/", 2)[1])
-		g.writeJSON(w, http.StatusCreated, map[string]any{"content": map[string]string{"path": "x"}})
+	case r.Method == http.MethodPatch && strings.Contains(path, "/git/refs/heads/"):
+		g.refUpdates++
+		g.writeJSON(w, http.StatusOK, map[string]string{})
 	case r.Method == http.MethodGet && strings.HasSuffix(path, "/pulls"):
 		if num, ok := g.openPRHeads[r.URL.Query().Get("head")]; ok {
 			g.writeJSON(w, http.StatusOK, []map[string]any{
@@ -159,12 +273,18 @@ func (g *fakeGitHub) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		g.writeJSON(w, http.StatusOK, []any{}) // FindOpenPRByHead: none yet
-	case r.Method == http.MethodPost && strings.HasSuffix(path, "/pulls"):
+	case r.Method == http.MethodPost && path == "/repos/"+testCommunityRepo+"/pulls":
 		g.pulls++
 		var req struct {
 			Head string `json:"head"`
+			Base string `json:"base"`
+			Body string `json:"body"`
 		}
 		g.decode(r, &req)
+		if req.Base != "main" {
+			g.t.Errorf("PR base = %q, want main", req.Base)
+		}
+		g.pullBodies = append(g.pullBodies, req.Body)
 		g.openPRHeads[req.Head] = 42
 		g.writeJSON(w, http.StatusCreated, map[string]any{"number": 42, "html_url": g.srv.URL + "/pull/42"})
 
@@ -211,6 +331,8 @@ type fakeMeta struct {
 	lookups map[string]string
 	// works maps work id -> (title, hasChars, hasRecaps); absent id => 404.
 	works map[string]metaWorkFixture
+	// redirects maps a RETIRED work id -> its survivor (answered 301, as meta does).
+	redirects map[string]string
 }
 
 type metaWorkFixture struct {
@@ -247,12 +369,16 @@ func (m *fakeMeta) handle(w http.ResponseWriter, r *http.Request) {
 
 	case strings.HasPrefix(r.URL.Path, "/api/v1/works/"):
 		id := strings.TrimPrefix(r.URL.Path, "/api/v1/works/")
+		if to, ok := m.redirects[id]; ok {
+			http.Redirect(w, r, "/api/v1/works/"+to, http.StatusMovedPermanently)
+			return
+		}
 		wf, ok := m.works[id]
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		out := map[string]any{"title": wf.title}
+		out := map[string]any{"id": id, "title": wf.title}
 		if len(wf.recordings) > 0 {
 			out["recordings"] = wf.recordings
 		}
@@ -270,8 +396,6 @@ func (m *fakeMeta) handle(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- helpers -----------------------------------------------------------------
-
-const testRepo = "KodeStar/audiosilo-meta"
 
 func openContribDB(t *testing.T) *store.DB {
 	t.Helper()
@@ -309,15 +433,15 @@ func contribConfig(t *testing.T, db *store.DB, mode, ghURL, metaURL, exportRoot 
 		meta = metaops.NewClient(metaURL)
 	}
 	return Config{
-		DB:             db,
-		DataDir:        t.TempDir(),
-		Fallback:       scheduler.NewStubExecutor(0, 0),
-		Meta:           meta,
-		TokenSource:    tok,
-		ContribMode:    mode,
-		ContribRepo:    testRepo,
-		ContribBaseURL: ghURL,
-		ExportRoot:     exportRoot,
+		DB:                   db,
+		DataDir:              t.TempDir(),
+		Fallback:             scheduler.NewStubExecutor(0, 0),
+		Meta:                 meta,
+		TokenSource:          tok,
+		ContribMode:          mode,
+		ContribCommunityRepo: testCommunityRepo,
+		ContribBaseURL:       ghURL,
+		ExportRoot:           exportRoot,
 	}
 }
 
@@ -424,6 +548,9 @@ func TestContributeIssueHappyPath(t *testing.T) {
 		if !strings.Contains(iss.body, `"work": "reacher-01"`) {
 			t.Errorf("issue %q missing rewritten work slug", iss.title)
 		}
+		if iss.repo != testCommunityRepo {
+			t.Errorf("issue %q opened on %q, want the community repo %q (the core bot refuses sidecars)", iss.title, iss.repo, testCommunityRepo)
+		}
 		switch {
 		case contains(iss.labels, "data:characters"):
 			gotChars = true
@@ -435,11 +562,11 @@ func TestContributeIssueHappyPath(t *testing.T) {
 		t.Errorf("expected both characters+recaps labelled issues (chars=%v recaps=%v)", gotChars, gotRecaps)
 	}
 
-	// Both rows recorded submitted, no note.
+	// Both rows recorded submitted against the community repo, no note.
 	rows := rowsByKind(t, db, b.ID)
 	for _, k := range []string{store.ContribKindCharacters, store.ContribKindRecaps} {
 		r := rows[k]
-		if r.Status != store.ContribStatusSubmitted || r.URL == "" || r.Note != "" {
+		if r.Status != store.ContribStatusSubmitted || r.URL == "" || r.Note != "" || r.Repo != testCommunityRepo {
 			t.Errorf("%s row = %+v, want submitted with url and no note", k, r)
 		}
 	}
@@ -528,33 +655,157 @@ func TestContributeSkipsCoveredDimension(t *testing.T) {
 	}
 }
 
+// communityEntry parses the committed pack holding slug and returns that entry's
+// members (name -> raw).
+func communityEntry(t *testing.T, g *fakeGitHub, slug string) map[string]json.RawMessage {
+	t.Helper()
+	for p, content := range g.committed {
+		f, err := pack.Parse(content)
+		if err != nil {
+			t.Fatalf("committed %s does not parse as a pack: %v", p, err)
+		}
+		if raw, ok := f.Get(slug); ok {
+			var m map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &m); err != nil {
+				t.Fatal(err)
+			}
+			return m
+		}
+	}
+	t.Fatalf("no committed pack holds %s (committed: %v)", slug, mapKeys(g.committed))
+	return nil
+}
+
+func mapKeys(m map[string][]byte) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// TestContributePRMode: a direct PR is a correct PACK edit of the COMMUNITY
+// repository - the sidecars become members of the work's works-community entry in
+// the pack pkg/pack places it in, committed as one commit, and the PR body names the
+// entry and the pack files. Both rows share the one PR.
 func TestContributePRMode(t *testing.T) {
 	db := openContribDB(t)
 	gh := newFakeGitHub(t)
+	gh.seedCommunity("aardvark-tales") // an unrelated entry already upstream
 
 	b := contribBook(t, db, store.NewBook{WorkID: "reacher-01"}, baseChars("x"), baseRecaps("x"))
 	cfg := contribConfig(t, db, contribModePR, gh.srv.URL, "", "", fakeTokenResolver{token: "ghp_x"})
 	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("contribute: %v", err)
 	}
-	if gh.forks != 1 || gh.pulls != 1 || len(gh.puts) != 2 {
-		t.Fatalf("pr flow: forks=%d pulls=%d puts=%d, want 1/1/2", gh.forks, gh.pulls, len(gh.puts))
+	if gh.forks != 1 || gh.pulls != 1 || gh.refs != 1 || gh.issueCount() != 0 {
+		t.Fatalf("pr flow: forks=%d pulls=%d refs=%d issues=%d, want 1/1/1/0", gh.forks, gh.pulls, gh.refs, gh.issueCount())
 	}
-	// Contents committed at the canonical data/works/<shard>/<slug>/ paths.
-	shard := contrib.LegacyShard("reacher-01")
-	wantChars := fmt.Sprintf("data/works/%s/reacher-01/characters.json", shard)
-	wantRecaps := fmt.Sprintf("data/works/%s/reacher-01/recaps.json", shard)
-	if !contains(gh.puts, wantChars) || !contains(gh.puts, wantRecaps) {
-		t.Errorf("PutContents paths = %v, want %s + %s", gh.puts, wantChars, wantRecaps)
+	if len(gh.committed) != 1 || gh.committed["data/works-community/0/0.json"] == nil {
+		t.Fatalf("committed = %v, want the one pack data/works-community/0/0.json", mapKeys(gh.committed))
 	}
-	// Both rows share the one PR url/number.
+	for p := range gh.committed {
+		if strings.Contains(p, "/works/") || strings.HasSuffix(p, "characters.json") {
+			t.Fatalf("committed %s: the retired per-record layout", p)
+		}
+	}
+	entry := communityEntry(t, gh, "reacher-01")
+	if entry["characters"] == nil || entry["recaps"] == nil {
+		t.Fatalf("reacher-01 entry members = %v, want characters + recaps", entry)
+	}
+	if !strings.Contains(string(entry["recaps"]), `"work":"reacher-01"`) && !strings.Contains(string(entry["recaps"]), `"work": "reacher-01"`) {
+		t.Errorf("recaps member not keyed to the work: %s", entry["recaps"])
+	}
+	// The unrelated entry is carried through untouched.
+	if other := communityEntry(t, gh, "aardvark-tales"); other["characters"] == nil {
+		t.Error("an unrelated entry lost its member")
+	}
+	body := gh.pullBodies[0]
+	if !strings.Contains(body, "`reacher-01`") || !strings.Contains(body, "`data/works-community/0/0.json`") {
+		t.Errorf("PR body does not name the entry and pack:\n%s", body)
+	}
 	rows := rowsByKind(t, db, b.ID)
 	c, r := rows[store.ContribKindCharacters], rows[store.ContribKindRecaps]
-	if c.URL == "" || c.URL != r.URL || c.Number != r.Number || c.Status != store.ContribStatusSubmitted {
-		t.Errorf("pr rows do not share the PR: chars=%+v recaps=%+v", c, r)
+	if c.URL == "" || c.URL != r.URL || c.Number != r.Number || c.Status != store.ContribStatusSubmitted ||
+		c.Mode != store.ContribModePR || c.Repo != testCommunityRepo {
+		t.Errorf("pr rows do not share the community PR: chars=%+v recaps=%+v", c, r)
 	}
 }
 
+// TestContributePRModeExistingMemberFallsBackToIssue: the community entry already
+// carries characters for this work (replacing them is the maintainers' call), so the
+// PR carries recaps alone and the characters go through the intake issue - where the
+// bot hands them to a human - with a row note saying why.
+func TestContributePRModeExistingMemberFallsBackToIssue(t *testing.T) {
+	db := openContribDB(t)
+	gh := newFakeGitHub(t)
+	gh.seedCommunity("reacher-01") // characters already upstream (not yet in a release)
+
+	b := contribBook(t, db, store.NewBook{WorkID: "reacher-01"}, baseChars("x"), baseRecaps("x"))
+	cfg := contribConfig(t, db, contribModePR, gh.srv.URL, "", "", fakeTokenResolver{token: "ghp_x"})
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
+		t.Fatalf("contribute: %v", err)
+	}
+	if gh.pulls != 1 || gh.issueCount() != 1 {
+		t.Fatalf("pulls=%d issues=%d, want the recaps PR + a characters issue", gh.pulls, gh.issueCount())
+	}
+	if gh.issues[0].repo != testCommunityRepo || !contains(gh.issues[0].labels, "data:characters") {
+		t.Fatalf("fallback issue = %+v, want a characters issue on the community repo", gh.issues[0])
+	}
+	rows := rowsByKind(t, db, b.ID)
+	if r := rows[store.ContribKindRecaps]; r.Mode != store.ContribModePR || r.Status != store.ContribStatusSubmitted {
+		t.Errorf("recaps row = %+v, want the PR", r)
+	}
+	c := rows[store.ContribKindCharacters]
+	if c.Mode != store.ContribModeIssue || !strings.Contains(c.Note, "maintainers' call") || !strings.Contains(c.Note, "intake issue instead") {
+		t.Errorf("characters row = %+v, want an issue row noting the refusal", c)
+	}
+}
+
+// TestContributePRModeFailureFallsBackToIssue: when the PR cannot be prepared (here
+// the tree download fails), no broken PR is opened - every dimension goes through the
+// intake issue path with a note.
+func TestContributePRModeFailureFallsBackToIssue(t *testing.T) {
+	db := openContribDB(t)
+	gh := newFakeGitHub(t)
+	gh.tarballFail = true
+
+	b := contribBook(t, db, store.NewBook{WorkID: "reacher-01"}, baseChars("x"), baseRecaps("x"))
+	cfg := contribConfig(t, db, contribModePR, gh.srv.URL, "", "", fakeTokenResolver{token: "ghp_x"})
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
+		t.Fatalf("contribute: %v", err)
+	}
+	if gh.pulls != 0 || gh.refs != 0 || gh.issueCount() != 2 {
+		t.Fatalf("pulls=%d refs=%d issues=%d, want 0/0/2", gh.pulls, gh.refs, gh.issueCount())
+	}
+	for k, r := range rowsByKind(t, db, b.ID) {
+		if r.Mode != store.ContribModeIssue || !strings.Contains(r.Note, "direct PR not opened") {
+			t.Errorf("%s row = %+v, want an issue row noting the PR failure", k, r)
+		}
+	}
+}
+
+// TestContributePRModeLeftoverBranchIsForceMoved: a branch left by a run that died
+// before opening its PR is force-moved onto the fresh one-commit change, not stacked
+// on or re-created.
+func TestContributePRModeLeftoverBranchIsForceMoved(t *testing.T) {
+	db := openContribDB(t)
+	gh := newFakeGitHub(t)
+	b := contribBook(t, db, store.NewBook{WorkID: "reacher-01"}, baseChars("x"), baseRecaps("x"))
+	gh.branches[fmt.Sprintf("sidecars/reacher-01-%d", b.ID)] = true
+
+	cfg := contribConfig(t, db, contribModePR, gh.srv.URL, "", "", fakeTokenResolver{token: "ghp_x"})
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
+		t.Fatalf("contribute: %v", err)
+	}
+	if gh.refs != 0 || gh.refUpdates != 1 || gh.pulls != 1 {
+		t.Fatalf("refs=%d updates=%d pulls=%d, want 0/1/1", gh.refs, gh.refUpdates, gh.pulls)
+	}
+}
+
+// TestContributeLocalMode: a local export is the bare sidecar FILE per dimension,
+// <export>/<slug>/<name>.json - exactly what an intake-issue attachment takes - with
+// no repository layout.
 func TestContributeLocalMode(t *testing.T) {
 	db := openContribDB(t)
 	export := t.TempDir()
@@ -564,12 +815,19 @@ func TestContributeLocalMode(t *testing.T) {
 	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("contribute: %v", err)
 	}
-	shard := contrib.LegacyShard("reacher-01")
 	for _, name := range []string{charactersFileName, recapsFileName} {
-		p := filepath.Join(export, "works", shard, "reacher-01", name)
-		if _, err := os.Stat(p); err != nil {
-			t.Errorf("local export missing %s: %v", p, err)
+		p := filepath.Join(export, "reacher-01", name)
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("local export missing %s: %v", p, err)
 		}
+		src, _ := os.ReadFile(filepath.Join(b.WorkDir, sidecarsDir, name))
+		if !bytes.Equal(raw, src) {
+			t.Errorf("%s: export is not the sidecar file byte for byte", name)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(export, "works")); !os.IsNotExist(err) {
+		t.Errorf("the retired works/<shard>/ layout was written (stat err %v)", err)
 	}
 	rows := rowsByKind(t, db, b.ID)
 	if rows[store.ContribKindCharacters].Status != store.ContribStatusLocal {
@@ -611,7 +869,7 @@ func TestContributeLocalModeUnresolvedSlugUsesPlaceholder(t *testing.T) {
 		t.Fatalf("contribute: %v", err)
 	}
 	slug := "some-unknown-book"
-	p := filepath.Join(export, "works", contrib.LegacyShard(slug), slug, charactersFileName)
+	p := filepath.Join(export, slug, charactersFileName)
 	if _, err := os.Stat(p); err != nil {
 		t.Errorf("placeholder export missing %s: %v", p, err)
 	}
@@ -880,10 +1138,13 @@ func TestContributeSettledRowNotOverwrittenByCovered(t *testing.T) {
 	}
 }
 
-// TestContributeMergedCoreTrustsWorkIDOn404 proves a book whose work id 404s upstream
-// but has a MERGED core row proceeds on that trusted slug (the merged intake PR created
-// it; the data release just has not rebuilt yet) instead of re-parking needs-core.
-func TestContributeMergedCoreTrustsWorkIDOn404(t *testing.T) {
+// TestContributeMergedCoreWaitsForRelease is the release gate: a book whose work id
+// came from a MERGED add-work PR but 404s in the published catalogue has a work no
+// data release holds yet. The community intake verifies a sidecar's key against the
+// newest release, so contributing now would be refused - the book parks core_pending
+// with the release-wait message (the poller re-admits it once the work is live),
+// submits nothing, and does NOT re-park needs-core.
+func TestContributeMergedCoreWaitsForRelease(t *testing.T) {
 	db := openContribDB(t)
 	gh := newFakeGitHub(t)
 	meta := newFakeMeta(t, nil, nil) // every work id 404s
@@ -895,15 +1156,63 @@ func TestContributeMergedCoreTrustsWorkIDOn404(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := contribConfig(t, db, contribModeIssue, gh.srv.URL, meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
-	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
-		t.Fatalf("contribute should proceed on the merged-core slug, got: %v", err)
+	_, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{})
+	assertPark(t, err, state.ParkCorePending)
+	var pe *scheduler.ParkError
+	if errors.As(err, &pe) && pe.Reason != contrib.ReleaseWaitMsg {
+		t.Errorf("park reason = %q, want the release-wait message", pe.Reason)
 	}
-	if gh.issueCount() != 2 {
-		t.Errorf("issues = %d, want 2 (both dims submitted with the trusted slug)", gh.issueCount())
+	if gh.issueCount() != 0 {
+		t.Errorf("issues = %d, want 0 before the work is released", gh.issueCount())
+	}
+}
+
+// TestContributeAdoptsSurvivorSlug: a recorded work id a merge has RETIRED is answered
+// by the catalogue with a 301 to its survivor; the sidecars attach to the survivor and
+// the book remembers it.
+func TestContributeAdoptsSurvivorSlug(t *testing.T) {
+	db := openContribDB(t)
+	gh := newFakeGitHub(t)
+	meta := newFakeMeta(t, nil, map[string]metaWorkFixture{"reacher-01": {title: "Killing Floor"}})
+	meta.redirects = map[string]string{"killing-floor-old": "reacher-01"}
+	b := contribBook(t, db, store.NewBook{WorkID: "killing-floor-old"}, baseChars("x"), baseRecaps("x"))
+	cfg := contribConfig(t, db, contribModeIssue, gh.srv.URL, meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
+		t.Fatalf("contribute: %v", err)
+	}
+	if got, _ := db.GetBook(context.Background(), b.ID); got.WorkID != "reacher-01" {
+		t.Errorf("work_id = %q, want the survivor reacher-01", got.WorkID)
 	}
 	raw, _ := os.ReadFile(filepath.Join(b.WorkDir, sidecarsDir, charactersFileName))
 	if !strings.Contains(string(raw), `"work": "reacher-01"`) {
-		t.Errorf("characters not reconciled to the trusted slug:\n%s", raw)
+		t.Errorf("sidecar not keyed to the survivor:\n%s", raw)
+	}
+	for _, iss := range gh.issues {
+		if !strings.Contains(iss.body, `"work": "reacher-01"`) {
+			t.Errorf("issue %q not keyed to the survivor", iss.title)
+		}
+	}
+}
+
+// TestContributeCoreDuplicateAsksForWork: the add-work proposal was answered as a
+// duplicate (the core row is already_covered) and no identifier reaches the work - a
+// human sets it, rather than a proposal being re-submitted into the same answer.
+func TestContributeCoreDuplicateAsksForWork(t *testing.T) {
+	db := openContribDB(t)
+	meta := newFakeMeta(t, nil, nil)
+	b := contribBook(t, db, store.NewBook{Title: "Dup Book"}, baseChars("x"), baseRecaps("x"))
+	if _, err := db.UpsertContribution(context.Background(), store.Contribution{
+		BookID: b.ID, Kind: store.ContribKindCore, Mode: store.ContribModeIssue,
+		Status: store.ContribStatusAlreadyCovered, Number: 9, URL: "https://x/9", Note: store.ContribNoteIntakeDuplicate,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := contribConfig(t, db, contribModeIssue, "", meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
+	_, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{})
+	assertPark(t, err, state.ParkCoreNeeded)
+	var pe *scheduler.ParkError
+	if errors.As(err, &pe) && pe.Reason != CoreDuplicateMsg {
+		t.Errorf("park reason = %q, want the duplicate message", pe.Reason)
 	}
 }
 

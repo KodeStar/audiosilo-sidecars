@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/kodestar/audiosilo-sidecars/internal/contrib"
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
@@ -48,14 +47,15 @@ func ExportSlug(b store.Book) string {
 	return workSlug(b)
 }
 
-// ExportArchive builds an in-memory zip of a book's sidecars in the meta repo's
-// layout (works/<shard>/<slug>/characters.json and/or recaps.json, whichever
-// exist), for the "keep local" download. It returns ErrNoSidecars when neither
-// sidecar file exists. The file set is fixed (never user-supplied paths) and the
-// slug is a validated placeholder, so no traversal is possible. The api injects
+// ExportArchive builds an in-memory zip of a book's sidecars for the "keep local"
+// download: <slug>/characters.json and/or <slug>/recaps.json, whichever exist. Each
+// is the bare sidecar FILE, exactly what an intake-issue attachment takes - there is
+// no repository layout to mirror, since upstream stores sidecars as members of
+// range-packed entries only its own tooling writes. It returns ErrNoSidecars when
+// neither sidecar file exists. The file set is fixed (never user-supplied paths) and
+// the slug is a validated placeholder, so no traversal is possible. The api injects
 // this (via ExportSlug) as its ExportArchive seam.
 func ExportArchive(workDir, slug string) ([]byte, error) {
-	shard := contrib.LegacyShard(slug)
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 	added := 0
@@ -68,7 +68,7 @@ func ExportArchive(workDir, slug string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		w, err := zw.Create(fmt.Sprintf("works/%s/%s/%s", shard, slug, name))
+		w, err := zw.Create(slug + "/" + name)
 		if err != nil {
 			return nil, err
 		}

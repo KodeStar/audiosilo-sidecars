@@ -50,11 +50,11 @@ func TestExportArchive(t *testing.T) {
 		t.Fatalf("ExportArchive: %v", err)
 	}
 	names := zipNames(t, data)
-	if len(names) != 1 || names[0] != "works/my/my-work/characters.json" {
+	if len(names) != 1 || names[0] != "my-work/characters.json" {
 		t.Fatalf("entries = %v", names)
 	}
 
-	// Both sidecars -> both entries in the meta layout.
+	// Both sidecars -> both bare files under the slug.
 	if err := os.WriteFile(filepath.Join(sc, recapsFileName), []byte(`{"work":"my-work"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestExportArchive(t *testing.T) {
 		t.Fatalf("ExportArchive: %v", err)
 	}
 	names = zipNames(t, data)
-	want := []string{"works/my/my-work/characters.json", "works/my/my-work/recaps.json"}
+	want := []string{"my-work/characters.json", "my-work/recaps.json"}
 	if len(names) != 2 || names[0] != want[0] || names[1] != want[1] {
 		t.Fatalf("entries = %v, want %v", names, want)
 	}
