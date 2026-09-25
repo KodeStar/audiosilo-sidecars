@@ -40,6 +40,8 @@ type rowTarget struct {
 	note       string
 	verdict    *intakeVerdict
 	newVerdict bool
+	// issueSeenAt is the issue's updated_at as of this check (verdict rows only).
+	issueSeenAt string
 }
 
 // RunPoller polls the upstream repos for open-contribution and core-pending state
@@ -121,8 +123,8 @@ func (s *Service) verdictRecheckNotDue(row store.Contribution) bool {
 }
 
 // advanceRow computes a row's new state from GitHub and persists it only when
-// something changed, publishing a contrib.update. An unchanged row waiting on a
-// verdict is touched instead, which is what spaces its re-checks.
+// something changed, publishing a contrib.update. A verdict row is also touched,
+// which spaces its re-checks.
 func (s *Service) advanceRow(ctx context.Context, cli *Client, row store.Contribution) error {
 	var target rowTarget
 	var err error
@@ -134,18 +136,18 @@ func (s *Service) advanceRow(ctx context.Context, cli *Client, row store.Contrib
 	if err != nil {
 		return err
 	}
-	if target.status == row.Status && target.prNumber == row.PRNumber && target.prURL == row.PRURL && target.note == row.Note {
-		if target.verdict != nil && target.status == store.ContribStatusSubmitted {
-			return s.deps.DB.TouchContribution(ctx, row.ID)
+	if target.status != row.Status || target.prNumber != row.PRNumber || target.prURL != row.PRURL || target.note != row.Note {
+		if err := s.deps.DB.SetContributionStatus(ctx, row.ID, target.status, target.prNumber, target.prURL, target.note); err != nil {
+			return err
 		}
-		return nil // steady state: no persist, no publish
+		s.publish(row.BookID, row.Kind, target.status, prURLOr(target.prURL, row.URL))
+		if row.Kind == store.ContribKindCore && target.newVerdict {
+			s.coreVerdictFollowUp(ctx, row, *target.verdict)
+		}
 	}
-	if err := s.deps.DB.SetContributionStatus(ctx, row.ID, target.status, target.prNumber, target.prURL, target.note); err != nil {
-		return err
-	}
-	s.publish(row.BookID, row.Kind, target.status, prURLOr(target.prURL, row.URL))
-	if row.Kind == store.ContribKindCore && target.newVerdict {
-		s.coreVerdictFollowUp(ctx, row, *target.verdict)
+	if target.verdict != nil {
+		// Spaces the next check and records which issue state the verdict reflects.
+		return s.deps.DB.TouchContribution(ctx, row.ID, target.issueSeenAt)
 	}
 	return nil
 }
@@ -166,11 +168,32 @@ func (s *Service) coreVerdictFollowUp(ctx context.Context, row store.Contributio
 		}
 		return
 	}
-	msg := fmt.Sprintf(CoreVerdictMsgFormat, strings.TrimPrefix(v.note, store.ContribNoteIntakeVerdictPrefix), row.URL)
+	msg := fmt.Sprintf(CoreVerdictMsgFormat, verdictWord(v.note), row.URL)
 	if err := s.deps.DB.SetBookStatus(ctx, b.ID, string(state.StatusNeedsAttention), msg, string(state.ParkCorePending)); err != nil {
 		s.logf("contrib poller: note core verdict for book %d: %v", b.ID, err)
 	}
 }
+
+// CoreVerdictMsg is the park message for a core row carrying a needs-human or
+// invalid verdict (ok=false for any other row), so a re-run of the contributing
+// stage re-parks with the verdict rather than the generic "waiting to merge".
+func CoreVerdictMsg(row store.Contribution) (string, bool) {
+	for _, n := range []string{store.ContribNoteIntakeNeedsHuman, store.ContribNoteIntakeInvalid} {
+		if strings.Contains(row.Note, n) {
+			return fmt.Sprintf(CoreVerdictMsgFormat, verdictWord(n), row.URL), true
+		}
+	}
+	return "", false
+}
+
+// verdictWord is a verdict note marker without its common prefix.
+func verdictWord(note string) string {
+	return strings.TrimPrefix(note, store.ContribNoteIntakeVerdictPrefix)
+}
+
+// CoreSlugUnresolvedMsgFormat is the park message of a core_pending book whose
+// add-work PR merged without naming exactly one new work: the reason, the PR URL.
+const CoreSlugUnresolvedMsgFormat = "the work proposal merged, but its work could not be read from the PR (%s) - see %s; set the book's work by hand"
 
 // CoreVerdictMsgFormat is the park message of a core_pending book whose add-work
 // issue the intake bot answered needs-human or invalid: the verdict, the issue URL.
@@ -215,16 +238,17 @@ func (s *Service) pollIssueMode(ctx context.Context, cli *Client, row store.Cont
 // intakeVerdict is an outcome the intake bot labels an issue with when it opens no
 // pull request (intake.yml, in both the core and the community repo).
 type intakeVerdict struct {
-	label string // the verdict label the bot applies
-	note  string // the row-note segment (a store.ContribNoteIntake* marker)
+	label  string // the verdict label the bot applies
+	note   string // the row-note segment (a store.ContribNoteIntake* marker)
+	phrase string // what the bot's verdict comment says (intake.yml's headline)
 }
 
 // intakeVerdicts in precedence order: a duplicate is settled, so it wins over a
 // needs-human label left from an earlier run.
 var intakeVerdicts = []intakeVerdict{
-	{label: "data:duplicate", note: store.ContribNoteIntakeDuplicate},
-	{label: "data:needs-human", note: store.ContribNoteIntakeNeedsHuman},
-	{label: "data:invalid", note: store.ContribNoteIntakeInvalid},
+	{label: "data:duplicate", note: store.ContribNoteIntakeDuplicate, phrase: "already in the database"},
+	{label: "data:needs-human", note: store.ContribNoteIntakeNeedsHuman, phrase: "needs a **maintainer**"},
+	{label: "data:invalid", note: store.ContribNoteIntakeInvalid, phrase: "couldn't be processed automatically"},
 }
 
 // verdictFromLabels returns the verdict an issue's labels carry, if any.
@@ -245,38 +269,70 @@ const maxVerdictDetail = 400
 
 // verdictTarget maps an intake verdict to the row's new state: a duplicate is
 // already_covered (upstream already, done by someone else); needs-human/invalid stay
-// submitted with an actionable note. The bot comment's message lines are read only
-// when the verdict is new to the row.
-func (s *Service) verdictTarget(ctx context.Context, cli *Client, row store.Contribution, issue Issue, v intakeVerdict, base string) (rowTarget, error) {
-	t := rowTarget{status: store.ContribStatusSubmitted, verdict: &v}
+// submitted with an actionable note. The bot's comments are read only when the issue
+// changed since the recorded verdict was read; the verdict is then the NEWEST bot
+// comment's (the bot adds labels without removing old ones), labels as fallback.
+func (s *Service) verdictTarget(ctx context.Context, cli *Client, row store.Contribution, issue Issue, labelled intakeVerdict, base string) (rowTarget, error) {
+	recorded, segment := recordedVerdict(row.Note)
+	if recorded != nil && issue.UpdatedAt != "" && issue.UpdatedAt == row.IssueSeenAt {
+		return verdictRow(*recorded, issue, JoinNotes(base, segment), false), nil
+	}
+	comments, err := cli.IssueComments(ctx, row.Repo, row.Number)
+	if err != nil {
+		return rowTarget{}, err
+	}
+	v, detail := labelled, ""
+	if said, d, ok := latestBotComment(comments); ok {
+		detail = d
+		if said != nil {
+			v = *said
+		}
+	}
+	segment = v.note
+	if detail != "" {
+		segment += " - " + detail
+	}
+	return verdictRow(v, issue, JoinNotes(base, segment), recorded == nil || recorded.note != v.note), nil
+}
+
+// verdictRow is the rowTarget a verdict yields for an issue in its current state.
+func verdictRow(v intakeVerdict, issue Issue, note string, isNew bool) rowTarget {
+	t := rowTarget{status: store.ContribStatusSubmitted, note: note, verdict: &v, newVerdict: isNew, issueSeenAt: issue.UpdatedAt}
 	if v.note == store.ContribNoteIntakeDuplicate {
 		t.status = store.ContribStatusAlreadyCovered
 	} else if issue.State == "closed" {
 		t.status = store.ContribStatusClosed
 	}
-	if i := strings.Index(row.Note, v.note); i >= 0 {
-		t.note = JoinNotes(base, row.Note[i:])
-		return t, nil
-	}
-	segment := v.note
-	comments, err := cli.IssueComments(ctx, row.Repo, row.Number)
-	if err != nil {
-		return rowTarget{}, err
-	}
-	if detail := latestBotDetail(comments); detail != "" {
-		segment += " - " + detail
-	}
-	t.note, t.newVerdict = JoinNotes(base, segment), true
-	return t, nil
+	return t
 }
 
-// latestBotDetail returns the "- " message lines of the intake bot's most recent
-// verdict comment, joined and bounded, or "" when there is none.
-func latestBotDetail(comments []IssueComment) string {
+// recordedVerdict returns the verdict a row note carries and its segment (the note
+// from the marker to the end), or nil.
+func recordedVerdict(note string) (*intakeVerdict, string) {
+	for _, v := range intakeVerdicts {
+		if i := strings.Index(note, v.note); i >= 0 {
+			return &v, note[i:]
+		}
+	}
+	return nil, ""
+}
+
+// latestBotComment reads the intake bot's most recent verdict comment: the verdict
+// it names (nil when its headline names none), and its "- " message lines, joined
+// and bounded. Only a bot account's comment counts (the workflow posts as
+// github-actions[bot]; a "[bot]" login cannot be held by a person), so a pasted
+// marker cannot put text in a note. ok is false when there is no such comment.
+func latestBotComment(comments []IssueComment) (said *intakeVerdict, detail string, ok bool) {
 	for i := len(comments) - 1; i >= 0; i-- {
 		body := comments[i].Body
-		if !strings.Contains(body, intakeBotMarker) {
+		if !strings.HasSuffix(comments[i].Author, "[bot]") || !strings.Contains(body, intakeBotMarker) {
 			continue
+		}
+		for _, v := range intakeVerdicts {
+			if strings.Contains(body, v.phrase) {
+				said = &v
+				break
+			}
 		}
 		var lines []string
 		for _, l := range strings.Split(body, "\n") {
@@ -284,9 +340,9 @@ func latestBotDetail(comments []IssueComment) string {
 				lines = append(lines, strings.TrimSpace(l[2:]))
 			}
 		}
-		return truncateRunes(strings.Join(lines, " / "), maxVerdictDetail)
+		return said, truncateRunes(strings.Join(lines, " / "), maxVerdictDetail), true
 	}
-	return ""
+	return nil, "", false
 }
 
 // withoutVerdictNote drops a recorded intake verdict - always the note's last
@@ -387,6 +443,16 @@ func (s *Service) resolveCorePending(ctx context.Context, client func() *Client)
 				s.logf("contrib poller: note unresolved core slug for book %d: %v", b.ID, err)
 			}
 			s.publish(b.ID, store.ContribKindCore, core.Status, prURLOr(core.PRURL, core.URL))
+			// The book's own park message said it resumes automatically; nothing will
+			// resume it now, so say what the human has to do (a merged row is not an
+			// attention-flagged row, so the note alone would go unseen).
+			if state.IsParkedWith(b.Status, b.ParkCode, state.ParkCorePending) {
+				if err := s.deps.DB.SetBookStatus(ctx, b.ID, string(state.StatusNeedsAttention),
+					fmt.Sprintf(CoreSlugUnresolvedMsgFormat, why, prURLOr(core.PRURL, core.URL)),
+					string(state.ParkCorePending)); err != nil {
+					s.logf("contrib poller: note unresolved core slug on book %d: %v", b.ID, err)
+				}
+			}
 			continue
 		}
 		// Recorded regardless of park state: a book that already left core_pending

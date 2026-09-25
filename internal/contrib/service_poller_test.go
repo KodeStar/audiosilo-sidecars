@@ -500,6 +500,11 @@ func TestPollCoreMergedAmbiguousNoGuess(t *testing.T) {
 			if !strings.Contains(row.Note, store.ContribNoteCoreSlugUnresolvedPrefix) {
 				t.Fatalf("core note = %q, want the unresolved-slug note", row.Note)
 			}
+			// The book no longer claims it resumes automatically: it names the fix.
+			if nb, _ := db.GetBook(context.Background(), b.ID); !strings.Contains(nb.Error, "set the book's work by hand") ||
+				nb.ParkCode != string(state.ParkCorePending) {
+				t.Fatalf("book park = %s / %q, want core_pending with the set-work message", nb.ParkCode, nb.Error)
+			}
 			svc.Poll(context.Background())
 			if n := reads.Load(); n != 1 {
 				t.Fatalf("PR change read %d times, want 1 (a settled answer is not re-read)", n)
@@ -654,34 +659,60 @@ func TestPollReleaseGateTransientLeavesBook(t *testing.T) {
 
 // --- poller: intake verdicts ---
 
-// verdictCalls counts the GitHub requests a verdictFake served.
-type verdictCalls struct{ all, comments atomic.Int32 }
+// verdictIssue is the mutable issue #12 a verdictFake serves, and the requests it
+// served.
+type verdictIssue struct {
+	mu        sync.Mutex
+	state     string
+	labels    []string
+	comments  string
+	updatedAt string
+	all       atomic.Int32
+	commentRd atomic.Int32
+}
+
+// set replaces the issue's labels, comments and updated_at (a bot re-run).
+func (v *verdictIssue) set(labels []string, comments, updatedAt string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.labels, v.comments, v.updatedAt = labels, comments, updatedAt
+}
 
 // verdictFake serves one issue (#12) in the given state with the given labels, no
 // intake PR, and the given comments.
-func verdictFake(t *testing.T, issueState string, labels []string, comments string) (*httptest.Server, *verdictCalls) {
+func verdictFake(t *testing.T, issueState string, labels []string, comments string) (*httptest.Server, *verdictIssue) {
 	t.Helper()
-	calls := &verdictCalls{}
-	ls := make([]string, 0, len(labels))
-	for _, l := range labels {
-		ls = append(ls, fmt.Sprintf(`{"name":%q}`, l))
-	}
+	v := &verdictIssue{state: issueState, labels: labels, comments: comments, updatedAt: "2026-09-25T10:00:00Z"}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.all.Add(1)
+		v.all.Add(1)
+		v.mu.Lock()
+		defer v.mu.Unlock()
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/pulls") && r.Method == http.MethodGet:
 			io.WriteString(w, `[]`)
 		case strings.HasSuffix(r.URL.Path, "/issues/12/comments"):
-			calls.comments.Add(1)
-			io.WriteString(w, comments)
+			v.commentRd.Add(1)
+			io.WriteString(w, v.comments)
 		case strings.HasSuffix(r.URL.Path, "/issues/12"):
-			fmt.Fprintf(w, `{"number":12,"html_url":"https://gh/issues/12","state":%q,"labels":[%s]}`, issueState, strings.Join(ls, ","))
+			ls := make([]string, 0, len(v.labels))
+			for _, l := range v.labels {
+				ls = append(ls, fmt.Sprintf(`{"name":%q}`, l))
+			}
+			fmt.Fprintf(w, `{"number":12,"html_url":"https://gh/issues/12","state":%q,"updated_at":%q,"labels":[%s]}`,
+				v.state, v.updatedAt, strings.Join(ls, ","))
 		default:
 			http.Error(w, "unexpected "+r.URL.Path, http.StatusInternalServerError)
 		}
 	}))
 	t.Cleanup(srv.Close)
-	return srv, calls
+	return srv, v
+}
+
+// botSays renders one intake-bot verdict comment (intake.yml's shape) as a comments
+// JSON array.
+func botSays(headline, reason string) string {
+	body := headline + "\n\n- " + reason + "\n\n" + intakeBotMarker
+	return fmt.Sprintf(`[{"body":%q,"user":{"login":"github-actions[bot]"}}]`, body)
 }
 
 const botComment = `[{"body":"a human says hi","user":{"login":"someone"}},` +
@@ -702,7 +733,7 @@ func TestPollVerdicts(t *testing.T) {
 			wantNote:      "audit passed; " + store.ContribNoteIntakeNeedsHuman + " - a characters.json sidecar already exists",
 			wantAttention: true},
 		{name: "duplicate", issueState: "closed", label: "data:duplicate",
-			comments:   `[{"body":"- the characters are already there\n\n_Posted by the intake bot._"}]`,
+			comments:   `[{"body":"- the characters are already there\n\n_Posted by the intake bot._","user":{"login":"github-actions[bot]"}}]`,
 			wantStatus: store.ContribStatusAlreadyCovered,
 			wantNote:   "audit passed; " + store.ContribNoteIntakeDuplicate + " - the characters are already there",
 			wantLanded: true},
@@ -740,6 +771,53 @@ func TestPollVerdicts(t *testing.T) {
 	}
 }
 
+// TestPollVerdictDetailRefresh: the bot re-runs on an edited issue and answers
+// again, adding its label without removing the old one. On the (hourly) re-check the
+// comments are re-read only when the issue itself changed, and the verdict follows
+// the NEWEST bot comment - so a later invalid wins over a stale needs-human label,
+// and a new needs-human reason replaces the old one.
+func TestPollVerdictDetailRefresh(t *testing.T) {
+	db := openDB(t)
+	b := makeBook(t, db, "Rerun Book", string(state.ParkCorePending))
+	addRow(t, db, b.ID, store.ContribKindCore, store.ContribModeIssue, 12, store.ContribStatusSubmitted)
+	needsHuman := "Thanks! This needs a **maintainer** to finish - it can't be applied mechanically."
+	invalid := "This submission couldn't be processed automatically. Please check the details below."
+	gh, issue := verdictFake(t, "open", []string{"data", "data:needs-human"}, botSays(needsHuman, "first reason"))
+	svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, nil, nil)
+	later := func() { svc.now = func() time.Time { return time.Now().Add(2 * time.Hour) } }
+	row := func() store.Contribution { return getRow(t, db, b.ID, store.ContribKindCore) }
+
+	svc.Poll(context.Background())
+	if !strings.Contains(row().Note, store.ContribNoteIntakeNeedsHuman+" - first reason") {
+		t.Fatalf("note = %q", row().Note)
+	}
+
+	// Due re-check, issue unchanged: no comment fetch.
+	later()
+	svc.Poll(context.Background())
+	if issue.commentRd.Load() != 1 {
+		t.Fatalf("comment reads = %d, want 1 (the issue did not change)", issue.commentRd.Load())
+	}
+
+	// A re-run answers needs-human again with a new reason.
+	issue.set([]string{"data", "data:needs-human"}, botSays(needsHuman, "second reason"), "2026-09-26T10:00:00Z")
+	svc.Poll(context.Background())
+	if n := row().Note; !strings.Contains(n, "second reason") || strings.Contains(n, "first reason") {
+		t.Fatalf("note = %q, want the new reason alone", n)
+	}
+
+	// A later run answers invalid; the stale needs-human label stays on the issue.
+	issue.set([]string{"data", "data:needs-human", "data:invalid"}, botSays(invalid, "bad field"), "2026-09-27T10:00:00Z")
+	svc.Poll(context.Background())
+	if n := row().Note; !strings.Contains(n, store.ContribNoteIntakeInvalid+" - bad field") || strings.Contains(n, store.ContribNoteIntakeNeedsHuman) {
+		t.Fatalf("note = %q, want the invalid verdict from the newest bot comment", n)
+	}
+	// The core book's park message follows the new verdict.
+	if nb, _ := db.GetBook(context.Background(), b.ID); !strings.Contains(nb.Error, `"invalid"`) {
+		t.Fatalf("book message = %q, want the invalid verdict", nb.Error)
+	}
+}
+
 // TestPollVerdictRecheckBackoff: a row waiting on a human costs no GitHub call until
 // an hour after it was last checked; a due re-check that changes nothing re-reads no
 // comments and touches the row, which defers the next check another hour.
@@ -767,8 +845,8 @@ func TestPollVerdictRecheckBackoff(t *testing.T) {
 		t.Fatalf("calls within the hour = %d, want none", calls.all.Load()-3)
 	}
 	at(61 * time.Minute)
-	if calls.all.Load() != 5 || calls.comments.Load() != 1 {
-		t.Fatalf("due re-check: calls=%d comments=%d, want 5 and still 1", calls.all.Load(), calls.comments.Load())
+	if calls.all.Load() != 5 || calls.commentRd.Load() != 1 {
+		t.Fatalf("due re-check: calls=%d comments=%d, want 5 and still 1", calls.all.Load(), calls.commentRd.Load())
 	}
 	at(10 * time.Minute) // measured from the touch the re-check left
 	if calls.all.Load() != 5 {
@@ -926,6 +1004,57 @@ func TestSubmitCoreResubmitReusesRecordedIssue(t *testing.T) {
 	}
 	if nb, _ := db.GetBook(context.Background(), b.ID); nb.ParkCode != string(state.ParkCorePending) {
 		t.Fatalf("park = %s, want core_pending (the flip is ensured on resubmit)", nb.ParkCode)
+	}
+}
+
+// TestSubmitCoreSettledRowOpensFreshIssue: a core row the bot answered duplicate
+// (already_covered) or that closed is followed by nothing, so a resubmit must open a
+// fresh issue (clearing the old intake-PR pointer) rather than reuse it - reuse would
+// park the book core_pending with nothing ever moving it again.
+func TestSubmitCoreSettledRowOpensFreshIssue(t *testing.T) {
+	for _, status := range []string{store.ContribStatusAlreadyCovered, store.ContribStatusClosed} {
+		t.Run(status, func(t *testing.T) {
+			db := openDB(t)
+			b := makeBook(t, db, "Needs Core", string(state.ParkCoreNeeded))
+			prior, err := db.UpsertContribution(context.Background(), store.Contribution{
+				BookID: b.ID, Kind: store.ContribKindCore, Mode: store.ContribModeIssue,
+				Number: 77, URL: "https://gh/issues/77", Status: status,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.SetContributionStatus(context.Background(), prior.ID, status, 9, "https://gh/pull/9", ""); err != nil {
+				t.Fatal(err)
+			}
+			var issues int32
+			gh := issueCounter(t, &issues)
+			svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, nil, nil)
+			p := CoreProposal{Title: "Needs Core", Authors: []string{"A"}, Language: "en", Narrators: []string{"N"}, Sources: "scan"}
+
+			row, err := svc.SubmitCore(context.Background(), b, p)
+			if err != nil {
+				t.Fatalf("resubmit: %v", err)
+			}
+			if got := atomic.LoadInt32(&issues); got != 1 {
+				t.Fatalf("resubmit opened %d issues, want 1", got)
+			}
+			got := getRow(t, db, b.ID, store.ContribKindCore)
+			if row.Number == 77 || got.Status != store.ContribStatusSubmitted || got.PRNumber != 0 || got.PRURL != "" {
+				t.Fatalf("row = %+v, want a fresh submitted row with no intake-PR pointer", got)
+			}
+		})
+	}
+}
+
+// TestLatestBotDetailIgnoresNonBotAuthors: a person pasting the bot's marker cannot
+// put text into a row note.
+func TestLatestBotDetailIgnoresNonBotAuthors(t *testing.T) {
+	_, got, _ := latestBotComment([]IssueComment{
+		{Body: "- real\n\n" + intakeBotMarker, Author: "github-actions[bot]"},
+		{Body: "- spoofed\n\n" + intakeBotMarker, Author: "someone"},
+	})
+	if got != "real" {
+		t.Fatalf("detail = %q, want the bot's own comment", got)
 	}
 }
 

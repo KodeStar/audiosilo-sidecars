@@ -552,7 +552,8 @@ internal/
             SetWork validates the slug upstream), and the poller. Where things live:
               poller.go  row lifecycle (FindIntakePR -> pr_open -> merged/closed),
                          intake verdicts as the note's last segment (re-checked at
-                         most hourly), learnCreatedWork (base.sha...head.sha compare,
+                         most hourly; comments re-read only when the issue changed,
+                         newest bot comment wins), learnCreatedWork (base.sha...head.sha compare,
                          works-pack ENTRY KEYS at merge base vs head), the release
                          gate (admitWhenLive / releaseCorePending)
               notes.go   JoinNotes, AdoptLiveWork (shared with the stage)

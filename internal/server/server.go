@@ -339,7 +339,8 @@ func Run(ctx context.Context, opts Options) error {
 		Publish:  func(u contrib.ContribUpdate) { _ = hub.PublishBook("contrib.update", u.BookID, u) },
 		Readmit:  sched.Retry,
 		ResolveWork: func(ctx context.Context, workID string) (string, error) {
-			cov, err := metaClient.CoverageForWork(ctx, workID)
+			// Fresh: this decides which slug is live (adoption, the release gate).
+			cov, err := metaClient.FreshCoverageForWork(ctx, workID)
 			switch {
 			case err == nil:
 				return cov.WorkID, nil

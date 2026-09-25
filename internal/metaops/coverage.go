@@ -203,6 +203,13 @@ func (c *ttlCache[K, V]) get(key K) (V, bool) {
 	return e.val, true
 }
 
+// drop forgets key.
+func (c *ttlCache[K, V]) drop(key K) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.items, key)
+}
+
 // put stores val for key stamped at now, evicting first if a new key would push
 // the map past cacheCap.
 func (c *ttlCache[K, V]) put(key K, val V) {
@@ -401,6 +408,15 @@ func (c *Client) CoverageForWork(ctx context.Context, workID string) (Coverage, 
 		HasCharacters: v.hasChars, HasRecaps: v.hasRecap,
 		Recordings: cloneRecordingRefs(v.recordings),
 	}, nil
+}
+
+// FreshCoverageForWork is CoverageForWork without the work cache: the answer an
+// ADOPTION decision needs (which slug is live now), since a slug a merge retired
+// within the cache's hour would otherwise still read as live. The fresh result
+// replaces the cached one.
+func (c *Client) FreshCoverageForWork(ctx context.Context, workID string) (Coverage, error) {
+	c.works.drop(workID)
+	return c.CoverageForWork(ctx, workID)
 }
 
 // SearchWorks proxies a free-text query to the metadata search endpoint, keeping

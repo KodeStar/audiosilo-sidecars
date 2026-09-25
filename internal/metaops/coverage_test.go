@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -970,5 +971,40 @@ func TestCoverageForWorkFollowsRetiredSlug(t *testing.T) {
 	got, err = c.CoverageForWork(context.Background(), "no-id")
 	if err != nil || got.WorkID != "no-id" {
 		t.Fatalf("id-less body = %+v, %v, want no-id", got, err)
+	}
+}
+
+// TestFreshCoverageForWorkSeesARetirementTheCacheHides: a work read live is cached
+// for an hour under its slug, so a merge retiring that slug inside the hour is
+// invisible to CoverageForWork. FreshCoverageForWork - what the adopt / release-gate
+// path reads - bypasses the cache and follows the new 301.
+func TestFreshCoverageForWorkSeesARetirementTheCacheHides(t *testing.T) {
+	var retired atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/works/old-slug" && retired.Load():
+			http.Redirect(w, r, "/api/v1/works/new-slug", http.StatusMovedPermanently)
+		case r.URL.Path == "/api/v1/works/old-slug":
+			_, _ = w.Write([]byte(`{"id":"old-slug","title":"Before"}`))
+		case r.URL.Path == "/api/v1/works/new-slug":
+			_, _ = w.Write([]byte(`{"id":"new-slug","title":"Survivor"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.URL)
+	ctx := context.Background()
+
+	if got, err := c.CoverageForWork(ctx, "old-slug"); err != nil || got.WorkID != "old-slug" {
+		t.Fatalf("warm read = %+v, %v", got, err)
+	}
+	retired.Store(true)
+	if got, _ := c.CoverageForWork(ctx, "old-slug"); got.WorkID != "old-slug" {
+		t.Fatalf("cached read = %q; the cache is expected to hide the retirement", got.WorkID)
+	}
+	got, err := c.FreshCoverageForWork(ctx, "old-slug")
+	if err != nil || got.WorkID != "new-slug" {
+		t.Fatalf("fresh read = %+v, %v, want the survivor new-slug", got, err)
 	}
 }

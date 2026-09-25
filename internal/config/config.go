@@ -317,6 +317,9 @@ type Config struct {
 	// deprecations are notices about retired settings Load honoured (never saved;
 	// the server logs them at startup).
 	deprecations []string
+	// legacyCustomRepo is a custom legacy contribution.repo loaded without an
+	// explicit community_repo; Validate refuses it (see foldLegacyContribution).
+	legacyCustomRepo string
 }
 
 // Deprecations returns the notices Load collected about deprecated settings it
@@ -402,7 +405,8 @@ func Load(dataDir string) (Config, error) {
 		// seeds core_repo, so only the file can say whether a legacy `repo:` was
 		// written alongside an explicit core_repo (which then wins) or alone.
 		Contribution struct {
-			CoreRepo *string `yaml:"core_repo"`
+			CoreRepo      *string `yaml:"core_repo"`
+			CommunityRepo *string `yaml:"community_repo"`
 		} `yaml:"contribution"`
 	}
 	switch {
@@ -443,7 +447,8 @@ func Load(dataDir string) (Config, error) {
 	if env.legacyRepo {
 		repoSource = "AUDIOSILO_SIDECARS_CONTRIBUTION_REPO"
 	}
-	foldLegacyContribution(&cfg, capacityKeys.Contribution.CoreRepo != nil || env.coreRepo, repoSource)
+	foldLegacyContribution(&cfg, capacityKeys.Contribution.CoreRepo != nil || env.coreRepo,
+		capacityKeys.Contribution.CommunityRepo != nil || env.communityRepo, repoSource)
 	if cfg.Agent.TimeoutMinutes == 0 {
 		cfg.Agent.TimeoutMinutes = DefaultTimeoutMinutes
 	}
@@ -496,7 +501,7 @@ func Load(dataDir string) (Config, error) {
 
 // envSeen reports which contribution repo variables applyEnv found, for the
 // legacy-repo fold.
-type envSeen struct{ coreRepo, legacyRepo bool }
+type envSeen struct{ coreRepo, communityRepo, legacyRepo bool }
 
 // applyEnv overlays AUDIOSILO_SIDECARS_* environment variables onto cfg.
 func applyEnv(cfg *Config) (seen envSeen) {
@@ -612,6 +617,7 @@ func applyEnv(cfg *Config) (seen envSeen) {
 	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_COMMUNITY_REPO"); ok {
 		cfg.Contribution.CommunityRepo = strings.TrimSpace(v)
+		seen.communityRepo = true
 	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_AUTO_PURGE"); ok {
 		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
@@ -632,8 +638,10 @@ func applyEnv(cfg *Config) (seen envSeen) {
 // foldLegacyContribution honours the two retired contribution settings, each with a
 // deprecation notice. The pre-split single `repo` keeps its one still-valid meaning,
 // the CORE repo, unless an explicit core_repo (file or env) is set, which wins; it
-// never reroutes the sidecars. Mode `pr` (the direct PR) is read as issue.
-func foldLegacyContribution(cfg *Config, explicitCore bool, repoSource string) {
+// never reroutes the sidecars. A CUSTOM legacy repo (a fork or test repo) with no
+// explicit community_repo is refused by Validate: it used to take the sidecars too,
+// which would now go to the public community repo. Mode `pr` is read as issue.
+func foldLegacyContribution(cfg *Config, explicitCore, explicitCommunity bool, repoSource string) {
 	if cfg.Contribution.Mode == legacyContributionModePR {
 		cfg.Contribution.Mode = ContributionModeIssue
 		cfg.deprecations = append(cfg.deprecations,
@@ -641,6 +649,9 @@ func foldLegacyContribution(cfg *Config, explicitCore bool, repoSource string) {
 	}
 	legacy := strings.TrimSpace(cfg.Contribution.Repo)
 	cfg.Contribution.Repo = ""
+	if legacy != "" && legacy != DefaultContributionCoreRepo && !explicitCommunity {
+		cfg.legacyCustomRepo = legacy
+	}
 	switch {
 	case legacy == "":
 	case explicitCore:
@@ -835,6 +846,11 @@ func (c Config) Validate() error {
 	default:
 		return fmt.Errorf("contribution.mode %q must be %q or %q",
 			c.Contribution.Mode, ContributionModeIssue, ContributionModeLocal)
+	}
+	if c.legacyCustomRepo != "" {
+		return fmt.Errorf("contribution.repo %q (deprecated) now sets only contribution.core_repo, so the "+
+			"sidecars would go to the public %s: set contribution.community_repo explicitly "+
+			"(e.g. your test fork) or remove contribution.repo", c.legacyCustomRepo, DefaultContributionCommunityRepo)
 	}
 	if err := validateRepo("contribution.core_repo", c.Contribution.CoreRepo); err != nil {
 		return err

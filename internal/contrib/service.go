@@ -160,8 +160,12 @@ func (s *Service) SubmitCore(ctx context.Context, book store.Book, p CoreProposa
 
 	// Idempotent reuse: a core row that already carries a created issue is authoritative -
 	// never open a second. Just ensure the park is flipped to core_pending (a prior submit
-	// may have crashed between recording the row and flipping the park).
-	if existing, ok := s.existingCoreRow(ctx, book.ID); ok && existing.URL != "" {
+	// may have crashed between recording the row and flipping the park). Only an
+	// IN-FLIGHT row is reused: a settled one (already_covered - the bot answered
+	// duplicate - or closed) is followed by nothing, so reusing it would park the book
+	// core_pending with no poll or release gate ever moving it again.
+	existing, hasExisting := s.existingCoreRow(ctx, book.ID)
+	if hasExisting && existing.URL != "" && coreRowInFlight(existing) {
 		if err := s.ensureCorePending(ctx, fresh); err != nil {
 			return store.Contribution{}, err
 		}
@@ -201,6 +205,14 @@ func (s *Service) SubmitCore(ctx context.Context, book store.Book, p CoreProposa
 	if err != nil {
 		return store.Contribution{}, fmt.Errorf("contrib: record core row: %w", err)
 	}
+	// The upsert keeps a replaced row's intake-PR pointer: clear it, or the poller
+	// would follow the settled row's old PR instead of the new issue.
+	if hasExisting && (row.PRNumber != 0 || row.PRURL != "") {
+		if err := s.deps.DB.SetContributionStatus(ctx, row.ID, row.Status, 0, "", row.Note); err != nil {
+			return store.Contribution{}, fmt.Errorf("contrib: reset core row: %w", err)
+		}
+		row.PRNumber, row.PRURL = 0, ""
+	}
 
 	// Flip the park core_needed -> core_pending (state stays contributing, status
 	// stays needs_attention). SetBookStatus preserves the pipeline state.
@@ -216,6 +228,16 @@ func (s *Service) SubmitCore(ctx context.Context, book store.Book, p CoreProposa
 // (core_needed) nor already carries a recorded core issue - so there is nothing to
 // submit and opening one would be spurious. The API maps it to 409.
 var ErrNotAwaitingCore = errors.New("contrib: book is not awaiting a work proposal")
+
+// coreRowInFlight reports whether a core row is still followed by the poller
+// (submitted / pr_open) or the release gate (merged).
+func coreRowInFlight(r store.Contribution) bool {
+	switch r.Status {
+	case store.ContribStatusSubmitted, store.ContribStatusPROpen, store.ContribStatusMerged:
+		return true
+	}
+	return false
+}
 
 // existingCoreRow reads the book's kind=core contribution row, if any.
 func (s *Service) existingCoreRow(ctx context.Context, bookID int64) (store.Contribution, bool) {

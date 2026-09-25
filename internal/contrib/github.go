@@ -29,10 +29,11 @@ const maxErrorBody = 300
 // the labels that actually stuck (GitHub silently drops labels set by a
 // non-collaborator, so the caller re-reads via GetIssue to verify).
 type Issue struct {
-	Number int
-	URL    string
-	State  string // "open" | "closed" (the poller closes an issue with no merged intake PR)
-	Labels []string
+	Number    int
+	URL       string
+	State     string // "open" | "closed" (the poller closes an issue with no merged intake PR)
+	Labels    []string
+	UpdatedAt string // GitHub's updated_at: moves on any edit, comment or label change
 }
 
 // PR is the subset of a GitHub pull request the contribution flow needs. BaseSHA
@@ -220,10 +221,11 @@ func OwnerOf(repo string) string {
 // --- response shapes ---
 
 type issueResp struct {
-	Number  int    `json:"number"`
-	HTMLURL string `json:"html_url"`
-	State   string `json:"state"`
-	Labels  []struct {
+	Number    int    `json:"number"`
+	HTMLURL   string `json:"html_url"`
+	State     string `json:"state"`
+	UpdatedAt string `json:"updated_at"`
+	Labels    []struct {
 		Name string `json:"name"`
 	} `json:"labels"`
 }
@@ -233,7 +235,7 @@ func (r issueResp) toIssue() Issue {
 	for _, l := range r.Labels {
 		labels = append(labels, l.Name)
 	}
-	return Issue{Number: r.Number, URL: r.HTMLURL, State: r.State, Labels: labels}
+	return Issue{Number: r.Number, URL: r.HTMLURL, State: r.State, Labels: labels, UpdatedAt: r.UpdatedAt}
 }
 
 type pullResp struct {

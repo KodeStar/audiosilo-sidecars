@@ -78,15 +78,18 @@ type Contribution struct {
 	Note      string
 	CreatedAt string
 	UpdatedAt string
+	// IssueSeenAt is the intake issue's updated_at when its verdict comments were
+	// last read (see TouchContribution).
+	IssueSeenAt string
 }
 
 const contribCols = `id, book_id, kind, mode, repo, number, url, pr_number, pr_url,
-	status, note, created_at, updated_at`
+	status, note, created_at, updated_at, issue_seen_at`
 
 func scanContribution(sc interface{ Scan(...any) error }) (Contribution, error) {
 	var c Contribution
 	if err := sc.Scan(&c.ID, &c.BookID, &c.Kind, &c.Mode, &c.Repo, &c.Number, &c.URL,
-		&c.PRNumber, &c.PRURL, &c.Status, &c.Note, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		&c.PRNumber, &c.PRURL, &c.Status, &c.Note, &c.CreatedAt, &c.UpdatedAt, &c.IssueSeenAt); err != nil {
 		return Contribution{}, err
 	}
 	return c, nil
@@ -235,10 +238,12 @@ func (db *DB) SetContributionStatus(ctx context.Context, id int64, status string
 	return checkAffected(res, err)
 }
 
-// TouchContribution bumps a row's updated_at alone: the poller's record that it
-// re-checked a row waiting on an intake verdict, which spaces the next check.
-func (db *DB) TouchContribution(ctx context.Context, id int64) error {
-	res, err := db.sql.ExecContext(ctx, `UPDATE contributions SET updated_at=? WHERE id=?`, timestamp(nowFn()), id)
+// TouchContribution records that the poller re-checked a row waiting on an intake
+// verdict: it bumps updated_at (which spaces the next check) and stores the issue's
+// updated_at as of that check (which decides whether its comments are re-read).
+func (db *DB) TouchContribution(ctx context.Context, id int64, issueSeenAt string) error {
+	res, err := db.sql.ExecContext(ctx, `UPDATE contributions SET updated_at=?, issue_seen_at=? WHERE id=?`,
+		timestamp(nowFn()), issueSeenAt, id)
 	return checkAffected(res, err)
 }
 

@@ -670,7 +670,14 @@ Milestones from the workspace plan; each is shippable.
   become the row note instead of "intake PR overdue". A duplicate is
   `already_covered`, and on a core row it re-admits the book. A needs-human or
   invalid row is re-checked at most hourly (`TouchContribution`), sparing the
-  60/hour unauthenticated budget. The authoring prompt describes the sidecar
+  60/hour unauthenticated budget. Its comments are re-read only when the issue's
+  `updated_at` has moved since the last read (`issue_seen_at`, migration 0013),
+  and the verdict then follows the NEWEST bot comment, because the bot adds
+  labels without removing old ones. A custom legacy `repo` with no explicit
+  community_repo is refused at Load: it used to take the sidecars too, and they
+  would now go to the public repo. The adoption / release-gate lookup is
+  `FreshCoverageForWork`, which bypasses the hour-long work cache so a slug
+  retired inside that hour is not taken as live. The authoring prompt describes the sidecar
   file, not a storage layout. The round-trip test runs metaissue as each
   repo's bot does (community profile + a metabuild artifact as `--works-db`;
   core profile for add-work) and passes against meta HEAD, including the

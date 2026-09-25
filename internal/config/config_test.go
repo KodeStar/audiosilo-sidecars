@@ -498,24 +498,31 @@ func TestContributionNormalizesEmpty(t *testing.T) {
 // explicit core_repo (file or env) is set, which wins; mode "pr" loads as issue.
 // Each is reported once through Deprecations.
 func TestContributionLegacySettings(t *testing.T) {
+	const community = "\n  community_repo: me/community-test\n"
 	cases := []struct {
-		name       string
-		file       string
-		env        map[string]string
-		wantCore   string
-		wantMode   string
-		wantNotice string
+		name          string
+		file          string
+		env           map[string]string
+		wantCore      string
+		wantCommunity string
+		wantMode      string
+		wantNotice    string
 	}{
-		{name: "file repo", file: "contribution:\n  repo: acme/meta\n",
-			wantCore: "acme/meta", wantNotice: "config.yaml contribution.repo is deprecated"},
-		{name: "file repo loses to file core_repo", file: "contribution:\n  repo: old/meta\n  core_repo: new/meta\n",
-			wantCore: "new/meta", wantNotice: "ignored"},
-		{name: "env repo", env: map[string]string{"AUDIOSILO_SIDECARS_CONTRIBUTION_REPO": "env/meta"},
-			wantCore: "env/meta", wantNotice: "AUDIOSILO_SIDECARS_CONTRIBUTION_REPO is deprecated"},
-		{name: "env repo loses to file core_repo", file: "contribution:\n  core_repo: file/core\n",
-			env: map[string]string{"AUDIOSILO_SIDECARS_CONTRIBUTION_REPO": "env/meta"}, wantCore: "file/core", wantNotice: "ignored"},
-		{name: "file repo loses to env core_repo", file: "contribution:\n  repo: file/meta\n",
-			env: map[string]string{"AUDIOSILO_SIDECARS_CONTRIBUTION_CORE_REPO": "env/core"}, wantCore: "env/core", wantNotice: "ignored"},
+		{name: "file repo, the default", file: "contribution:\n  repo: KodeStar/audiosilo-meta\n",
+			wantCore: DefaultContributionCoreRepo, wantNotice: "config.yaml contribution.repo is deprecated"},
+		{name: "file repo, custom, with community_repo", file: "contribution:\n  repo: acme/meta" + community,
+			wantCore: "acme/meta", wantCommunity: "me/community-test", wantNotice: "config.yaml contribution.repo is deprecated"},
+		{name: "file repo loses to file core_repo", file: "contribution:\n  repo: old/meta\n  core_repo: new/meta" + community,
+			wantCore: "new/meta", wantCommunity: "me/community-test", wantNotice: "ignored"},
+		{name: "env repo, custom, with env community_repo", env: map[string]string{
+			"AUDIOSILO_SIDECARS_CONTRIBUTION_REPO": "env/meta", "AUDIOSILO_SIDECARS_CONTRIBUTION_COMMUNITY_REPO": "env/community"},
+			wantCore: "env/meta", wantCommunity: "env/community", wantNotice: "AUDIOSILO_SIDECARS_CONTRIBUTION_REPO is deprecated"},
+		{name: "env repo loses to file core_repo", file: "contribution:\n  core_repo: file/core" + community,
+			env: map[string]string{"AUDIOSILO_SIDECARS_CONTRIBUTION_REPO": "env/meta"}, wantCore: "file/core",
+			wantCommunity: "me/community-test", wantNotice: "ignored"},
+		{name: "file repo loses to env core_repo", file: "contribution:\n  repo: file/meta" + community,
+			env: map[string]string{"AUDIOSILO_SIDECARS_CONTRIBUTION_CORE_REPO": "env/core"}, wantCore: "env/core",
+			wantCommunity: "me/community-test", wantNotice: "ignored"},
 		{name: "mode pr", file: "contribution:\n  mode: pr\n",
 			wantCore: DefaultContributionCoreRepo, wantMode: ContributionModeIssue, wantNotice: `"pr" is retired`},
 	}
@@ -534,9 +541,13 @@ func TestContributionLegacySettings(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Load: %v", err)
 			}
-			if cfg.Contribution.CoreRepo != c.wantCore || cfg.Contribution.CommunityRepo != DefaultContributionCommunityRepo {
-				t.Errorf("repos = %q / %q, want core %q and the default community repo",
-					cfg.Contribution.CoreRepo, cfg.Contribution.CommunityRepo, c.wantCore)
+			wantCommunity := c.wantCommunity
+			if wantCommunity == "" {
+				wantCommunity = DefaultContributionCommunityRepo
+			}
+			if cfg.Contribution.CoreRepo != c.wantCore || cfg.Contribution.CommunityRepo != wantCommunity {
+				t.Errorf("repos = %q / %q, want %q / %q",
+					cfg.Contribution.CoreRepo, cfg.Contribution.CommunityRepo, c.wantCore, wantCommunity)
 			}
 			if c.wantMode != "" && cfg.Contribution.Mode != c.wantMode {
 				t.Errorf("mode = %q, want %q", cfg.Contribution.Mode, c.wantMode)
@@ -557,6 +568,38 @@ func TestContributionLegacySettings(t *testing.T) {
 			}
 			if len(again.Deprecations()) != 0 || again.Contribution.CoreRepo != c.wantCore {
 				t.Errorf("reload = %+v deprecations=%q", again.Contribution, again.Deprecations())
+			}
+		})
+	}
+}
+
+// TestContributionLegacyCustomRepoNeedsCommunity: a legacy `repo` naming a custom
+// (fork / test) repository used to take the sidecars too. It now only sets
+// core_repo, so without an explicit community_repo the sidecars would silently go
+// to the PUBLIC community repo - Load refuses instead, naming both settings.
+func TestContributionLegacyCustomRepoNeedsCommunity(t *testing.T) {
+	for name, setup := range map[string]struct {
+		file string
+		env  map[string]string
+	}{
+		"file":                {file: "contribution:\n  repo: me/audiosilo-meta-test\n"},
+		"env":                 {env: map[string]string{"AUDIOSILO_SIDECARS_CONTRIBUTION_REPO": "me/audiosilo-meta-test"}},
+		"file with core_repo": {file: "contribution:\n  repo: me/audiosilo-meta-test\n  core_repo: me/core\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for k, v := range setup.env {
+				t.Setenv(k, v)
+			}
+			dir := t.TempDir()
+			if setup.file != "" {
+				if err := os.WriteFile(filepath.Join(dir, FileName), []byte(setup.file), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := Load(dir)
+			if err == nil || !strings.Contains(err.Error(), "contribution.community_repo") ||
+				!strings.Contains(err.Error(), "contribution.repo") || !strings.Contains(err.Error(), "me/audiosilo-meta-test") {
+				t.Fatalf("Load err = %v, want a refusal naming contribution.repo and contribution.community_repo", err)
 			}
 		})
 	}

@@ -32,6 +32,8 @@ import (
 type MetaCoverage interface {
 	CoverageFor(context.Context, metaops.BookIdentity) (metaops.Coverage, error)
 	CoverageForWork(context.Context, string) (metaops.Coverage, error)
+	// FreshCoverageForWork bypasses the work cache, for deciding which slug is live.
+	FreshCoverageForWork(context.Context, string) (metaops.Coverage, error)
 	// SeriesGlossary feeds the spelling stage's canonical-name evidence. It lives on
 	// this interface rather than a separately type-asserted one so the compiler
 	// holds the dependency: this feature exists because silent degradation let a
@@ -214,11 +216,15 @@ func (e *Executor) resolveWorkSlug(ctx context.Context, book store.Book) (slug, 
 	// is a stale match (fall through to lookup); a disabled service can't verify, so
 	// trust the recorded match; any other error is transient.
 	if id := strings.TrimSpace(book.WorkID); id != "" {
-		cov, verr := e.metaCoverageForWork(ctx, id)
+		// Fresh: a slug retired inside the cache's hour must be seen as retired.
+		cov, verr := e.metaCoverageForWork(ctx, id, true)
 		switch {
 		case verr == nil:
 			// A slug a merge RETIRED is answered under its survivor; attach to that.
-			live, _ := contrib.AdoptLiveWork(ctx, e.db, book.ID, id, cov.WorkID)
+			live, aerr := contrib.AdoptLiveWork(ctx, e.db, book.ID, id, cov.WorkID)
+			if aerr != nil {
+				e.log.Warn("contributing: record surviving work id", "book", book.ID, "work", cov.WorkID, "err", aerr)
+			}
 			return live, "", nil, nil
 		case errors.Is(verr, metaops.ErrWorkNotFound):
 			// A 404 is normally a stale manual match. With a MERGED core row the work
@@ -269,9 +275,12 @@ func (e *Executor) hasMergedCoreRow(ctx context.Context, bookID int64) bool {
 
 // metaCoverageForWork verifies/reads a work upstream, treating a nil meta client as a
 // disabled service.
-func (e *Executor) metaCoverageForWork(ctx context.Context, workID string) (metaops.Coverage, error) {
+func (e *Executor) metaCoverageForWork(ctx context.Context, workID string, fresh bool) (metaops.Coverage, error) {
 	if e.meta == nil {
 		return metaops.Coverage{}, metaops.ErrDisabled
+	}
+	if fresh {
+		return e.meta.FreshCoverageForWork(ctx, workID)
 	}
 	return e.meta.CoverageForWork(ctx, workID)
 }
@@ -321,7 +330,12 @@ func (e *Executor) needsCore(ctx context.Context, book store.Book) (park, err er
 			switch r.Status {
 			case store.ContribStatusSubmitted, store.ContribStatusPROpen, store.ContribStatusMerged:
 				// A proposal is in flight (merged-but-work_id-empty is the poller race:
-				// the asin/isbn lookup above was the one re-check; keep waiting).
+				// the asin/isbn lookup above was the one re-check; keep waiting). A
+				// needs-human/invalid verdict the poller recorded keeps its message: the
+				// poller writes it once, so a Retry must not overwrite it.
+				if msg, ok := contrib.CoreVerdictMsg(r); ok {
+					return scheduler.ParkWithCode(state.ParkCorePending, msg), nil
+				}
 				return scheduler.ParkWithCode(state.ParkCorePending, CorePendingMsg), nil
 			case store.ContribStatusAlreadyCovered:
 				// The intake bot answered the proposal as a duplicate: the work exists,
@@ -626,7 +640,7 @@ func contributionSources(sourceRef string) []model.Source {
 // locally captured ASIN/ISBN is strongest. Otherwise the resolved work's recordings
 // are matched against local narrator/runtime evidence; only a tie-free match is used.
 func (e *Executor) contributionSourceRef(ctx context.Context, book store.Book, slug string) string {
-	cov, covErr := e.metaCoverageForWork(ctx, slug)
+	cov, covErr := e.metaCoverageForWork(ctx, slug, false)
 	if asin := strings.TrimSpace(book.ASIN); asin != "" {
 		for _, rec := range cov.Recordings {
 			for _, candidate := range rec.ASINs {

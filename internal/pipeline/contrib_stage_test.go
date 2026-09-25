@@ -833,6 +833,33 @@ func TestContributeAdoptsSurvivorSlug(t *testing.T) {
 	}
 }
 
+// TestContributeAdoptsSurvivorPastAWarmCache: the work was read live (and cached)
+// just before a merge retired its slug. The stage's adoption lookup is fresh, so it
+// follows the new 301 instead of keying the sidecars to the retired slug.
+func TestContributeAdoptsSurvivorPastAWarmCache(t *testing.T) {
+	db := openContribDB(t)
+	gh := newFakeGitHub(t)
+	meta := newFakeMeta(t, nil, map[string]metaWorkFixture{
+		"killing-floor-old": {title: "Killing Floor"},
+		"reacher-01":        {title: "Killing Floor"},
+	})
+	b := contribBook(t, db, store.NewBook{WorkID: "killing-floor-old"}, baseChars("x"), baseRecaps("x"))
+	cfg := contribConfig(t, db, contribModeIssue, gh.srv.URL, meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
+	client := metaops.NewClient(meta.srv.URL)
+	cfg.Meta = client
+	if cov, err := client.CoverageForWork(context.Background(), "killing-floor-old"); err != nil || cov.WorkID != "killing-floor-old" {
+		t.Fatalf("warm read = %+v, %v", cov, err)
+	}
+	meta.redirects = map[string]string{"killing-floor-old": "reacher-01"} // the merge lands
+
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
+		t.Fatalf("contribute: %v", err)
+	}
+	if got, _ := db.GetBook(context.Background(), b.ID); got.WorkID != "reacher-01" {
+		t.Errorf("work_id = %q, want the survivor reacher-01 despite the warm cache", got.WorkID)
+	}
+}
+
 // TestContributeCoreDuplicateAsksForWork: the add-work proposal was answered as a
 // duplicate (the core row is already_covered) and no identifier reaches the work - a
 // human sets it, rather than a proposal being re-submitted into the same answer.
@@ -852,6 +879,29 @@ func TestContributeCoreDuplicateAsksForWork(t *testing.T) {
 	var pe *scheduler.ParkError
 	if errors.As(err, &pe) && pe.Reason != CoreDuplicateMsg {
 		t.Errorf("park reason = %q, want the duplicate message", pe.Reason)
+	}
+}
+
+// TestContributeCoreVerdictKeepsItsMessage: a Retry of a book whose submitted core
+// row carries a needs-human verdict re-parks core_pending WITH the verdict message
+// (the poller writes it once; the generic "waiting to merge" would hide it).
+func TestContributeCoreVerdictKeepsItsMessage(t *testing.T) {
+	db := openContribDB(t)
+	meta := newFakeMeta(t, nil, nil)
+	b := contribBook(t, db, store.NewBook{Title: "Verdict Book"}, baseChars("x"), baseRecaps("x"))
+	if _, err := db.UpsertContribution(context.Background(), store.Contribution{
+		BookID: b.ID, Kind: store.ContribKindCore, Mode: store.ContribModeIssue,
+		Status: store.ContribStatusSubmitted, Number: 9, URL: "https://x/9",
+		Note: store.ContribNoteIntakeNeedsHuman + " - a maintainer must look",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := contribConfig(t, db, contribModeIssue, "", meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
+	_, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{})
+	assertPark(t, err, state.ParkCorePending)
+	var pe *scheduler.ParkError
+	if errors.As(err, &pe) && (pe.Reason == CorePendingMsg || !strings.Contains(pe.Reason, "https://x/9")) {
+		t.Errorf("park reason = %q, want the verdict message naming the issue", pe.Reason)
 	}
 }
 
