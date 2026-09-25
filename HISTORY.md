@@ -611,12 +611,16 @@ Milestones from the workspace plan; each is shippable.
   their behaviour through `contrib.LegacyShard`, a verbatim copy; they target
   a layout upstream retired (and a repo the sidecar layer left on 2026-08-21),
   which is a separate redesign, recorded in CLAUDE.md. (2) `extract.NGram` now
-  identifies a bare sidecar by EVERY schema-required key and refuses one
-  missing any - which would have failed the validating stage, whose contract
-  is that only IO fails it. `ngramGate` reports a missing key (or a non-object
-  file) as an ERROR finding and skips the n-gram check until the fixer repairs
-  the record; `sidecarRequiredKeys` is pinned to the schemas' `required` by
-  the drift test. One test fixture gained the keys. The drift guard is STRICT
-  again: `stalePinLicenseContent` and
-  `TestSidecarLicenseIsTheCommunityLayerValue` are gone, since the upstream
-  enum is now CC-BY-SA-4.0 and plain equality holds. Gate: full Go gate green.
+  hard-fails on a sidecar its schema rejects - a missing required key, or
+  (unlike v0.8.0) a null or wrong-typed field such as `"ending": null`, which
+  the typed decode and the structural rules both accept - and that would have
+  failed the validating stage, whose contract is that only IO fails it.
+  `ngramGate` validates each sidecar against meta's embedded characters/recaps
+  schema (compiled once, santhosh-tekuri/jsonschema/v6, now a direct
+  dependency) and passes only the VALID files to NGram; each invalid one is a
+  single ERROR finding naming its first schema violation, so a valid
+  recaps.json is still scanned beside a broken characters.json. One test
+  fixture now builds complete records. The drift guard is STRICT again:
+  `stalePinLicenseContent` and `TestSidecarLicenseIsTheCommunityLayerValue`
+  are gone, since the upstream enum is now CC-BY-SA-4.0 and plain equality
+  holds. Gate: full Go gate green.
