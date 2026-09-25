@@ -108,10 +108,12 @@ func TestNgramCheckUsesTheEbookLayer(t *testing.T) {
 	}
 	chars := filepath.Join(work, "characters.json")
 	recaps := filepath.Join(work, "recaps.json")
-	if err := os.WriteFile(chars, []byte(`{"characters":[{"id":"x","name":"X","description":"`+copied+`"}]}`), 0o600); err != nil {
+	// Complete records: extract.NGram discriminates a bare sidecar by every key its
+	// schema requires (work, license, sources, and the member's own array).
+	if err := os.WriteFile(chars, []byte(`{"work":"w","license":"CC-BY-SA-4.0","sources":[],"characters":[{"id":"x","name":"X","description":"`+copied+`"}]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(recaps, []byte(`{"recaps":[]}`), 0o600); err != nil {
+	if err := os.WriteFile(recaps, []byte(`{"work":"w","license":"CC-BY-SA-4.0","sources":[],"recaps":[]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

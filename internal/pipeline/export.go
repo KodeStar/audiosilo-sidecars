@@ -9,8 +9,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/kodestar/audiosilo-meta/pkg/model"
-
+	"github.com/kodestar/audiosilo-sidecars/internal/contrib"
 	"github.com/kodestar/audiosilo-sidecars/internal/fsutil"
 	"github.com/kodestar/audiosilo-sidecars/internal/store"
 )
@@ -56,7 +55,7 @@ func ExportSlug(b store.Book) string {
 // slug is a validated placeholder, so no traversal is possible. The api injects
 // this (via ExportSlug) as its ExportArchive seam.
 func ExportArchive(workDir, slug string) ([]byte, error) {
-	shard := model.Shard(slug)
+	shard := contrib.LegacyShard(slug)
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 	added := 0

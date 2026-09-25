@@ -80,11 +80,23 @@ func (e *Executor) validateSidecarsStage(ctx context.Context, book store.Book, r
 	}
 
 	// No-verbatim n-gram check against both transcript layers: every overlap is an ERROR.
-	ngramFindings, err := ngramCheck(book, charsPath, recapsPath)
+	// extract.NGram identifies a sidecar by every key its schema requires and REFUSES a
+	// record missing one - an error, which here would fail the stage over a defect the
+	// fixer can repair. So an incomplete record is an ERROR finding instead, and the
+	// check runs on the repaired record in the next validation round.
+	gate, err := ngramGate(charsPath, recapsPath)
 	if err != nil {
-		return scheduler.StageResult{}, fmt.Errorf("validating: ngram check: %w", err)
+		return scheduler.StageResult{}, fmt.Errorf("validating: %w", err)
 	}
-	errs = append(errs, ngramFindings...)
+	if len(gate) > 0 {
+		errs = append(errs, gate...)
+	} else {
+		ngramFindings, err := ngramCheck(book, charsPath, recapsPath)
+		if err != nil {
+			return scheduler.StageResult{}, fmt.Errorf("validating: ngram check: %w", err)
+		}
+		errs = append(errs, ngramFindings...)
+	}
 
 	if err := writeValidationReport(book.WorkDir, errs, warns); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("validating: write report: %w", err)
@@ -141,6 +153,41 @@ func decodeForValidation(charsPath, recapsPath string) (*model.Characters, *mode
 		recs = &r
 	}
 	return chars, recs, findings
+}
+
+// sidecarRequiredKeys is the top-level key set a sidecar record's schema requires
+// (its `required`): the member's own array plus work, license and sources. It is
+// what extract.NGram discriminates a bare record by; the schema drift test pins it.
+func sidecarRequiredKeys(member string) []string {
+	return []string{"work", member, "license", "sources"}
+}
+
+// ngramGate returns one finding per sidecar that extract.NGram would refuse: a file
+// that is not a JSON object, or one missing a required key. No findings means both
+// records are complete enough to scan. Only a read failure is an error.
+func ngramGate(charsPath, recapsPath string) ([]string, error) {
+	var findings []string
+	for _, f := range []struct{ path, member string }{
+		{charsPath, "characters"},
+		{recapsPath, "recaps"},
+	} {
+		raw, err := os.ReadFile(f.path) //nolint:gosec // path derives from the book's work dir
+		if err != nil {
+			return nil, err
+		}
+		name := filepath.Base(f.path)
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(raw, &obj) != nil || obj == nil {
+			findings = append(findings, fmt.Sprintf("%s: not a JSON object; the n-gram check was not run", name))
+			continue
+		}
+		for _, k := range sidecarRequiredKeys(f.member) {
+			if _, ok := obj[k]; !ok {
+				findings = append(findings, fmt.Sprintf("%s: missing required key %q; the n-gram check was not run", name, k))
+			}
+		}
+	}
+	return findings, nil
 }
 
 // ngramCheck runs the audiosilo-meta shingle-overlap check over the sidecars against

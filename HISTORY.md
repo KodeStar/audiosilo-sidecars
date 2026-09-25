@@ -599,3 +599,24 @@ Milestones from the workspace plan; each is shippable.
   characters.json AND recaps.json. Unblocking the pin is an upstream job: give
   audiosilo-meta a nested `data/go.mod` so the data tree drops out of the module
   zip, then tag. Gate: full Go gate green; no web changes.
+
+- **Go 1.26 + the audiosilo-meta pin unstuck (2026-09-25).** audiosilo-meta PR
+  #2366 made its `data/` tree a nested module, so a meta tag's module zip is a
+  few MiB again and the pin moved from v0.8.0 to **v0.17.0**, the first tag
+  carrying that change. Taking it forces meta's Go floor (`go 1.26.0`) here:
+  go.mod, the Dockerfile's `golang:1.26` build stage, README and CLAUDE (CI
+  reads `go-version-file: go.mod`). What broke against the new pkg/*: (1)
+  `model.Shard` is gone - upstream's tree is range-packed, so a path no longer
+  names a record. The contribution paths that spell per-record paths keep
+  their behaviour through `contrib.LegacyShard`, a verbatim copy; they target
+  a layout upstream retired (and a repo the sidecar layer left on 2026-08-21),
+  which is a separate redesign, recorded in CLAUDE.md. (2) `extract.NGram` now
+  identifies a bare sidecar by EVERY schema-required key and refuses one
+  missing any - which would have failed the validating stage, whose contract
+  is that only IO fails it. `ngramGate` reports a missing key (or a non-object
+  file) as an ERROR finding and skips the n-gram check until the fixer repairs
+  the record; `sidecarRequiredKeys` is pinned to the schemas' `required` by
+  the drift test. One test fixture gained the keys. The drift guard is STRICT
+  again: `stalePinLicenseContent` and
+  `TestSidecarLicenseIsTheCommunityLayerValue` are gone, since the upstream
+  enum is now CC-BY-SA-4.0 and plain equality holds. Gate: full Go gate green.

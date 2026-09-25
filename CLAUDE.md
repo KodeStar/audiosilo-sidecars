@@ -70,7 +70,8 @@ scripts/build-web.sh          # builds web/, syncs into internal/web/dist, build
 
 **Before a change is done, run all of the above for the side(s) you touched.**
 golangci-lint is **v2** at a **green baseline** - fix new findings, don't widen
-excludes (matches the server/meta repos' policy). Go 1.25; Node 24.
+excludes (matches the server/meta repos' policy). Go 1.26 (go.mod's `go` line
+is a floor, set by audiosilo-meta's); Node 24.
 
 > Before adding code, read the workspace **[CODE-HEALTH.md](../CODE-HEALTH.md)** -
 > Definition of Done + the recurring drift patterns. Especially: keep business
@@ -189,20 +190,19 @@ every remaining stage real; M6 Done board + richer Running board + ETA engine
 + typed park reasons; M7 contribution (issue/PR/local, needs-core flow,
 poller, auto-purge); M8 packaging (GoReleaser binaries + GHCR CPU/CUDA
 images); M9 ebook input (an EPUB is a first-class source - extracting ->
-[chapter_mapping] -> the unchanged authoring tail; needs audiosilo-meta
-v0.8.0 or newer, and v0.8.0 is what go.mod still pins - see the license
-caveat below). Post-milestone rounds followed: UX/observability, spelling-cost,
-reliability (the two bounded loops learned to ACCEPT; availability
-self-resume via retry_at; per-book budget; superseded stage_runs), fact-pass
-cost (bounded map-reduce), canonical-spelling (reference-match pre-pass +
-series glossary), and library-matching + network-source (the metaops
-ladder.go retrieval ladder + narrator evidence in the SHARED matcher [server
-PR #40] + path hints, 510 unknown -> 45 over the live library; read-time
-contribution folding into frozen scan verdicts; staged local split source,
-source-IO serialization, one serial ASR slot, transient-EINTR retry,
-time-bounded splits), and the Library "New" view (library_sightings +
-read-time `is_new`/`first_seen_at`, attached by the API on every read and never
-cached; the first recorded batch is the baseline). The
+[chapter_mapping] -> the unchanged authoring tail; needs audiosilo-meta v0.8.0
+or newer - see the module-pin caveat below). Post-milestone rounds followed:
+UX/observability, spelling-cost, reliability (the two bounded loops learned to
+ACCEPT; availability self-resume via retry_at; per-book budget; superseded
+stage_runs), fact-pass cost (bounded map-reduce), canonical-spelling
+(reference-match pre-pass + series glossary), and library-matching +
+network-source (the metaops ladder.go retrieval ladder + narrator evidence in
+the SHARED matcher [server PR #40] + path hints, 510 unknown -> 45 over the
+live library; read-time contribution folding into frozen scan verdicts; staged
+local split source, source-IO serialization, one serial ASR slot,
+transient-EINTR retry, time-bounded splits), and the Library "New" view
+(library_sightings + read-time `is_new`/`first_seen_at`, attached by the API
+on every read and never cached; the first recorded batch is the baseline). The
 detailed milestone log - what each landed, the live incidents behind the
 invariants, and the verification evidence - lives in [HISTORY.md](HISTORY.md);
 read the entries for any stage or era you are working near.
@@ -213,19 +213,20 @@ Operative caveats surviving from that history:
   sentinel on resume - delete + re-enqueue such books. Books parked at the
   pre-M5 `markers_normalizing`/`qa_adjudicating` are safe (those parks wrote
   no sentinel).
-- **The audiosilo-meta module pin is stuck at v0.8.0.** The community layer
-  moved to **CC BY-SA 4.0** upstream (audiosilo-meta 4a06b1a1, first tagged in
-  v0.13.0), and this tool now emits `"license": "CC-BY-SA-4.0"`. The module
-  itself cannot be bumped past v0.8.0: from v0.9.0 on, audiosilo-meta's `data/`
-  tree is ~1.6 GB, over the go command's 500 MiB module-zip ceiling, so
-  `go get github.com/kodestar/audiosilo-meta@v0.13.0+` fails with "module source
-  tree too large". That is harmless for the sidecar contract - v0.8.0's
-  `characters.schema.json` / `recaps.schema.json` are byte-identical to
-  v0.15.0's, only `common.schema.json`'s license enum moved - but it means the
-  drift guard in `internal/pipeline/schema_drift_test.go` tolerates ONE known
-  mismatch (the license) and pins 4.0 in a separate test. Unblocking it needs an
-  upstream change (a nested `data/go.mod` so the data tree leaves the module zip)
-  plus a new tag.
+- **The audiosilo-meta module pin is v0.17.0** (it was stuck at v0.8.0 until
+  2026-09). Every meta tag from v0.9.0 to v0.16.x is unfetchable - its ~1.6 GB
+  `data/` tree was over the go command's 500 MiB module-zip ceiling - until
+  meta PR #2366 (first tagged in v0.17.0) made `data/` a nested module
+  (`data/go.mod`), which drops it from the zip, so later tags `go get` normally. Taking meta forces its Go floor here (1.26). The schema drift guard
+  (`internal/pipeline/schema_drift_test.go`) is strict again: the license enum
+  (CC-BY-SA-4.0) and the sidecars' required keys must equal upstream.
+  **The contribution paths still address meta's RETIRED file-per-record layout**
+  (`data/works/<shard>/<slug>/...`): PR mode's file writes, the local export
+  layout and the poller's work-slug-from-file-list resolution, through
+  `contrib.LegacyShard` (a copy of the `model.Shard` upstream removed). Upstream
+  is range-packed (PACK-SPEC.md) and its CC BY-SA layer lives in
+  KodeStar/audiosilo-meta-community since 2026-08-21, so those paths (and
+  `contribution.repo`'s single default) need their own redesign.
 - **whisper.cpp binaries ship on their own cadence** (`whisper-binaries.yml`,
   a separate release `toolfetch` consumes; publish first, then bump
   `toolfetch.WhisperCLIReleaseTag`) - never couple them into

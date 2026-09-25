@@ -299,7 +299,7 @@ func workSlugFromFiles(files []string) string {
 			continue
 		}
 		slug := parts[3]
-		if model.ValidSlug(slug) && model.Shard(slug) == parts[2] {
+		if model.ValidSlug(slug) && LegacyShard(slug) == parts[2] {
 			return slug
 		}
 	}

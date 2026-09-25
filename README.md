@@ -45,7 +45,7 @@ To build from source instead, see below.
 
 ## Build and run
 
-Requires Go 1.25 and (for the web UI) Node 24.
+Requires Go 1.26 and (for the web UI) Node 24.
 
 ```sh
 # Daemon + tests (no Node needed; the default build embeds a UI placeholder):

@@ -277,6 +277,52 @@ func TestValidateFlagsEmDash(t *testing.T) {
 	}
 }
 
+// TestValidateReportsAnIncompleteRecordInsteadOfFailing: extract.NGram refuses a
+// sidecar missing a schema-required key, and the stage's contract is that only IO
+// fails it. So a record without its sources is an ERROR finding the fixer can act on
+// (and the n-gram check waits for the repaired record), never a stage error.
+func TestValidateReportsAnIncompleteRecordInsteadOfFailing(t *testing.T) {
+	work := t.TempDir()
+	seedSidecarManifest(t, work)
+	seedWorkSidecars(t, work, baseChars("book"), baseRecaps("book"))
+	seedTranscriptsText(t, work, "unrelated one", "unrelated two")
+	// Rewrite characters.json without its sources key.
+	charsPath := filepath.Join(work, sidecarsDir, charactersFileName)
+	raw, err := os.ReadFile(charsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatal(err)
+	}
+	delete(obj, "sources")
+	writeJSON(t, charsPath, obj)
+
+	exe := NewExecutor(Config{DataDir: t.TempDir(), Fallback: scheduler.NewStubExecutor(0, 0)})
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Validating, scheduler.StageReport{}); err != nil {
+		t.Fatalf("validating failed the stage over a repairable record: %v", err)
+	}
+	rep := readValidationReport(t, work)
+	if rep.Clean || !containsSub(rep.Errors, `missing required key "sources"`) {
+		t.Errorf("report = %+v, want a missing-required-key error", rep)
+	}
+}
+
+// TestNgramGateAcceptsCompleteRecords: the gate stands aside for records carrying
+// every required key, so the n-gram check runs on them.
+func TestNgramGateAcceptsCompleteRecords(t *testing.T) {
+	work := t.TempDir()
+	seedWorkSidecars(t, work, baseChars("book"), baseRecaps("book"))
+	got, err := ngramGate(filepath.Join(work, sidecarsDir, charactersFileName), filepath.Join(work, sidecarsDir, recapsFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("gate findings = %v, want none for complete records", got)
+	}
+}
+
 // --- auditing ---
 
 func seedForAudit(t *testing.T, work string, valClean bool) {
