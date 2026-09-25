@@ -300,13 +300,13 @@ func TestGetPullMerged(t *testing.T) {
 		if r.URL.Path != "/repos/"+testRepo+"/pulls/123" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
-		io.WriteString(w, `{"number":123,"html_url":"u","state":"closed","merged":true,"merge_commit_sha":"m3rg3"}`)
+		io.WriteString(w, `{"number":123,"html_url":"u","state":"closed","merged":true,"merge_commit_sha":"m3rg3","commits":2}`)
 	})
 	pr, err := c.GetPull(context.Background(), testRepo, 123)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !pr.Merged || pr.State != "closed" || pr.MergeCommitSHA != "m3rg3" {
+	if !pr.Merged || pr.State != "closed" || pr.MergeCommitSHA != "m3rg3" || pr.Commits != 2 {
 		t.Fatalf("pr = %+v", pr)
 	}
 }
@@ -326,18 +326,15 @@ func TestGetPullOpenHidesTestMergeSHA(t *testing.T) {
 	}
 }
 
-func TestPullFiles(t *testing.T) {
+func TestCompareFiles(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/repos/"+testRepo+"/pulls/123/files" {
+		if r.URL.Path != "/repos/"+testRepo+"/compare/b4se...m3rg3" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
-		if r.URL.Query().Get("page") != "1" {
-			t.Fatalf("page = %q, want 1 (a short page ends the listing)", r.URL.Query().Get("page"))
-		}
-		io.WriteString(w, `[{"filename":"data/works/c/cat.json","status":"modified"},`+
-			`{"filename":"data/works/c/dog.json","status":"renamed","previous_filename":"data/works/c/cow.json"}]`)
+		io.WriteString(w, `{"files":[{"filename":"data/works/c/cat.json","status":"modified"},`+
+			`{"filename":"data/works/c/dog.json","status":"renamed","previous_filename":"data/works/c/cow.json"}]}`)
 	})
-	files, err := c.PullFiles(context.Background(), testRepo, 123)
+	files, err := c.CompareFiles(context.Background(), testRepo, "b4se", "m3rg3")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,9 +347,12 @@ func TestPullFiles(t *testing.T) {
 	}
 }
 
-// TestPullFilesPaginates: a full page of 100 asks for the next one.
-func TestPullFilesPaginates(t *testing.T) {
+// TestPullCommits: oldest first, message + author date, paginated past a full page.
+func TestPullCommits(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/"+testRepo+"/pulls/9/commits" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
 		switch r.URL.Query().Get("page") {
 		case "1":
 			var b strings.Builder
@@ -361,22 +361,22 @@ func TestPullFilesPaginates(t *testing.T) {
 				if i > 0 {
 					b.WriteString(",")
 				}
-				fmt.Fprintf(&b, `{"filename":"f%d.json","status":"added"}`, i)
+				fmt.Fprintf(&b, `{"sha":"s%d","commit":{"message":"m%d","author":{"date":"d%d"}}}`, i, i, i)
 			}
 			b.WriteString("]")
 			io.WriteString(w, b.String())
 		case "2":
-			io.WriteString(w, `[{"filename":"last.json","status":"added"}]`)
+			io.WriteString(w, `[{"sha":"last","commit":{"message":"final","author":{"date":"2026-09-25T00:00:00Z"}}}]`)
 		default:
 			t.Fatalf("unexpected page %q", r.URL.Query().Get("page"))
 		}
 	})
-	files, err := c.PullFiles(context.Background(), testRepo, 9)
+	got, err := c.PullCommits(context.Background(), testRepo, 9)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) != 101 || files[100].Filename != "last.json" {
-		t.Fatalf("files = %d, last = %+v", len(files), files[len(files)-1])
+	if len(got) != 101 || got[0].Message != "m0" || got[100].Message != "final" || got[100].AuthorDate != "2026-09-25T00:00:00Z" {
+		t.Fatalf("commits = %d, first %+v, last %+v", len(got), got[0], got[len(got)-1])
 	}
 }
 
@@ -409,7 +409,8 @@ func TestGetCommitAndDefaultBranch(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/" + testRepo + "/git/commits/c1":
-			io.WriteString(w, `{"sha":"c1","tree":{"sha":"t1"},"parents":[{"sha":"p1"},{"sha":"p2"}]}`)
+			io.WriteString(w, `{"sha":"c1","tree":{"sha":"t1"},"parents":[{"sha":"p1"},{"sha":"p2"}],`+
+				`"message":"intake: issue #3","author":{"date":"2026-09-25T10:00:00Z"}}`)
 		case "/repos/" + testRepo:
 			io.WriteString(w, `{"full_name":"x","default_branch":"trunk"}`)
 		default:
@@ -417,7 +418,8 @@ func TestGetCommitAndDefaultBranch(t *testing.T) {
 		}
 	})
 	cm, err := c.GetCommit(context.Background(), testRepo, "c1")
-	if err != nil || cm.TreeSHA != "t1" || len(cm.Parents) != 2 || cm.Parents[0] != "p1" {
+	if err != nil || cm.TreeSHA != "t1" || len(cm.Parents) != 2 || cm.Parents[0] != "p1" ||
+		cm.Message != "intake: issue #3" || cm.AuthorDate != "2026-09-25T10:00:00Z" {
 		t.Fatalf("commit = %+v err=%v", cm, err)
 	}
 	br, err := c.DefaultBranch(context.Background(), testRepo)

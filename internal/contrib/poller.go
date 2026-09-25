@@ -524,15 +524,15 @@ func isWorksPack(path string) bool {
 // The works family is range-packed, so a pack path names a slug RANGE, not a work,
 // and a write re-renders its pack and may SPLIT it (entries move into new files and
 // the old file is renamed or removed). So the answer is read from the ENTRY KEYS,
-// across every works pack the PR touched taken as ONE set on each side: the keys at
-// the merge commit minus the keys just before it. A key that merely moved between
-// packs is on both sides and cancels out. Exactly one new key is the created work;
-// zero or several yield "" with the reason, and nothing is guessed.
+// across every works pack the change touched taken as ONE set on each side: the keys
+// after the PR landed minus the keys just before it. A key that merely moved
+// between packs is on both sides and cancels out. Exactly one new key is the
+// created work; zero or several yield "" with the reason, and nothing is guessed.
 //
-// The two sides are the merge commit and its first parent - the base branch just
-// before this PR landed - which is the PR's net change in every merge mode (merge
-// commit, squash, and the one-commit rebase the intake bot's PRs are). err is a
-// transient failure (the tick retries); a "" slug with a reason is a settled answer.
+// The two sides are the PR's net change ON THE BASE BRANCH (prChangeRange), which
+// is exact in every merge style, and the files are the compare API's list between
+// them. err is a transient failure (the tick retries); a "" slug with a reason is a
+// settled answer.
 func learnCreatedWork(ctx context.Context, cli *Client, repo string, prNumber int) (slug, why string, err error) {
 	pr, err := cli.GetPull(ctx, repo, prNumber)
 	if err != nil {
@@ -541,7 +541,11 @@ func learnCreatedWork(ctx context.Context, cli *Client, repo string, prNumber in
 	if !pr.Merged || pr.MergeCommitSHA == "" {
 		return "", "", errors.New("merged PR carries no merge commit yet")
 	}
-	files, err := cli.PullFiles(ctx, repo, prNumber)
+	base, why, err := prChangeRange(ctx, cli, repo, pr)
+	if err != nil || why != "" {
+		return "", why, err
+	}
+	files, err := cli.CompareFiles(ctx, repo, base, pr.MergeCommitSHA)
 	if err != nil {
 		return "", "", err
 	}
@@ -557,19 +561,12 @@ func learnCreatedWork(ctx context.Context, cli *Client, repo string, prNumber in
 	if len(paths) == 0 {
 		return "", "the PR changed no data/works pack file", nil
 	}
-	merge, err := cli.GetCommit(ctx, repo, pr.MergeCommitSHA)
-	if err != nil {
-		return "", "", err
-	}
-	if len(merge.Parents) == 0 {
-		return "", "the merge commit has no parent", nil
-	}
 	before, after := map[string]bool{}, map[string]bool{}
 	for _, p := range slices.Sorted(maps.Keys(paths)) {
 		for _, side := range []struct {
 			ref  string
 			keys map[string]bool
-		}{{merge.Parents[0], before}, {pr.MergeCommitSHA, after}} {
+		}{{base, before}, {pr.MergeCommitSHA, after}} {
 			raw, found, err := cli.FileAt(ctx, repo, p, side.ref)
 			if err != nil {
 				return "", "", err
@@ -606,6 +603,60 @@ func learnCreatedWork(ctx context.Context, cli *Client, repo string, prNumber in
 		return "", fmt.Sprintf("new entry key %q is not a valid slug", added[0]), nil
 	}
 	return added[0], "", nil
+}
+
+// maxRebaseWalk bounds how many commits prChangeRange walks back for a rebase merge
+// (GitHub lists at most 250 commits on a pull request).
+const maxRebaseWalk = 250
+
+// prChangeRange returns the base-branch commit just before a merged PR's change,
+// so that base..pr.MergeCommitSHA is EXACTLY the PR's net change, in each merge
+// style GitHub offers:
+//
+//   - a merge commit (two parents): its first parent - the base branch before;
+//   - a squash merge: one new commit carrying the whole change, whose parent is
+//     the base branch before;
+//   - a rebase merge: the PR's N commits re-created on the base branch, the merge
+//     sha being the LAST of them, so the base is N commits back. Diffing only the
+//     last commit would miss an entry an earlier commit added.
+//
+// A squash and a rebase both leave single-parent commits, so the two are told
+// apart by what a rebase preserves: the re-created commits carry the PR commits'
+// messages and author dates, in order. Walking back from the merge sha, a chain
+// matching every PR commit is a rebase; anything else is a squash (and for a
+// one-commit PR the two readings agree). why is set when the history cannot be
+// read as either.
+func prChangeRange(ctx context.Context, cli *Client, repo string, pr PR) (base, why string, err error) {
+	merge, err := cli.GetCommit(ctx, repo, pr.MergeCommitSHA)
+	if err != nil {
+		return "", "", err
+	}
+	if len(merge.Parents) == 0 {
+		return "", "the merge commit has no parent", nil
+	}
+	if len(merge.Parents) > 1 || pr.Commits <= 1 {
+		return merge.Parents[0], "", nil
+	}
+	commits, err := cli.PullCommits(ctx, repo, pr.Number)
+	if err != nil {
+		return "", "", err
+	}
+	if len(commits) == 0 || len(commits) > maxRebaseWalk {
+		return merge.Parents[0], "", nil
+	}
+	cur := merge
+	for i := len(commits) - 1; i >= 0; i-- {
+		if cur.Message != commits[i].Message || cur.AuthorDate != commits[i].AuthorDate || len(cur.Parents) != 1 {
+			return merge.Parents[0], "", nil // not the PR's commits re-created: a squash
+		}
+		if i == 0 {
+			return cur.Parents[0], "", nil // rebase: the parent of the PR's first commit
+		}
+		if cur, err = cli.GetCommit(ctx, repo, cur.Parents[0]); err != nil {
+			return "", "", err
+		}
+	}
+	return merge.Parents[0], "", nil
 }
 
 // joinNote appends part to a "; "-joined row note.

@@ -44,14 +44,16 @@ type Issue struct {
 
 // PR is the subset of a GitHub pull request the contribution flow needs.
 // MergeCommitSHA is the commit a merge left on the base branch (set once the PR
-// merged, in every merge mode): the poller diffs its first parent against it to
-// learn which work a merged add-work PR created.
+// merged, in every merge mode) and Commits the number of commits the PR carried:
+// together they locate the PR's net change on the base branch, which is how the
+// poller learns which work a merged add-work PR created.
 type PR struct {
 	Number         int
 	URL            string
 	State          string
 	Merged         bool
 	MergeCommitSHA string
+	Commits        int
 }
 
 // APIError is an unexpected (non-success) GitHub HTTP response. It carries the
@@ -250,6 +252,7 @@ type pullResp struct {
 	Merged         bool    `json:"merged"`
 	MergedAt       *string `json:"merged_at"`
 	MergeCommitSHA string  `json:"merge_commit_sha"`
+	Commits        int     `json:"commits"`
 }
 
 func (r pullResp) toPR() PR {
@@ -258,7 +261,8 @@ func (r pullResp) toPR() PR {
 		URL:    r.HTMLURL,
 		State:  r.State,
 		// The list endpoint omits `merged`, so fall back to merged_at != null.
-		Merged: r.Merged || r.MergedAt != nil,
+		Merged:  r.Merged || r.MergedAt != nil,
+		Commits: r.Commits,
 	}
 	// merge_commit_sha is GitHub's test-merge commit while a PR is open; it only
 	// names the commit on the base branch once the PR has merged.
@@ -485,7 +489,7 @@ func (c *Client) GetPull(ctx context.Context, repo string, number int) (PR, erro
 	return r.toPR(), nil
 }
 
-// PullFile is one file a pull request touches. Status is GitHub's
+// PullFile is one file a change touches. Status is GitHub's
 // added|removed|modified|renamed|copied|changed|unchanged; PreviousFilename is set
 // for a rename (a pack REBIND renames the file, since a pack's bound is its name).
 type PullFile struct {
@@ -494,32 +498,63 @@ type PullFile struct {
 	PreviousFilename string
 }
 
-// maxPullFilePages bounds PullFiles' pagination: GitHub itself lists at most 3000
-// files per pull request (30 pages of 100).
-const maxPullFilePages = 30
-
-// PullFiles returns the files a pull request touches (used to learn the real work
-// slug a merged core PR created, from the pack files it changed).
-func (c *Client) PullFiles(ctx context.Context, repo string, number int) ([]PullFile, error) {
-	var out []PullFile
-	for page := 1; page <= maxPullFilePages; page++ {
-		respBody, _, err := c.request(ctx, http.MethodGet,
-			fmt.Sprintf("/repos/%s/pulls/%d/files?per_page=100&page=%d", repo, number, page), nil, http.StatusOK)
-		if err != nil {
-			return nil, err
-		}
-		var files []struct {
+// CompareFiles returns the files changed between two commits (GitHub's compare
+// API, base...head; with base an ancestor of head that is exactly base..head). It
+// is how the poller reads a merged PR's net change on the base branch, whatever
+// the merge style. GitHub lists at most 300 files per comparison.
+func (c *Client) CompareFiles(ctx context.Context, repo, base, head string) ([]PullFile, error) {
+	respBody, _, err := c.request(ctx, http.MethodGet,
+		"/repos/"+repo+"/compare/"+url.PathEscape(base)+"..."+url.PathEscape(head), nil, http.StatusOK)
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		Files []struct {
 			Filename         string `json:"filename"`
 			Status           string `json:"status"`
 			PreviousFilename string `json:"previous_filename"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(respBody, &r); err != nil {
+		return nil, fmt.Errorf("contrib: decode compare: %w", err)
+	}
+	out := make([]PullFile, 0, len(r.Files))
+	for _, f := range r.Files {
+		out = append(out, PullFile{Filename: f.Filename, Status: f.Status, PreviousFilename: f.PreviousFilename})
+	}
+	return out, nil
+}
+
+// maxPullCommitPages bounds PullCommits' pagination: GitHub lists at most 250
+// commits for a pull request.
+const maxPullCommitPages = 3
+
+// PullCommits returns a pull request's commits, oldest first, with the message and
+// author date of each - what a rebase merge preserves on the commits it re-creates.
+func (c *Client) PullCommits(ctx context.Context, repo string, number int) ([]Commit, error) {
+	var out []Commit
+	for page := 1; page <= maxPullCommitPages; page++ {
+		respBody, _, err := c.request(ctx, http.MethodGet,
+			fmt.Sprintf("/repos/%s/pulls/%d/commits?per_page=100&page=%d", repo, number, page), nil, http.StatusOK)
+		if err != nil {
+			return nil, err
 		}
-		if err := json.Unmarshal(respBody, &files); err != nil {
-			return nil, fmt.Errorf("contrib: decode pull files: %w", err)
+		var list []struct {
+			SHA    string `json:"sha"`
+			Commit struct {
+				Message string `json:"message"`
+				Author  struct {
+					Date string `json:"date"`
+				} `json:"author"`
+			} `json:"commit"`
 		}
-		for _, f := range files {
-			out = append(out, PullFile{Filename: f.Filename, Status: f.Status, PreviousFilename: f.PreviousFilename})
+		if err := json.Unmarshal(respBody, &list); err != nil {
+			return nil, fmt.Errorf("contrib: decode pull commits: %w", err)
 		}
-		if len(files) < 100 {
+		for _, cm := range list {
+			out = append(out, Commit{SHA: cm.SHA, Message: cm.Commit.Message, AuthorDate: cm.Commit.Author.Date})
+		}
+		if len(list) < 100 {
 			break
 		}
 	}
@@ -553,9 +588,11 @@ func escapePath(p string) string {
 
 // Commit is the subset of a git commit object the contribution flow needs.
 type Commit struct {
-	SHA     string
-	TreeSHA string
-	Parents []string
+	SHA        string
+	TreeSHA    string
+	Parents    []string
+	Message    string
+	AuthorDate string
 }
 
 // GetCommit reads a git commit object (its tree and parents).
@@ -572,11 +609,15 @@ func (c *Client) GetCommit(ctx context.Context, repo, sha string) (Commit, error
 		Parents []struct {
 			SHA string `json:"sha"`
 		} `json:"parents"`
+		Message string `json:"message"`
+		Author  struct {
+			Date string `json:"date"`
+		} `json:"author"`
 	}
 	if err := json.Unmarshal(respBody, &r); err != nil {
 		return Commit{}, fmt.Errorf("contrib: decode commit: %w", err)
 	}
-	out := Commit{SHA: r.SHA, TreeSHA: r.Tree.SHA}
+	out := Commit{SHA: r.SHA, TreeSHA: r.Tree.SHA, Message: r.Message, AuthorDate: r.Author.Date}
 	for _, p := range r.Parents {
 		out.Parents = append(out.Parents, p.SHA)
 	}

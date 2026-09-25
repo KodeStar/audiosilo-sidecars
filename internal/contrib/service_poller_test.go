@@ -326,11 +326,12 @@ func packJSON(keys ...string) string {
 	return b.String()
 }
 
-// coreRepoFake stands in for the core repository around ONE merged add-work PR
-// (#40, merge commit "m3rg3", first parent "p4r3nt"): the PR's changed-file list and
-// every pack's content at the two revisions ("" = absent at that revision).
+// coreRepoFake stands in for the core repository around ONE merged single-commit
+// add-work PR (#40, merge commit "m3rg3", parent "p4r3nt"): the change's file list
+// (the compare API's) and every pack's content at the two revisions ("" = absent at
+// that revision).
 type coreRepoFake struct {
-	files  string                                        // the /pulls/40/files JSON body
+	files  string                                        // the compare API's "files" JSON array
 	before map[string]string                             // path -> pack JSON at the parent
 	after  map[string]string                             // path -> pack JSON at the merge commit
 	extra  func(http.ResponseWriter, *http.Request) bool // earlier routes (FindIntakePR, ...)
@@ -345,9 +346,9 @@ func (f coreRepoFake) server(t *testing.T) *httptest.Server {
 		p := r.URL.Path
 		switch {
 		case strings.HasSuffix(p, "/pulls/40"):
-			io.WriteString(w, `{"number":40,"html_url":"https://gh/pull/40","state":"closed","merged":true,"merge_commit_sha":"m3rg3"}`)
-		case strings.HasSuffix(p, "/pulls/40/files"):
-			io.WriteString(w, f.files)
+			io.WriteString(w, `{"number":40,"html_url":"https://gh/pull/40","state":"closed","merged":true,"merge_commit_sha":"m3rg3","commits":1}`)
+		case strings.HasSuffix(p, "/compare/p4r3nt...m3rg3"):
+			io.WriteString(w, `{"files":`+f.files+`}`)
 		case strings.HasSuffix(p, "/git/commits/m3rg3"):
 			io.WriteString(w, `{"sha":"m3rg3","tree":{"sha":"t"},"parents":[{"sha":"p4r3nt"}]}`)
 		case strings.Contains(p, "/contents/"):
@@ -469,7 +470,7 @@ func TestPollCoreMergedAmbiguousNoGuess(t *testing.T) {
 				before: map[string]string{"data/works/0/0.json": packJSON("old")},
 				after:  map[string]string{"data/works/0/0.json": after},
 				extra: func(_ http.ResponseWriter, r *http.Request) bool {
-					if strings.HasSuffix(r.URL.Path, "/pulls/40/files") {
+					if strings.Contains(r.URL.Path, "/compare/") {
 						reads.Add(1)
 					}
 					return false
@@ -492,7 +493,170 @@ func TestPollCoreMergedAmbiguousNoGuess(t *testing.T) {
 			}
 			svc.Poll(context.Background())
 			if n := reads.Load(); n != 1 {
-				t.Fatalf("PR files read %d times, want 1 (a settled answer is not re-read)", n)
+				t.Fatalf("PR change read %d times, want 1 (a settled answer is not re-read)", n)
+			}
+		})
+	}
+}
+
+// fakeCommit is one commit in historyFake's graph.
+type fakeCommit struct {
+	parents []string
+	message string
+	date    string
+	packs   map[string]string // path -> pack JSON in this commit's tree (absent = no file)
+}
+
+// historyFake serves a core repository whose history is an explicit commit graph,
+// around ONE merged PR (#40) of prCommits commits merged as mergeSHA. The compare
+// API answers any ancestor...descendant pair with the paths whose content differs,
+// as GitHub does - so a test proves WHICH range was asked for, not just the answer.
+type historyFake struct {
+	commits   map[string]fakeCommit
+	mergeSHA  string
+	prCommits []string // the PR's own commits, oldest first (as the PR lists them)
+	compared  []string // "base...head" pairs requested
+}
+
+func (h *historyFake) server(t *testing.T) *httptest.Server {
+	t.Helper()
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		p := r.URL.Path
+		switch {
+		case strings.HasSuffix(p, "/pulls/40"):
+			fmt.Fprintf(w, `{"number":40,"html_url":"https://gh/pull/40","state":"closed","merged":true,"merge_commit_sha":%q,"commits":%d}`,
+				h.mergeSHA, len(h.prCommits))
+		case strings.HasSuffix(p, "/pulls/40/commits"):
+			var parts []string
+			for _, sha := range h.prCommits {
+				c := h.commits[sha]
+				parts = append(parts, fmt.Sprintf(`{"sha":%q,"commit":{"message":%q,"author":{"date":%q}}}`, sha, c.message, c.date))
+			}
+			io.WriteString(w, "["+strings.Join(parts, ",")+"]")
+		case strings.Contains(p, "/git/commits/"):
+			sha := p[strings.LastIndex(p, "/")+1:]
+			c, ok := h.commits[sha]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			var ps []string
+			for _, par := range c.parents {
+				ps = append(ps, fmt.Sprintf(`{"sha":%q}`, par))
+			}
+			fmt.Fprintf(w, `{"sha":%q,"tree":{"sha":"t"},"parents":[%s],"message":%q,"author":{"date":%q}}`,
+				sha, strings.Join(ps, ","), c.message, c.date)
+		case strings.Contains(p, "/compare/"):
+			rng := p[strings.Index(p, "/compare/")+len("/compare/"):]
+			h.compared = append(h.compared, rng)
+			base, head, _ := strings.Cut(rng, "...")
+			from, to := h.commits[base].packs, h.commits[head].packs
+			var files []string
+			for path := range union(from, to) {
+				if from[path] != to[path] {
+					files = append(files, fmt.Sprintf(`{"filename":%q,"status":"modified"}`, path))
+				}
+			}
+			io.WriteString(w, `{"files":[`+strings.Join(files, ",")+`]}`)
+		case strings.Contains(p, "/contents/"):
+			path := p[strings.Index(p, "/contents/")+len("/contents/"):]
+			body, ok := h.commits[r.URL.Query().Get("ref")].packs[path]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			io.WriteString(w, body)
+		default:
+			http.Error(w, "unexpected "+r.Method+" "+p, http.StatusInternalServerError)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func union(a, b map[string]string) map[string]bool {
+	out := map[string]bool{}
+	for k := range a {
+		out[k] = true
+	}
+	for k := range b {
+		out[k] = true
+	}
+	return out
+}
+
+// TestPollCoreMergedEveryMergeStyle: the PR's net change on the base branch is read
+// exactly whichever way it was merged. Main before the merge is "main0"; the PR has
+// TWO commits, and the new entry is added by the FIRST (the second only edits an
+// existing entry in another pack) - so a rebase merge diffed only against its last
+// commit's parent would find no new work.
+func TestPollCoreMergedEveryMergeStyle(t *testing.T) {
+	const pk = "data/works/0/0.json"
+	const pp = "data/works/0/p.json"
+	before := map[string]string{pk: packJSON("old"), pp: packJSON("p-thing")}
+	withNew := map[string]string{pk: packJSON("new-work", "old"), pp: packJSON("p-thing")}
+	// The PR's second commit only EDITS an existing entry in a different works pack
+	// (a changed pack, no new key).
+	withNewAndTweak := map[string]string{pk: packJSON("new-work", "old"), pp: `{"entries":{"p-thing":{"id":"p-thing","title":"tidied"}}}` + "\n"}
+	base := map[string]fakeCommit{
+		"main0": {parents: []string{"older"}, message: "earlier", date: "2026-09-01T00:00:00Z", packs: before},
+		// The PR branch's own commits (as the PR lists them).
+		"b1": {parents: []string{"main0"}, message: "intake: add the work", date: "2026-09-20T00:00:00Z", packs: withNew},
+		"b2": {parents: []string{"b1"}, message: "intake: tidy a neighbour", date: "2026-09-21T00:00:00Z", packs: withNewAndTweak},
+	}
+	shapes := map[string]struct {
+		extra map[string]fakeCommit
+		merge string
+		want  string // the base the change must be read from
+	}{
+		"merge commit": {
+			extra: map[string]fakeCommit{"m": {parents: []string{"main0", "b2"}, message: "Merge pull request #40", date: "2026-09-22T00:00:00Z", packs: withNewAndTweak}},
+			merge: "m", want: "main0",
+		},
+		"squash": {
+			extra: map[string]fakeCommit{"sq": {parents: []string{"main0"}, message: "Add the work (#40)", date: "2026-09-22T00:00:00Z", packs: withNewAndTweak}},
+			merge: "sq", want: "main0",
+		},
+		"rebase, entry in the first commit": {
+			// The PR's commits re-created on main: new shas, same messages and author dates.
+			extra: map[string]fakeCommit{
+				"r1": {parents: []string{"main0"}, message: "intake: add the work", date: "2026-09-20T00:00:00Z", packs: withNew},
+				"r2": {parents: []string{"r1"}, message: "intake: tidy a neighbour", date: "2026-09-21T00:00:00Z", packs: withNewAndTweak},
+			},
+			merge: "r2", want: "main0",
+		},
+	}
+	for name, shape := range shapes {
+		t.Run(name, func(t *testing.T) {
+			commits := map[string]fakeCommit{}
+			for k, v := range base {
+				commits[k] = v
+			}
+			for k, v := range shape.extra {
+				commits[k] = v
+			}
+			h := &historyFake{commits: commits, mergeSHA: shape.merge, prCommits: []string{"b1", "b2"}}
+			gh := h.server(t)
+
+			db := openDB(t)
+			b := makeBook(t, db, "Styled", string(state.ParkCorePending))
+			mergedCoreRow(t, db, b.ID)
+			spy := &readmitSpy{}
+			svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, spy, nil)
+			svc.Poll(context.Background())
+
+			if nb, _ := db.GetBook(context.Background(), b.ID); nb.WorkID != "new-work" {
+				row := getRow(t, db, b.ID, store.ContribKindCore)
+				t.Fatalf("work_id = %q (core note %q), want new-work", nb.WorkID, row.Note)
+			}
+			if want := shape.want + "..." + shape.merge; len(h.compared) != 1 || h.compared[0] != want {
+				t.Fatalf("compared %v, want exactly %s", h.compared, want)
+			}
+			if len(spy.called()) != 1 {
+				t.Fatalf("readmit = %v, want one", spy.called())
 			}
 		})
 	}
