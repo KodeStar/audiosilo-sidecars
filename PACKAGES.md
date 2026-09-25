@@ -322,6 +322,8 @@ internal/
             + validated outputs via the shared runAgent driver, usage recorded onto the
             open stage_run after every invocation), while retranscribing/correcting/
             validating are MECHANICAL (ASR+repair / spelling engine / canonicalize+ngram).
+            validating skips the n-gram scan only for a sidecar NGram would refuse
+            (ngramGate).
             M7 made contributing real (contrib_stage.go: slug reconcile -> skip-if-
             covered -> submit per contribution.mode, resume-idempotent via the
             contributions rows; export.go composes the download zip + core-proposal
@@ -545,7 +547,9 @@ internal/
             SetWork validates the slug upstream), and the poller (jittered
             poll_minutes tick; issue rows advance submitted -> pr_open [FindIntakePR
             on branch intake/issue-<n>] -> merged/closed; a merged core PR's files
-            name data/works/<shard>/<slug>/work.json -> SetBookWorkID [regardless of
+            name data/works/<shard>/<slug>/work.json [meta's RETIRED per-record
+            layout, sharded by LegacyShard, layout.go - stale upstream, see
+            CLAUDE.md] -> SetBookWorkID [regardless of
             park state] -> Readmit [only when parked core_pending]; targeted
             ListBooksWithUnresolvedMergedCore query, no full scans; tokenless reads
             work). Imports neither scheduler nor api - reaches them via injected

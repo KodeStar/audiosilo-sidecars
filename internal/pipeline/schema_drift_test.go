@@ -44,46 +44,15 @@ func TestSidecarConstantsMatchUpstreamSchema(t *testing.T) {
 	}
 
 	// The share-alike license enum (referenced by both sidecar schemas via
-	// common.schema.json#/$defs/license_content) is a single value. It must equal the
-	// local constant, with ONE documented exception: the pinned module predates the
-	// community layer's move to CC BY-SA 4.0 - see stalePinLicenseContent.
+	// common.schema.json#/$defs/license_content) is a single value, and it must equal
+	// the one this tool emits.
 	lc := asObj(t, asObj(t, asObj(t, common)["$defs"])["license_content"])
 	enum, _ := lc["enum"].([]any)
 	if len(enum) != 1 {
 		t.Fatalf("license_content enum = %v, want exactly one value", enum)
 	}
-	// The pinned value may lag: audiosilo-meta moved the community layer to CC BY-SA
-	// 4.0 on 2026-08-21 (upstream commit 4a06b1a1, released in v0.13.0), but NO tag
-	// carrying that change is consumable as a Go module - from v0.9.0 on, the repo's
-	// data/ tree is ~1.6 GB, over the go command's 500 MiB module-zip ceiling
-	// ("module source tree too large"), so `go get` fails for every 4.0-era tag. We
-	// stay on v0.8.0 - whose characters/recaps schemas are byte-identical to
-	// v0.15.0's - and emit the 4.0 value the intake requires. So the pinned enum is
-	// accepted when it equals the local constant OR when it is that one known-stale
-	// value; anything else is real upstream drift. Once upstream excludes data/ from
-	// the module (a nested data/go.mod) and this pin moves forward, only the equality
-	// can hold. TestSidecarLicenseIsTheCommunityLayerValue pins the emitted value.
-	if v, _ := enum[0].(string); v != sidecarLicenseContent && v != stalePinLicenseContent {
+	if v, _ := enum[0].(string); v != sidecarLicenseContent {
 		t.Errorf("license_content enum[0] = %q, local sidecarLicenseContent = %q", v, sidecarLicenseContent)
-	}
-}
-
-// stalePinLicenseContent is the license value of the PINNED audiosilo-meta module
-// (v0.8.0), which predates the community layer's move to CC BY-SA 4.0. It is not a
-// value this tool may ever emit - see TestSidecarLicenseIsTheCommunityLayerValue.
-const stalePinLicenseContent = "CC-BY-SA-3.0"
-
-// TestSidecarLicenseIsTheCommunityLayerValue pins the emitted license string to the
-// value KodeStar/audiosilo-meta-community's intake requires. The upstream schema
-// cannot enforce it here (the module pin is stale, see above), so this is the guard
-// that stops a silent revert to 3.0 - the exact failure the intake bot reports as
-// "characters: /license: value must be 'CC-BY-SA-4.0'".
-func TestSidecarLicenseIsTheCommunityLayerValue(t *testing.T) {
-	if sidecarLicenseContent != "CC-BY-SA-4.0" {
-		t.Errorf("sidecarLicenseContent = %q, want %q", sidecarLicenseContent, "CC-BY-SA-4.0")
-	}
-	if sidecarLicenseContent == stalePinLicenseContent {
-		t.Error("sidecarLicenseContent is the retired 3.0 value the community intake rejects")
 	}
 }
 

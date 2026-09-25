@@ -541,7 +541,7 @@ func TestContributePRMode(t *testing.T) {
 		t.Fatalf("pr flow: forks=%d pulls=%d puts=%d, want 1/1/2", gh.forks, gh.pulls, len(gh.puts))
 	}
 	// Contents committed at the canonical data/works/<shard>/<slug>/ paths.
-	shard := model.Shard("reacher-01")
+	shard := contrib.LegacyShard("reacher-01")
 	wantChars := fmt.Sprintf("data/works/%s/reacher-01/characters.json", shard)
 	wantRecaps := fmt.Sprintf("data/works/%s/reacher-01/recaps.json", shard)
 	if !contains(gh.puts, wantChars) || !contains(gh.puts, wantRecaps) {
@@ -564,7 +564,7 @@ func TestContributeLocalMode(t *testing.T) {
 	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("contribute: %v", err)
 	}
-	shard := model.Shard("reacher-01")
+	shard := contrib.LegacyShard("reacher-01")
 	for _, name := range []string{charactersFileName, recapsFileName} {
 		p := filepath.Join(export, "works", shard, "reacher-01", name)
 		if _, err := os.Stat(p); err != nil {
@@ -611,7 +611,7 @@ func TestContributeLocalModeUnresolvedSlugUsesPlaceholder(t *testing.T) {
 		t.Fatalf("contribute: %v", err)
 	}
 	slug := "some-unknown-book"
-	p := filepath.Join(export, "works", model.Shard(slug), slug, charactersFileName)
+	p := filepath.Join(export, "works", contrib.LegacyShard(slug), slug, charactersFileName)
 	if _, err := os.Stat(p); err != nil {
 		t.Errorf("placeholder export missing %s: %v", p, err)
 	}

@@ -79,12 +79,19 @@ func (e *Executor) validateSidecarsStage(ctx context.Context, book store.Book, r
 		warns = append(warns, structWarns...)
 	}
 
-	// No-verbatim n-gram check against both transcript layers: every overlap is an ERROR.
-	ngramFindings, err := ngramCheck(book, charsPath, recapsPath)
+	// No-verbatim n-gram check over the sidecars NGram accepts: every overlap is an ERROR.
+	scannable, gate, err := ngramGate(charsPath, recapsPath)
 	if err != nil {
-		return scheduler.StageResult{}, fmt.Errorf("validating: ngram check: %w", err)
+		return scheduler.StageResult{}, fmt.Errorf("validating: %w", err)
 	}
-	errs = append(errs, ngramFindings...)
+	errs = append(errs, gate...)
+	if len(scannable) > 0 {
+		ngramFindings, err := ngramCheck(book, scannable)
+		if err != nil {
+			return scheduler.StageResult{}, fmt.Errorf("validating: ngram check: %w", err)
+		}
+		errs = append(errs, ngramFindings...)
+	}
 
 	if err := writeValidationReport(book.WorkDir, errs, warns); err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("validating: write report: %w", err)
@@ -143,15 +150,41 @@ func decodeForValidation(charsPath, recapsPath string) (*model.Characters, *mode
 	return chars, recs, findings
 }
 
+// ngramGate returns the sidecars extract.NGram can scan, plus one finding per file
+// it would refuse (a schema violation schemaViolation marks refused), because NGram
+// hard-fails on such a record and that must be a finding the fixer repairs, not a
+// failed stage.
+func ngramGate(charsPath, recapsPath string) (scannable, findings []string, err error) {
+	schemas, err := sidecarSchemas()
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, f := range []struct{ path, kind string }{
+		{charsPath, "characters"},
+		{recapsPath, "recaps"},
+	} {
+		raw, err := os.ReadFile(f.path) //nolint:gosec // path derives from the book's work dir
+		if err != nil {
+			return nil, nil, err
+		}
+		if v, refused := schemaViolation(schemas[f.kind], raw); refused {
+			findings = append(findings, fmt.Sprintf("n-gram check skipped until %s satisfies the %s schema: %s",
+				filepath.Base(f.path), f.kind, v))
+			continue
+		}
+		scannable = append(scannable, f.path)
+	}
+	return scannable, findings, nil
+}
+
 // ngramCheck runs the audiosilo-meta shingle-overlap check over the sidecars against
 // both the transcripts-text/ and transcripts-corrected/ layers, per source file. Each
 // overlap is a finding naming the locus, the source layer, and the offending run. A
 // layer that does not exist (or holds no .txt files) is skipped; a genuine read
 // failure inside the check is returned as an error.
-func ngramCheck(book store.Book, charsPath, recapsPath string) ([]string, error) {
+func ngramCheck(book store.Book, sidecars []string) ([]string, error) {
 	workDir := book.WorkDir
 	var findings []string
-	sidecars := []string{charsPath, recapsPath}
 	sources := []ngramSource{
 		{"transcripts-text", filepath.Join(workDir, transcript.TextDir)},
 		{"transcripts-corrected", filepath.Join(workDir, spelling.CorrectedDir)},
