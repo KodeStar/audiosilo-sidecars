@@ -26,15 +26,9 @@ const ContribNoteIntakePRStale = "intake PR overdue - review the GitHub issue"
 // GitHub drops the requested routing label from a newly created intake issue.
 const ContribNoteLabelsMissingPrefix = "labels missing"
 
-// Intake-verdict notes. The metadata repositories' intake bot answers a submission
-// it cannot turn into a pull request with a verdict label (data:needs-human,
-// data:invalid, data:duplicate) and a comment; the poller surfaces that verdict as
-// the LAST segment of the row's note, headed by ContribNoteIntakeVerdictPrefix, so
-// a later verdict (or the intake PR appearing after all) replaces it cleanly.
-//
-// needs-human and invalid keep the row submitted (the issue stays open and an edit
-// re-runs the bot) and are actionable; duplicate is recorded already_covered - the
-// work or sidecar is upstream already, done by someone else, not an error.
+// Intake-verdict notes: the poller records the intake bot's verdict label as the
+// LAST segment of a row's note. needs-human and invalid are actionable on a
+// submitted row; a duplicate row is already_covered (upstream already, not an error).
 const (
 	ContribNoteIntakeVerdictPrefix = "intake verdict: "
 	ContribNoteIntakeNeedsHuman    = ContribNoteIntakeVerdictPrefix + "needs a maintainer"
@@ -42,9 +36,8 @@ const (
 	ContribNoteIntakeDuplicate     = ContribNoteIntakeVerdictPrefix + "already in the database"
 )
 
-// ContribNoteCoreSlugUnresolvedPrefix heads the note the poller records on a merged
-// core row whose pull request did not name exactly one new work (none, or several):
-// it never guesses, so the book waits for a human to set its work.
+// ContribNoteCoreSlugUnresolvedPrefix heads the note on a merged core row whose PR
+// did not add exactly one work; nothing is guessed, a human sets the work.
 const ContribNoteCoreSlugUnresolvedPrefix = "work slug not learned from the merged PR"
 
 // Contribution mode values (how the artifact was contributed). Mirrors
@@ -69,7 +62,7 @@ const (
 )
 
 // Contribution is one tracked contribution row: the state of one artifact (kind) for
-// one book. Number/URL identify the created issue (issue mode) or PR (pr mode);
+// one book. Number/URL identify the created issue (issue mode) or PR (the retired pr mode);
 // PRNumber/PRURL track the intake bot PR an issue-mode contribution produces.
 type Contribution struct {
 	ID        int64
@@ -202,7 +195,7 @@ func (db *DB) ListOpenContributions(ctx context.Context) ([]Contribution, error)
 // of the list as soon as its work_id is set (so an already-resolved book is not
 // re-processed every tick), independent of the book's park state.
 func (db *DB) ListBooksWithUnresolvedMergedCore(ctx context.Context) ([]Book, error) {
-	rows, err := db.sql.QueryContext(ctx,
+	return db.queryBooks(ctx,
 		`SELECT `+bookCols+` FROM books b
 		 WHERE (b.work_id IS NULL OR b.work_id = '')
 		   AND EXISTS (
@@ -211,33 +204,16 @@ func (db *DB) ListBooksWithUnresolvedMergedCore(ctx context.Context) ([]Book, er
 		   )
 		 ORDER BY b.id`,
 		ContribKindCore, ContribStatusMerged)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []Book
-	for rows.Next() {
-		b, err := scanBook(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, b)
-	}
-	return out, rows.Err()
 }
 
-// parkCodeCorePending mirrors state.ParkCorePending (the store keeps its opaque-string
-// decoupling from internal/state, as statusNeedsAttention does).
+// parkCodeCorePending mirrors state.ParkCorePending (drift-tested, like the kinds).
 const parkCodeCorePending = "core_pending"
 
-// ListBooksAwaitingRelease returns the books parked core_pending that already carry a
-// work_id and a merged kind=core row: the add-work PR merged and the poller learned
-// the new work's slug, but the published catalogue did not hold it yet when last
-// checked. The poller re-checks each one and re-admits it once the work is live
-// (the release gate: contributing a sidecar keyed by a slug no data release holds
-// yet is refused by the community intake).
+// ListBooksAwaitingRelease returns the books parked core_pending with a work_id and
+// a merged core row: the release gate's work list (the poller re-admits each once a
+// data release holds the work).
 func (db *DB) ListBooksAwaitingRelease(ctx context.Context) ([]Book, error) {
-	rows, err := db.sql.QueryContext(ctx,
+	return db.queryBooks(ctx,
 		`SELECT `+bookCols+` FROM books b
 		 WHERE b.work_id IS NOT NULL AND b.work_id != ''
 		   AND b.status = ? AND b.park_code = ?
@@ -247,19 +223,6 @@ func (db *DB) ListBooksAwaitingRelease(ctx context.Context) ([]Book, error) {
 		   )
 		 ORDER BY b.id`,
 		statusNeedsAttention, parkCodeCorePending, ContribKindCore, ContribStatusMerged)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []Book
-	for rows.Next() {
-		b, err := scanBook(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, b)
-	}
-	return out, rows.Err()
 }
 
 // SetContributionStatus advances a contribution row's lifecycle: the poller uses it to
@@ -269,6 +232,13 @@ func (db *DB) SetContributionStatus(ctx context.Context, id int64, status string
 	res, err := db.sql.ExecContext(ctx,
 		`UPDATE contributions SET status=?, pr_number=?, pr_url=?, note=?, updated_at=? WHERE id=?`,
 		status, prNumber, prURL, note, timestamp(nowFn()), id)
+	return checkAffected(res, err)
+}
+
+// TouchContribution bumps a row's updated_at alone: the poller's record that it
+// re-checked a row waiting on an intake verdict, which spaces the next check.
+func (db *DB) TouchContribution(ctx context.Context, id int64) error {
+	res, err := db.sql.ExecContext(ctx, `UPDATE contributions SET updated_at=? WHERE id=?`, timestamp(nowFn()), id)
 	return checkAffected(res, err)
 }
 

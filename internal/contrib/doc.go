@@ -3,10 +3,9 @@
 // CC0 core (KodeStar/audiosilo-meta - add-work proposals) and the CC BY-SA
 // community layer (KodeStar/audiosilo-meta-community - the characters/recaps
 // sidecars). It composes prefilled intake-issue / add-work bodies that the repos'
-// metaissue bot parses verbatim, prepares a direct PR as a pkg/pack edit of the
-// range-packed community tree (communitytree.go), and drives the GitHub REST API
-// (issues, gists, forks, refs, git data, tarballs, pulls) with the stdlib HTTP
-// client against an injectable base URL so every path is httptest-covered.
+// metaissue bot parses verbatim, and drives the GitHub REST API (issues, gists,
+// pulls, compare, contents) with the stdlib HTTP client against an injectable base
+// URL so every path is httptest-covered.
 //
 // Security invariant: the GitHub credential (a PAT from the secrets store or a
 // token read from `gh auth token`) is carried ONLY in the Authorization request
@@ -19,8 +18,8 @@
 // Wave 1A added the token source, the REST client, and the body composers. Wave
 // 3A adds the Service + intake poller (service.go / poller.go): the shared
 // core-submit and status-polling logic. It imports the stdlib, the secrets store,
-// the meta module's pkg/model (slug rules), pkg/pack and pkg/check (the pack edit
-// and its validation), and internal/{store,state}; the
+// the meta module's pkg/model (slug rules) and pkg/pack (reading a merged PR's
+// pack files), and internal/{store,state}; the
 // scheduler and event hub are reached through injected Readmit/Publish function
 // seams, so contrib imports neither scheduler nor pipeline (no import cycle: the
 // pipeline contributing stage imports contrib, never the reverse).

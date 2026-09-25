@@ -326,19 +326,21 @@ func packJSON(keys ...string) string {
 	return b.String()
 }
 
-// coreRepoFake stands in for the core repository around ONE merged single-commit
-// add-work PR (#40, merge commit "m3rg3", parent "p4r3nt"): the change's file list
-// (the compare API's) and every pack's content at the two revisions ("" = absent at
-// that revision).
+// coreRepoFake stands in for the core repository around ONE merged add-work PR
+// (#40, base.sha "b4se", head.sha "h3ad", merge base "mb"): the compare API's file
+// list and every pack's content at the merge base (before) and the head (after);
+// "" = absent at that revision. refs records every revision a file was read at.
 type coreRepoFake struct {
-	files  string                                        // the compare API's "files" JSON array
-	before map[string]string                             // path -> pack JSON at the parent
-	after  map[string]string                             // path -> pack JSON at the merge commit
-	extra  func(http.ResponseWriter, *http.Request) bool // earlier routes (FindIntakePR, ...)
+	files  string            // the compare API's files array
+	before map[string]string // path -> pack JSON at the merge base
+	after  map[string]string // path -> pack JSON at the PR head
+	extra  func(http.ResponseWriter, *http.Request) bool
+	refs   *[]string
 }
 
 func (f coreRepoFake) server(t *testing.T) *httptest.Server {
 	t.Helper()
+	var mu sync.Mutex
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if f.extra != nil && f.extra(w, r) {
 			return
@@ -346,15 +348,22 @@ func (f coreRepoFake) server(t *testing.T) *httptest.Server {
 		p := r.URL.Path
 		switch {
 		case strings.HasSuffix(p, "/pulls/40"):
-			io.WriteString(w, `{"number":40,"html_url":"https://gh/pull/40","state":"closed","merged":true,"merge_commit_sha":"m3rg3","commits":1}`)
-		case strings.HasSuffix(p, "/compare/p4r3nt...m3rg3"):
-			io.WriteString(w, `{"files":`+f.files+`}`)
-		case strings.HasSuffix(p, "/git/commits/m3rg3"):
-			io.WriteString(w, `{"sha":"m3rg3","tree":{"sha":"t"},"parents":[{"sha":"p4r3nt"}]}`)
+			io.WriteString(w, `{"number":40,"html_url":"https://gh/pull/40","state":"closed","merged":true,"base":{"sha":"b4se"},"head":{"sha":"h3ad"}}`)
+		case strings.HasSuffix(p, "/compare/b4se...h3ad"):
+			io.WriteString(w, `{"merge_base_commit":{"sha":"mb"},"files":`+f.files+`}`)
 		case strings.Contains(p, "/contents/"):
 			path := p[strings.Index(p, "/contents/")+len("/contents/"):]
-			side := f.before
-			if r.URL.Query().Get("ref") == "m3rg3" {
+			ref := r.URL.Query().Get("ref")
+			if f.refs != nil {
+				mu.Lock()
+				*f.refs = append(*f.refs, ref)
+				mu.Unlock()
+			}
+			var side map[string]string
+			switch ref {
+			case "mb":
+				side = f.before
+			case "h3ad":
 				side = f.after
 			}
 			body, ok := side[path]
@@ -499,166 +508,37 @@ func TestPollCoreMergedAmbiguousNoGuess(t *testing.T) {
 	}
 }
 
-// fakeCommit is one commit in historyFake's graph.
-type fakeCommit struct {
-	parents []string
-	message string
-	date    string
-	packs   map[string]string // path -> pack JSON in this commit's tree (absent = no file)
-}
+// TestPollCoreMergedReadsTheWholePR: the PR has two commits and the new entry is
+// added by the FIRST (the second only edits an existing entry in another pack). The
+// slug is read from the PR's own change - merge base vs head - so it is found
+// whatever the merge style, and no other revision is read.
+func TestPollCoreMergedReadsTheWholePR(t *testing.T) {
+	db := openDB(t)
+	b := makeBook(t, db, "Two Commits", string(state.ParkCorePending))
+	mergedCoreRow(t, db, b.ID)
+	var refs []string
+	gh := coreRepoFake{
+		files: `[{"filename":"data/works/0/0.json","status":"modified"},{"filename":"data/works/0/p.json","status":"modified"}]`,
+		before: map[string]string{
+			"data/works/0/0.json": packJSON("old"),
+			"data/works/0/p.json": packJSON("p-thing"),
+		},
+		after: map[string]string{
+			"data/works/0/0.json": packJSON("new-work", "old"),
+			"data/works/0/p.json": `{"entries":{"p-thing":{"id":"p-thing","title":"tidied"}}}` + "\n",
+		},
+		refs: &refs,
+	}.server(t)
+	svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, &readmitSpy{}, nil)
+	svc.Poll(context.Background())
 
-// historyFake serves a core repository whose history is an explicit commit graph,
-// around ONE merged PR (#40) of prCommits commits merged as mergeSHA. The compare
-// API answers any ancestor...descendant pair with the paths whose content differs,
-// as GitHub does - so a test proves WHICH range was asked for, not just the answer.
-type historyFake struct {
-	commits   map[string]fakeCommit
-	mergeSHA  string
-	prCommits []string // the PR's own commits, oldest first (as the PR lists them)
-	compared  []string // "base...head" pairs requested
-}
-
-func (h *historyFake) server(t *testing.T) *httptest.Server {
-	t.Helper()
-	var mu sync.Mutex
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-		p := r.URL.Path
-		switch {
-		case strings.HasSuffix(p, "/pulls/40"):
-			fmt.Fprintf(w, `{"number":40,"html_url":"https://gh/pull/40","state":"closed","merged":true,"merge_commit_sha":%q,"commits":%d}`,
-				h.mergeSHA, len(h.prCommits))
-		case strings.HasSuffix(p, "/pulls/40/commits"):
-			var parts []string
-			for _, sha := range h.prCommits {
-				c := h.commits[sha]
-				parts = append(parts, fmt.Sprintf(`{"sha":%q,"commit":{"message":%q,"author":{"date":%q}}}`, sha, c.message, c.date))
-			}
-			io.WriteString(w, "["+strings.Join(parts, ",")+"]")
-		case strings.Contains(p, "/git/commits/"):
-			sha := p[strings.LastIndex(p, "/")+1:]
-			c, ok := h.commits[sha]
-			if !ok {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-			var ps []string
-			for _, par := range c.parents {
-				ps = append(ps, fmt.Sprintf(`{"sha":%q}`, par))
-			}
-			fmt.Fprintf(w, `{"sha":%q,"tree":{"sha":"t"},"parents":[%s],"message":%q,"author":{"date":%q}}`,
-				sha, strings.Join(ps, ","), c.message, c.date)
-		case strings.Contains(p, "/compare/"):
-			rng := p[strings.Index(p, "/compare/")+len("/compare/"):]
-			h.compared = append(h.compared, rng)
-			base, head, _ := strings.Cut(rng, "...")
-			from, to := h.commits[base].packs, h.commits[head].packs
-			var files []string
-			for path := range union(from, to) {
-				if from[path] != to[path] {
-					files = append(files, fmt.Sprintf(`{"filename":%q,"status":"modified"}`, path))
-				}
-			}
-			io.WriteString(w, `{"files":[`+strings.Join(files, ",")+`]}`)
-		case strings.Contains(p, "/contents/"):
-			path := p[strings.Index(p, "/contents/")+len("/contents/"):]
-			body, ok := h.commits[r.URL.Query().Get("ref")].packs[path]
-			if !ok {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-			io.WriteString(w, body)
-		default:
-			http.Error(w, "unexpected "+r.Method+" "+p, http.StatusInternalServerError)
+	if nb, _ := db.GetBook(context.Background(), b.ID); nb.WorkID != "new-work" {
+		t.Fatalf("work_id = %q, want new-work", nb.WorkID)
+	}
+	for _, ref := range refs {
+		if ref != "mb" && ref != "h3ad" {
+			t.Fatalf("read a file at %q; only the merge base and the PR head define the change", ref)
 		}
-	}))
-	t.Cleanup(srv.Close)
-	return srv
-}
-
-func union(a, b map[string]string) map[string]bool {
-	out := map[string]bool{}
-	for k := range a {
-		out[k] = true
-	}
-	for k := range b {
-		out[k] = true
-	}
-	return out
-}
-
-// TestPollCoreMergedEveryMergeStyle: the PR's net change on the base branch is read
-// exactly whichever way it was merged. Main before the merge is "main0"; the PR has
-// TWO commits, and the new entry is added by the FIRST (the second only edits an
-// existing entry in another pack) - so a rebase merge diffed only against its last
-// commit's parent would find no new work.
-func TestPollCoreMergedEveryMergeStyle(t *testing.T) {
-	const pk = "data/works/0/0.json"
-	const pp = "data/works/0/p.json"
-	before := map[string]string{pk: packJSON("old"), pp: packJSON("p-thing")}
-	withNew := map[string]string{pk: packJSON("new-work", "old"), pp: packJSON("p-thing")}
-	// The PR's second commit only EDITS an existing entry in a different works pack
-	// (a changed pack, no new key).
-	withNewAndTweak := map[string]string{pk: packJSON("new-work", "old"), pp: `{"entries":{"p-thing":{"id":"p-thing","title":"tidied"}}}` + "\n"}
-	base := map[string]fakeCommit{
-		"main0": {parents: []string{"older"}, message: "earlier", date: "2026-09-01T00:00:00Z", packs: before},
-		// The PR branch's own commits (as the PR lists them).
-		"b1": {parents: []string{"main0"}, message: "intake: add the work", date: "2026-09-20T00:00:00Z", packs: withNew},
-		"b2": {parents: []string{"b1"}, message: "intake: tidy a neighbour", date: "2026-09-21T00:00:00Z", packs: withNewAndTweak},
-	}
-	shapes := map[string]struct {
-		extra map[string]fakeCommit
-		merge string
-		want  string // the base the change must be read from
-	}{
-		"merge commit": {
-			extra: map[string]fakeCommit{"m": {parents: []string{"main0", "b2"}, message: "Merge pull request #40", date: "2026-09-22T00:00:00Z", packs: withNewAndTweak}},
-			merge: "m", want: "main0",
-		},
-		"squash": {
-			extra: map[string]fakeCommit{"sq": {parents: []string{"main0"}, message: "Add the work (#40)", date: "2026-09-22T00:00:00Z", packs: withNewAndTweak}},
-			merge: "sq", want: "main0",
-		},
-		"rebase, entry in the first commit": {
-			// The PR's commits re-created on main: new shas, same messages and author dates.
-			extra: map[string]fakeCommit{
-				"r1": {parents: []string{"main0"}, message: "intake: add the work", date: "2026-09-20T00:00:00Z", packs: withNew},
-				"r2": {parents: []string{"r1"}, message: "intake: tidy a neighbour", date: "2026-09-21T00:00:00Z", packs: withNewAndTweak},
-			},
-			merge: "r2", want: "main0",
-		},
-	}
-	for name, shape := range shapes {
-		t.Run(name, func(t *testing.T) {
-			commits := map[string]fakeCommit{}
-			for k, v := range base {
-				commits[k] = v
-			}
-			for k, v := range shape.extra {
-				commits[k] = v
-			}
-			h := &historyFake{commits: commits, mergeSHA: shape.merge, prCommits: []string{"b1", "b2"}}
-			gh := h.server(t)
-
-			db := openDB(t)
-			b := makeBook(t, db, "Styled", string(state.ParkCorePending))
-			mergedCoreRow(t, db, b.ID)
-			spy := &readmitSpy{}
-			svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, spy, nil)
-			svc.Poll(context.Background())
-
-			if nb, _ := db.GetBook(context.Background(), b.ID); nb.WorkID != "new-work" {
-				row := getRow(t, db, b.ID, store.ContribKindCore)
-				t.Fatalf("work_id = %q (core note %q), want new-work", nb.WorkID, row.Note)
-			}
-			if want := shape.want + "..." + shape.merge; len(h.compared) != 1 || h.compared[0] != want {
-				t.Fatalf("compared %v, want exactly %s", h.compared, want)
-			}
-			if len(spy.called()) != 1 {
-				t.Fatalf("readmit = %v, want one", spy.called())
-			}
-		})
 	}
 }
 
@@ -774,22 +654,25 @@ func TestPollReleaseGateTransientLeavesBook(t *testing.T) {
 
 // --- poller: intake verdicts ---
 
-// verdictFake serves one open issue (#12) with the given labels, no intake PR, and
-// the given comments.
-func verdictFake(t *testing.T, issueState string, labels []string, comments string, commentReads *atomic.Int32) *httptest.Server {
+// verdictCalls counts the GitHub requests a verdictFake served.
+type verdictCalls struct{ all, comments atomic.Int32 }
+
+// verdictFake serves one issue (#12) in the given state with the given labels, no
+// intake PR, and the given comments.
+func verdictFake(t *testing.T, issueState string, labels []string, comments string) (*httptest.Server, *verdictCalls) {
 	t.Helper()
+	calls := &verdictCalls{}
 	ls := make([]string, 0, len(labels))
 	for _, l := range labels {
 		ls = append(ls, fmt.Sprintf(`{"name":%q}`, l))
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.all.Add(1)
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/pulls") && r.Method == http.MethodGet:
 			io.WriteString(w, `[]`)
 		case strings.HasSuffix(r.URL.Path, "/issues/12/comments"):
-			if commentReads != nil {
-				commentReads.Add(1)
-			}
+			calls.comments.Add(1)
 			io.WriteString(w, comments)
 		case strings.HasSuffix(r.URL.Path, "/issues/12"):
 			fmt.Fprintf(w, `{"number":12,"html_url":"https://gh/issues/12","state":%q,"labels":[%s]}`, issueState, strings.Join(ls, ","))
@@ -798,86 +681,98 @@ func verdictFake(t *testing.T, issueState string, labels []string, comments stri
 		}
 	}))
 	t.Cleanup(srv.Close)
-	return srv
+	return srv, calls
 }
 
 const botComment = `[{"body":"a human says hi","user":{"login":"someone"}},` +
 	`{"body":"Thanks! This needs a **maintainer** to finish - it can't be applied mechanically.\n\n- a characters.json sidecar already exists at data/works-community/0/0.json: characters; replacing it needs a maintainer\n\n_Posted by the intake bot._","user":{"login":"github-actions[bot]"}}]`
 
-// TestPollSurfacesNeedsHumanVerdict: a needs-human verdict is surfaced on the row
-// (status stays submitted, an actionable note carrying the bot's own message)
-// instead of "intake PR overdue", and the comments are read once, not every tick.
-func TestPollSurfacesNeedsHumanVerdict(t *testing.T) {
-	db := openDB(t)
-	b := makeBook(t, db, "Refused Book", "")
-	created := addRow(t, db, b.ID, store.ContribKindCharacters, store.ContribModeIssue, 12, store.ContribStatusSubmitted)
-	if err := db.SetContributionStatus(context.Background(), created.ID, created.Status, 0, "", "audit passed"); err != nil {
-		t.Fatal(err)
+// TestPollVerdicts: the intake bot's verdict replaces "intake PR overdue" on the row.
+// needs-human keeps the row submitted (an edit re-runs the bot) with an actionable
+// note carrying the bot's own message; duplicate is already_covered - upstream
+// already, landed, not an error; invalid on a closed issue is closed with the reason.
+func TestPollVerdicts(t *testing.T) {
+	cases := []struct {
+		name, issueState, label, comments string
+		wantStatus, wantNote              string
+		wantAttention, wantLanded         bool
+	}{
+		{name: "needs-human", issueState: "open", label: "data:needs-human", comments: botComment,
+			wantStatus:    store.ContribStatusSubmitted,
+			wantNote:      "audit passed; " + store.ContribNoteIntakeNeedsHuman + " - a characters.json sidecar already exists",
+			wantAttention: true},
+		{name: "duplicate", issueState: "closed", label: "data:duplicate",
+			comments:   `[{"body":"- the characters are already there\n\n_Posted by the intake bot._"}]`,
+			wantStatus: store.ContribStatusAlreadyCovered,
+			wantNote:   "audit passed; " + store.ContribNoteIntakeDuplicate + " - the characters are already there",
+			wantLanded: true},
+		{name: "invalid, closed", issueState: "closed", label: "data:invalid", comments: `[]`,
+			wantStatus: store.ContribStatusClosed, wantNote: "audit passed; " + store.ContribNoteIntakeInvalid},
 	}
-	var reads atomic.Int32
-	gh := verdictFake(t, "open", []string{"data", "data:characters", "data:needs-human"}, botComment, &reads)
-	cap := &capture{}
-	svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, cap, nil, nil)
-	// Well past the grace window: without the verdict this would be "overdue".
-	svc.now = func() time.Time { return time.Now().Add(24 * time.Hour) }
-	svc.Poll(context.Background())
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			db := openDB(t)
+			b := makeBook(t, db, "Verdict Book", "")
+			created := addRow(t, db, b.ID, store.ContribKindCharacters, store.ContribModeIssue, 12, store.ContribStatusSubmitted)
+			if err := db.SetContributionStatus(context.Background(), created.ID, created.Status, 0, "", "audit passed"); err != nil {
+				t.Fatal(err)
+			}
+			gh, _ := verdictFake(t, c.issueState, []string{"data", c.label}, c.comments)
+			svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, nil, nil)
+			// Well past the grace window: without the verdict this would be "overdue".
+			svc.now = func() time.Time { return time.Now().Add(24 * time.Hour) }
+			svc.Poll(context.Background())
 
-	row := getRow(t, db, b.ID, store.ContribKindCharacters)
-	if row.Status != store.ContribStatusSubmitted {
-		t.Fatalf("status = %s, want submitted (the issue is open; an edit re-runs the bot)", row.Status)
-	}
-	if !strings.HasPrefix(row.Note, "audit passed; "+store.ContribNoteIntakeNeedsHuman) ||
-		!strings.Contains(row.Note, "already exists at data/works-community/0/0.json") {
-		t.Fatalf("note = %q, want the audit note then the needs-human verdict with the bot's message", row.Note)
-	}
-	if strings.Contains(row.Note, store.ContribNoteIntakePRStale) {
-		t.Fatalf("note = %q: a verdict must replace the overdue warning", row.Note)
-	}
-	if !store.ContributionNeedsAttention([]store.Contribution{row}) {
-		t.Fatal("a needs-human verdict must flag the chip for attention")
-	}
-	svc.Poll(context.Background())
-	if reads.Load() != 1 || len(cap.all()) != 1 {
-		t.Fatalf("steady verdict tick: comment reads=%d publishes=%d, want 1/1", reads.Load(), len(cap.all()))
+			row := getRow(t, db, b.ID, store.ContribKindCharacters)
+			if row.Status != c.wantStatus || !strings.HasPrefix(row.Note, c.wantNote) {
+				t.Fatalf("row = %s / %q, want %s / %q...", row.Status, row.Note, c.wantStatus, c.wantNote)
+			}
+			if strings.Contains(row.Note, store.ContribNoteIntakePRStale) {
+				t.Fatalf("note = %q: a verdict replaces the overdue warning", row.Note)
+			}
+			if got := store.ContributionNeedsAttention([]store.Contribution{row}); got != c.wantAttention {
+				t.Errorf("attention = %v, want %v", got, c.wantAttention)
+			}
+			if hasChars, _ := store.LandedCoverage([]store.Contribution{row}); hasChars != c.wantLanded {
+				t.Errorf("landed = %v, want %v", hasChars, c.wantLanded)
+			}
+		})
 	}
 }
 
-// TestPollDuplicateVerdictIsDone: a duplicate means the thing is in the database
-// already - recorded already_covered (done by someone else), not an error, and it
-// counts as landed coverage.
-func TestPollDuplicateVerdictIsDone(t *testing.T) {
+// TestPollVerdictRecheckBackoff: a row waiting on a human costs no GitHub call until
+// an hour after it was last checked; a due re-check that changes nothing re-reads no
+// comments and touches the row, which defers the next check another hour.
+func TestPollVerdictRecheckBackoff(t *testing.T) {
 	db := openDB(t)
-	b := makeBook(t, db, "Dup Book", "")
-	addRow(t, db, b.ID, store.ContribKindRecaps, store.ContribModeIssue, 12, store.ContribStatusSubmitted)
-	gh := verdictFake(t, "closed", []string{"data", "data:recaps", "data:duplicate"},
-		`[{"body":"This looks like it's **already in the database**.\n\n- the recaps are already there\n\n_Posted by the intake bot._"}]`, nil)
-	svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, nil, nil)
-	svc.Poll(context.Background())
-
-	row := getRow(t, db, b.ID, store.ContribKindRecaps)
-	if row.Status != store.ContribStatusAlreadyCovered || !strings.HasPrefix(row.Note, store.ContribNoteIntakeDuplicate) {
-		t.Fatalf("row = %+v, want already_covered with the duplicate note", row)
-	}
-	if store.ContributionNeedsAttention([]store.Contribution{row}) {
-		t.Fatal("a duplicate is done, not an attention state")
-	}
-	if _, hasRecaps := store.LandedCoverage([]store.Contribution{row}); !hasRecaps {
-		t.Fatal("a duplicate verdict means the recaps are upstream (landed)")
-	}
-}
-
-// TestPollInvalidVerdictClosedIssue: an invalid verdict on an issue the submitter
-// closed is closed, keeping the verdict as the reason.
-func TestPollInvalidVerdictClosedIssue(t *testing.T) {
-	db := openDB(t)
-	b := makeBook(t, db, "Invalid Book", "")
+	b := makeBook(t, db, "Waiting Book", "")
 	addRow(t, db, b.ID, store.ContribKindCharacters, store.ContribModeIssue, 12, store.ContribStatusSubmitted)
-	gh := verdictFake(t, "closed", []string{"data:invalid"}, `[]`, nil)
+	gh, calls := verdictFake(t, "open", []string{"data:needs-human"}, botComment)
 	svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, nil, nil)
-	svc.Poll(context.Background())
-	row := getRow(t, db, b.ID, store.ContribKindCharacters)
-	if row.Status != store.ContribStatusClosed || row.Note != store.ContribNoteIntakeInvalid {
-		t.Fatalf("row = %+v, want closed with the bare invalid verdict (no bot comment)", row)
+	at := func(d time.Duration) {
+		updated, err := time.Parse(time.RFC3339Nano, getRow(t, db, b.ID, store.ContribKindCharacters).UpdatedAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		svc.now = func() time.Time { return updated.Add(d) }
+		svc.Poll(context.Background())
+	}
+
+	svc.Poll(context.Background()) // records the verdict: PR lookup, issue, comments
+	if calls.all.Load() != 3 {
+		t.Fatalf("first tick calls = %d, want 3", calls.all.Load())
+	}
+	at(10 * time.Minute)
+	if calls.all.Load() != 3 {
+		t.Fatalf("calls within the hour = %d, want none", calls.all.Load()-3)
+	}
+	at(61 * time.Minute)
+	if calls.all.Load() != 5 || calls.comments.Load() != 1 {
+		t.Fatalf("due re-check: calls=%d comments=%d, want 5 and still 1", calls.all.Load(), calls.comments.Load())
+	}
+	at(10 * time.Minute) // measured from the touch the re-check left
+	if calls.all.Load() != 5 {
+		t.Fatalf("calls after the touch = %d, want none", calls.all.Load()-5)
 	}
 }
 
@@ -896,6 +791,7 @@ func TestPollVerdictClearedByIntakePR(t *testing.T) {
 	}))
 	defer gh.Close()
 	svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, nil, nil)
+	svc.now = func() time.Time { return time.Now().Add(2 * time.Hour) } // past the verdict re-check spacing
 	svc.Poll(context.Background())
 	row := getRow(t, db, b.ID, store.ContribKindCharacters)
 	if row.Status != store.ContribStatusPROpen || row.Note != "audit passed" {
@@ -912,7 +808,7 @@ func TestPollCoreVerdictMovesBookOn(t *testing.T) {
 		db := openDB(t)
 		b := makeBook(t, db, "Core Dup", string(state.ParkCorePending))
 		addRow(t, db, b.ID, store.ContribKindCore, store.ContribModeIssue, 12, store.ContribStatusSubmitted)
-		gh := verdictFake(t, "closed", []string{"data:duplicate"}, `[]`, nil)
+		gh, _ := verdictFake(t, "closed", []string{"data:duplicate"}, `[]`)
 		spy := &readmitSpy{}
 		svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, spy, nil)
 		svc.Poll(context.Background())
@@ -928,7 +824,7 @@ func TestPollCoreVerdictMovesBookOn(t *testing.T) {
 		db := openDB(t)
 		b := makeBook(t, db, "Core Human", string(state.ParkCorePending))
 		addRow(t, db, b.ID, store.ContribKindCore, store.ContribModeIssue, 12, store.ContribStatusSubmitted)
-		gh := verdictFake(t, "open", []string{"data:needs-human"}, `[]`, nil)
+		gh, _ := verdictFake(t, "open", []string{"data:needs-human"}, `[]`)
 		spy := &readmitSpy{}
 		svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, spy, nil)
 		svc.Poll(context.Background())

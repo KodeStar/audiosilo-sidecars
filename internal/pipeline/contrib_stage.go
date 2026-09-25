@@ -54,7 +54,6 @@ type TokenResolver interface {
 // a plain-map view of the agent config).
 const (
 	contribModeIssue = "issue"
-	contribModePR    = "pr"
 	contribModeLocal = "local"
 )
 
@@ -65,7 +64,7 @@ const defaultContribBaseURL = "https://api.github.com"
 // Contributing-stage park messages (exported so the UI and tests can assert them
 // exactly, mirroring AgentUnavailableMsg / MediaToolsUnavailableMsg).
 const (
-	// ContribUnavailableMsg parks a book in issue/pr mode when no GitHub credential
+	// ContribUnavailableMsg parks a book in issue mode when no GitHub credential
 	// is available (no PAT in secrets, no `gh auth token`).
 	ContribUnavailableMsg = "GitHub credential unavailable - add a personal access token in Settings or run `gh auth login`, then Retry"
 	// CoreNeededMsg parks a book whose work does not exist upstream: a core add-work
@@ -99,14 +98,12 @@ type contribArtifact struct {
 }
 
 // contribute is the M7 contributing stage: it reconciles the validated sidecars'
-// placeholder work slug to the real meta.audiosilo.app work and publishes them to the
-// metadata database's COMMUNITY repository (contribution.community_repo, default
-// KodeStar/audiosilo-meta-community - the CC BY-SA layer's home since the 2026-08-21
-// split; the core repository's intake bot refuses a sidecar) per the configured mode
-// (issue / pr / local), then writes its sentinel. The flow mirrors M7-DESIGN.md ("The contributing stage") step by step.
+// placeholder work slug to the real meta.audiosilo.app work, publishes them to the
+// COMMUNITY repository (contribution.community_repo - the core repo's intake refuses
+// a sidecar) per the configured mode (issue / local), and writes its sentinel.
 //
 // Parks (all Retry-re-admittable) replace a hard failure for a human-fixable
-// precondition: no GitHub credential (issue/pr) parks ParkContribUnavailable; a work
+// precondition: no GitHub credential (issue mode) parks ParkContribUnavailable; a work
 // that does not exist upstream parks ParkCoreNeeded (after prefilling a proposal) or
 // ParkCorePending (a proposal already in flight). A GitHub rate limit returns a plain
 // (transient) stage error rather than a park.
@@ -208,7 +205,7 @@ func (e *Executor) contribute(ctx context.Context, book store.Book, r scheduler.
 
 // resolveWorkSlug determines the upstream work slug for the book's sidecars. It
 // returns (slug, placeholderNote, park, err): park is a non-nil ParkError when the
-// book must wait for a human/poller (needs-core in issue/pr mode); err is a transient
+// book must wait for a human/poller (needs-core in issue mode); err is a transient
 // stage error (a metadata transport failure while verifying a manual match).
 // placeholderNote is set only when local mode proceeds on a title-derived placeholder
 // (no upstream match), so the recorded rows carry that provenance.
@@ -220,23 +217,13 @@ func (e *Executor) resolveWorkSlug(ctx context.Context, book store.Book) (slug, 
 		cov, verr := e.metaCoverageForWork(ctx, id)
 		switch {
 		case verr == nil:
-			// The catalogue answers a slug a merge has RETIRED under its survivor
-			// (metaops follows the 301); attach to - and remember - the live one.
-			if live := cov.WorkID; live != "" && live != id && model.ValidSlug(live) {
-				if e.db != nil {
-					_ = e.db.SetBookWorkID(context.WithoutCancel(ctx), book.ID, live)
-				}
-				return live, "", nil, nil
-			}
-			return id, "", nil, nil
+			// A slug a merge RETIRED is answered under its survivor; attach to that.
+			live, _ := contrib.AdoptLiveWork(ctx, e.db, book.ID, id, cov.WorkID)
+			return live, "", nil, nil
 		case errors.Is(verr, metaops.ErrWorkNotFound):
-			// A 404 normally means a stale manual match - fall through to identifier
-			// lookup. BUT when this book's core add-work row is merged, book.WorkID came
-			// from that merged intake PR: the work exists in the repository, and no
-			// published data release holds it yet. The community intake verifies a
-			// sidecar's key against the newest release, so contributing now would be
-			// refused there - wait (the release gate). The poller re-checks every tick
-			// and re-admits the book once the work is live.
+			// A 404 is normally a stale manual match. With a MERGED core row the work
+			// exists but no data release holds it yet, and the community intake would
+			// refuse its sidecars: wait (the release gate; the poller re-admits).
 			if e.hasMergedCoreRow(ctx, book.ID) {
 				return "", "", scheduler.ParkWithCode(state.ParkCorePending, contrib.ReleaseWaitMsg), nil
 			}
@@ -258,7 +245,7 @@ func (e *Executor) resolveWorkSlug(ctx context.Context, book store.Book) (slug, 
 		return wid, "", nil, nil
 	}
 
-	// (c) No upstream match. Local mode proceeds on a placeholder; issue/pr modes need
+	// (c) No upstream match. Local mode proceeds on a placeholder; issue mode needs
 	// a core add-work proposal first.
 	if e.contribModeOrDefault() == contribModeLocal {
 		return ExportSlug(book), placeholderExportNote, nil, nil
@@ -434,27 +421,10 @@ func (e *Executor) coveredDimensions(ctx context.Context, slug string) (hasChars
 // non-empty "audit converged..." line when the sidecars were accepted on a converging
 // trajectory) is appended to each submitted row's note.
 func (e *Executor) submitContributions(ctx context.Context, book store.Book, slug string, artifacts []contribArtifact, placeholderNote, auditNote string) error {
-	switch e.contribModeOrDefault() {
-	case contribModeLocal:
+	if e.contribModeOrDefault() == contribModeLocal {
 		return e.submitLocal(ctx, book, slug, artifacts, placeholderNote, auditNote)
-	case contribModePR:
-		return e.submitPR(ctx, book, slug, artifacts, auditNote)
-	default:
-		return e.submitIssue(ctx, book, slug, artifacts, auditNote)
 	}
-}
-
-// joinNotes concatenates the non-empty note parts with "; " (a row note is free text
-// that rides to the UI). It drops empty parts so a row with no per-row note carries just
-// the audit note, and vice versa.
-func joinNotes(parts ...string) string {
-	kept := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if strings.TrimSpace(p) != "" {
-			kept = append(kept, p)
-		}
-	}
-	return strings.Join(kept, "; ")
+	return e.submitIssue(ctx, book, slug, artifacts, auditNote)
 }
 
 // submitIssue opens one intake issue per uncovered dimension. It verifies the routing
@@ -504,194 +474,16 @@ func (e *Executor) submitIssue(ctx context.Context, book store.Book, slug string
 				note = fmt.Sprintf("%s - a maintainer must apply %s for intake to run", store.ContribNoteLabelsMissingPrefix, routingLabel(a.kind))
 			}
 		}
-		if err := e.upsertRow(ctx, book.ID, a.kind, store.ContribModeIssue, issue.Number, issue.URL, store.ContribStatusSubmitted, joinNotes(note, auditNote)); err != nil {
+		if err := e.upsertRow(ctx, book.ID, a.kind, store.ContribModeIssue, issue.Number, issue.URL, store.ContribStatusSubmitted, contrib.JoinNotes(note, auditNote)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// submitPR opens ONE direct pull request on the community repository carrying every
-// uncovered sidecar, as a correct PACK edit: the fork's community data tree is read
-// at its default branch, each sidecar is placed as a member of the work's
-// works-community entry through audiosilo-meta's own pkg/pack (placement, due splits,
-// canonical rendering) and validated with its pkg/check, and exactly the pack files
-// that changed are committed as one commit on sidecars/<slug>-<bookID>. Covered
-// dimensions are recorded already_covered.
-//
-// It never opens a broken PR: a dimension whose member the entry already carries
-// (replacing a sidecar is the maintainers' call), and every dimension when the PR
-// cannot be prepared (the tree does not validate, a GitHub call fails), goes through
-// the intake-issue path instead, with a row note saying why. A rate limit, a missing
-// credential and a cancelled context still propagate - those are retried, not
-// rerouted. A resume that finds its PR already open reuses it.
-func (e *Executor) submitPR(ctx context.Context, book store.Book, slug string, artifacts []contribArtifact, auditNote string) error {
-	cli, err := e.contribClient(ctx)
-	if err != nil {
-		return err
-	}
-	existing := e.bookContributions(ctx, book.ID)
-	var toSubmit []contribArtifact
-	for _, a := range artifacts {
-		// Settled first, so an upstream-covered verdict never overwrites a prior submission.
-		if rowSettled(existing, a.kind) {
-			continue
-		}
-		if a.covered {
-			if err := e.recordCovered(ctx, book.ID, a.kind, store.ContribModePR); err != nil {
-				return err
-			}
-			continue
-		}
-		toSubmit = append(toSubmit, a)
-	}
-	if len(toSubmit) == 0 {
-		return nil
-	}
-
-	pr, placed, refused, perr := e.openSidecarPR(ctx, cli, book, slug, toSubmit)
-	if perr != nil {
-		if !fallbackToIssue(ctx, perr) {
-			return perr
-		}
-		note := "direct PR not opened (" + shortErr(perr) + ") - submitted as an intake issue instead"
-		return e.submitIssue(ctx, book, slug, toSubmit, joinNotes(note, auditNote))
-	}
-	for _, a := range placed {
-		if err := e.upsertRow(ctx, book.ID, a.kind, store.ContribModePR, pr.Number, pr.URL, store.ContribStatusSubmitted, auditNote); err != nil {
-			return err
-		}
-	}
-	for _, r := range refused {
-		if err := e.submitIssue(ctx, book, slug, []contribArtifact{r.artifact}, joinNotes(r.reason+"; submitted as an intake issue instead", auditNote)); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// refusedArtifact is a dimension the pack edit would not place, and why.
-type refusedArtifact struct {
-	artifact contribArtifact
-	reason   string
-}
-
-// openSidecarPR prepares, commits and opens (or, on a resume, finds) the sidecar pull
-// request. placed are the dimensions the PR carries; refused are the ones it could not
-// place (the member already exists), for the caller to route through the issue path.
-// A nil PR with no error means nothing was placed.
-func (e *Executor) openSidecarPR(ctx context.Context, cli *contrib.Client, book store.Book, slug string, toSubmit []contribArtifact) (contrib.PR, []contribArtifact, []refusedArtifact, error) {
-	upstream := e.contribCommunityRepo
-	fork, err := cli.EnsureFork(ctx, upstream)
-	if err != nil {
-		return contrib.PR{}, nil, nil, err
-	}
-	branch := fmt.Sprintf("sidecars/%s-%d", slug, book.ID)
-	head := contrib.OwnerOf(fork) + ":" + branch
-	// Crash-resume idempotency: a prior run may have opened the PR but persisted no
-	// rows. Reuse it rather than rebuilding the branch under an open PR.
-	if pr, open, ferr := cli.FindOpenPRByHead(ctx, upstream, head); ferr != nil {
-		return contrib.PR{}, nil, nil, ferr
-	} else if open {
-		return pr, toSubmit, nil, nil
-	}
-
-	base, err := cli.DefaultBranch(ctx, upstream)
-	if err != nil {
-		return contrib.PR{}, nil, nil, err
-	}
-	_ = cli.MergeUpstream(ctx, fork, base) // best-effort fast-forward of the fork
-	baseSHA, err := cli.BranchSHA(ctx, fork, base)
-	if err != nil {
-		return contrib.PR{}, nil, nil, err
-	}
-
-	members := make([]contrib.SidecarMember, 0, len(toSubmit))
-	byMember := map[string]contribArtifact{}
-	for _, a := range toSubmit {
-		content, rerr := os.ReadFile(a.path) //nolint:gosec // path derives from the book's work dir
-		if rerr != nil {
-			return contrib.PR{}, nil, nil, rerr
-		}
-		members = append(members, contrib.SidecarMember{Member: a.kind, Content: content})
-		byMember[a.kind] = a
-	}
-	edit, err := contrib.PrepareCommunityEdit(ctx, cli, fork, baseSHA, slug, members)
-	if err != nil {
-		return contrib.PR{}, nil, nil, err
-	}
-	var placed []contribArtifact
-	for _, m := range edit.Applied {
-		placed = append(placed, byMember[m])
-	}
-	var refused []refusedArtifact
-	for _, a := range toSubmit {
-		if reason, ok := edit.Refused[a.kind]; ok {
-			refused = append(refused, refusedArtifact{artifact: a, reason: reason})
-		}
-	}
-	if len(placed) == 0 {
-		return contrib.PR{}, nil, refused, nil
-	}
-	if !edit.Changed() {
-		return contrib.PR{}, nil, nil, errors.New("the pack edit changed no file")
-	}
-
-	commit, err := cli.CommitFiles(ctx, fork, baseSHA, "Add "+strings.Join(edit.Applied, " + ")+" for "+slug, edit.Files, edit.Deleted)
-	if err != nil {
-		return contrib.PR{}, nil, nil, err
-	}
-	// The branch is always ONE commit on a fresh base: a leftover branch from a run
-	// that died before opening its PR is force-moved rather than stacked on.
-	_, branchExists, berr := cli.BranchRef(ctx, fork, branch)
-	if berr != nil {
-		return contrib.PR{}, nil, nil, berr
-	}
-	if branchExists {
-		err = cli.UpdateRef(ctx, fork, branch, commit)
-	} else {
-		err = cli.CreateRef(ctx, fork, "refs/heads/"+branch, commit)
-	}
-	if err != nil {
-		return contrib.PR{}, nil, nil, err
-	}
-	pr, err := cli.CreatePull(ctx, upstream, head, base, "Add sidecars for "+slug, prBody(book, slug, edit))
-	if err != nil {
-		return contrib.PR{}, nil, nil, err
-	}
-	return pr, placed, refused, nil
-}
-
-// fallbackToIssue reports whether a PR-mode failure should be rerouted through the
-// intake-issue path. A cancelled context, a rate limit and a park (no credential)
-// are not failures of THIS path - they are retried as they always were.
-func fallbackToIssue(ctx context.Context, err error) bool {
-	if ctx.Err() != nil {
-		return false
-	}
-	var rl *contrib.RateLimitError
-	var pe *scheduler.ParkError
-	return !errors.As(err, &rl) && !errors.As(err, &pe) &&
-		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
-}
-
-// shortErr renders an error for a row note, bounded (it rides to the UI).
-func shortErr(err error) string {
-	const limit = 200
-	msg := err.Error()
-	if len(msg) > limit {
-		msg = msg[:limit] + "..."
-	}
-	return msg
-}
-
-// submitLocal exports each uncovered sidecar as <exportRoot>/<slug>/<characters|
-// recaps>.json - the bare sidecar FILE, exactly what an intake-issue attachment (or a
-// pasted payload) takes, so a local export can be contributed later by hand. There is
-// no repository layout to mirror: upstream stores sidecars as members of range-packed
-// entries in the community repository, which only its tooling writes. The row is
-// recorded local (with placeholderNote when the slug is a title-derived placeholder).
-// No network, no credential.
+// submitLocal exports each uncovered sidecar as <exportRoot>/<slug>/<kind>.json - the
+// bare file an intake-issue attachment takes - and records a local row (with
+// placeholderNote for a title-derived placeholder slug). No network, no credential.
 func (e *Executor) submitLocal(ctx context.Context, book store.Book, slug string, artifacts []contribArtifact, placeholderNote, auditNote string) error {
 	// WriteFileAtomic MkdirAlls the destination parent, so no explicit MkdirAll here.
 	destDir := filepath.Join(e.exportRoot, slug)
@@ -715,7 +507,7 @@ func (e *Executor) submitLocal(ctx context.Context, book store.Book, slug string
 		if err := fsutil.WriteFileAtomic(filepath.Join(destDir, fileNameFor(a.kind)), content, 0o644); err != nil {
 			return err
 		}
-		if err := e.upsertRow(ctx, book.ID, a.kind, store.ContribModeLocal, 0, "", store.ContribStatusLocal, joinNotes(placeholderNote, auditNote)); err != nil {
+		if err := e.upsertRow(ctx, book.ID, a.kind, store.ContribModeLocal, 0, "", store.ContribStatusLocal, contrib.JoinNotes(placeholderNote, auditNote)); err != nil {
 			return err
 		}
 	}
@@ -967,34 +759,6 @@ func routingLabel(kind string) string {
 // labelStuck reports whether want is among the labels GitHub echoed back.
 func labelStuck(got []string, want string) bool {
 	return slices.Contains(got, want)
-}
-
-// prBody composes the PR description: the entry key, the pack files the edit
-// writes or removes, the members it places, the CC BY-SA statement and the book
-// title. No commit/PR trailers (workspace convention).
-func prBody(book store.Book, slug string, edit contrib.CommunityEdit) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "Community sidecars for **%s** (`%s`).\n\n", book.Title, slug)
-	fmt.Fprintf(&b, "Entry: `%s` in the works-community family", slug)
-	if edit.Pack != "" {
-		fmt.Fprintf(&b, " (`%s`)", edit.Pack)
-	}
-	fmt.Fprintf(&b, ", members: %s.\n\n", strings.Join(edit.Applied, ", "))
-	b.WriteString("Pack files:\n")
-	paths := make([]string, 0, len(edit.Files))
-	for p := range edit.Files {
-		paths = append(paths, p)
-	}
-	slices.Sort(paths)
-	for _, p := range paths {
-		fmt.Fprintf(&b, "- `%s`\n", p)
-	}
-	for _, p := range edit.Deleted {
-		fmt.Fprintf(&b, "- `%s` (removed)\n", p)
-	}
-	b.WriteString("\nWritten through audiosilo-meta's pkg/pack and validated with its pkg/check (community profile).\n")
-	b.WriteString("\nLicensed under CC BY-SA 4.0. Own-words, spoiler-gated; generated by audiosilo-sidecars.\n")
-	return b.String()
 }
 
 // placeholderExportNote annotates a local-export row whose work could not be resolved

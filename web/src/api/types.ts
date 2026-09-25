@@ -405,6 +405,7 @@ export interface BookProgress {
 export type ContributionKind = 'characters' | 'recaps' | 'core';
 
 // How a single contribution was published (the config mode at submit time).
+// 'pr' is the retired direct-PR mode; rows recorded in it keep being polled.
 export type ContributionMode = 'issue' | 'pr' | 'local';
 
 // A single contribution's lifecycle status. submitted/pr_open are open; merged/

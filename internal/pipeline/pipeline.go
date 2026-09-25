@@ -133,8 +133,8 @@ type Config struct {
 
 	// Contribution (M7) drives the contributing stage. Meta resolves a book's work
 	// slug and reads sidecar coverage (nil = metadata disabled); TokenSource resolves a
-	// GitHub credential for issue/pr modes (nil = no credential); ContribMode is
-	// issue|pr|local; ContribCommunityRepo is the owner/name of the metadata
+	// GitHub credential for issue mode (nil = no credential); ContribMode is
+	// issue|local; ContribCommunityRepo is the owner/name of the metadata
 	// database's COMMUNITY repository, which takes the characters/recaps sidecars
 	// (add-work proposals go to the core repository through contrib.Service, not
 	// through this stage); ContribBaseURL overrides the GitHub REST base for tests

@@ -19,11 +19,9 @@ import (
 // meta slug. The API maps it to 400.
 var ErrInvalidSlug = errors.New("contrib: invalid work id")
 
-// ReleaseWaitMsg is the park message of a book whose add-work PR has merged but whose
-// new work no published data release holds yet. Contributing a sidecar keyed by that
-// slug now would be refused by the community intake (it verifies the key against the
-// newest release), so the book waits; the poller re-checks every tick and re-admits
-// it once the work is live.
+// ReleaseWaitMsg parks a book whose add-work PR merged but whose work no published
+// data release holds yet (the community intake would refuse its sidecars); the
+// poller re-admits it once the work is live.
 const ReleaseWaitMsg = "the work proposal merged - waiting for the next data release to publish it; the book resumes automatically"
 
 // ErrWorkNotFound signals that a work id does not exist upstream. The injected
@@ -253,19 +251,20 @@ func (s *Service) SetWork(ctx context.Context, book store.Book, workID string) e
 	if !model.ValidSlug(workID) {
 		return ErrInvalidSlug
 	}
+	live := workID
 	if s.deps.ResolveWork != nil {
-		live, err := s.deps.ResolveWork(ctx, workID)
-		if err != nil {
+		var err error
+		if live, err = s.deps.ResolveWork(ctx, workID); err != nil {
 			if errors.Is(err, ErrWorkNotFound) {
 				return ErrWorkNotFound
 			}
 			return fmt.Errorf("contrib: verify work: %w", err)
 		}
-		if model.ValidSlug(live) {
-			workID = live
+		if live == "" {
+			live = workID
 		}
 	}
-	if err := s.deps.DB.SetBookWorkID(ctx, book.ID, workID); err != nil {
+	if _, err := AdoptLiveWork(ctx, s.deps.DB, book.ID, book.WorkID, live); err != nil {
 		return fmt.Errorf("contrib: set work id: %w", err)
 	}
 	if awaitingWork(book) && s.deps.Readmit != nil {

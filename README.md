@@ -15,8 +15,8 @@ or API key).
 > auto-downloaded), transcript QA, the agent fact/synthesis/audit stages,
 > validation, and contribution back to meta.audiosilo.app - sidecars to the
 > community repository (KodeStar/audiosilo-meta-community), add-work proposals
-> to the core one (KodeStar/audiosilo-meta); prefilled intake issues by default,
-> a direct fork+PR, or a keep-local export of the sidecar files - with live boards,
+> to the core one (KodeStar/audiosilo-meta), as prefilled intake issues or a
+> keep-local export of the sidecar files - with live boards,
 > ETAs, and per-stage cost tracking in the web UI. Packaging is in place -
 > tagged (`v*`) releases publish native binaries (GitHub Releases) and container
 > images (GHCR, plus a `-cuda` GPU variant); see **Install** below. See

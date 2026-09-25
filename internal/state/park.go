@@ -33,7 +33,7 @@ const (
 	// immediate retry would just time out again).
 	ParkASRDecodeTimeout ParkCode = "asr_decode_timeout"
 
-	// ParkContribUnavailable: the contributing stage runs in issue/pr mode but no
+	// ParkContribUnavailable: the contributing stage runs in issue mode but no
 	// GitHub credential is available (no PAT in secrets, no `gh auth token`). The user
 	// adds a PAT in Settings or runs `gh auth login`, then Retry.
 	ParkContribUnavailable ParkCode = "contrib_unavailable"

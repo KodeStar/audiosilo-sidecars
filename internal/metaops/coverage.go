@@ -239,10 +239,8 @@ type lookupVal struct {
 }
 
 type workVal struct {
-	// id is the slug the API answered under. It differs from the id asked for when
-	// the asked-for slug has been RETIRED by a merge: meta answers a tombstoned slug
-	// with a 301 to the surviving one, which the HTTP client follows, so the body
-	// names the survivor.
+	// id is the slug the API answered under: for a slug a merge RETIRED, meta's 301
+	// is followed and the body names the survivor.
 	id         string
 	title      string
 	series     *SeriesRef

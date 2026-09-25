@@ -7,10 +7,9 @@
 import type { ContributionConfig, ContributionUpdate } from '@/api/types';
 import { parseIntOrNaN } from '@/lib/formNumbers';
 
-// The three publish modes for the contributing stage.
+// The publish modes for the contributing stage (the direct-PR mode is retired).
 export const CONTRIBUTION_MODES: { value: string; label: string }[] = [
   { value: 'issue', label: 'Issue (intake bot composes the PR)' },
-  { value: 'pr', label: 'Pull request (direct)' },
   { value: 'local', label: 'Local export only (one sidecar file per kind)' },
 ];
 
@@ -24,6 +23,31 @@ export interface ContributionFormState {
   autoPurge: boolean;
   pollMinutes: string;
 }
+
+// REPO_FIELDS are the two halves of the split metadata database, rendered and
+// validated from this one list.
+export const REPO_FIELDS: {
+  key: 'communityRepo' | 'coreRepo';
+  id: string;
+  label: string;
+  example: string;
+  hint: string;
+}[] = [
+  {
+    key: 'communityRepo',
+    id: 'contrib-community-repo',
+    label: 'Community repository',
+    example: 'KodeStar/audiosilo-meta-community',
+    hint: 'Receives the characters and recaps sidecars (the CC BY-SA layer).',
+  },
+  {
+    key: 'coreRepo',
+    id: 'contrib-core-repo',
+    label: 'Core repository',
+    example: 'KodeStar/audiosilo-meta',
+    hint: 'Receives add-work proposals, for a book whose work is not on AudioSilo Meta yet.',
+  },
+];
 
 // contributionConfigToForm seeds the form from the loaded settings.
 export function contributionConfigToForm(cfg: ContributionConfig): ContributionFormState {
@@ -54,12 +78,10 @@ export function contributionFormToUpdate(form: ContributionFormState): Contribut
 // disagreement.
 export function validateContributionForm(form: ContributionFormState): string | null {
   // owner/name: a single slash, no spaces, non-empty halves.
-  const ownerName = /^[^/\s]+\/[^/\s]+$/;
-  if (!ownerName.test(form.coreRepo.trim())) {
-    return 'Core repository must be in owner/name form (e.g. KodeStar/audiosilo-meta).';
-  }
-  if (!ownerName.test(form.communityRepo.trim())) {
-    return 'Community repository must be in owner/name form (e.g. KodeStar/audiosilo-meta-community).';
+  for (const f of REPO_FIELDS) {
+    if (!/^[^/\s]+\/[^/\s]+$/.test(form[f.key].trim())) {
+      return `${f.label} must be in owner/name form (e.g. ${f.example}).`;
+    }
   }
   const p = parseIntOrNaN(form.pollMinutes);
   if (!Number.isInteger(p) || p < 1) {

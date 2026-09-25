@@ -219,19 +219,13 @@ Operative caveats surviving from that history:
   (`internal/pipeline/schema_drift_test.go`) is strict. Background: HISTORY.md
   (2026-09-25).
 - **The metadata database is TWO repositories** (since 2026-08-21):
-  `contribution.core_repo` (default KodeStar/audiosilo-meta) takes add-work
-  proposals, `contribution.community_repo` (default
-  KodeStar/audiosilo-meta-community) the characters/recaps sidecars - the core
-  repo's intake bot refuses a sidecar. The legacy single `contribution.repo`
-  (config or `AUDIOSILO_SIDECARS_CONTRIBUTION_REPO`) is still read, as the CORE
-  repo only, with a startup deprecation line; a contribution row keeps the repo
-  it was made against. Upstream storage is range-packed (meta PACK-SPEC.md): PR
-  mode writes a sidecar as a MEMBER of its work's works-community entry through
-  meta's own `pkg/pack` + `pkg/check`, never a hand-computed path, and the
-  poller learns a merged add-work's slug from ENTRY KEYS, never from a file
-  name. The env-gated round trips: `AUDIOSILO_META_DIR` (compose_roundtrip_test,
-  metaissue under `--profile community --works-db` / `--profile core`) and
-  `AUDIOSILO_META_COMMUNITY_DIR` (the pack edit over a copy of the real tree).
+  `contribution.core_repo` takes add-work proposals, `contribution.community_repo`
+  the sidecars (the core intake refuses them). Contributions go through the
+  repos' intake bots (issue mode) or a local export - never a client-built pack
+  edit (the retired `pr` mode loads as issue). Anything read from upstream
+  storage (a merged PR's new work) goes through meta's `pkg/pack` and ENTRY KEYS,
+  never a file path. A merged work is contributed only once a data release holds
+  it (the release gate). Round trips: `AUDIOSILO_META_DIR` (compose_roundtrip_test).
 - **whisper.cpp binaries ship on their own cadence** (`whisper-binaries.yml`,
   a separate release `toolfetch` consumes; publish first, then bump
   `toolfetch.WhisperCLIReleaseTag`) - never couple them into

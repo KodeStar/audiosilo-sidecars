@@ -345,21 +345,14 @@ type contributionUpdate struct {
 	Mode          *string `json:"mode"`
 	CoreRepo      *string `json:"core_repo"`
 	CommunityRepo *string `json:"community_repo"`
-	// Repo is the pre-split single-repository field, still accepted from an older
-	// client with its one still-valid meaning: the core repository. An explicit
-	// core_repo in the same update wins.
-	Repo        *string `json:"repo"`
-	AutoPurge   *bool   `json:"auto_purge"`
-	PollMinutes *int    `json:"poll_minutes"`
+	AutoPurge     *bool   `json:"auto_purge"`
+	PollMinutes   *int    `json:"poll_minutes"`
 }
 
 // applyContributionUpdate overlays u onto cfg in place.
 func applyContributionUpdate(cfg *config.ContributionConfig, u *contributionUpdate) {
 	if u.Mode != nil {
 		cfg.Mode = *u.Mode
-	}
-	if u.Repo != nil && u.CoreRepo == nil {
-		cfg.CoreRepo = *u.Repo
 	}
 	if u.CoreRepo != nil {
 		cfg.CoreRepo = *u.CoreRepo

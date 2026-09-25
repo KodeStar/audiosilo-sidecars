@@ -47,14 +47,10 @@ func ExportSlug(b store.Book) string {
 	return workSlug(b)
 }
 
-// ExportArchive builds an in-memory zip of a book's sidecars for the "keep local"
-// download: <slug>/characters.json and/or <slug>/recaps.json, whichever exist. Each
-// is the bare sidecar FILE, exactly what an intake-issue attachment takes - there is
-// no repository layout to mirror, since upstream stores sidecars as members of
-// range-packed entries only its own tooling writes. It returns ErrNoSidecars when
-// neither sidecar file exists. The file set is fixed (never user-supplied paths) and
-// the slug is a validated placeholder, so no traversal is possible. The api injects
-// this (via ExportSlug) as its ExportArchive seam.
+// ExportArchive zips a book's sidecars for the "keep local" download as
+// <slug>/characters.json and/or <slug>/recaps.json - the bare files an intake-issue
+// attachment takes. ErrNoSidecars when neither exists; the file set is fixed and the
+// slug validated, so no traversal is possible.
 func ExportArchive(workDir, slug string) ([]byte, error) {
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)

@@ -43,7 +43,7 @@ describe('contributionFormToUpdate', () => {
     expect(
       contributionFormToUpdate(
         form({
-          mode: 'pr',
+          mode: 'local',
           coreRepo: '  Own/core  ',
           communityRepo: ' Own/comm ',
           autoPurge: false,
@@ -51,7 +51,7 @@ describe('contributionFormToUpdate', () => {
         }),
       ),
     ).toEqual({
-      mode: 'pr',
+      mode: 'local',
       core_repo: 'Own/core',
       community_repo: 'Own/comm',
       auto_purge: false,

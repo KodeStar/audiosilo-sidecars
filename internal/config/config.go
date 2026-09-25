@@ -84,25 +84,23 @@ const (
 const DefaultMetadataBaseURL = "https://meta.audiosilo.app"
 
 // Contribution mode selector values: how the contributing stage publishes a book's
-// sidecars. issue opens prefilled intake issues (the meta repo's bot composes the
-// PR); pr forks + opens a direct PR; local exports to <data>/export with no network.
+// sidecars. issue opens prefilled intake issues (the repo's bot composes the PR);
+// local exports to <data>/export with no network.
 const (
 	ContributionModeIssue = "issue"
-	ContributionModePR    = "pr"
 	ContributionModeLocal = "local"
+	// legacyContributionModePR is the retired direct-PR mode, read as issue.
+	legacyContributionModePR = "pr"
 )
 
 // Contribution section defaults.
 const (
 	DefaultContributionMode = ContributionModeIssue
-	// DefaultContributionCoreRepo is the CC0 core of the metadata database: works,
-	// recordings, people and series. Add-work proposals (a book whose work does not
-	// exist upstream yet) go here.
+	// DefaultContributionCoreRepo is the CC0 core (works/people/series): add-work
+	// proposals go here.
 	DefaultContributionCoreRepo = "KodeStar/audiosilo-meta"
-	// DefaultContributionCommunityRepo holds the CC BY-SA community layer (the
-	// characters/recaps sidecars) since the 2026-08-21 community-repo split. The
-	// core repository's intake bot REFUSES a sidecar submission, so the sidecars
-	// must be sent here.
+	// DefaultContributionCommunityRepo is the CC BY-SA layer since the 2026-08-21
+	// split: the sidecars go here (the core repo's intake bot refuses them).
 	DefaultContributionCommunityRepo = "KodeStar/audiosilo-meta-community"
 	DefaultContributionAutoPurge     = true
 	DefaultContributionPollMinutes   = 10
@@ -241,16 +239,13 @@ type SupervisorConfig struct {
 // and poller are wired once at startup, like asr.backend and agent.*), unlike
 // cors_origins which the API re-reads live per request.
 type ContributionConfig struct {
-	Mode string `yaml:"mode"` // "issue" | "pr" | "local"
+	Mode string `yaml:"mode"` // "issue" | "local" (a legacy "pr" loads as issue)
 	// CoreRepo receives add-work proposals (the CC0 core: works/people/series).
 	CoreRepo string `yaml:"core_repo"`
 	// CommunityRepo receives the characters/recaps sidecars (the CC BY-SA layer).
 	CommunityRepo string `yaml:"community_repo"`
-	// Repo is the LEGACY single-repository setting, from before the metadata
-	// database was split in two. It is read for compatibility only: Load folds it
-	// into CoreRepo (its one still-valid meaning - sidecars never belonged in the
-	// core repository after the split) with a deprecation notice, and clears it, so
-	// the next Save writes core_repo instead. Nothing reads it after Load.
+	// Repo is the LEGACY pre-split single repository: Load folds it into CoreRepo
+	// (see foldLegacyContribution) and clears it, so Save never writes it back.
 	Repo        string `yaml:"repo,omitempty"`
 	AutoPurge   bool   `yaml:"auto_purge"`   // purge scratch when a book reaches done
 	PollMinutes int    `yaml:"poll_minutes"` // open-contribution poll interval (>= 1)
@@ -319,9 +314,8 @@ type Config struct {
 	// Contribution configures the contributing stage + intake poller (M7).
 	Contribution ContributionConfig `yaml:"contribution"`
 
-	// deprecations are the one-time notices Load collected about deprecated
-	// settings it honoured (e.g. the legacy contribution.repo). Unexported, so it
-	// never reaches config.yaml; the server logs them once at startup.
+	// deprecations are notices about retired settings Load honoured (never saved;
+	// the server logs them at startup).
 	deprecations []string
 }
 
@@ -444,8 +438,12 @@ func Load(dataDir string) (Config, error) {
 			cfg.Agent.Concurrency = 0
 		}
 	}
-	foldLegacyContributionRepo(&cfg, capacityKeys.Contribution.CoreRepo != nil, "config.yaml contribution.repo")
-	applyEnv(&cfg)
+	repoSource := "config.yaml contribution.repo"
+	env := applyEnv(&cfg)
+	if env.legacyRepo {
+		repoSource = "AUDIOSILO_SIDECARS_CONTRIBUTION_REPO"
+	}
+	foldLegacyContribution(&cfg, capacityKeys.Contribution.CoreRepo != nil || env.coreRepo, repoSource)
 	if cfg.Agent.TimeoutMinutes == 0 {
 		cfg.Agent.TimeoutMinutes = DefaultTimeoutMinutes
 	}
@@ -496,8 +494,12 @@ func Load(dataDir string) (Config, error) {
 	return cfg, nil
 }
 
+// envSeen reports which contribution repo variables applyEnv found, for the
+// legacy-repo fold.
+type envSeen struct{ coreRepo, legacyRepo bool }
+
 // applyEnv overlays AUDIOSILO_SIDECARS_* environment variables onto cfg.
-func applyEnv(cfg *Config) {
+func applyEnv(cfg *Config) (seen envSeen) {
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_LISTEN"); ok {
 		cfg.Listen = v
 	}
@@ -600,13 +602,13 @@ func applyEnv(cfg *Config) {
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_MODE"); ok {
 		cfg.Contribution.Mode = strings.TrimSpace(v)
 	}
-	_, coreEnv := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_CORE_REPO")
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_CORE_REPO"); ok {
 		cfg.Contribution.CoreRepo = strings.TrimSpace(v)
+		seen.coreRepo = true
 	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_REPO"); ok {
 		cfg.Contribution.Repo = strings.TrimSpace(v)
-		foldLegacyContributionRepo(cfg, coreEnv, "AUDIOSILO_SIDECARS_CONTRIBUTION_REPO")
+		seen.legacyRepo = true
 	}
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_COMMUNITY_REPO"); ok {
 		cfg.Contribution.CommunityRepo = strings.TrimSpace(v)
@@ -624,34 +626,32 @@ func applyEnv(cfg *Config) {
 	if v, ok := os.LookupEnv("AUDIOSILO_SIDECARS_CONTRIBUTION_API_BASE_URL"); ok {
 		cfg.Contribution.APIBaseURL = strings.TrimSpace(v)
 	}
+	return seen
 }
 
-// foldLegacyContributionRepo honours the pre-split `contribution.repo` setting.
-//
-// Before the metadata database was split, one repository took every contribution.
-// Since 2026-08-21 the characters/recaps sidecars belong in the community
-// repository and the core repository's intake bot refuses them, so the legacy
-// value keeps the ONE meaning still valid for it - the core repository add-work
-// proposals go to - and never reroutes the sidecars. An explicit core_repo from
-// the same source wins (explicitCore). Either way the legacy field is cleared,
-// so a later Save writes core_repo and the notice is not repeated. source names
-// where the setting came from, for the deprecation notice.
-func foldLegacyContributionRepo(cfg *Config, explicitCore bool, source string) {
+// foldLegacyContribution honours the two retired contribution settings, each with a
+// deprecation notice. The pre-split single `repo` keeps its one still-valid meaning,
+// the CORE repo, unless an explicit core_repo (file or env) is set, which wins; it
+// never reroutes the sidecars. Mode `pr` (the direct PR) is read as issue.
+func foldLegacyContribution(cfg *Config, explicitCore bool, repoSource string) {
+	if cfg.Contribution.Mode == legacyContributionModePR {
+		cfg.Contribution.Mode = ContributionModeIssue
+		cfg.deprecations = append(cfg.deprecations,
+			`contribution.mode "pr" is retired: contributing through intake issues (the bot opens the PR)`)
+	}
 	legacy := strings.TrimSpace(cfg.Contribution.Repo)
 	cfg.Contribution.Repo = ""
-	if legacy == "" {
-		return
-	}
-	if explicitCore {
+	switch {
+	case legacy == "":
+	case explicitCore:
 		cfg.deprecations = append(cfg.deprecations, fmt.Sprintf(
-			"%s is deprecated and ignored (contribution.core_repo is also set); remove it", source))
-		return
+			"%s is deprecated and ignored (contribution.core_repo is also set); remove it", repoSource))
+	default:
+		cfg.Contribution.CoreRepo = legacy
+		cfg.deprecations = append(cfg.deprecations, fmt.Sprintf(
+			"%s is deprecated: %q is used as contribution.core_repo (add-work proposals); "+
+				"characters/recaps go to contribution.community_repo", repoSource, legacy))
 	}
-	cfg.Contribution.CoreRepo = legacy
-	cfg.deprecations = append(cfg.deprecations, fmt.Sprintf(
-		"%s is deprecated: %q is used as contribution.core_repo (add-work proposals); "+
-			"characters/recaps go to contribution.community_repo (default %s)",
-		source, legacy, DefaultContributionCommunityRepo))
 }
 
 // splitList parses a comma-separated env value into a trimmed, non-empty slice.
@@ -831,10 +831,10 @@ func (c Config) Validate() error {
 			c.ASR.Backend, ASRBackendAuto, ASRBackendMLXWhisper, ASRBackendWhisperCpp)
 	}
 	switch c.Contribution.Mode {
-	case ContributionModeIssue, ContributionModePR, ContributionModeLocal:
+	case ContributionModeIssue, ContributionModeLocal:
 	default:
-		return fmt.Errorf("contribution.mode %q must be %q, %q, or %q",
-			c.Contribution.Mode, ContributionModeIssue, ContributionModePR, ContributionModeLocal)
+		return fmt.Errorf("contribution.mode %q must be %q or %q",
+			c.Contribution.Mode, ContributionModeIssue, ContributionModeLocal)
 	}
 	if err := validateRepo("contribution.core_repo", c.Contribution.CoreRepo); err != nil {
 		return err

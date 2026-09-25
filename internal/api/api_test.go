@@ -470,7 +470,7 @@ func TestSettingsContributionPUT(t *testing.T) {
 	env := newTestEnv(t)
 	token := env.login(t)
 
-	body := `{"contribution":{"mode":"pr","core_repo":"acme/meta","community_repo":"acme/meta-community","auto_purge":false,"poll_minutes":20}}`
+	body := `{"contribution":{"mode":"local","core_repo":"acme/meta","community_repo":"acme/meta-community","auto_purge":false,"poll_minutes":20}}`
 	resp := env.do(t, http.MethodPut, "/api/v1/settings", token, body)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("put contribution = %d, want 200", resp.StatusCode)
@@ -480,7 +480,7 @@ func TestSettingsContributionPUT(t *testing.T) {
 	if env.saved == nil {
 		t.Fatal("config not persisted")
 	}
-	if env.saved.Contribution.Mode != "pr" || env.saved.Contribution.CoreRepo != "acme/meta" ||
+	if env.saved.Contribution.Mode != "local" || env.saved.Contribution.CoreRepo != "acme/meta" ||
 		env.saved.Contribution.CommunityRepo != "acme/meta-community" ||
 		env.saved.Contribution.AutoPurge || env.saved.Contribution.PollMinutes != 20 {
 		t.Errorf("saved contribution = %+v", env.saved.Contribution)
@@ -491,36 +491,9 @@ func TestSettingsContributionPUT(t *testing.T) {
 	if err := json.Unmarshal([]byte(readAll(t, resp)), &view); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if view.Contribution.Mode != "pr" || view.Contribution.AutoPurge ||
+	if view.Contribution.Mode != "local" || view.Contribution.AutoPurge ||
 		view.Contribution.CoreRepo != "acme/meta" || view.Contribution.CommunityRepo != "acme/meta-community" {
 		t.Errorf("GET after PUT = %+v", view.Contribution)
-	}
-}
-
-// TestSettingsContributionPUTLegacyRepo: an older client's single `repo` field is
-// still accepted with its one still-valid meaning, the CORE repository - it never
-// reroutes the sidecars - and an explicit core_repo in the same update wins.
-func TestSettingsContributionPUTLegacyRepo(t *testing.T) {
-	env := newTestEnv(t)
-	token := env.login(t)
-
-	resp := env.do(t, http.MethodPut, "/api/v1/settings", token, `{"contribution":{"repo":"acme/meta"}}`)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("legacy repo PUT = %d, want 200", resp.StatusCode)
-	}
-	resp.Body.Close()
-	if env.saved == nil || env.saved.Contribution.CoreRepo != "acme/meta" ||
-		env.saved.Contribution.CommunityRepo != config.DefaultContributionCommunityRepo {
-		t.Fatalf("saved = %+v, want core=acme/meta and the default community repo", env.saved)
-	}
-
-	resp = env.do(t, http.MethodPut, "/api/v1/settings", token, `{"contribution":{"repo":"old/one","core_repo":"new/one"}}`)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("both fields PUT = %d, want 200", resp.StatusCode)
-	}
-	resp.Body.Close()
-	if env.saved.Contribution.CoreRepo != "new/one" {
-		t.Fatalf("core_repo = %q, want the explicit new/one", env.saved.Contribution.CoreRepo)
 	}
 }
 
@@ -533,6 +506,12 @@ func TestSettingsContributionPUTRejectsInvalid(t *testing.T) {
 	resp := env.do(t, http.MethodPut, "/api/v1/settings", token, `{"contribution":{"mode":"email"}}`)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("bad mode = %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+	// The retired direct-PR mode loads from an old config as issue, but cannot be set.
+	resp = env.do(t, http.MethodPut, "/api/v1/settings", token, `{"contribution":{"mode":"pr"}}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("retired pr mode = %d, want 400", resp.StatusCode)
 	}
 	if body := readAll(t, resp); !strings.Contains(body, "contribution.mode") {
 		t.Errorf("400 body missing validation message: %s", body)

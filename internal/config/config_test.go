@@ -410,10 +410,10 @@ func TestContributionValidation(t *testing.T) {
 			}
 		})
 	}
-	// Valid non-default: pr mode, a custom owner/name repo, poll interval 1, an
+	// Valid non-default: local mode, a custom owner/name repo, poll interval 1, an
 	// enterprise-style api base URL.
 	good := Default()
-	good.Contribution.Mode = ContributionModePR
+	good.Contribution.Mode = ContributionModeLocal
 	good.Contribution.CoreRepo = "acme/meta"
 	good.Contribution.CommunityRepo = "acme/meta-community"
 	good.Contribution.PollMinutes = 1
@@ -427,7 +427,7 @@ func TestContributionEnvOverridesAndRoundTrip(t *testing.T) {
 	// Round-trip through Save/Load, including an explicit auto_purge=false.
 	dir := t.TempDir()
 	in := Default()
-	in.Contribution.Mode = ContributionModePR
+	in.Contribution.Mode = ContributionModeLocal
 	in.Contribution.CoreRepo = "acme/meta"
 	in.Contribution.CommunityRepo = "acme/meta-community"
 	in.Contribution.AutoPurge = false
@@ -440,7 +440,7 @@ func TestContributionEnvOverridesAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if out.Contribution.Mode != ContributionModePR || out.Contribution.CoreRepo != "acme/meta" ||
+	if out.Contribution.Mode != ContributionModeLocal || out.Contribution.CoreRepo != "acme/meta" ||
 		out.Contribution.CommunityRepo != "acme/meta-community" ||
 		out.Contribution.AutoPurge || out.Contribution.PollMinutes != 30 ||
 		out.Contribution.APIBaseURL != "https://github.acme.com/api/v3" {
@@ -493,94 +493,72 @@ func TestContributionNormalizesEmpty(t *testing.T) {
 	}
 }
 
-// TestContributionLegacyRepoFile: a config.yaml written before the metadata database
-// was split carries one `repo:` (every saved config did - Save wrote the default).
-// It keeps working as the CORE repository, its one still-valid meaning, never as the
-// sidecar target; Load says so once and a later Save drops the legacy key.
-func TestContributionLegacyRepoFile(t *testing.T) {
-	dir := t.TempDir()
-	legacy := "contribution:\n  mode: issue\n  repo: acme/meta\n"
-	if err := os.WriteFile(filepath.Join(dir, FileName), []byte(legacy), 0o600); err != nil {
-		t.Fatal(err)
+// TestContributionLegacySettings: the retired settings keep loading. The pre-split
+// `repo` (file or env) is the CORE repo - never the sidecar target - unless an
+// explicit core_repo (file or env) is set, which wins; mode "pr" loads as issue.
+// Each is reported once through Deprecations.
+func TestContributionLegacySettings(t *testing.T) {
+	cases := []struct {
+		name       string
+		file       string
+		env        map[string]string
+		wantCore   string
+		wantMode   string
+		wantNotice string
+	}{
+		{name: "file repo", file: "contribution:\n  repo: acme/meta\n",
+			wantCore: "acme/meta", wantNotice: "config.yaml contribution.repo is deprecated"},
+		{name: "file repo loses to file core_repo", file: "contribution:\n  repo: old/meta\n  core_repo: new/meta\n",
+			wantCore: "new/meta", wantNotice: "ignored"},
+		{name: "env repo", env: map[string]string{"AUDIOSILO_SIDECARS_CONTRIBUTION_REPO": "env/meta"},
+			wantCore: "env/meta", wantNotice: "AUDIOSILO_SIDECARS_CONTRIBUTION_REPO is deprecated"},
+		{name: "env repo loses to file core_repo", file: "contribution:\n  core_repo: file/core\n",
+			env: map[string]string{"AUDIOSILO_SIDECARS_CONTRIBUTION_REPO": "env/meta"}, wantCore: "file/core", wantNotice: "ignored"},
+		{name: "file repo loses to env core_repo", file: "contribution:\n  repo: file/meta\n",
+			env: map[string]string{"AUDIOSILO_SIDECARS_CONTRIBUTION_CORE_REPO": "env/core"}, wantCore: "env/core", wantNotice: "ignored"},
+		{name: "mode pr", file: "contribution:\n  mode: pr\n",
+			wantCore: DefaultContributionCoreRepo, wantMode: ContributionModeIssue, wantNotice: `"pr" is retired`},
 	}
-	cfg, err := Load(dir)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.Contribution.CoreRepo != "acme/meta" {
-		t.Errorf("core_repo = %q, want the legacy repo acme/meta", cfg.Contribution.CoreRepo)
-	}
-	if cfg.Contribution.CommunityRepo != DefaultContributionCommunityRepo {
-		t.Errorf("community_repo = %q, want the default (the legacy repo must not reroute sidecars)", cfg.Contribution.CommunityRepo)
-	}
-	if cfg.Contribution.Repo != "" {
-		t.Errorf("legacy repo = %q, want cleared after the fold", cfg.Contribution.Repo)
-	}
-	deps := cfg.Deprecations()
-	if len(deps) != 1 || !strings.Contains(deps[0], "contribution.repo") || !strings.Contains(deps[0], "core_repo") {
-		t.Fatalf("deprecations = %q, want one notice naming contribution.repo -> core_repo", deps)
-	}
-
-	// Saving writes core_repo and no repo key, so the next Load is notice-free.
-	if err := Save(dir, cfg); err != nil {
-		t.Fatal(err)
-	}
-	raw, _ := os.ReadFile(filepath.Join(dir, FileName))
-	if strings.Contains(string(raw), "\n    repo:") || !strings.Contains(string(raw), "core_repo: acme/meta") {
-		t.Errorf("saved config still carries the legacy key or lost core_repo:\n%s", raw)
-	}
-	again, err := Load(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(again.Deprecations()) != 0 || again.Contribution.CoreRepo != "acme/meta" {
-		t.Errorf("reload = %+v deprecations=%q", again.Contribution, again.Deprecations())
-	}
-}
-
-// TestContributionLegacyRepoLosesToExplicitCore: a file carrying both keys keeps the
-// explicit core_repo; the legacy key is ignored (and noted).
-func TestContributionLegacyRepoLosesToExplicitCore(t *testing.T) {
-	dir := t.TempDir()
-	both := "contribution:\n  repo: old/meta\n  core_repo: new/meta\n"
-	if err := os.WriteFile(filepath.Join(dir, FileName), []byte(both), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(dir)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.Contribution.CoreRepo != "new/meta" {
-		t.Errorf("core_repo = %q, want the explicit new/meta", cfg.Contribution.CoreRepo)
-	}
-	if deps := cfg.Deprecations(); len(deps) != 1 || !strings.Contains(deps[0], "ignored") {
-		t.Errorf("deprecations = %q, want one 'ignored' notice", deps)
-	}
-}
-
-// TestContributionLegacyRepoEnv: the legacy AUDIOSILO_SIDECARS_CONTRIBUTION_REPO
-// env var sets the core repository (with a notice) unless the new core env var is
-// also set, which wins.
-func TestContributionLegacyRepoEnv(t *testing.T) {
-	t.Setenv("AUDIOSILO_SIDECARS_CONTRIBUTION_REPO", "env/meta")
-	cfg, err := Load(t.TempDir())
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.Contribution.CoreRepo != "env/meta" || cfg.Contribution.CommunityRepo != DefaultContributionCommunityRepo {
-		t.Errorf("contribution = %+v, want core=env/meta and the default community repo", cfg.Contribution)
-	}
-	if deps := cfg.Deprecations(); len(deps) != 1 || !strings.Contains(deps[0], "AUDIOSILO_SIDECARS_CONTRIBUTION_REPO") {
-		t.Errorf("deprecations = %q", deps)
-	}
-
-	t.Setenv("AUDIOSILO_SIDECARS_CONTRIBUTION_CORE_REPO", "env/core")
-	cfg, err = Load(t.TempDir())
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.Contribution.CoreRepo != "env/core" {
-		t.Errorf("core_repo = %q, want the explicit env/core", cfg.Contribution.CoreRepo)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for k, v := range c.env {
+				t.Setenv(k, v)
+			}
+			dir := t.TempDir()
+			if c.file != "" {
+				if err := os.WriteFile(filepath.Join(dir, FileName), []byte(c.file), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg, err := Load(dir)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.Contribution.CoreRepo != c.wantCore || cfg.Contribution.CommunityRepo != DefaultContributionCommunityRepo {
+				t.Errorf("repos = %q / %q, want core %q and the default community repo",
+					cfg.Contribution.CoreRepo, cfg.Contribution.CommunityRepo, c.wantCore)
+			}
+			if c.wantMode != "" && cfg.Contribution.Mode != c.wantMode {
+				t.Errorf("mode = %q, want %q", cfg.Contribution.Mode, c.wantMode)
+			}
+			if deps := cfg.Deprecations(); len(deps) != 1 || !strings.Contains(deps[0], c.wantNotice) {
+				t.Errorf("deprecations = %q, want one containing %q", deps, c.wantNotice)
+			}
+			// Saving drops the legacy key, so the next Load is notice-free.
+			if err := Save(dir, cfg); err != nil {
+				t.Fatal(err)
+			}
+			for k := range c.env {
+				_ = os.Unsetenv(k) // re-read without it; t.Setenv restores it after
+			}
+			again, err := Load(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(again.Deprecations()) != 0 || again.Contribution.CoreRepo != c.wantCore {
+				t.Errorf("reload = %+v deprecations=%q", again.Contribution, again.Deprecations())
+			}
+		})
 	}
 }
 

@@ -4,13 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 )
 
 const testRepo = "KodeStar/audiosilo-meta"
@@ -113,151 +111,6 @@ func TestCreateGist(t *testing.T) {
 	}
 }
 
-// TestEnsureFork exercises the POST-then-poll flow: the fork GET 404s once
-// before becoming ready.
-func TestEnsureFork(t *testing.T) {
-	orig := forkPollInterval
-	forkPollInterval = time.Millisecond // fast poll for the test
-	t.Cleanup(func() { forkPollInterval = orig })
-	fork := "tester/audiosilo-meta"
-	var getCount int
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/repos/"+testRepo+"/forks":
-			w.WriteHeader(http.StatusAccepted)
-			io.WriteString(w, `{"full_name":"`+fork+`"}`)
-		case r.Method == http.MethodGet && r.URL.Path == "/repos/"+fork:
-			getCount++
-			if getCount == 1 {
-				w.WriteHeader(http.StatusNotFound)
-				io.WriteString(w, `{"message":"Not Found"}`)
-				return
-			}
-			io.WriteString(w, `{"full_name":"`+fork+`"}`)
-		default:
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-	})
-	got, err := c.EnsureFork(context.Background(), testRepo)
-	if err != nil {
-		t.Fatalf("EnsureFork: %v", err)
-	}
-	if got != fork {
-		t.Fatalf("fork = %q", got)
-	}
-	if getCount < 2 {
-		t.Fatalf("expected the readiness poll to retry, getCount=%d", getCount)
-	}
-}
-
-func TestBranchSHAAndCreateRef(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/repos/"+testRepo+"/git/ref/heads/main":
-			io.WriteString(w, `{"object":{"sha":"deadbeef"}}`)
-		case r.Method == http.MethodPost && r.URL.Path == "/repos/"+testRepo+"/git/refs":
-			body := readJSON(t, r)
-			if body["ref"] != "refs/heads/sidecars/x-1" || body["sha"] != "deadbeef" {
-				t.Fatalf("ref body = %v", body)
-			}
-			w.WriteHeader(http.StatusCreated)
-			io.WriteString(w, `{}`)
-		default:
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-	})
-	sha, err := c.BranchSHA(context.Background(), testRepo, "main")
-	if err != nil || sha != "deadbeef" {
-		t.Fatalf("BranchSHA = %q, %v", sha, err)
-	}
-	if err := c.CreateRef(context.Background(), testRepo, "refs/heads/sidecars/x-1", sha); err != nil {
-		t.Fatalf("CreateRef: %v", err)
-	}
-}
-
-func TestMergeUpstream(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/repos/tester/audiosilo-meta/merge-upstream" {
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-		body := readJSON(t, r)
-		if body["branch"] != "main" {
-			t.Fatalf("branch = %v", body["branch"])
-		}
-		io.WriteString(w, `{"merged":true}`)
-	})
-	if err := c.MergeUpstream(context.Background(), "tester/audiosilo-meta", "main"); err != nil {
-		t.Fatalf("MergeUpstream: %v", err)
-	}
-}
-
-func TestBranchRef(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/git/ref/heads/present"):
-			io.WriteString(w, `{"object":{"sha":"cafe"}}`)
-		case strings.HasSuffix(r.URL.Path, "/git/ref/heads/absent"):
-			w.WriteHeader(http.StatusNotFound)
-		default:
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-	})
-	sha, exists, err := c.BranchRef(context.Background(), testRepo, "present")
-	if err != nil || !exists || sha != "cafe" {
-		t.Fatalf("present branch = (%q, %v, %v)", sha, exists, err)
-	}
-	_, exists, err = c.BranchRef(context.Background(), testRepo, "absent")
-	if err != nil || exists {
-		t.Fatalf("absent branch = (exists=%v, err=%v), want (false, nil)", exists, err)
-	}
-}
-
-// TestFindOpenPRByHead: an open PR for the head is returned found=true; an empty list is
-// found=false.
-func TestFindOpenPRByHead(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if got := r.URL.Query().Get("head"); got != "tester:sidecars/x-1" {
-			t.Fatalf("head = %q", got)
-		}
-		if got := r.URL.Query().Get("state"); got != "open" {
-			t.Fatalf("state = %q, want open", got)
-		}
-		io.WriteString(w, `[{"number":7,"html_url":"https://github.com/x/y/pull/7","state":"open"}]`)
-	})
-	pr, found, err := c.FindOpenPRByHead(context.Background(), testRepo, "tester:sidecars/x-1")
-	if err != nil || !found || pr.Number != 7 {
-		t.Fatalf("FindOpenPRByHead = (%+v, %v, %v)", pr, found, err)
-	}
-
-	c2 := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, `[]`)
-	})
-	if _, found, err := c2.FindOpenPRByHead(context.Background(), testRepo, "tester:none"); err != nil || found {
-		t.Fatalf("empty = (found=%v, err=%v), want (false, nil)", found, err)
-	}
-}
-
-func TestCreatePull(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/repos/"+testRepo+"/pulls" {
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-		body := readJSON(t, r)
-		if body["head"] != "tester:sidecars/x-1" || body["base"] != "main" {
-			t.Fatalf("pull body = %v", body)
-		}
-		w.WriteHeader(http.StatusCreated)
-		io.WriteString(w, `{"number":99,"html_url":"https://github.com/x/y/pull/99","state":"open"}`)
-	})
-	pr, err := c.CreatePull(context.Background(), testRepo, "tester:sidecars/x-1", "main", "title", "body")
-	if err != nil {
-		t.Fatalf("CreatePull: %v", err)
-	}
-	if pr.Number != 99 || pr.URL != "https://github.com/x/y/pull/99" {
-		t.Fatalf("pr = %+v", pr)
-	}
-}
-
 // TestFindIntakePR checks the head-branch query and merged_at -> Merged mapping.
 func TestFindIntakePR(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -300,83 +153,35 @@ func TestGetPullMerged(t *testing.T) {
 		if r.URL.Path != "/repos/"+testRepo+"/pulls/123" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
-		io.WriteString(w, `{"number":123,"html_url":"u","state":"closed","merged":true,"merge_commit_sha":"m3rg3","commits":2}`)
+		io.WriteString(w, `{"number":123,"html_url":"u","state":"closed","merged":true,"base":{"sha":"b4se"},"head":{"sha":"h3ad"}}`)
 	})
 	pr, err := c.GetPull(context.Background(), testRepo, 123)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !pr.Merged || pr.State != "closed" || pr.MergeCommitSHA != "m3rg3" || pr.Commits != 2 {
+	if !pr.Merged || pr.State != "closed" || pr.BaseSHA != "b4se" || pr.HeadSHA != "h3ad" {
 		t.Fatalf("pr = %+v", pr)
 	}
 }
 
-// TestGetPullOpenHidesTestMergeSHA: an OPEN PR's merge_commit_sha is GitHub's
-// test-merge commit, not a commit on the base branch, so it is not surfaced.
-func TestGetPullOpenHidesTestMergeSHA(t *testing.T) {
+func TestCompare(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, `{"number":1,"html_url":"u","state":"open","merged":false,"merge_commit_sha":"test-merge"}`)
-	})
-	pr, err := c.GetPull(context.Background(), testRepo, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pr.MergeCommitSHA != "" {
-		t.Fatalf("open PR merge sha = %q, want empty", pr.MergeCommitSHA)
-	}
-}
-
-func TestCompareFiles(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/repos/"+testRepo+"/compare/b4se...m3rg3" {
+		if r.URL.Path != "/repos/"+testRepo+"/compare/b4se...h3ad" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
-		io.WriteString(w, `{"files":[{"filename":"data/works/c/cat.json","status":"modified"},`+
+		io.WriteString(w, `{"merge_base_commit":{"sha":"mb"},"files":[{"filename":"data/works/c/cat.json","status":"modified"},`+
 			`{"filename":"data/works/c/dog.json","status":"renamed","previous_filename":"data/works/c/cow.json"}]}`)
 	})
-	files, err := c.CompareFiles(context.Background(), testRepo, "b4se", "m3rg3")
+	got, err := c.Compare(context.Background(), testRepo, "b4se", "h3ad")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []PullFile{
-		{Filename: "data/works/c/cat.json", Status: "modified"},
-		{Filename: "data/works/c/dog.json", Status: "renamed", PreviousFilename: "data/works/c/cow.json"},
+	want := []ChangedFile{
+		{Filename: "data/works/c/cat.json"},
+		{Filename: "data/works/c/dog.json", PreviousFilename: "data/works/c/cow.json"},
 	}
-	if len(files) != 2 || files[0] != want[0] || files[1] != want[1] {
-		t.Fatalf("files = %+v", files)
-	}
-}
-
-// TestPullCommits: oldest first, message + author date, paginated past a full page.
-func TestPullCommits(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/repos/"+testRepo+"/pulls/9/commits" {
-			t.Fatalf("unexpected path %s", r.URL.Path)
-		}
-		switch r.URL.Query().Get("page") {
-		case "1":
-			var b strings.Builder
-			b.WriteString("[")
-			for i := range 100 {
-				if i > 0 {
-					b.WriteString(",")
-				}
-				fmt.Fprintf(&b, `{"sha":"s%d","commit":{"message":"m%d","author":{"date":"d%d"}}}`, i, i, i)
-			}
-			b.WriteString("]")
-			io.WriteString(w, b.String())
-		case "2":
-			io.WriteString(w, `[{"sha":"last","commit":{"message":"final","author":{"date":"2026-09-25T00:00:00Z"}}}]`)
-		default:
-			t.Fatalf("unexpected page %q", r.URL.Query().Get("page"))
-		}
-	})
-	got, err := c.PullCommits(context.Background(), testRepo, 9)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 101 || got[0].Message != "m0" || got[100].Message != "final" || got[100].AuthorDate != "2026-09-25T00:00:00Z" {
-		t.Fatalf("commits = %d, first %+v, last %+v", len(got), got[0], got[len(got)-1])
+	if got.MergeBase != "mb" || len(got.Files) != 2 || got.Files[0] != want[0] || got.Files[1] != want[1] {
+		t.Fatalf("compare = %+v", got)
 	}
 }
 
@@ -402,141 +207,6 @@ func TestFileAt(t *testing.T) {
 	_, found, err = c.FileAt(context.Background(), testRepo, "data/works/0/gone.json", "abc123")
 	if err != nil || found {
 		t.Fatalf("missing file: found=%v err=%v, want found=false and no error", found, err)
-	}
-}
-
-func TestGetCommitAndDefaultBranch(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/repos/" + testRepo + "/git/commits/c1":
-			io.WriteString(w, `{"sha":"c1","tree":{"sha":"t1"},"parents":[{"sha":"p1"},{"sha":"p2"}],`+
-				`"message":"intake: issue #3","author":{"date":"2026-09-25T10:00:00Z"}}`)
-		case "/repos/" + testRepo:
-			io.WriteString(w, `{"full_name":"x","default_branch":"trunk"}`)
-		default:
-			t.Fatalf("unexpected path %s", r.URL.Path)
-		}
-	})
-	cm, err := c.GetCommit(context.Background(), testRepo, "c1")
-	if err != nil || cm.TreeSHA != "t1" || len(cm.Parents) != 2 || cm.Parents[0] != "p1" ||
-		cm.Message != "intake: issue #3" || cm.AuthorDate != "2026-09-25T10:00:00Z" {
-		t.Fatalf("commit = %+v err=%v", cm, err)
-	}
-	br, err := c.DefaultBranch(context.Background(), testRepo)
-	if err != nil || br != "trunk" {
-		t.Fatalf("default branch = %q err=%v", br, err)
-	}
-}
-
-// TestCommitFiles: one commit through the git data API - a blob per written file, a
-// tree over the parent's tree carrying a NULL sha for a deleted path (the only way
-// the trees API removes a file), and a commit whose only parent is the parent.
-func TestCommitFiles(t *testing.T) {
-	var treeBody map[string]any
-	var commitBody map[string]any
-	blobs := 0
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/repos/f/r/git/commits/base":
-			io.WriteString(w, `{"sha":"base","tree":{"sha":"basetree"},"parents":[]}`)
-		case r.Method == http.MethodPost && r.URL.Path == "/repos/f/r/git/blobs":
-			body := readJSON(t, r)
-			if body["encoding"] != "base64" {
-				t.Fatalf("blob encoding = %v", body["encoding"])
-			}
-			blobs++
-			w.WriteHeader(http.StatusCreated)
-			fmt.Fprintf(w, `{"sha":"blob%d"}`, blobs)
-		case r.Method == http.MethodPost && r.URL.Path == "/repos/f/r/git/trees":
-			treeBody = readJSON(t, r)
-			w.WriteHeader(http.StatusCreated)
-			io.WriteString(w, `{"sha":"newtree"}`)
-		case r.Method == http.MethodPost && r.URL.Path == "/repos/f/r/git/commits":
-			commitBody = readJSON(t, r)
-			w.WriteHeader(http.StatusCreated)
-			io.WriteString(w, `{"sha":"newcommit"}`)
-		default:
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-	})
-	sha, err := c.CommitFiles(context.Background(), "f/r", "base", "msg",
-		map[string][]byte{"data/b.json": []byte("b"), "data/a.json": []byte("a")}, []string{"data/old.json"})
-	if err != nil || sha != "newcommit" {
-		t.Fatalf("CommitFiles = %q, %v", sha, err)
-	}
-	if blobs != 2 || treeBody["base_tree"] != "basetree" {
-		t.Fatalf("blobs=%d tree=%v", blobs, treeBody)
-	}
-	entries := treeBody["tree"].([]any)
-	if len(entries) != 3 {
-		t.Fatalf("tree entries = %v", entries)
-	}
-	first := entries[0].(map[string]any)
-	last := entries[2].(map[string]any)
-	if first["path"] != "data/a.json" || first["sha"] != "blob1" {
-		t.Fatalf("first entry = %v (want the sorted, blobbed a.json)", first)
-	}
-	if last["path"] != "data/old.json" || last["sha"] != nil {
-		t.Fatalf("deletion entry = %v, want a null sha", last)
-	}
-	if v, ok := last["sha"]; !ok || v != nil {
-		t.Fatalf("deletion must carry an explicit null sha: %v", last)
-	}
-	parents := commitBody["parents"].([]any)
-	if commitBody["tree"] != "newtree" || len(parents) != 1 || parents[0] != "base" {
-		t.Fatalf("commit body = %v", commitBody)
-	}
-}
-
-func TestUpdateRef(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPatch || r.URL.Path != "/repos/f/r/git/refs/heads/sidecars/x-1" {
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-		body := readJSON(t, r)
-		if body["sha"] != "s" || body["force"] != true {
-			t.Fatalf("body = %v", body)
-		}
-		io.WriteString(w, `{}`)
-	})
-	if err := c.UpdateRef(context.Background(), "f/r", "sidecars/x-1", "s"); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// TestTarballFollowsRedirectAndCaps: the tarball endpoint 302s to an archive host;
-// the stream is handed to fn, and a body over the cap fails the read rather than
-// being truncated silently.
-func TestTarballFollowsRedirectAndCaps(t *testing.T) {
-	var srvURL string
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/repos/f/r/tarball/abc":
-			http.Redirect(w, r, srvURL+"/archive", http.StatusFound)
-		case "/archive":
-			io.WriteString(w, "0123456789")
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	})
-	srvURL = c.baseURL
-	var got []byte
-	if err := c.Tarball(context.Background(), "f/r", "abc", 10, func(r io.Reader) error {
-		var err error
-		got, err = io.ReadAll(r)
-		return err
-	}); err != nil || string(got) != "0123456789" {
-		t.Fatalf("Tarball = %q, %v", got, err)
-	}
-	err := c.Tarball(context.Background(), "f/r", "abc", 9, func(r io.Reader) error {
-		_, err := io.ReadAll(r)
-		return err
-	})
-	if !errors.Is(err, errTooLarge) {
-		t.Fatalf("over-cap tarball err = %v, want errTooLarge", err)
-	}
-	if err := c.Tarball(context.Background(), "f/r", "missing", 10, func(io.Reader) error { return nil }); err == nil {
-		t.Fatal("a 404 tarball must error")
 	}
 }
 
