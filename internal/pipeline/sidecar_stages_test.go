@@ -347,6 +347,90 @@ func TestValidateSkipsNgramForSchemaInvalidSidecars(t *testing.T) {
 	}
 }
 
+// TestValidateScansThroughViolationsNgramAccepts: a schema violation extract.NGram
+// reads through (an over-cap description, an empty aliases list, an empty role) must
+// not skip the scan, or a verbatim run in that file surfaces a whole fix round late.
+func TestValidateScansThroughViolationsNgramAccepts(t *testing.T) {
+	const stolen = "the ancient tower stood alone against the crimson sky"
+	work := t.TempDir()
+	seedSidecarManifest(t, work)
+	chars := baseChars("book")
+	chars.Characters[0].Description = "In this book, " + stolen + " throughout. " + strings.Repeat("a", capDescription)
+	seedWorkSidecars(t, work, chars, baseRecaps("book"))
+	seedTranscriptsText(t, work, "before it "+stolen+" after it", "unrelated text here")
+
+	path := filepath.Join(work, sidecarsDir, charactersFileName)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatal(err)
+	}
+	c0 := obj["characters"].([]any)[0].(map[string]any)
+	c0["aliases"] = []any{}
+	c0["role"] = ""
+	writeJSON(t, path, obj)
+
+	schemas, err := sidecarSchemas()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, refused := schemaViolation(schemas["characters"], raw); v == "" || refused {
+		t.Fatalf("schemaViolation = %q, refused=%v; want a violation NGram does not refuse", v, refused)
+	}
+
+	exe := NewExecutor(Config{DataDir: t.TempDir(), Fallback: scheduler.NewStubExecutor(0, 0)})
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Validating, scheduler.StageReport{}); err != nil {
+		t.Fatalf("validating: %v", err)
+	}
+	rep := readValidationReport(t, work)
+	if containsSub(rep.Errors, "n-gram check skipped") {
+		t.Errorf("errors %v: the scan was skipped over a violation NGram accepts", rep.Errors)
+	}
+	if !containsSub(rep.Errors, "near-verbatim overlap") || !containsSub(rep.Errors, "in "+charactersFileName+" vs") {
+		t.Errorf("errors %v: the overlap in characters.json was not reported in this round", rep.Errors)
+	}
+}
+
+// TestSchemaViolationIsDeterministic: the validator walks an object's properties in
+// map order, so with several violations its own first leaf varies run to run. The
+// finding must name the same violation every time (and count the rest).
+func TestSchemaViolationIsDeterministic(t *testing.T) {
+	schemas, err := sidecarSchemas()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(baseRecaps("book"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatal(err)
+	}
+	obj["in_short"] = 42
+	obj["ending"] = nil
+	obj["license"] = "CC0-1.0"
+	if raw, err = json.Marshal(obj); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := schemaViolation(schemas["recaps"], raw)
+	if !strings.HasPrefix(first, "/ending: ") || !strings.HasSuffix(first, "(and 2 more)") {
+		t.Fatalf("violation = %q, want the smallest location first and a count of the rest", first)
+	}
+	for range 50 {
+		if got, _ := schemaViolation(schemas["recaps"], raw); got != first {
+			t.Fatalf("violation changed between runs: %q then %q", first, got)
+		}
+	}
+}
+
 // --- auditing ---
 
 func seedForAudit(t *testing.T, work string, valClean bool) {

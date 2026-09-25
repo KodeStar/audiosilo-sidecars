@@ -70,7 +70,10 @@ scripts/build-web.sh          # builds web/, syncs into internal/web/dist, build
 
 **Before a change is done, run all of the above for the side(s) you touched.**
 golangci-lint is **v2** at a **green baseline** - fix new findings, don't widen
-excludes (matches the server/meta repos' policy). Go 1.26; Node 24.
+excludes (matches the server/meta repos' policy). Go 1.26; Node 24. CI's
+setup-go reads the bare minor from `.go-version` with `check-latest` (go.mod's
+exact `go` floor would pin builds to its .0 patch), so a Go bump is three edits:
+go.mod's `go` line, `.go-version`, and the Dockerfile's `golang:` tag.
 
 > Before adding code, read the workspace **[CODE-HEALTH.md](../CODE-HEALTH.md)** -
 > Definition of Done + the recurring drift patterns. Especially: keep business

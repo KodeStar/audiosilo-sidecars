@@ -79,7 +79,7 @@ func (e *Executor) validateSidecarsStage(ctx context.Context, book store.Book, r
 		warns = append(warns, structWarns...)
 	}
 
-	// No-verbatim n-gram check over the schema-valid sidecars: every overlap is an ERROR.
+	// No-verbatim n-gram check over the sidecars NGram accepts: every overlap is an ERROR.
 	scannable, gate, err := ngramGate(charsPath, recapsPath)
 	if err != nil {
 		return scheduler.StageResult{}, fmt.Errorf("validating: %w", err)
@@ -150,9 +150,10 @@ func decodeForValidation(charsPath, recapsPath string) (*model.Characters, *mode
 	return chars, recs, findings
 }
 
-// ngramGate returns the sidecars VALID against meta's embedded schema, plus one
-// finding per invalid file, because extract.NGram hard-fails on a record its schema
-// rejects and that must be a finding the fixer repairs, not a failed stage.
+// ngramGate returns the sidecars extract.NGram can scan, plus one finding per file
+// it would refuse (a schema violation schemaViolation marks refused), because NGram
+// hard-fails on such a record and that must be a finding the fixer repairs, not a
+// failed stage.
 func ngramGate(charsPath, recapsPath string) (scannable, findings []string, err error) {
 	schemas, err := sidecarSchemas()
 	if err != nil {
@@ -166,7 +167,7 @@ func ngramGate(charsPath, recapsPath string) (scannable, findings []string, err 
 		if err != nil {
 			return nil, nil, err
 		}
-		if v := firstSchemaViolation(schemas[f.kind], raw); v != "" {
+		if v, refused := schemaViolation(schemas[f.kind], raw); refused {
 			findings = append(findings, fmt.Sprintf("n-gram check skipped until %s satisfies the %s schema: %s",
 				filepath.Base(f.path), f.kind, v))
 			continue
