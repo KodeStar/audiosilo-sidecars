@@ -29,10 +29,15 @@ internal/
             timeout_minutes, and the per-stage claude/openai model maps (keys are agent
             stage names). Validate rejects an unknown backend, an unknown model-map key,
             or timeout_minutes < 1; Default() seeds the claude map. M7 added
-            contribution.{mode [issue|pr|local], repo, auto_purge, poll_minutes,
-            api_base_url} (restart-to-apply; api_base_url exists for tests/GHE;
-            Validate rejects an unknown mode, a non-owner/name repo, poll_minutes < 1,
-            a non-http(s) api_base_url). The reliability round added
+            contribution.{mode [issue|pr|local], core_repo, community_repo, auto_purge,
+            poll_minutes, api_base_url} (restart-to-apply; api_base_url exists for
+            tests/GHE; Validate rejects an unknown mode, a non-owner/name repo,
+            poll_minutes < 1, a non-http(s) api_base_url). core_repo (default
+            KodeStar/audiosilo-meta) takes add-work proposals, community_repo (default
+            KodeStar/audiosilo-meta-community) the sidecars. The pre-split single
+            `repo` (yaml or AUDIOSILO_SIDECARS_CONTRIBUTION_REPO) is folded into
+            core_repo by Load (an explicit core_repo wins), cleared so Save drops it,
+            and reported through Config.Deprecations (server logs it once per start). The reliability round added
             agent.book_budget_usd (default 75; 0 in yaml normalizes to the default, so
             set a very large value to effectively disable; Validate rejects negative;
             env AUDIOSILO_SIDECARS_AGENT_BOOK_BUDGET_USD; restart-to-apply like the
@@ -327,7 +332,19 @@ internal/
             M7 made contributing real (contrib_stage.go: slug reconcile -> skip-if-
             covered -> submit per contribution.mode, resume-idempotent via the
             contributions rows; export.go composes the download zip + core-proposal
-            JSON injected into api) - EVERY stage is now real.
+            JSON injected into api) - EVERY stage is now real. The stage contributes
+            to contribution.COMMUNITY_repo only (Config.ContribCommunityRepo): issue
+            mode opens the intake issue there, PR mode commits a pkg/pack edit of the
+            work's works-community entry (contrib.PrepareCommunityEdit + CommitFiles,
+            one commit, force-moving a leftover branch; an already-present member or
+            any preparation failure reroutes that dimension to an intake issue with a
+            row note - never a broken PR; rate limit/park/cancel still propagate),
+            local mode and the zip write the bare sidecar file <slug>/<kind>.json. A
+            recorded work id the catalogue 301s is replaced by the survivor; one that
+            404s while the book's core row is MERGED parks core_pending with
+            contrib.ReleaseWaitMsg (the release gate - the poller re-admits), and a
+            core row answered duplicate (already_covered) parks core_needed with
+            CoreDuplicateMsg for a human to Set work.
             spelling_research additionally assembles OUTSIDE spelling evidence before
             it stages anything: referenceSources() ranks the metaops series glossary
             and the publisher's marker titles as VERIFIED against the predecessor's
@@ -546,13 +563,29 @@ internal/
             already-recorded core issue, persists the row BEFORE the park flip;
             SetWork validates the slug upstream), and the poller (jittered
             poll_minutes tick; issue rows advance submitted -> pr_open [FindIntakePR
-            on branch intake/issue-<n>] -> merged/closed; a merged core PR's files
-            name data/works/<shard>/<slug>/work.json [meta's RETIRED per-record
-            layout, sharded by LegacyShard, layout.go - stale upstream, see
-            CLAUDE.md] -> SetBookWorkID [regardless of
-            park state] -> Readmit [only when parked core_pending]; targeted
-            ListBooksWithUnresolvedMergedCore query, no full scans; tokenless reads
-            work). Imports neither scheduler nor api - reaches them via injected
+            on branch intake/issue-<n>] -> merged/closed, and an issue the intake bot
+            labelled data:needs-human / data:invalid / data:duplicate instead surfaces
+            that verdict + the bot comment's message lines as the note's LAST segment
+            (store.ContribNoteIntake*; duplicate -> already_covered, and on a core row
+            re-admits the book); a merged core PR's slug is learned from ENTRY KEYS
+            (learnCreatedWork: every changed data/works/*.json pack, rename sources
+            included, read at the merge commit and its first parent via FileAt +
+            pack.Parse, one key set per side - a split's moved keys cancel; exactly
+            one new key or a noted refusal on the core row, never a guess) ->
+            SetBookWorkID [regardless of park state] -> admitWhenLive (the RELEASE
+            GATE: ResolveWork must find the work in the published catalogue, a 301
+            adopting the survivor; until then the book stays core_pending with
+            ReleaseWaitMsg and releaseCorePending re-checks every tick via
+            ListBooksAwaitingRelease) -> Readmit [only when parked core_pending];
+            targeted store queries, no full scans; tokenless reads work). PR mode's
+            pack edit lives here too (communitytree.go: PrepareCommunityEdit fetches
+            the fork's community tarball, ExtractCommunityData keeps only
+            data/works-community/**.json under size/path caps, EditCommunityTree is
+            the pkg/pack read-modify-write under ProfileCommunity - an existing member
+            REFUSED - then Flush + check.LoadProfile; Client.CommitFiles commits the
+            result as one git-data commit). ServiceDeps.CoreRepo is where SubmitCore
+            opens add-work issues; every other call follows the repo a row records.
+            Imports neither scheduler nor api - reaches them via injected
             Readmit/Publish seams.
   auth/     single admin password (argon2id, generated + printed once on first run),
             opaque SHA-256-hashed session tokens, a per-IP login rate limiter; the

@@ -631,3 +631,43 @@ Milestones from the workspace plan; each is shippable.
   drift guard is STRICT again: `stalePinLicenseContent` and
   `TestSidecarLicenseIsTheCommunityLayerValue` are gone, since the upstream
   enum is now CC-BY-SA-4.0 and plain equality holds. Gate: full Go gate green.
+
+- **Contributions follow the community-repo split (2026-09-25).** Since
+  2026-08-21 the CC BY-SA layer lives in KodeStar/audiosilo-meta-community and
+  meta's core intake refuses a sidecar (needs-human, "open it on the community
+  repository"), so every default-mode submission this tool made was refused,
+  and every path still spelled the retired per-record layout. Now: two
+  settings, `contribution.core_repo` (add-work) and
+  `contribution.community_repo` (sidecars), with the legacy `contribution.repo`
+  folded into core_repo plus a deprecation line (`Config.Deprecations`,
+  logged once per start; a Save drops the key); API + Settings UI carry both.
+  PR mode is a real pack edit: the fork's community tree comes down as one
+  tarball (`Client.Tarball`, capped), `contrib.EditCommunityTree` places the
+  members through `pkg/pack` under `ProfileCommunity` (read-modify-write of the
+  entry; an existing member is REFUSED, never overwritten - that dimension
+  goes through an intake issue with a row note), flushes (placement, due
+  splits, canonical render), validates with `check.LoadProfile`, and
+  `Client.CommitFiles` lands exactly the changed packs as ONE git-data commit
+  (deleted paths as null-sha tree entries). Any preparation failure other than
+  a rate limit / park / cancellation reroutes to issue mode with a note rather
+  than opening a broken PR. Local mode and the export zip write the bare
+  sidecar file (`<slug>/<kind>.json`, what an issue attachment takes);
+  `contrib.LegacyShard` is gone. The poller learns a merged add-work PR's slug
+  by diffing entry keys across all changed `data/works/*.json` packs between
+  the merge commit and its first parent (moved keys cancel out, so a split is
+  handled; none or several is noted on the core row, never guessed), then
+  applies the RELEASE GATE: the book is re-admitted only once the published
+  catalogue holds the work (a 301 adopts the survivor slug, which metaops now
+  surfaces as `Coverage.WorkID`), since the community intake verifies a key
+  against the newest data release - until then it waits parked core_pending
+  with `contrib.ReleaseWaitMsg` and a per-tick release pass re-checks. The
+  intake bot's verdict labels (data:needs-human / data:invalid /
+  data:duplicate) and its latest verdict comment are surfaced as the row's
+  note instead of "intake PR overdue"; a duplicate is `already_covered`
+  (landed, not an error), and on a core row it re-admits the book (which asks
+  a human to Set work when no identifier reaches the existing work). The
+  authoring prompt describes the sidecar file, not a storage layout. The
+  round-trip test runs metaissue as each repo's bot does (community profile +
+  a metabuild artifact as `--works-db`; core profile for add-work) - verified
+  ok against meta HEAD, plus the "unreleased work is refused" case the gate
+  exists for.

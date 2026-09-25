@@ -216,11 +216,22 @@ Operative caveats surviving from that history:
   pre-M5 `markers_normalizing`/`qa_adjudicating` are safe (those parks wrote
   no sentinel).
 - **audiosilo-meta is pinned at v0.17.0** and the schema drift guard
-  (`internal/pipeline/schema_drift_test.go`) is strict. The contribution paths
-  (PR-mode writes, local export, the poller's slug lookup) still address meta's
-  RETIRED per-record layout through `contrib.LegacyShard`; upstream is
-  range-packed and its CC BY-SA layer lives in KodeStar/audiosilo-meta-community,
-  so they need their own redesign. Background: HISTORY.md (2026-09-25).
+  (`internal/pipeline/schema_drift_test.go`) is strict. Background: HISTORY.md
+  (2026-09-25).
+- **The metadata database is TWO repositories** (since 2026-08-21):
+  `contribution.core_repo` (default KodeStar/audiosilo-meta) takes add-work
+  proposals, `contribution.community_repo` (default
+  KodeStar/audiosilo-meta-community) the characters/recaps sidecars - the core
+  repo's intake bot refuses a sidecar. The legacy single `contribution.repo`
+  (config or `AUDIOSILO_SIDECARS_CONTRIBUTION_REPO`) is still read, as the CORE
+  repo only, with a startup deprecation line; a contribution row keeps the repo
+  it was made against. Upstream storage is range-packed (meta PACK-SPEC.md): PR
+  mode writes a sidecar as a MEMBER of its work's works-community entry through
+  meta's own `pkg/pack` + `pkg/check`, never a hand-computed path, and the
+  poller learns a merged add-work's slug from ENTRY KEYS, never from a file
+  name. The env-gated round trips: `AUDIOSILO_META_DIR` (compose_roundtrip_test,
+  metaissue under `--profile community --works-db` / `--profile core`) and
+  `AUDIOSILO_META_COMMUNITY_DIR` (the pack edit over a copy of the real tree).
 - **whisper.cpp binaries ship on their own cadence** (`whisper-binaries.yml`,
   a separate release `toolfetch` consumes; publish first, then bump
   `toolfetch.WhisperCLIReleaseTag`) - never couple them into
