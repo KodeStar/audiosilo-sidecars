@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -934,5 +935,76 @@ func TestTTLCacheEvictsExpiredFirst(t *testing.T) {
 	// A stale entry from the first batch must be gone (expired-first eviction).
 	if _, ok := c.get(0); ok {
 		t.Error("expired entry 0 survived eviction")
+	}
+}
+
+// TestCoverageForWorkFollowsRetiredSlug: meta answers a slug a merge has RETIRED with
+// a 301 to the surviving slug. The verdict must name the survivor (the HTTP client
+// follows the redirect and the body carries the live id), so a caller adopts it
+// rather than attaching sidecars to a tombstoned key.
+func TestCoverageForWorkFollowsRetiredSlug(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/works/old-slug":
+			w.Header().Set("Location", "/api/v1/works/new-slug")
+			w.WriteHeader(http.StatusMovedPermanently)
+			_, _ = w.Write([]byte(`{"redirect":"new-slug"}`))
+		case "/api/v1/works/new-slug":
+			_, _ = w.Write([]byte(`{"id":"new-slug","title":"Survivor"}`))
+		case "/api/v1/works/no-id":
+			_, _ = w.Write([]byte(`{"title":"Older server"}`)) // no id field
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.URL)
+
+	got, err := c.CoverageForWork(context.Background(), "old-slug")
+	if err != nil {
+		t.Fatalf("CoverageForWork: %v", err)
+	}
+	if got.WorkID != "new-slug" || got.WorkTitle != "Survivor" {
+		t.Fatalf("retired slug verdict = %+v, want the survivor new-slug", got)
+	}
+	// A body without an id keeps the id that was asked for.
+	got, err = c.CoverageForWork(context.Background(), "no-id")
+	if err != nil || got.WorkID != "no-id" {
+		t.Fatalf("id-less body = %+v, %v, want no-id", got, err)
+	}
+}
+
+// TestFreshCoverageForWorkSeesARetirementTheCacheHides: a work read live is cached
+// for an hour under its slug, so a merge retiring that slug inside the hour is
+// invisible to CoverageForWork. FreshCoverageForWork - what the adopt / release-gate
+// path reads - bypasses the cache and follows the new 301.
+func TestFreshCoverageForWorkSeesARetirementTheCacheHides(t *testing.T) {
+	var retired atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/works/old-slug" && retired.Load():
+			http.Redirect(w, r, "/api/v1/works/new-slug", http.StatusMovedPermanently)
+		case r.URL.Path == "/api/v1/works/old-slug":
+			_, _ = w.Write([]byte(`{"id":"old-slug","title":"Before"}`))
+		case r.URL.Path == "/api/v1/works/new-slug":
+			_, _ = w.Write([]byte(`{"id":"new-slug","title":"Survivor"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.URL)
+	ctx := context.Background()
+
+	if got, err := c.CoverageForWork(ctx, "old-slug"); err != nil || got.WorkID != "old-slug" {
+		t.Fatalf("warm read = %+v, %v", got, err)
+	}
+	retired.Store(true)
+	if got, _ := c.CoverageForWork(ctx, "old-slug"); got.WorkID != "old-slug" {
+		t.Fatalf("cached read = %q; the cache is expected to hide the retirement", got.WorkID)
+	}
+	got, err := c.FreshCoverageForWork(ctx, "old-slug")
+	if err != nil || got.WorkID != "new-slug" {
+		t.Fatalf("fresh read = %+v, %v, want the survivor new-slug", got, err)
 	}
 }

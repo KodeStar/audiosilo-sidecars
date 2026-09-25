@@ -43,32 +43,31 @@ func (f fakeTokenResolver) Resolve(context.Context) (string, string, error) {
 
 // createdIssue records an issue the fake GitHub server was asked to open.
 type createdIssue struct {
+	repo   string // owner/name the issue was opened on
 	number int
 	title  string
 	body   string
 	labels []string
 }
 
-// fakeGitHub stands in for api.github.com for the contribution client.
+// fakeGitHub stands in for api.github.com for the contribution client: the intake
+// issue and gist calls issue mode makes.
 type fakeGitHub struct {
 	t   *testing.T
 	srv *httptest.Server
 
-	mu          sync.Mutex
-	issues      []createdIssue
-	gists       int
-	forks       int
-	puts        []string        // contents paths PUT (also the "file exists" set for GET contents)
-	pulls       int             // POST /pulls count (a resume must not add another)
-	refs        int             // POST /git/refs count (a resume must not re-create the branch)
-	branches    map[string]bool // branches created on the fork
-	openPRHeads map[string]int  // open PR head -> number
-	dropLabels  bool            // GET issue omits the routing labels (non-collaborator drop)
-	rateLimit   bool            // creation calls return a 403 rate-limit
+	mu         sync.Mutex
+	issues     []createdIssue
+	gists      int
+	dropLabels bool // GET issue omits the routing labels (non-collaborator drop)
+	rateLimit  bool // creation calls return a 403 rate-limit
 }
 
+// testCommunityRepo is the repository the stage contributes sidecars to.
+const testCommunityRepo = "KodeStar/audiosilo-meta-community"
+
 func newFakeGitHub(t *testing.T) *fakeGitHub {
-	g := &fakeGitHub{t: t, branches: map[string]bool{}, openPRHeads: map[string]int{}}
+	g := &fakeGitHub{t: t}
 	g.srv = httptest.NewServer(http.HandlerFunc(g.handle))
 	t.Cleanup(g.srv.Close)
 	return g
@@ -96,7 +95,8 @@ func (g *fakeGitHub) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		g.decode(r, &req)
 		num := len(g.issues) + 1
-		g.issues = append(g.issues, createdIssue{number: num, title: req.Title, body: req.Body, labels: req.Labels})
+		repo := strings.TrimSuffix(strings.TrimPrefix(path, "/repos/"), "/issues")
+		g.issues = append(g.issues, createdIssue{repo: repo, number: num, title: req.Title, body: req.Body, labels: req.Labels})
 		g.writeIssue(w, http.StatusCreated, num, req.Labels)
 
 	case r.Method == http.MethodGet && strings.Contains(path, "/issues/"):
@@ -118,55 +118,6 @@ func (g *fakeGitHub) handle(w http.ResponseWriter, r *http.Request) {
 				"recaps.json":     map[string]string{"raw_url": g.srv.URL + "/gist/recaps.json"},
 			},
 		})
-
-	case r.Method == http.MethodPost && strings.HasSuffix(path, "/forks"):
-		g.forks++
-		g.writeJSON(w, http.StatusAccepted, map[string]string{"full_name": "tester/audiosilo-meta"})
-	case r.Method == http.MethodGet && path == "/repos/tester/audiosilo-meta":
-		g.writeJSON(w, http.StatusOK, map[string]string{"full_name": "tester/audiosilo-meta"})
-	case r.Method == http.MethodPost && strings.HasSuffix(path, "/merge-upstream"):
-		g.writeJSON(w, http.StatusOK, map[string]string{})
-	case r.Method == http.MethodGet && strings.Contains(path, "/git/ref/heads/"):
-		branch := strings.SplitN(path, "/git/ref/heads/", 2)[1]
-		if branch == "main" || g.branches[branch] {
-			g.writeJSON(w, http.StatusOK, map[string]any{"object": map[string]string{"sha": "deadbeef"}})
-			return
-		}
-		w.WriteHeader(http.StatusNotFound) // BranchRef: branch not created yet
-	case r.Method == http.MethodPost && strings.HasSuffix(path, "/git/refs"):
-		var req struct {
-			Ref string `json:"ref"`
-		}
-		g.decode(r, &req)
-		g.refs++
-		g.branches[strings.TrimPrefix(req.Ref, "refs/heads/")] = true
-		g.writeJSON(w, http.StatusCreated, map[string]string{"ref": req.Ref})
-	case r.Method == http.MethodGet && strings.Contains(path, "/contents/"):
-		file := strings.SplitN(path, "/contents/", 2)[1]
-		if contains(g.puts, file) {
-			g.writeJSON(w, http.StatusOK, map[string]string{"sha": "blob-sha"}) // file exists -> update
-			return
-		}
-		w.WriteHeader(http.StatusNotFound) // contentSHA: file not present -> create
-	case r.Method == http.MethodPut && strings.Contains(path, "/contents/"):
-		g.puts = append(g.puts, strings.SplitN(path, "/contents/", 2)[1])
-		g.writeJSON(w, http.StatusCreated, map[string]any{"content": map[string]string{"path": "x"}})
-	case r.Method == http.MethodGet && strings.HasSuffix(path, "/pulls"):
-		if num, ok := g.openPRHeads[r.URL.Query().Get("head")]; ok {
-			g.writeJSON(w, http.StatusOK, []map[string]any{
-				{"number": num, "html_url": g.srv.URL + fmt.Sprintf("/pull/%d", num), "state": "open"},
-			})
-			return
-		}
-		g.writeJSON(w, http.StatusOK, []any{}) // FindOpenPRByHead: none yet
-	case r.Method == http.MethodPost && strings.HasSuffix(path, "/pulls"):
-		g.pulls++
-		var req struct {
-			Head string `json:"head"`
-		}
-		g.decode(r, &req)
-		g.openPRHeads[req.Head] = 42
-		g.writeJSON(w, http.StatusCreated, map[string]any{"number": 42, "html_url": g.srv.URL + "/pull/42"})
 
 	default:
 		g.t.Errorf("fakeGitHub: unhandled %s %s", r.Method, path)
@@ -211,6 +162,8 @@ type fakeMeta struct {
 	lookups map[string]string
 	// works maps work id -> (title, hasChars, hasRecaps); absent id => 404.
 	works map[string]metaWorkFixture
+	// redirects maps a RETIRED work id -> its survivor (answered 301, as meta does).
+	redirects map[string]string
 }
 
 type metaWorkFixture struct {
@@ -247,12 +200,16 @@ func (m *fakeMeta) handle(w http.ResponseWriter, r *http.Request) {
 
 	case strings.HasPrefix(r.URL.Path, "/api/v1/works/"):
 		id := strings.TrimPrefix(r.URL.Path, "/api/v1/works/")
+		if to, ok := m.redirects[id]; ok {
+			http.Redirect(w, r, "/api/v1/works/"+to, http.StatusMovedPermanently)
+			return
+		}
 		wf, ok := m.works[id]
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		out := map[string]any{"title": wf.title}
+		out := map[string]any{"id": id, "title": wf.title}
 		if len(wf.recordings) > 0 {
 			out["recordings"] = wf.recordings
 		}
@@ -270,8 +227,6 @@ func (m *fakeMeta) handle(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- helpers -----------------------------------------------------------------
-
-const testRepo = "KodeStar/audiosilo-meta"
 
 func openContribDB(t *testing.T) *store.DB {
 	t.Helper()
@@ -309,15 +264,15 @@ func contribConfig(t *testing.T, db *store.DB, mode, ghURL, metaURL, exportRoot 
 		meta = metaops.NewClient(metaURL)
 	}
 	return Config{
-		DB:             db,
-		DataDir:        t.TempDir(),
-		Fallback:       scheduler.NewStubExecutor(0, 0),
-		Meta:           meta,
-		TokenSource:    tok,
-		ContribMode:    mode,
-		ContribRepo:    testRepo,
-		ContribBaseURL: ghURL,
-		ExportRoot:     exportRoot,
+		DB:                   db,
+		DataDir:              t.TempDir(),
+		Fallback:             scheduler.NewStubExecutor(0, 0),
+		Meta:                 meta,
+		TokenSource:          tok,
+		ContribMode:          mode,
+		ContribCommunityRepo: testCommunityRepo,
+		ContribBaseURL:       ghURL,
+		ExportRoot:           exportRoot,
 	}
 }
 
@@ -424,6 +379,9 @@ func TestContributeIssueHappyPath(t *testing.T) {
 		if !strings.Contains(iss.body, `"work": "reacher-01"`) {
 			t.Errorf("issue %q missing rewritten work slug", iss.title)
 		}
+		if iss.repo != testCommunityRepo {
+			t.Errorf("issue %q opened on %q, want the community repo %q (the core bot refuses sidecars)", iss.title, iss.repo, testCommunityRepo)
+		}
 		switch {
 		case contains(iss.labels, "data:characters"):
 			gotChars = true
@@ -435,11 +393,11 @@ func TestContributeIssueHappyPath(t *testing.T) {
 		t.Errorf("expected both characters+recaps labelled issues (chars=%v recaps=%v)", gotChars, gotRecaps)
 	}
 
-	// Both rows recorded submitted, no note.
+	// Both rows recorded submitted against the community repo, no note.
 	rows := rowsByKind(t, db, b.ID)
 	for _, k := range []string{store.ContribKindCharacters, store.ContribKindRecaps} {
 		r := rows[k]
-		if r.Status != store.ContribStatusSubmitted || r.URL == "" || r.Note != "" {
+		if r.Status != store.ContribStatusSubmitted || r.URL == "" || r.Note != "" || r.Repo != testCommunityRepo {
 			t.Errorf("%s row = %+v, want submitted with url and no note", k, r)
 		}
 	}
@@ -528,33 +486,9 @@ func TestContributeSkipsCoveredDimension(t *testing.T) {
 	}
 }
 
-func TestContributePRMode(t *testing.T) {
-	db := openContribDB(t)
-	gh := newFakeGitHub(t)
-
-	b := contribBook(t, db, store.NewBook{WorkID: "reacher-01"}, baseChars("x"), baseRecaps("x"))
-	cfg := contribConfig(t, db, contribModePR, gh.srv.URL, "", "", fakeTokenResolver{token: "ghp_x"})
-	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
-		t.Fatalf("contribute: %v", err)
-	}
-	if gh.forks != 1 || gh.pulls != 1 || len(gh.puts) != 2 {
-		t.Fatalf("pr flow: forks=%d pulls=%d puts=%d, want 1/1/2", gh.forks, gh.pulls, len(gh.puts))
-	}
-	// Contents committed at the canonical data/works/<shard>/<slug>/ paths.
-	shard := contrib.LegacyShard("reacher-01")
-	wantChars := fmt.Sprintf("data/works/%s/reacher-01/characters.json", shard)
-	wantRecaps := fmt.Sprintf("data/works/%s/reacher-01/recaps.json", shard)
-	if !contains(gh.puts, wantChars) || !contains(gh.puts, wantRecaps) {
-		t.Errorf("PutContents paths = %v, want %s + %s", gh.puts, wantChars, wantRecaps)
-	}
-	// Both rows share the one PR url/number.
-	rows := rowsByKind(t, db, b.ID)
-	c, r := rows[store.ContribKindCharacters], rows[store.ContribKindRecaps]
-	if c.URL == "" || c.URL != r.URL || c.Number != r.Number || c.Status != store.ContribStatusSubmitted {
-		t.Errorf("pr rows do not share the PR: chars=%+v recaps=%+v", c, r)
-	}
-}
-
+// TestContributeLocalMode: a local export is the bare sidecar FILE per dimension,
+// <export>/<slug>/<name>.json - exactly what an intake-issue attachment takes - with
+// no repository layout.
 func TestContributeLocalMode(t *testing.T) {
 	db := openContribDB(t)
 	export := t.TempDir()
@@ -564,12 +498,19 @@ func TestContributeLocalMode(t *testing.T) {
 	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
 		t.Fatalf("contribute: %v", err)
 	}
-	shard := contrib.LegacyShard("reacher-01")
 	for _, name := range []string{charactersFileName, recapsFileName} {
-		p := filepath.Join(export, "works", shard, "reacher-01", name)
-		if _, err := os.Stat(p); err != nil {
-			t.Errorf("local export missing %s: %v", p, err)
+		p := filepath.Join(export, "reacher-01", name)
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("local export missing %s: %v", p, err)
 		}
+		src, _ := os.ReadFile(filepath.Join(b.WorkDir, sidecarsDir, name))
+		if !bytes.Equal(raw, src) {
+			t.Errorf("%s: export is not the sidecar file byte for byte", name)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(export, "works")); !os.IsNotExist(err) {
+		t.Errorf("the retired works/<shard>/ layout was written (stat err %v)", err)
 	}
 	rows := rowsByKind(t, db, b.ID)
 	if rows[store.ContribKindCharacters].Status != store.ContribStatusLocal {
@@ -611,7 +552,7 @@ func TestContributeLocalModeUnresolvedSlugUsesPlaceholder(t *testing.T) {
 		t.Fatalf("contribute: %v", err)
 	}
 	slug := "some-unknown-book"
-	p := filepath.Join(export, "works", contrib.LegacyShard(slug), slug, charactersFileName)
+	p := filepath.Join(export, slug, charactersFileName)
 	if _, err := os.Stat(p); err != nil {
 		t.Errorf("placeholder export missing %s: %v", p, err)
 	}
@@ -806,50 +747,6 @@ func TestContributeRateLimitIsTransientNotPark(t *testing.T) {
 	}
 }
 
-// TestContributePRResumeReusesBranchAndPR simulates a first run that created the
-// branch + files + PR but persisted no rows (a crash before the rows/sentinel), then
-// re-runs and asserts the branch and PR are REUSED (not duplicated) and the rows are
-// persisted with the existing PR's URL. This guards the M7 crash-resume idempotency.
-func TestContributePRResumeReusesBranchAndPR(t *testing.T) {
-	db := openContribDB(t)
-	gh := newFakeGitHub(t)
-	b := contribBook(t, db, store.NewBook{WorkID: "reacher-01"}, baseChars("x"), baseRecaps("x"))
-
-	// First run with NO db -> it creates the branch/files/PR on the fake but persists no
-	// contribution rows (the crash window).
-	cfg1 := contribConfig(t, db, contribModePR, gh.srv.URL, "", "", fakeTokenResolver{token: "ghp_x"})
-	cfg1.DB = nil
-	if _, err := NewExecutor(cfg1).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
-		t.Fatalf("first run: %v", err)
-	}
-	if gh.forks == 0 || gh.pulls != 1 || gh.refs != 1 {
-		t.Fatalf("first run: forks=%d pulls=%d refs=%d, want forks>=1 pulls=1 refs=1", gh.forks, gh.pulls, gh.refs)
-	}
-	if n := len(rowsByKind(t, db, b.ID)); n != 0 {
-		t.Fatalf("first run persisted %d rows, want 0 (no db)", n)
-	}
-
-	// Second run WITH the db: it must reuse the existing branch (no new ref) and the
-	// existing open PR (no new pull), and persist both rows pointing at that PR.
-	cfg2 := contribConfig(t, db, contribModePR, gh.srv.URL, "", "", fakeTokenResolver{token: "ghp_x"})
-	if _, err := NewExecutor(cfg2).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
-		t.Fatalf("second run: %v", err)
-	}
-	if gh.refs != 1 {
-		t.Errorf("branch re-created on resume: refs=%d, want 1", gh.refs)
-	}
-	if gh.pulls != 1 {
-		t.Errorf("duplicate PR opened on resume: pulls=%d, want 1", gh.pulls)
-	}
-	rows := rowsByKind(t, db, b.ID)
-	wantURL := gh.srv.URL + "/pull/42"
-	for _, k := range []string{store.ContribKindCharacters, store.ContribKindRecaps} {
-		if rows[k].URL != wantURL || rows[k].Status != store.ContribStatusSubmitted {
-			t.Errorf("%s row = %+v, want submitted with url %s", k, rows[k], wantURL)
-		}
-	}
-}
-
 // TestContributeSettledRowNotOverwrittenByCovered proves a settled (submitted) row is
 // never clobbered by a later upstream-covered verdict: the rowSettled check runs BEFORE
 // the covered branch.
@@ -880,10 +777,13 @@ func TestContributeSettledRowNotOverwrittenByCovered(t *testing.T) {
 	}
 }
 
-// TestContributeMergedCoreTrustsWorkIDOn404 proves a book whose work id 404s upstream
-// but has a MERGED core row proceeds on that trusted slug (the merged intake PR created
-// it; the data release just has not rebuilt yet) instead of re-parking needs-core.
-func TestContributeMergedCoreTrustsWorkIDOn404(t *testing.T) {
+// TestContributeMergedCoreWaitsForRelease is the release gate: a book whose work id
+// came from a MERGED add-work PR but 404s in the published catalogue has a work no
+// data release holds yet. The community intake verifies a sidecar's key against the
+// newest release, so contributing now would be refused - the book parks core_pending
+// with the release-wait message (the poller re-admits it once the work is live),
+// submits nothing, and does NOT re-park needs-core.
+func TestContributeMergedCoreWaitsForRelease(t *testing.T) {
 	db := openContribDB(t)
 	gh := newFakeGitHub(t)
 	meta := newFakeMeta(t, nil, nil) // every work id 404s
@@ -895,15 +795,113 @@ func TestContributeMergedCoreTrustsWorkIDOn404(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := contribConfig(t, db, contribModeIssue, gh.srv.URL, meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
-	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
-		t.Fatalf("contribute should proceed on the merged-core slug, got: %v", err)
+	_, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{})
+	assertPark(t, err, state.ParkCorePending)
+	var pe *scheduler.ParkError
+	if errors.As(err, &pe) && pe.Reason != contrib.ReleaseWaitMsg {
+		t.Errorf("park reason = %q, want the release-wait message", pe.Reason)
 	}
-	if gh.issueCount() != 2 {
-		t.Errorf("issues = %d, want 2 (both dims submitted with the trusted slug)", gh.issueCount())
+	if gh.issueCount() != 0 {
+		t.Errorf("issues = %d, want 0 before the work is released", gh.issueCount())
+	}
+}
+
+// TestContributeAdoptsSurvivorSlug: a recorded work id a merge has RETIRED is answered
+// by the catalogue with a 301 to its survivor; the sidecars attach to the survivor and
+// the book remembers it.
+func TestContributeAdoptsSurvivorSlug(t *testing.T) {
+	db := openContribDB(t)
+	gh := newFakeGitHub(t)
+	meta := newFakeMeta(t, nil, map[string]metaWorkFixture{"reacher-01": {title: "Killing Floor"}})
+	meta.redirects = map[string]string{"killing-floor-old": "reacher-01"}
+	b := contribBook(t, db, store.NewBook{WorkID: "killing-floor-old"}, baseChars("x"), baseRecaps("x"))
+	cfg := contribConfig(t, db, contribModeIssue, gh.srv.URL, meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
+		t.Fatalf("contribute: %v", err)
+	}
+	if got, _ := db.GetBook(context.Background(), b.ID); got.WorkID != "reacher-01" {
+		t.Errorf("work_id = %q, want the survivor reacher-01", got.WorkID)
 	}
 	raw, _ := os.ReadFile(filepath.Join(b.WorkDir, sidecarsDir, charactersFileName))
 	if !strings.Contains(string(raw), `"work": "reacher-01"`) {
-		t.Errorf("characters not reconciled to the trusted slug:\n%s", raw)
+		t.Errorf("sidecar not keyed to the survivor:\n%s", raw)
+	}
+	for _, iss := range gh.issues {
+		if !strings.Contains(iss.body, `"work": "reacher-01"`) {
+			t.Errorf("issue %q not keyed to the survivor", iss.title)
+		}
+	}
+}
+
+// TestContributeAdoptsSurvivorPastAWarmCache: the work was read live (and cached)
+// just before a merge retired its slug. The stage's adoption lookup is fresh, so it
+// follows the new 301 instead of keying the sidecars to the retired slug.
+func TestContributeAdoptsSurvivorPastAWarmCache(t *testing.T) {
+	db := openContribDB(t)
+	gh := newFakeGitHub(t)
+	meta := newFakeMeta(t, nil, map[string]metaWorkFixture{
+		"killing-floor-old": {title: "Killing Floor"},
+		"reacher-01":        {title: "Killing Floor"},
+	})
+	b := contribBook(t, db, store.NewBook{WorkID: "killing-floor-old"}, baseChars("x"), baseRecaps("x"))
+	cfg := contribConfig(t, db, contribModeIssue, gh.srv.URL, meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
+	client := metaops.NewClient(meta.srv.URL)
+	cfg.Meta = client
+	if cov, err := client.CoverageForWork(context.Background(), "killing-floor-old"); err != nil || cov.WorkID != "killing-floor-old" {
+		t.Fatalf("warm read = %+v, %v", cov, err)
+	}
+	meta.redirects = map[string]string{"killing-floor-old": "reacher-01"} // the merge lands
+
+	if _, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{}); err != nil {
+		t.Fatalf("contribute: %v", err)
+	}
+	if got, _ := db.GetBook(context.Background(), b.ID); got.WorkID != "reacher-01" {
+		t.Errorf("work_id = %q, want the survivor reacher-01 despite the warm cache", got.WorkID)
+	}
+}
+
+// TestContributeCoreDuplicateAsksForWork: the add-work proposal was answered as a
+// duplicate (the core row is already_covered) and no identifier reaches the work - a
+// human sets it, rather than a proposal being re-submitted into the same answer.
+func TestContributeCoreDuplicateAsksForWork(t *testing.T) {
+	db := openContribDB(t)
+	meta := newFakeMeta(t, nil, nil)
+	b := contribBook(t, db, store.NewBook{Title: "Dup Book"}, baseChars("x"), baseRecaps("x"))
+	if _, err := db.UpsertContribution(context.Background(), store.Contribution{
+		BookID: b.ID, Kind: store.ContribKindCore, Mode: store.ContribModeIssue,
+		Status: store.ContribStatusAlreadyCovered, Number: 9, URL: "https://x/9", Note: store.ContribNoteIntakeDuplicate,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := contribConfig(t, db, contribModeIssue, "", meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
+	_, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{})
+	assertPark(t, err, state.ParkCoreNeeded)
+	var pe *scheduler.ParkError
+	if errors.As(err, &pe) && pe.Reason != CoreDuplicateMsg {
+		t.Errorf("park reason = %q, want the duplicate message", pe.Reason)
+	}
+}
+
+// TestContributeCoreVerdictKeepsItsMessage: a Retry of a book whose submitted core
+// row carries a needs-human verdict re-parks core_pending WITH the verdict message
+// (the poller writes it once; the generic "waiting to merge" would hide it).
+func TestContributeCoreVerdictKeepsItsMessage(t *testing.T) {
+	db := openContribDB(t)
+	meta := newFakeMeta(t, nil, nil)
+	b := contribBook(t, db, store.NewBook{Title: "Verdict Book"}, baseChars("x"), baseRecaps("x"))
+	if _, err := db.UpsertContribution(context.Background(), store.Contribution{
+		BookID: b.ID, Kind: store.ContribKindCore, Mode: store.ContribModeIssue,
+		Status: store.ContribStatusSubmitted, Number: 9, URL: "https://x/9",
+		Note: store.ContribNoteIntakeNeedsHuman + " - a maintainer must look",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := contribConfig(t, db, contribModeIssue, "", meta.srv.URL, "", fakeTokenResolver{token: "ghp_x"})
+	_, err := NewExecutor(cfg).Execute(context.Background(), b, state.Contributing, scheduler.StageReport{})
+	assertPark(t, err, state.ParkCorePending)
+	var pe *scheduler.ParkError
+	if errors.As(err, &pe) && (pe.Reason == CorePendingMsg || !strings.Contains(pe.Reason, "https://x/9")) {
+		t.Errorf("park reason = %q, want the verdict message naming the issue", pe.Reason)
 	}
 }
 

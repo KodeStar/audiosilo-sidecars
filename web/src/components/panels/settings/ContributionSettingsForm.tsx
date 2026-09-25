@@ -5,6 +5,7 @@ import type { ContributionConfig } from '@/api/types';
 import { Field } from '@/components/ui/Field';
 import {
   CONTRIBUTION_MODES,
+  REPO_FIELDS,
   contributionConfigToForm,
   contributionFormToUpdate,
   validateContributionForm,
@@ -20,8 +21,9 @@ interface ContributionSettingsFormProps {
 type Feedback = { kind: 'ok' | 'error'; text: string } | null;
 
 // ContributionSettingsForm edits how the contributing stage publishes a book's
-// sidecars (issue / PR / local), the target repo, auto-purge, and the intake poll
-// interval, saving the whole contribution envelope via PUT /settings. Changes are
+// sidecars (issue / local), the two target repositories (core for add-work
+// proposals, community for the sidecars), auto-purge, and the intake poll interval,
+// saving the whole contribution envelope via PUT /settings. Changes are
 // restart-to-apply, so a successful save shows that note.
 export function ContributionSettingsForm({ client, initial }: ContributionSettingsFormProps) {
   const [form, setForm] = useState<ContributionFormState>(() => contributionConfigToForm(initial));
@@ -88,16 +90,22 @@ export function ContributionSettingsForm({ client, initial }: ContributionSettin
         </Field>
       </div>
 
-      <Field label="Repository (owner/name)" htmlFor="contrib-repo">
-        <input
-          id="contrib-repo"
-          type="text"
-          value={form.repo}
-          onChange={(e) => set('repo', e.target.value)}
-          placeholder="KodeStar/audiosilo-meta"
-          className="w-full max-w-md rounded-md border border-edge bg-raised px-3 py-2 text-body placeholder:text-dim"
-        />
-      </Field>
+      {REPO_FIELDS.map((f) => (
+        <Field key={f.key} label={`${f.label} (owner/name)`} htmlFor={f.id}>
+          <input
+            id={f.id}
+            type="text"
+            value={form[f.key]}
+            onChange={(e) => set(f.key, e.target.value)}
+            placeholder={f.example}
+            aria-describedby={`${f.id}-hint`}
+            className="w-full max-w-md rounded-md border border-edge bg-raised px-3 py-2 text-body placeholder:text-dim"
+          />
+          <p id={`${f.id}-hint`} className="max-w-prose text-xs text-dim">
+            {f.hint}
+          </p>
+        </Field>
+      ))}
 
       <label className="flex w-max items-center gap-2 text-sm text-body">
         <input

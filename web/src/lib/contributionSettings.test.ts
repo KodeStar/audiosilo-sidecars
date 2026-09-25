@@ -9,20 +9,29 @@ import {
 
 const config: ContributionConfig = {
   mode: 'issue',
-  repo: 'KodeStar/audiosilo-meta',
+  core_repo: 'KodeStar/audiosilo-meta',
+  community_repo: 'KodeStar/audiosilo-meta-community',
   auto_purge: true,
   poll_minutes: 10,
 };
 
 function form(partial: Partial<ContributionFormState>): ContributionFormState {
-  return { mode: 'issue', repo: 'Owner/name', autoPurge: true, pollMinutes: '10', ...partial };
+  return {
+    mode: 'issue',
+    coreRepo: 'Owner/core',
+    communityRepo: 'Owner/community',
+    autoPurge: true,
+    pollMinutes: '10',
+    ...partial,
+  };
 }
 
 describe('contributionConfigToForm', () => {
   it('seeds the form from the config, stringifying poll minutes', () => {
     expect(contributionConfigToForm(config)).toEqual({
       mode: 'issue',
-      repo: 'KodeStar/audiosilo-meta',
+      coreRepo: 'KodeStar/audiosilo-meta',
+      communityRepo: 'KodeStar/audiosilo-meta-community',
       autoPurge: true,
       pollMinutes: '10',
     });
@@ -30,12 +39,24 @@ describe('contributionConfigToForm', () => {
 });
 
 describe('contributionFormToUpdate', () => {
-  it('builds the full envelope, trimming repo and parsing poll minutes', () => {
+  it('builds the full envelope, trimming both repos and parsing poll minutes', () => {
     expect(
       contributionFormToUpdate(
-        form({ mode: 'pr', repo: '  Own/nm  ', autoPurge: false, pollMinutes: '30' }),
+        form({
+          mode: 'local',
+          coreRepo: '  Own/core  ',
+          communityRepo: ' Own/comm ',
+          autoPurge: false,
+          pollMinutes: '30',
+        }),
       ),
-    ).toEqual({ mode: 'pr', repo: 'Own/nm', auto_purge: false, poll_minutes: 30 });
+    ).toEqual({
+      mode: 'local',
+      core_repo: 'Own/core',
+      community_repo: 'Own/comm',
+      auto_purge: false,
+      poll_minutes: 30,
+    });
   });
 });
 
@@ -44,10 +65,19 @@ describe('validateContributionForm', () => {
     expect(validateContributionForm(form({}))).toBeNull();
   });
 
-  it('rejects a repo that is not owner/name', () => {
-    expect(validateContributionForm(form({ repo: 'nowhere' }))).toMatch(/owner\/name/i);
-    expect(validateContributionForm(form({ repo: 'a/b/c' }))).toMatch(/owner\/name/i);
-    expect(validateContributionForm(form({ repo: 'a /b' }))).toMatch(/owner\/name/i);
+  it('rejects a core repo that is not owner/name', () => {
+    expect(validateContributionForm(form({ coreRepo: 'nowhere' }))).toMatch(
+      /core repository.*owner\/name/i,
+    );
+    expect(validateContributionForm(form({ coreRepo: 'a/b/c' }))).toMatch(/owner\/name/i);
+    expect(validateContributionForm(form({ coreRepo: 'a /b' }))).toMatch(/owner\/name/i);
+  });
+
+  it('rejects a community repo that is not owner/name', () => {
+    expect(validateContributionForm(form({ communityRepo: 'nowhere' }))).toMatch(
+      /community repository.*owner\/name/i,
+    );
+    expect(validateContributionForm(form({ communityRepo: '' }))).toMatch(/community repository/i);
   });
 
   it('rejects a sub-1 or non-numeric poll interval', () => {

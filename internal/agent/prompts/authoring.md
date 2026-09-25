@@ -1,4 +1,4 @@
-<!-- vendored from audiosilo-meta AUTHORING.md at 8c85dfc9; refresh when upstream changes -->
+<!-- vendored from audiosilo-meta AUTHORING.md at 8c85dfc9 (now in audiosilo-meta-community); storage-layout passages replaced by the sidecar-file description; refresh when upstream changes -->
 # Authoring characters and recaps (the CC BY-SA layer)
 
 This guide covers the **expressive layer** of the database: community-authored
@@ -20,17 +20,17 @@ still applies to their output.
 
 ## The two files
 
-Both are **per-work sidecars** that live inside the work's directory:
+Both are **per-work sidecars**: one JSON file per kind, each describing ONE work.
 
 ```
-data/works/<shard>/<work-slug>/characters.json   # the cast, spoiler-tagged
-data/works/<shard>/<work-slug>/recaps.json       # position-keyed "story so far"
+characters.json   # the cast, spoiler-tagged
+recaps.json       # position-keyed "story so far"
 ```
 
-`<shard>` is the first two characters of the **work** slug (the same shard the
-`work.json` is under). Each file carries `work` (the parent work slug, which
-must equal the directory), `license` (**must** be `"CC-BY-SA-4.0"`), and
-`sources`.
+Each file carries `work` (the slug of the work it describes - the pipeline sets
+it to the resolved meta.audiosilo.app work), its own member list (`characters`
+or `recaps`), `license` (**must** be `"CC-BY-SA-4.0"`), and `sources`. Where the
+file is stored upstream is not your concern: the contribution tooling places it.
 
 ### characters.json
 
@@ -191,14 +191,14 @@ style:
 - `license` is `"CC-BY-SA-4.0"` and `sources` is `[{ "type": "community" }]`
   (add `ref`/`imported_at` if a specific source applies).
 - The gate is: canonical formatting (sorted keys, 2-space) and schema +
-  integrity + uniqueness checks, which enforce valid JSON Schema, `work` matches
-  the directory, the parent work exists, character ids are unique within the
-  file, and recap positions are unique within the file.
+  integrity + uniqueness checks, which enforce valid JSON Schema, `work` names an
+  existing work, character ids are unique within the file, and recap positions
+  are unique within the file.
 
 ## Checklist
 
 - [ ] The work, its recording(s), author, and narrator already exist and validate.
-- [ ] `work` equals the directory slug; file is under the work's shard.
+- [ ] `work` is the slug of the work the file describes.
 - [ ] `license` is `"CC-BY-SA-4.0"`; `sources` present.
 - [ ] Every character has an `id` (unique in file), `name`, and `reveal`.
 - [ ] Descriptions/texts are your own words, within the caps, and accurate

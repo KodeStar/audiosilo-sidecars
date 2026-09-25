@@ -28,7 +28,8 @@ function settingsWith(agent: AgentConfig): Settings {
     agent,
     contribution: {
       mode: 'issue',
-      repo: 'KodeStar/audiosilo-meta',
+      core_repo: 'KodeStar/audiosilo-meta',
+      community_repo: 'KodeStar/audiosilo-meta-community',
       auto_purge: true,
       poll_minutes: 10,
     },

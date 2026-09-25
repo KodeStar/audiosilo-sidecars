@@ -631,3 +631,54 @@ Milestones from the workspace plan; each is shippable.
   drift guard is STRICT again: `stalePinLicenseContent` and
   `TestSidecarLicenseIsTheCommunityLayerValue` are gone, since the upstream
   enum is now CC-BY-SA-4.0 and plain equality holds. Gate: full Go gate green.
+
+- **Contributions follow the community-repo split (2026-09-25).** Since
+  2026-08-21 the CC BY-SA layer lives in KodeStar/audiosilo-meta-community and
+  meta's core intake refuses a sidecar, so every default-mode submission was
+  refused, and PR mode, local export and the poller all spelled the retired
+  per-record layout. Now there are two settings, `contribution.core_repo`
+  (add-work) and `contribution.community_repo` (sidecars). The pre-split
+  `contribution.repo` (file or env) loads as core_repo unless an explicit
+  core_repo is set; the notice comes from `Config.Deprecations`, logged at
+  start, and a Save drops the key.
+
+  The direct-PR mode is RETIRED rather than ported. A first cut made it a
+  client-side pack edit (pkg/pack + pkg/check over a downloaded community
+  tarball, committed through the git data API). Review found that the wrong
+  depth: a fork PR rewriting a ~256 KB pack conflicts whenever anything else
+  touches that pack, the community repo's rebase sweep only sweeps its own bot
+  branches, and it pinned this tool to meta's storage format. The community
+  intake bot composes exactly that PR server-side, on swept branches. So
+  `mode: pr` loads as issue (with a notice), and rows recorded in pr mode are
+  still polled. Local mode and the export zip write the bare sidecar file
+  (`<slug>/<kind>.json`, what an issue attachment takes); `contrib.LegacyShard`
+  is gone.
+
+  The poller learns a merged add-work PR's slug from the PR itself:
+  compare `base.sha...head.sha`, then the works-pack entry keys at the merge
+  base vs head.sha, one set per side. That makes it independent of the merge
+  style, and a split's moved keys cancel. One new key is the answer; zero or
+  several is noted on the core row and nothing is guessed.
+
+  Then the RELEASE GATE: the community intake verifies a sidecar's key
+  against the newest data release, so the book is re-admitted only once the
+  published catalogue holds the work. A 301 adopts the survivor through
+  `contrib.AdoptLiveWork`, shared with SetWork and the stage; until then the
+  book waits core_pending with `contrib.ReleaseWaitMsg`.
+
+  Intake verdicts (data:needs-human / invalid / duplicate + the bot comment)
+  become the row note instead of "intake PR overdue". A duplicate is
+  `already_covered`, and on a core row it re-admits the book. A needs-human or
+  invalid row is re-checked at most hourly (`TouchContribution`), sparing the
+  60/hour unauthenticated budget. Its comments are re-read only when the issue's
+  `updated_at` has moved since the last read (`issue_seen_at`, migration 0013),
+  and the verdict then follows the NEWEST bot comment, because the bot adds
+  labels without removing old ones. A custom legacy `repo` with no explicit
+  community_repo is refused at Load: it used to take the sidecars too, and they
+  would now go to the public repo. The adoption / release-gate lookup is
+  `FreshCoverageForWork`, which bypasses the hour-long work cache so a slug
+  retired inside that hour is not taken as live. The authoring prompt describes the sidecar
+  file, not a storage layout. The round-trip test runs metaissue as each
+  repo's bot does (community profile + a metabuild artifact as `--works-db`;
+  core profile for add-work) and passes against meta HEAD, including the
+  unreleased-work refusal the gate exists for.

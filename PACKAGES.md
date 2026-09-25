@@ -29,10 +29,11 @@ internal/
             timeout_minutes, and the per-stage claude/openai model maps (keys are agent
             stage names). Validate rejects an unknown backend, an unknown model-map key,
             or timeout_minutes < 1; Default() seeds the claude map. M7 added
-            contribution.{mode [issue|pr|local], repo, auto_purge, poll_minutes,
-            api_base_url} (restart-to-apply; api_base_url exists for tests/GHE;
-            Validate rejects an unknown mode, a non-owner/name repo, poll_minutes < 1,
-            a non-http(s) api_base_url). The reliability round added
+            contribution.{mode [issue|local], core_repo (add-work), community_repo
+            (sidecars), auto_purge, poll_minutes, api_base_url} (restart-to-apply;
+            api_base_url for tests/GHE). Retired settings load via
+            foldLegacyContribution + Config.Deprecations: `repo` -> core_repo (an
+            explicit core_repo wins), mode `pr` -> issue. The reliability round added
             agent.book_budget_usd (default 75; 0 in yaml normalizes to the default, so
             set a very large value to effectively disable; Validate rejects negative;
             env AUDIOSILO_SIDECARS_AGENT_BOOK_BUDGET_USD; restart-to-apply like the
@@ -327,7 +328,12 @@ internal/
             M7 made contributing real (contrib_stage.go: slug reconcile -> skip-if-
             covered -> submit per contribution.mode, resume-idempotent via the
             contributions rows; export.go composes the download zip + core-proposal
-            JSON injected into api) - EVERY stage is now real.
+            JSON injected into api) - EVERY stage is now real. Sidecars go to
+            Config.ContribCommunityRepo (issue mode) or <export>/<slug>/<kind>.json
+            (local mode, also the zip layout). resolveWorkSlug adopts a 301 survivor
+            (contrib.AdoptLiveWork) and parks core_pending with contrib.ReleaseWaitMsg
+            while a merged core row's work is unreleased; a duplicate-answered core
+            row parks core_needed with CoreDuplicateMsg.
             spelling_research additionally assembles OUTSIDE spelling evidence before
             it stages anything: referenceSources() ranks the metaops series glossary
             and the publisher's marker titles as VERIFIED against the predecessor's
@@ -533,8 +539,7 @@ internal/
             precise correct verdict.
   contrib/  M7: everything GitHub-facing for contribution. TokenSource (secrets
             GitHubPAT first, else `gh auth token` - the token NEVER enters argv/logs/
-            errors, leak-canary tested), a stdlib REST client (issues/gists/fork/
-            contents/refs/pulls; injectable base URL; typed RateLimitError; APIError
+            errors, leak-canary tested), a stdlib REST client (injectable base URL; typed RateLimitError; APIError
             carries status + trimmed body only), composers that render the meta repo's
             issue-form markdown VERBATIM to metaissue's parser contract (headings +
             ticked checkbox items pinned from the form YAML; env-gated round-trip test
@@ -544,15 +549,18 @@ internal/
             language/narrators/sources required; an ASIN without a region is rejected,
             never silently dropped), Service (SubmitCore: per-book mutex, reuses an
             already-recorded core issue, persists the row BEFORE the park flip;
-            SetWork validates the slug upstream), and the poller (jittered
-            poll_minutes tick; issue rows advance submitted -> pr_open [FindIntakePR
-            on branch intake/issue-<n>] -> merged/closed; a merged core PR's files
-            name data/works/<shard>/<slug>/work.json [meta's RETIRED per-record
-            layout, sharded by LegacyShard, layout.go - stale upstream, see
-            CLAUDE.md] -> SetBookWorkID [regardless of
-            park state] -> Readmit [only when parked core_pending]; targeted
-            ListBooksWithUnresolvedMergedCore query, no full scans; tokenless reads
-            work). Imports neither scheduler nor api - reaches them via injected
+            SetWork validates the slug upstream), and the poller. Where things live:
+              poller.go  row lifecycle (FindIntakePR -> pr_open -> merged/closed),
+                         intake verdicts as the note's last segment (re-checked at
+                         most hourly; comments re-read only when the issue changed,
+                         newest bot comment wins), learnCreatedWork (base.sha...head.sha compare,
+                         works-pack ENTRY KEYS at merge base vs head), the release
+                         gate (admitWhenLive / releaseCorePending)
+              notes.go   JoinNotes, AdoptLiveWork (shared with the stage)
+              github.go  the REST client: issues, gists, pulls, compare, contents
+            ServiceDeps.CoreRepo is where SubmitCore opens add-work issues; every
+            other call follows the repo a row records.
+            Imports neither scheduler nor api - reaches them via injected
             Readmit/Publish seams.
   auth/     single admin password (argon2id, generated + printed once on first run),
             opaque SHA-256-hashed session tokens, a per-IP login rate limiter; the

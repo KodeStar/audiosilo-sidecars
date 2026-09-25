@@ -188,11 +188,15 @@ type agentView struct {
 	OpenAIModels                   map[string]string `json:"openai_models"`
 }
 
+// contributionView is the contribution section of the settings read model. The two
+// repositories are the halves of the split metadata database: core_repo takes
+// add-work proposals, community_repo the characters/recaps sidecars.
 type contributionView struct {
-	Mode        string `json:"mode"`
-	Repo        string `json:"repo"`
-	AutoPurge   bool   `json:"auto_purge"`
-	PollMinutes int    `json:"poll_minutes"`
+	Mode          string `json:"mode"`
+	CoreRepo      string `json:"core_repo"`
+	CommunityRepo string `json:"community_repo"`
+	AutoPurge     bool   `json:"auto_purge"`
+	PollMinutes   int    `json:"poll_minutes"`
 }
 
 type supervisorView struct {
@@ -248,10 +252,11 @@ func (a *API) settingsView() (settingsResponse, error) {
 			OpenAIModels:                   copyStringMap(cfg.Agent.OpenAI),
 		},
 		Contribution: contributionView{
-			Mode:        cfg.Contribution.Mode,
-			Repo:        cfg.Contribution.Repo,
-			AutoPurge:   cfg.Contribution.AutoPurge,
-			PollMinutes: cfg.Contribution.PollMinutes,
+			Mode:          cfg.Contribution.Mode,
+			CoreRepo:      cfg.Contribution.CoreRepo,
+			CommunityRepo: cfg.Contribution.CommunityRepo,
+			AutoPurge:     cfg.Contribution.AutoPurge,
+			PollMinutes:   cfg.Contribution.PollMinutes,
 		},
 		Supervisor: supervisorView{Enabled: cfg.Supervisor.Enabled, AutomaticActions: cfg.Supervisor.AutomaticActions,
 			ModelAssisted: cfg.Supervisor.ModelAssisted, ModelAutomaticActions: cfg.Supervisor.ModelAutomaticActions,
@@ -337,10 +342,11 @@ type agentUpdate struct {
 // malformed repo, or a sub-1 poll interval. Like the agent config, changes persist to
 // config.yaml but take effect only on a daemon RESTART.
 type contributionUpdate struct {
-	Mode        *string `json:"mode"`
-	Repo        *string `json:"repo"`
-	AutoPurge   *bool   `json:"auto_purge"`
-	PollMinutes *int    `json:"poll_minutes"`
+	Mode          *string `json:"mode"`
+	CoreRepo      *string `json:"core_repo"`
+	CommunityRepo *string `json:"community_repo"`
+	AutoPurge     *bool   `json:"auto_purge"`
+	PollMinutes   *int    `json:"poll_minutes"`
 }
 
 // applyContributionUpdate overlays u onto cfg in place.
@@ -348,8 +354,11 @@ func applyContributionUpdate(cfg *config.ContributionConfig, u *contributionUpda
 	if u.Mode != nil {
 		cfg.Mode = *u.Mode
 	}
-	if u.Repo != nil {
-		cfg.Repo = *u.Repo
+	if u.CoreRepo != nil {
+		cfg.CoreRepo = *u.CoreRepo
+	}
+	if u.CommunityRepo != nil {
+		cfg.CommunityRepo = *u.CommunityRepo
 	}
 	if u.AutoPurge != nil {
 		cfg.AutoPurge = *u.AutoPurge

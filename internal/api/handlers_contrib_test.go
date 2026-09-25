@@ -35,16 +35,16 @@ func (r apiTokenResolver) Resolve(context.Context) (string, string, error) {
 
 // withContrib returns an option wiring a Contrib service over a fake GitHub base URL.
 // readmit defaults to the scheduler's Retry when nil.
-func withContrib(ghURL string, tok contrib.TokenResolver, verify func(context.Context, string) error, readmit func(context.Context, int64) error) func(*Deps) {
+func withContrib(ghURL string, tok contrib.TokenResolver, resolve func(context.Context, string) (string, error), readmit func(context.Context, int64) error) func(*Deps) {
 	return func(d *Deps) {
 		rd := readmit
 		if rd == nil {
 			rd = d.Scheduler.Retry
 		}
 		d.Contrib = contrib.NewService(contrib.ServiceDeps{
-			DB: d.Store, Repo: "KodeStar/audiosilo-meta", BaseURL: ghURL, Tokens: tok,
+			DB: d.Store, CoreRepo: "KodeStar/audiosilo-meta", BaseURL: ghURL, Tokens: tok,
 			Publish: func(u contrib.ContribUpdate) { _ = d.Events.PublishBook("contrib.update", u.BookID, u) },
-			Readmit: rd, VerifyWork: verify, CorePendingMsg: "waiting for the metadata PR",
+			Readmit: rd, ResolveWork: resolve, CorePendingMsg: "waiting for the metadata PR",
 		})
 	}
 }
@@ -181,11 +181,11 @@ func TestSetWorkEndpoint(t *testing.T) {
 		spy.ids = append(spy.ids, id)
 		return nil
 	}
-	verify := func(_ context.Context, workID string) error {
+	verify := func(_ context.Context, workID string) (string, error) {
 		if workID == "ghost-work" {
-			return contrib.ErrWorkNotFound
+			return "", contrib.ErrWorkNotFound
 		}
-		return nil
+		return workID, nil
 	}
 	env := newPipelineEnv(t, nil, withContrib("", apiTokenResolver{err: contrib.ErrNoCredential}, verify, readmit))
 	token := env.login(t)
@@ -275,7 +275,7 @@ func TestBookExport(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// With both sidecars -> 200 zip with works/my/my-work/{characters,recaps}.json.
+	// With both sidecars -> 200 zip with my-work/{characters,recaps}.json (the bare sidecar files).
 	writeWorkFile(t, b.WorkDir, filepath.Join("sidecars", "characters.json"), `{"work":"my-work","characters":[]}`)
 	writeWorkFile(t, b.WorkDir, filepath.Join("sidecars", "recaps.json"), `{"work":"my-work","recaps":[]}`)
 	resp = env.do(t, http.MethodGet, "/api/v1/books/"+bid+"/export", token, "")
@@ -300,7 +300,7 @@ func TestBookExport(t *testing.T) {
 		names = append(names, f.Name)
 	}
 	sort.Strings(names)
-	want := []string{"works/my/my-work/characters.json", "works/my/my-work/recaps.json"}
+	want := []string{"my-work/characters.json", "my-work/recaps.json"}
 	if len(names) != 2 || names[0] != want[0] || names[1] != want[1] {
 		t.Fatalf("zip entries = %v, want %v", names, want)
 	}

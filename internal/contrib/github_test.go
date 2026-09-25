@@ -2,7 +2,6 @@ package contrib
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,7 +9,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 )
 
 const testRepo = "KodeStar/audiosilo-meta"
@@ -113,213 +111,6 @@ func TestCreateGist(t *testing.T) {
 	}
 }
 
-// TestEnsureFork exercises the POST-then-poll flow: the fork GET 404s once
-// before becoming ready.
-func TestEnsureFork(t *testing.T) {
-	orig := forkPollInterval
-	forkPollInterval = time.Millisecond // fast poll for the test
-	t.Cleanup(func() { forkPollInterval = orig })
-	fork := "tester/audiosilo-meta"
-	var getCount int
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/repos/"+testRepo+"/forks":
-			w.WriteHeader(http.StatusAccepted)
-			io.WriteString(w, `{"full_name":"`+fork+`"}`)
-		case r.Method == http.MethodGet && r.URL.Path == "/repos/"+fork:
-			getCount++
-			if getCount == 1 {
-				w.WriteHeader(http.StatusNotFound)
-				io.WriteString(w, `{"message":"Not Found"}`)
-				return
-			}
-			io.WriteString(w, `{"full_name":"`+fork+`"}`)
-		default:
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-	})
-	got, err := c.EnsureFork(context.Background(), testRepo)
-	if err != nil {
-		t.Fatalf("EnsureFork: %v", err)
-	}
-	if got != fork {
-		t.Fatalf("fork = %q", got)
-	}
-	if getCount < 2 {
-		t.Fatalf("expected the readiness poll to retry, getCount=%d", getCount)
-	}
-}
-
-func TestBranchSHAAndCreateRef(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/repos/"+testRepo+"/git/ref/heads/main":
-			io.WriteString(w, `{"object":{"sha":"deadbeef"}}`)
-		case r.Method == http.MethodPost && r.URL.Path == "/repos/"+testRepo+"/git/refs":
-			body := readJSON(t, r)
-			if body["ref"] != "refs/heads/sidecars/x-1" || body["sha"] != "deadbeef" {
-				t.Fatalf("ref body = %v", body)
-			}
-			w.WriteHeader(http.StatusCreated)
-			io.WriteString(w, `{}`)
-		default:
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-	})
-	sha, err := c.BranchSHA(context.Background(), testRepo, "main")
-	if err != nil || sha != "deadbeef" {
-		t.Fatalf("BranchSHA = %q, %v", sha, err)
-	}
-	if err := c.CreateRef(context.Background(), testRepo, "refs/heads/sidecars/x-1", sha); err != nil {
-		t.Fatalf("CreateRef: %v", err)
-	}
-}
-
-func TestMergeUpstream(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/repos/tester/audiosilo-meta/merge-upstream" {
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-		body := readJSON(t, r)
-		if body["branch"] != "main" {
-			t.Fatalf("branch = %v", body["branch"])
-		}
-		io.WriteString(w, `{"merged":true}`)
-	})
-	if err := c.MergeUpstream(context.Background(), "tester/audiosilo-meta", "main"); err != nil {
-		t.Fatalf("MergeUpstream: %v", err)
-	}
-}
-
-func TestPutContents(t *testing.T) {
-	const contentsPath = "/repos/tester/audiosilo-meta/contents/data/works/aa/a-work/characters.json"
-
-	// Create path: the file does not exist on the branch (GET 404), so PUT carries no sha.
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == contentsPath:
-			if got := r.URL.Query().Get("ref"); got != "sidecars/x-1" {
-				t.Fatalf("ref = %q, want sidecars/x-1", got)
-			}
-			w.WriteHeader(http.StatusNotFound)
-		case r.Method == http.MethodPut && r.URL.Path == contentsPath:
-			body := readJSON(t, r)
-			dec, err := base64.StdEncoding.DecodeString(body["content"].(string))
-			if err != nil {
-				t.Fatalf("content not base64: %v", err)
-			}
-			if string(dec) != `{"work":"a-work"}` {
-				t.Fatalf("decoded content = %q", dec)
-			}
-			if body["branch"] != "sidecars/x-1" {
-				t.Fatalf("branch = %v", body["branch"])
-			}
-			if _, ok := body["sha"]; ok {
-				t.Fatalf("a create over a missing path must not carry a sha: %v", body)
-			}
-			w.WriteHeader(http.StatusCreated)
-			io.WriteString(w, `{"content":{"sha":"abc"}}`)
-		default:
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-	})
-	if err := c.PutContents(context.Background(), "tester/audiosilo-meta", "sidecars/x-1",
-		contentsPath[len("/repos/tester/audiosilo-meta/contents/"):], "add characters", []byte(`{"work":"a-work"}`)); err != nil {
-		t.Fatalf("PutContents (create): %v", err)
-	}
-
-	// Update path (resume): the file already exists (GET returns its sha), so the PUT must
-	// carry that sha - otherwise GitHub 422s the create-over-existing-path.
-	c2 := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			io.WriteString(w, `{"sha":"existing-sha"}`)
-		case http.MethodPut:
-			body := readJSON(t, r)
-			if body["sha"] != "existing-sha" {
-				t.Fatalf("an update over an existing path must carry its sha, got %v", body["sha"])
-			}
-			w.WriteHeader(http.StatusOK)
-			io.WriteString(w, `{}`)
-		default:
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-	})
-	if err := c2.PutContents(context.Background(), "tester/audiosilo-meta", "sidecars/x-1",
-		contentsPath[len("/repos/tester/audiosilo-meta/contents/"):], "update", []byte(`{"work":"a-work"}`)); err != nil {
-		t.Fatalf("PutContents (update): %v", err)
-	}
-}
-
-// TestBranchRef: an existing branch returns its sha + exists=true; a 404 returns
-// exists=false with no error (a resume then reuses/creates as appropriate).
-func TestBranchRef(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/git/ref/heads/present"):
-			io.WriteString(w, `{"object":{"sha":"cafe"}}`)
-		case strings.HasSuffix(r.URL.Path, "/git/ref/heads/absent"):
-			w.WriteHeader(http.StatusNotFound)
-		default:
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-	})
-	sha, exists, err := c.BranchRef(context.Background(), testRepo, "present")
-	if err != nil || !exists || sha != "cafe" {
-		t.Fatalf("present branch = (%q, %v, %v)", sha, exists, err)
-	}
-	_, exists, err = c.BranchRef(context.Background(), testRepo, "absent")
-	if err != nil || exists {
-		t.Fatalf("absent branch = (exists=%v, err=%v), want (false, nil)", exists, err)
-	}
-}
-
-// TestFindOpenPRByHead: an open PR for the head is returned found=true; an empty list is
-// found=false.
-func TestFindOpenPRByHead(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if got := r.URL.Query().Get("head"); got != "tester:sidecars/x-1" {
-			t.Fatalf("head = %q", got)
-		}
-		if got := r.URL.Query().Get("state"); got != "open" {
-			t.Fatalf("state = %q, want open", got)
-		}
-		io.WriteString(w, `[{"number":7,"html_url":"https://github.com/x/y/pull/7","state":"open"}]`)
-	})
-	pr, found, err := c.FindOpenPRByHead(context.Background(), testRepo, "tester:sidecars/x-1")
-	if err != nil || !found || pr.Number != 7 {
-		t.Fatalf("FindOpenPRByHead = (%+v, %v, %v)", pr, found, err)
-	}
-
-	c2 := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, `[]`)
-	})
-	if _, found, err := c2.FindOpenPRByHead(context.Background(), testRepo, "tester:none"); err != nil || found {
-		t.Fatalf("empty = (found=%v, err=%v), want (false, nil)", found, err)
-	}
-}
-
-func TestCreatePull(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/repos/"+testRepo+"/pulls" {
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-		body := readJSON(t, r)
-		if body["head"] != "tester:sidecars/x-1" || body["base"] != "main" {
-			t.Fatalf("pull body = %v", body)
-		}
-		w.WriteHeader(http.StatusCreated)
-		io.WriteString(w, `{"number":99,"html_url":"https://github.com/x/y/pull/99","state":"open"}`)
-	})
-	pr, err := c.CreatePull(context.Background(), testRepo, "tester:sidecars/x-1", "main", "title", "body")
-	if err != nil {
-		t.Fatalf("CreatePull: %v", err)
-	}
-	if pr.Number != 99 || pr.URL != "https://github.com/x/y/pull/99" {
-		t.Fatalf("pr = %+v", pr)
-	}
-}
-
 // TestFindIntakePR checks the head-branch query and merged_at -> Merged mapping.
 func TestFindIntakePR(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -362,30 +153,73 @@ func TestGetPullMerged(t *testing.T) {
 		if r.URL.Path != "/repos/"+testRepo+"/pulls/123" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
-		io.WriteString(w, `{"number":123,"html_url":"u","state":"closed","merged":true}`)
+		io.WriteString(w, `{"number":123,"html_url":"u","state":"closed","merged":true,"base":{"sha":"b4se"},"head":{"sha":"h3ad"}}`)
 	})
 	pr, err := c.GetPull(context.Background(), testRepo, 123)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !pr.Merged || pr.State != "closed" {
+	if !pr.Merged || pr.State != "closed" || pr.BaseSHA != "b4se" || pr.HeadSHA != "h3ad" {
 		t.Fatalf("pr = %+v", pr)
 	}
 }
 
-func TestPullFiles(t *testing.T) {
+func TestCompare(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/repos/"+testRepo+"/pulls/123/files" {
+		if r.URL.Path != "/repos/"+testRepo+"/compare/b4se...h3ad" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
-		io.WriteString(w, `[{"filename":"data/works/th/the-book/work.json"},{"filename":"data/people/au/author.json"}]`)
+		io.WriteString(w, `{"merge_base_commit":{"sha":"mb"},"files":[{"filename":"data/works/c/cat.json","status":"modified"},`+
+			`{"filename":"data/works/c/dog.json","status":"renamed","previous_filename":"data/works/c/cow.json"}]}`)
 	})
-	files, err := c.PullFiles(context.Background(), testRepo, 123)
+	got, err := c.Compare(context.Background(), testRepo, "b4se", "h3ad")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) != 2 || files[0] != "data/works/th/the-book/work.json" {
-		t.Fatalf("files = %v", files)
+	want := []ChangedFile{
+		{Filename: "data/works/c/cat.json"},
+		{Filename: "data/works/c/dog.json", PreviousFilename: "data/works/c/cow.json"},
+	}
+	if got.MergeBase != "mb" || len(got.Files) != 2 || got.Files[0] != want[0] || got.Files[1] != want[1] {
+		t.Fatalf("compare = %+v", got)
+	}
+}
+
+func TestFileAt(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Accept") != "application/vnd.github.raw+json" {
+			t.Fatalf("Accept = %q, want the raw media type", r.Header.Get("Accept"))
+		}
+		if r.URL.Query().Get("ref") != "abc123" {
+			t.Fatalf("ref = %q", r.URL.Query().Get("ref"))
+		}
+		switch r.URL.Path {
+		case "/repos/" + testRepo + "/contents/data/works/0/0.json":
+			io.WriteString(w, `{"entries":{}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	got, found, err := c.FileAt(context.Background(), testRepo, "data/works/0/0.json", "abc123")
+	if err != nil || !found || string(got) != `{"entries":{}}` {
+		t.Fatalf("FileAt = %q found=%v err=%v", got, found, err)
+	}
+	_, found, err = c.FileAt(context.Background(), testRepo, "data/works/0/gone.json", "abc123")
+	if err != nil || found {
+		t.Fatalf("missing file: found=%v err=%v, want found=false and no error", found, err)
+	}
+}
+
+func TestIssueComments(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/"+testRepo+"/issues/7/comments" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		io.WriteString(w, `[{"body":"first","user":{"login":"a"}},{"body":"second","user":{"login":"github-actions[bot]"}}]`)
+	})
+	got, err := c.IssueComments(context.Background(), testRepo, 7)
+	if err != nil || len(got) != 2 || got[1].Body != "second" || got[1].Author != "github-actions[bot]" {
+		t.Fatalf("comments = %+v err=%v", got, err)
 	}
 }
 

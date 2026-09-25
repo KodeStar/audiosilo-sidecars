@@ -124,11 +124,11 @@ func addRow(t *testing.T, db *store.DB, bookID int64, kind, mode string, number 
 	return c
 }
 
-func newService(t *testing.T, db *store.DB, ghURL string, tok TokenResolver, cap *capture, spy *readmitSpy, verify func(context.Context, string) error) *Service {
+func newService(t *testing.T, db *store.DB, ghURL string, tok TokenResolver, cap *capture, spy *readmitSpy, resolve func(context.Context, string) (string, error)) *Service {
 	t.Helper()
 	deps := ServiceDeps{
-		DB: db, Repo: testRepo, BaseURL: ghURL, Tokens: tok,
-		Publish: cap.publish, CorePendingMsg: corePendingMsg, VerifyWork: verify,
+		DB: db, CoreRepo: testRepo, BaseURL: ghURL, Tokens: tok,
+		Publish: cap.publish, CorePendingMsg: corePendingMsg, ResolveWork: resolve,
 	}
 	if spy != nil {
 		deps.Readmit = spy.readmit
@@ -308,25 +308,106 @@ func TestPollIssueWithoutPRMarksAndClearsStaleNote(t *testing.T) {
 	}
 }
 
-// --- poller: core merged -> slug extracted, work_id set, book re-admitted ---
+// --- poller: core merged -> slug learned from the pack files, work_id set, book
+// re-admitted once the work is live ---
+
+// packJSON renders a works pack holding the given entry keys (the entry bodies are
+// irrelevant to the key diff).
+func packJSON(keys ...string) string {
+	var b strings.Builder
+	b.WriteString(`{"entries":{`)
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `%q:{"id":%q}`, k, k)
+	}
+	b.WriteString("}}\n")
+	return b.String()
+}
+
+// coreRepoFake stands in for the core repository around ONE merged add-work PR
+// (#40, base.sha "b4se", head.sha "h3ad", merge base "mb"): the compare API's file
+// list and every pack's content at the merge base (before) and the head (after);
+// "" = absent at that revision. refs records every revision a file was read at.
+type coreRepoFake struct {
+	files  string            // the compare API's files array
+	before map[string]string // path -> pack JSON at the merge base
+	after  map[string]string // path -> pack JSON at the PR head
+	extra  func(http.ResponseWriter, *http.Request) bool
+	refs   *[]string
+}
+
+func (f coreRepoFake) server(t *testing.T) *httptest.Server {
+	t.Helper()
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if f.extra != nil && f.extra(w, r) {
+			return
+		}
+		p := r.URL.Path
+		switch {
+		case strings.HasSuffix(p, "/pulls/40"):
+			io.WriteString(w, `{"number":40,"html_url":"https://gh/pull/40","state":"closed","merged":true,"base":{"sha":"b4se"},"head":{"sha":"h3ad"}}`)
+		case strings.HasSuffix(p, "/compare/b4se...h3ad"):
+			io.WriteString(w, `{"merge_base_commit":{"sha":"mb"},"files":`+f.files+`}`)
+		case strings.Contains(p, "/contents/"):
+			path := p[strings.Index(p, "/contents/")+len("/contents/"):]
+			ref := r.URL.Query().Get("ref")
+			if f.refs != nil {
+				mu.Lock()
+				*f.refs = append(*f.refs, ref)
+				mu.Unlock()
+			}
+			var side map[string]string
+			switch ref {
+			case "mb":
+				side = f.before
+			case "h3ad":
+				side = f.after
+			}
+			body, ok := side[path]
+			if !ok || body == "" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			io.WriteString(w, body)
+		default:
+			http.Error(w, "unexpected "+r.Method+" "+p, http.StatusInternalServerError)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// mergedCoreRow records a merged core row whose intake PR is #40.
+func mergedCoreRow(t *testing.T, db *store.DB, bookID int64) store.Contribution {
+	t.Helper()
+	row := addRow(t, db, bookID, store.ContribKindCore, store.ContribModeIssue, 30, store.ContribStatusSubmitted)
+	if err := db.SetContributionStatus(context.Background(), row.ID, store.ContribStatusMerged, 40, "https://gh/pull/40", ""); err != nil {
+		t.Fatal(err)
+	}
+	return getRow(t, db, bookID, store.ContribKindCore)
+}
 
 func TestPollCoreMergedResolvesSlug(t *testing.T) {
 	db := openDB(t)
 	b := makeBook(t, db, "Core Book", string(state.ParkCorePending))
 	addRow(t, db, b.ID, store.ContribKindCore, store.ContribModeIssue, 30, store.ContribStatusSubmitted)
 
-	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/pulls") && r.Method == http.MethodGet:
-			// FindIntakePR for the core issue -> a merged PR (#40).
-			io.WriteString(w, `[{"number":40,"html_url":"https://gh/pull/40","state":"closed","merged":true,"merged_at":"t"}]`)
-		case strings.HasSuffix(r.URL.Path, "/pulls/40/files"):
-			io.WriteString(w, `[{"filename":"data/works/my/my-work/work.json"}]`)
-		default:
-			http.Error(w, "unexpected "+r.URL.Path, http.StatusInternalServerError)
-		}
-	}))
-	defer gh.Close()
+	gh := coreRepoFake{
+		files:  `[{"filename":"data/works/m/mo.json","status":"modified"}]`,
+		before: map[string]string{"data/works/m/mo.json": packJSON("mo-a", "mo-z")},
+		after:  map[string]string{"data/works/m/mo.json": packJSON("mo-a", "my-work", "mo-z")},
+		extra: func(w http.ResponseWriter, r *http.Request) bool {
+			if strings.HasSuffix(r.URL.Path, "/pulls") && r.Method == http.MethodGet {
+				// FindIntakePR for the core issue -> the merged PR (#40).
+				io.WriteString(w, `[{"number":40,"html_url":"https://gh/pull/40","state":"closed","merged":true,"merged_at":"t"}]`)
+				return true
+			}
+			return false
+		},
+	}.server(t)
 
 	cap := &capture{}
 	spy := &readmitSpy{}
@@ -345,6 +426,127 @@ func TestPollCoreMergedResolvesSlug(t *testing.T) {
 	}
 }
 
+// TestPollCoreMergedLearnsSlugAcrossASplit: the add-work write SPLIT its pack, so the
+// PR renames/removes the old file and adds new ones - entries MOVED between files.
+// Taken as one key set per side, only the genuinely new key survives the diff.
+func TestPollCoreMergedLearnsSlugAcrossASplit(t *testing.T) {
+	db := openDB(t)
+	b := makeBook(t, db, "Split Book", string(state.ParkCorePending))
+	mergedCoreRow(t, db, b.ID)
+
+	gh := coreRepoFake{
+		files: `[{"filename":"data/works/m/m.json","status":"modified"},` +
+			`{"filename":"data/works/m/n.json","status":"added"},` +
+			`{"filename":"data/works/m/p.json","status":"renamed","previous_filename":"data/works/m/o.json"}]`,
+		before: map[string]string{
+			"data/works/m/m.json": packJSON("ma", "mb", "nc", "nd"),
+			"data/works/m/o.json": packJSON("oa", "ob", "pa"),
+		},
+		after: map[string]string{
+			"data/works/m/m.json": packJSON("ma", "mb"),
+			"data/works/m/n.json": packJSON("nc", "nd", "new-work", "oa", "ob"),
+			"data/works/m/p.json": packJSON("pa"),
+		},
+	}.server(t)
+
+	spy := &readmitSpy{}
+	svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, spy, nil)
+	svc.Poll(context.Background())
+
+	if nb, _ := db.GetBook(context.Background(), b.ID); nb.WorkID != "new-work" {
+		t.Fatalf("work_id = %q, want new-work (moved keys must cancel out)", nb.WorkID)
+	}
+	if got := spy.called(); len(got) != 1 {
+		t.Fatalf("readmit = %v, want one", got)
+	}
+}
+
+// TestPollCoreMergedAmbiguousNoGuess: a PR adding two work entries (or none) names no
+// single work - the poller records why on the core row and guesses nothing, and a
+// later tick does not re-read the same PR.
+func TestPollCoreMergedAmbiguousNoGuess(t *testing.T) {
+	for name, after := range map[string]string{
+		"several": packJSON("a-one", "b-two", "old"),
+		"none":    packJSON("old"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			db := openDB(t)
+			b := makeBook(t, db, "Ambiguous", string(state.ParkCorePending))
+			mergedCoreRow(t, db, b.ID)
+			var reads atomic.Int32
+			fake := coreRepoFake{
+				files:  `[{"filename":"data/works/0/0.json","status":"modified"}]`,
+				before: map[string]string{"data/works/0/0.json": packJSON("old")},
+				after:  map[string]string{"data/works/0/0.json": after},
+				extra: func(_ http.ResponseWriter, r *http.Request) bool {
+					if strings.Contains(r.URL.Path, "/compare/") {
+						reads.Add(1)
+					}
+					return false
+				},
+			}
+			gh := fake.server(t)
+			spy := &readmitSpy{}
+			svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, spy, nil)
+			svc.Poll(context.Background())
+
+			if nb, _ := db.GetBook(context.Background(), b.ID); nb.WorkID != "" {
+				t.Fatalf("work_id = %q, want none (no guess)", nb.WorkID)
+			}
+			if len(spy.called()) != 0 {
+				t.Fatal("an unresolved book must not be re-admitted")
+			}
+			row := getRow(t, db, b.ID, store.ContribKindCore)
+			if !strings.Contains(row.Note, store.ContribNoteCoreSlugUnresolvedPrefix) {
+				t.Fatalf("core note = %q, want the unresolved-slug note", row.Note)
+			}
+			// The book no longer claims it resumes automatically: it names the fix.
+			if nb, _ := db.GetBook(context.Background(), b.ID); !strings.Contains(nb.Error, "set the book's work by hand") ||
+				nb.ParkCode != string(state.ParkCorePending) {
+				t.Fatalf("book park = %s / %q, want core_pending with the set-work message", nb.ParkCode, nb.Error)
+			}
+			svc.Poll(context.Background())
+			if n := reads.Load(); n != 1 {
+				t.Fatalf("PR change read %d times, want 1 (a settled answer is not re-read)", n)
+			}
+		})
+	}
+}
+
+// TestPollCoreMergedReadsTheWholePR: the PR has two commits and the new entry is
+// added by the FIRST (the second only edits an existing entry in another pack). The
+// slug is read from the PR's own change - merge base vs head - so it is found
+// whatever the merge style, and no other revision is read.
+func TestPollCoreMergedReadsTheWholePR(t *testing.T) {
+	db := openDB(t)
+	b := makeBook(t, db, "Two Commits", string(state.ParkCorePending))
+	mergedCoreRow(t, db, b.ID)
+	var refs []string
+	gh := coreRepoFake{
+		files: `[{"filename":"data/works/0/0.json","status":"modified"},{"filename":"data/works/0/p.json","status":"modified"}]`,
+		before: map[string]string{
+			"data/works/0/0.json": packJSON("old"),
+			"data/works/0/p.json": packJSON("p-thing"),
+		},
+		after: map[string]string{
+			"data/works/0/0.json": packJSON("new-work", "old"),
+			"data/works/0/p.json": `{"entries":{"p-thing":{"id":"p-thing","title":"tidied"}}}` + "\n",
+		},
+		refs: &refs,
+	}.server(t)
+	svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, &readmitSpy{}, nil)
+	svc.Poll(context.Background())
+
+	if nb, _ := db.GetBook(context.Background(), b.ID); nb.WorkID != "new-work" {
+		t.Fatalf("work_id = %q, want new-work", nb.WorkID)
+	}
+	for _, ref := range refs {
+		if ref != "mb" && ref != "h3ad" {
+			t.Fatalf("read a file at %q; only the merge base and the PR head define the change", ref)
+		}
+	}
+}
+
 // --- poller: a merged core row resolves the slug regardless of park state, but only a
 // core_pending book is re-admitted ---
 
@@ -353,19 +555,13 @@ func TestPollCoreMergedResolvesRegardlessOfPark(t *testing.T) {
 	// A book that already LEFT core_pending (no park) but whose core PR merged and whose
 	// work_id is still empty (a manual retry raced the poller).
 	b := makeBook(t, db, "Moved-on Book", "")
-	row := addRow(t, db, b.ID, store.ContribKindCore, store.ContribModeIssue, 30, store.ContribStatusSubmitted)
-	if err := db.SetContributionStatus(context.Background(), row.ID, store.ContribStatusMerged, 40, "https://gh/pull/40", ""); err != nil {
-		t.Fatal(err)
-	}
+	mergedCoreRow(t, db, b.ID)
 
-	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/pulls/40/files") {
-			io.WriteString(w, `[{"filename":"data/works/my/my-work/work.json"}]`)
-			return
-		}
-		http.Error(w, "unexpected "+r.URL.Path, http.StatusInternalServerError)
-	}))
-	defer gh.Close()
+	gh := coreRepoFake{
+		files:  `[{"filename":"data/works/m/mo.json","status":"modified"}]`,
+		before: map[string]string{"data/works/m/mo.json": packJSON("mo")},
+		after:  map[string]string{"data/works/m/mo.json": packJSON("mo", "my-work")},
+	}.server(t)
 
 	spy := &readmitSpy{}
 	svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, spy, nil)
@@ -378,6 +574,347 @@ func TestPollCoreMergedResolvesRegardlessOfPark(t *testing.T) {
 	if got := spy.called(); len(got) != 0 {
 		t.Fatalf("readmit called %v, want none (book is not parked core_pending)", got)
 	}
+}
+
+// --- poller: the release gate ---
+
+// TestPollReleaseGate: a merged add-work PR is not yet in any data release. The book
+// learns its slug but WAITS (parked core_pending, the release-wait message) while the
+// catalogue 404s the work, and is re-admitted by a later tick once it is live - under
+// the survivor slug when the catalogue redirects.
+func TestPollReleaseGate(t *testing.T) {
+	db := openDB(t)
+	b := makeBook(t, db, "Gated Book", string(state.ParkCorePending))
+	mergedCoreRow(t, db, b.ID)
+	gh := coreRepoFake{
+		files:  `[{"filename":"data/works/m/mo.json","status":"modified"}]`,
+		before: map[string]string{"data/works/m/mo.json": packJSON("mo")},
+		after:  map[string]string{"data/works/m/mo.json": packJSON("mo", "my-work")},
+	}.server(t)
+
+	var live atomic.Bool
+	var asked atomic.Int32
+	resolve := func(_ context.Context, id string) (string, error) {
+		asked.Add(1)
+		if id != "my-work" && id != "my-work-survivor" {
+			t.Errorf("resolve asked for %q", id)
+		}
+		if !live.Load() {
+			return "", ErrWorkNotFound
+		}
+		return "my-work-survivor", nil
+	}
+	spy := &readmitSpy{}
+	svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, spy, resolve)
+
+	// Tick 1: slug learned, not released -> waits with the release message.
+	svc.Poll(context.Background())
+	nb, _ := db.GetBook(context.Background(), b.ID)
+	if nb.WorkID != "my-work" || nb.ParkCode != string(state.ParkCorePending) || nb.Error != ReleaseWaitMsg {
+		t.Fatalf("after tick1 book = work %q park %q msg %q, want my-work / core_pending / the release wait", nb.WorkID, nb.ParkCode, nb.Error)
+	}
+	if len(spy.called()) != 0 {
+		t.Fatal("an unreleased work must not re-admit the book")
+	}
+	if asked.Load() != 1 {
+		t.Fatalf("resolve asked %d times in one tick, want 1", asked.Load())
+	}
+
+	// Tick 2: still unreleased - the release pass re-checks, nothing changes.
+	svc.Poll(context.Background())
+	if len(spy.called()) != 0 {
+		t.Fatal("still unreleased: no re-admit")
+	}
+
+	// Tick 3: released (under a survivor slug) -> adopted and re-admitted.
+	live.Store(true)
+	svc.Poll(context.Background())
+	nb, _ = db.GetBook(context.Background(), b.ID)
+	if nb.WorkID != "my-work-survivor" {
+		t.Fatalf("work_id = %q, want the survivor adopted", nb.WorkID)
+	}
+	if got := spy.called(); len(got) != 1 || got[0] != b.ID {
+		t.Fatalf("readmit = %v, want [%d]", got, b.ID)
+	}
+}
+
+// TestPollReleaseGateTransientLeavesBook: a transport failure checking the work is
+// neither a release nor a 404 - nothing changes and the next tick retries.
+func TestPollReleaseGateTransientLeavesBook(t *testing.T) {
+	db := openDB(t)
+	b := makeBook(t, db, "Flaky", string(state.ParkCorePending))
+	mergedCoreRow(t, db, b.ID)
+	if err := db.SetBookWorkID(context.Background(), b.ID, "known-work"); err != nil {
+		t.Fatal(err)
+	}
+	spy := &readmitSpy{}
+	svc := newService(t, db, "http://127.0.0.1:0", fakeTokenResolver{err: ErrNoCredential}, &capture{}, spy,
+		func(context.Context, string) (string, error) { return "", fmt.Errorf("upstream down") })
+	svc.Poll(context.Background())
+	nb, _ := db.GetBook(context.Background(), b.ID)
+	if len(spy.called()) != 0 || nb.Error != "parked" || nb.WorkID != "known-work" {
+		t.Fatalf("transient failure changed the book: readmit=%v msg=%q work=%q", spy.called(), nb.Error, nb.WorkID)
+	}
+}
+
+// --- poller: intake verdicts ---
+
+// verdictIssue is the mutable issue #12 a verdictFake serves, and the requests it
+// served.
+type verdictIssue struct {
+	mu        sync.Mutex
+	state     string
+	labels    []string
+	comments  string
+	updatedAt string
+	all       atomic.Int32
+	commentRd atomic.Int32
+}
+
+// set replaces the issue's labels, comments and updated_at (a bot re-run).
+func (v *verdictIssue) set(labels []string, comments, updatedAt string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.labels, v.comments, v.updatedAt = labels, comments, updatedAt
+}
+
+// verdictFake serves one issue (#12) in the given state with the given labels, no
+// intake PR, and the given comments.
+func verdictFake(t *testing.T, issueState string, labels []string, comments string) (*httptest.Server, *verdictIssue) {
+	t.Helper()
+	v := &verdictIssue{state: issueState, labels: labels, comments: comments, updatedAt: "2026-09-25T10:00:00Z"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		v.all.Add(1)
+		v.mu.Lock()
+		defer v.mu.Unlock()
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pulls") && r.Method == http.MethodGet:
+			io.WriteString(w, `[]`)
+		case strings.HasSuffix(r.URL.Path, "/issues/12/comments"):
+			v.commentRd.Add(1)
+			io.WriteString(w, v.comments)
+		case strings.HasSuffix(r.URL.Path, "/issues/12"):
+			ls := make([]string, 0, len(v.labels))
+			for _, l := range v.labels {
+				ls = append(ls, fmt.Sprintf(`{"name":%q}`, l))
+			}
+			fmt.Fprintf(w, `{"number":12,"html_url":"https://gh/issues/12","state":%q,"updated_at":%q,"labels":[%s]}`,
+				v.state, v.updatedAt, strings.Join(ls, ","))
+		default:
+			http.Error(w, "unexpected "+r.URL.Path, http.StatusInternalServerError)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, v
+}
+
+// botSays renders one intake-bot verdict comment (intake.yml's shape) as a comments
+// JSON array.
+func botSays(headline, reason string) string {
+	body := headline + "\n\n- " + reason + "\n\n" + intakeBotMarker
+	return fmt.Sprintf(`[{"body":%q,"user":{"login":"github-actions[bot]"}}]`, body)
+}
+
+const botComment = `[{"body":"a human says hi","user":{"login":"someone"}},` +
+	`{"body":"Thanks! This needs a **maintainer** to finish - it can't be applied mechanically.\n\n- a characters.json sidecar already exists at data/works-community/0/0.json: characters; replacing it needs a maintainer\n\n_Posted by the intake bot._","user":{"login":"github-actions[bot]"}}]`
+
+// TestPollVerdicts: the intake bot's verdict replaces "intake PR overdue" on the row.
+// needs-human keeps the row submitted (an edit re-runs the bot) with an actionable
+// note carrying the bot's own message; duplicate is already_covered - upstream
+// already, landed, not an error; invalid on a closed issue is closed with the reason.
+func TestPollVerdicts(t *testing.T) {
+	cases := []struct {
+		name, issueState, label, comments string
+		wantStatus, wantNote              string
+		wantAttention, wantLanded         bool
+	}{
+		{name: "needs-human", issueState: "open", label: "data:needs-human", comments: botComment,
+			wantStatus:    store.ContribStatusSubmitted,
+			wantNote:      "audit passed; " + store.ContribNoteIntakeNeedsHuman + " - a characters.json sidecar already exists",
+			wantAttention: true},
+		{name: "duplicate", issueState: "closed", label: "data:duplicate",
+			comments:   `[{"body":"- the characters are already there\n\n_Posted by the intake bot._","user":{"login":"github-actions[bot]"}}]`,
+			wantStatus: store.ContribStatusAlreadyCovered,
+			wantNote:   "audit passed; " + store.ContribNoteIntakeDuplicate + " - the characters are already there",
+			wantLanded: true},
+		{name: "invalid, closed", issueState: "closed", label: "data:invalid", comments: `[]`,
+			wantStatus: store.ContribStatusClosed, wantNote: "audit passed; " + store.ContribNoteIntakeInvalid},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			db := openDB(t)
+			b := makeBook(t, db, "Verdict Book", "")
+			created := addRow(t, db, b.ID, store.ContribKindCharacters, store.ContribModeIssue, 12, store.ContribStatusSubmitted)
+			if err := db.SetContributionStatus(context.Background(), created.ID, created.Status, 0, "", "audit passed"); err != nil {
+				t.Fatal(err)
+			}
+			gh, _ := verdictFake(t, c.issueState, []string{"data", c.label}, c.comments)
+			svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, nil, nil)
+			// Well past the grace window: without the verdict this would be "overdue".
+			svc.now = func() time.Time { return time.Now().Add(24 * time.Hour) }
+			svc.Poll(context.Background())
+
+			row := getRow(t, db, b.ID, store.ContribKindCharacters)
+			if row.Status != c.wantStatus || !strings.HasPrefix(row.Note, c.wantNote) {
+				t.Fatalf("row = %s / %q, want %s / %q...", row.Status, row.Note, c.wantStatus, c.wantNote)
+			}
+			if strings.Contains(row.Note, store.ContribNoteIntakePRStale) {
+				t.Fatalf("note = %q: a verdict replaces the overdue warning", row.Note)
+			}
+			if got := store.ContributionNeedsAttention([]store.Contribution{row}); got != c.wantAttention {
+				t.Errorf("attention = %v, want %v", got, c.wantAttention)
+			}
+			if hasChars, _ := store.LandedCoverage([]store.Contribution{row}); hasChars != c.wantLanded {
+				t.Errorf("landed = %v, want %v", hasChars, c.wantLanded)
+			}
+		})
+	}
+}
+
+// TestPollVerdictDetailRefresh: the bot re-runs on an edited issue and answers
+// again, adding its label without removing the old one. On the (hourly) re-check the
+// comments are re-read only when the issue itself changed, and the verdict follows
+// the NEWEST bot comment - so a later invalid wins over a stale needs-human label,
+// and a new needs-human reason replaces the old one.
+func TestPollVerdictDetailRefresh(t *testing.T) {
+	db := openDB(t)
+	b := makeBook(t, db, "Rerun Book", string(state.ParkCorePending))
+	addRow(t, db, b.ID, store.ContribKindCore, store.ContribModeIssue, 12, store.ContribStatusSubmitted)
+	needsHuman := "Thanks! This needs a **maintainer** to finish - it can't be applied mechanically."
+	invalid := "This submission couldn't be processed automatically. Please check the details below."
+	gh, issue := verdictFake(t, "open", []string{"data", "data:needs-human"}, botSays(needsHuman, "first reason"))
+	svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, nil, nil)
+	later := func() { svc.now = func() time.Time { return time.Now().Add(2 * time.Hour) } }
+	row := func() store.Contribution { return getRow(t, db, b.ID, store.ContribKindCore) }
+
+	svc.Poll(context.Background())
+	if !strings.Contains(row().Note, store.ContribNoteIntakeNeedsHuman+" - first reason") {
+		t.Fatalf("note = %q", row().Note)
+	}
+
+	// Due re-check, issue unchanged: no comment fetch.
+	later()
+	svc.Poll(context.Background())
+	if issue.commentRd.Load() != 1 {
+		t.Fatalf("comment reads = %d, want 1 (the issue did not change)", issue.commentRd.Load())
+	}
+
+	// A re-run answers needs-human again with a new reason.
+	issue.set([]string{"data", "data:needs-human"}, botSays(needsHuman, "second reason"), "2026-09-26T10:00:00Z")
+	svc.Poll(context.Background())
+	if n := row().Note; !strings.Contains(n, "second reason") || strings.Contains(n, "first reason") {
+		t.Fatalf("note = %q, want the new reason alone", n)
+	}
+
+	// A later run answers invalid; the stale needs-human label stays on the issue.
+	issue.set([]string{"data", "data:needs-human", "data:invalid"}, botSays(invalid, "bad field"), "2026-09-27T10:00:00Z")
+	svc.Poll(context.Background())
+	if n := row().Note; !strings.Contains(n, store.ContribNoteIntakeInvalid+" - bad field") || strings.Contains(n, store.ContribNoteIntakeNeedsHuman) {
+		t.Fatalf("note = %q, want the invalid verdict from the newest bot comment", n)
+	}
+	// The core book's park message follows the new verdict.
+	if nb, _ := db.GetBook(context.Background(), b.ID); !strings.Contains(nb.Error, `"invalid"`) {
+		t.Fatalf("book message = %q, want the invalid verdict", nb.Error)
+	}
+}
+
+// TestPollVerdictRecheckBackoff: a row waiting on a human costs no GitHub call until
+// an hour after it was last checked; a due re-check that changes nothing re-reads no
+// comments and touches the row, which defers the next check another hour.
+func TestPollVerdictRecheckBackoff(t *testing.T) {
+	db := openDB(t)
+	b := makeBook(t, db, "Waiting Book", "")
+	addRow(t, db, b.ID, store.ContribKindCharacters, store.ContribModeIssue, 12, store.ContribStatusSubmitted)
+	gh, calls := verdictFake(t, "open", []string{"data:needs-human"}, botComment)
+	svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, nil, nil)
+	at := func(d time.Duration) {
+		updated, err := time.Parse(time.RFC3339Nano, getRow(t, db, b.ID, store.ContribKindCharacters).UpdatedAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		svc.now = func() time.Time { return updated.Add(d) }
+		svc.Poll(context.Background())
+	}
+
+	svc.Poll(context.Background()) // records the verdict: PR lookup, issue, comments
+	if calls.all.Load() != 3 {
+		t.Fatalf("first tick calls = %d, want 3", calls.all.Load())
+	}
+	at(10 * time.Minute)
+	if calls.all.Load() != 3 {
+		t.Fatalf("calls within the hour = %d, want none", calls.all.Load()-3)
+	}
+	at(61 * time.Minute)
+	if calls.all.Load() != 5 || calls.commentRd.Load() != 1 {
+		t.Fatalf("due re-check: calls=%d comments=%d, want 5 and still 1", calls.all.Load(), calls.commentRd.Load())
+	}
+	at(10 * time.Minute) // measured from the touch the re-check left
+	if calls.all.Load() != 5 {
+		t.Fatalf("calls after the touch = %d, want none", calls.all.Load()-5)
+	}
+}
+
+// TestPollVerdictClearedByIntakePR: a later intake PR (a maintainer fixed the issue
+// and the bot re-ran) replaces the verdict.
+func TestPollVerdictClearedByIntakePR(t *testing.T) {
+	db := openDB(t)
+	b := makeBook(t, db, "Recovered", "")
+	created := addRow(t, db, b.ID, store.ContribKindCharacters, store.ContribModeIssue, 12, store.ContribStatusSubmitted)
+	if err := db.SetContributionStatus(context.Background(), created.ID, created.Status, 0, "",
+		"audit passed; "+store.ContribNoteIntakeNeedsHuman+" - stuff; more"); err != nil {
+		t.Fatal(err)
+	}
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `[{"number":22,"html_url":"https://gh/pull/22","state":"open","merged":false}]`)
+	}))
+	defer gh.Close()
+	svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, nil, nil)
+	svc.now = func() time.Time { return time.Now().Add(2 * time.Hour) } // past the verdict re-check spacing
+	svc.Poll(context.Background())
+	row := getRow(t, db, b.ID, store.ContribKindCharacters)
+	if row.Status != store.ContribStatusPROpen || row.Note != "audit passed" {
+		t.Fatalf("row = %+v, want pr_open with only the audit note left", row)
+	}
+}
+
+// TestPollCoreDuplicateReadmits: the add-work issue answered duplicate means the work
+// exists; the core_pending book is re-admitted so the contributing stage re-resolves
+// it instead of waiting on a PR that is never coming. A needs-human answer re-words
+// the book's park message to point at the issue.
+func TestPollCoreVerdictMovesBookOn(t *testing.T) {
+	t.Run("duplicate", func(t *testing.T) {
+		db := openDB(t)
+		b := makeBook(t, db, "Core Dup", string(state.ParkCorePending))
+		addRow(t, db, b.ID, store.ContribKindCore, store.ContribModeIssue, 12, store.ContribStatusSubmitted)
+		gh, _ := verdictFake(t, "closed", []string{"data:duplicate"}, `[]`)
+		spy := &readmitSpy{}
+		svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, spy, nil)
+		svc.Poll(context.Background())
+		if got := spy.called(); len(got) != 1 || got[0] != b.ID {
+			t.Fatalf("readmit = %v, want [%d]", got, b.ID)
+		}
+		svc.Poll(context.Background())
+		if got := spy.called(); len(got) != 1 {
+			t.Fatalf("readmit = %v, want exactly one (a settled verdict does not re-act)", got)
+		}
+	})
+	t.Run("needs-human", func(t *testing.T) {
+		db := openDB(t)
+		b := makeBook(t, db, "Core Human", string(state.ParkCorePending))
+		addRow(t, db, b.ID, store.ContribKindCore, store.ContribModeIssue, 12, store.ContribStatusSubmitted)
+		gh, _ := verdictFake(t, "open", []string{"data:needs-human"}, `[]`)
+		spy := &readmitSpy{}
+		svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, spy, nil)
+		svc.Poll(context.Background())
+		nb, _ := db.GetBook(context.Background(), b.ID)
+		if nb.ParkCode != string(state.ParkCorePending) || !strings.Contains(nb.Error, "needs a maintainer") ||
+			!strings.Contains(nb.Error, "https://gh/issues/12") {
+			t.Fatalf("book = park %q msg %q, want core_pending with the verdict + issue link", nb.ParkCode, nb.Error)
+		}
+		if len(spy.called()) != 0 {
+			t.Fatal("needs-human must not re-admit")
+		}
+	})
 }
 
 // --- SubmitCore concurrency + idempotency ---
@@ -470,6 +1007,57 @@ func TestSubmitCoreResubmitReusesRecordedIssue(t *testing.T) {
 	}
 }
 
+// TestSubmitCoreSettledRowOpensFreshIssue: a core row the bot answered duplicate
+// (already_covered) or that closed is followed by nothing, so a resubmit must open a
+// fresh issue (clearing the old intake-PR pointer) rather than reuse it - reuse would
+// park the book core_pending with nothing ever moving it again.
+func TestSubmitCoreSettledRowOpensFreshIssue(t *testing.T) {
+	for _, status := range []string{store.ContribStatusAlreadyCovered, store.ContribStatusClosed} {
+		t.Run(status, func(t *testing.T) {
+			db := openDB(t)
+			b := makeBook(t, db, "Needs Core", string(state.ParkCoreNeeded))
+			prior, err := db.UpsertContribution(context.Background(), store.Contribution{
+				BookID: b.ID, Kind: store.ContribKindCore, Mode: store.ContribModeIssue,
+				Number: 77, URL: "https://gh/issues/77", Status: status,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.SetContributionStatus(context.Background(), prior.ID, status, 9, "https://gh/pull/9", ""); err != nil {
+				t.Fatal(err)
+			}
+			var issues int32
+			gh := issueCounter(t, &issues)
+			svc := newService(t, db, gh.URL, fakeTokenResolver{token: "ghp_x"}, &capture{}, nil, nil)
+			p := CoreProposal{Title: "Needs Core", Authors: []string{"A"}, Language: "en", Narrators: []string{"N"}, Sources: "scan"}
+
+			row, err := svc.SubmitCore(context.Background(), b, p)
+			if err != nil {
+				t.Fatalf("resubmit: %v", err)
+			}
+			if got := atomic.LoadInt32(&issues); got != 1 {
+				t.Fatalf("resubmit opened %d issues, want 1", got)
+			}
+			got := getRow(t, db, b.ID, store.ContribKindCore)
+			if row.Number == 77 || got.Status != store.ContribStatusSubmitted || got.PRNumber != 0 || got.PRURL != "" {
+				t.Fatalf("row = %+v, want a fresh submitted row with no intake-PR pointer", got)
+			}
+		})
+	}
+}
+
+// TestLatestBotDetailIgnoresNonBotAuthors: a person pasting the bot's marker cannot
+// put text into a row note.
+func TestLatestBotDetailIgnoresNonBotAuthors(t *testing.T) {
+	_, got, _ := latestBotComment([]IssueComment{
+		{Body: "- real\n\n" + intakeBotMarker, Author: "github-actions[bot]"},
+		{Body: "- spoofed\n\n" + intakeBotMarker, Author: "someone"},
+	})
+	if got != "real" {
+		t.Fatalf("detail = %q, want the bot's own comment", got)
+	}
+}
+
 // --- poller: unauthenticated (tokenless) reads work; a 500 leaves rows unchanged ---
 
 func TestPollTokenlessAndErrorResilience(t *testing.T) {
@@ -544,6 +1132,11 @@ func TestSubmitCoreHappyPath(t *testing.T) {
 
 	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/issues") {
+			// An add-work proposal belongs to the CORE repository (the community repo
+			// holds only the CC BY-SA sidecars and refuses it).
+			if r.URL.Path != "/repos/"+testRepo+"/issues" {
+				t.Errorf("add-work issue opened at %s, want the core repo %s", r.URL.Path, testRepo)
+			}
 			w.WriteHeader(http.StatusCreated)
 			io.WriteString(w, `{"number":50,"html_url":"https://gh/issues/50","labels":[{"name":"data"},{"name":"data:add-work"}]}`)
 			return
@@ -560,7 +1153,7 @@ func TestSubmitCoreHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SubmitCore: %v", err)
 	}
-	if row.Number != 50 || row.Status != store.ContribStatusSubmitted || row.Kind != store.ContribKindCore {
+	if row.Number != 50 || row.Status != store.ContribStatusSubmitted || row.Kind != store.ContribKindCore || row.Repo != testRepo {
 		t.Fatalf("row = %+v", row)
 	}
 	nb, _ := db.GetBook(context.Background(), b.ID)
@@ -591,7 +1184,7 @@ func TestSetWork(t *testing.T) {
 	b := makeBook(t, db, "Set Work", string(state.ParkCoreNeeded))
 	spy := &readmitSpy{}
 	svc := newService(t, db, "", fakeTokenResolver{err: ErrNoCredential}, &capture{}, spy,
-		func(context.Context, string) error { return nil }) // verify: exists
+		func(_ context.Context, id string) (string, error) { return id, nil }) // resolve: exists
 
 	if err := svc.SetWork(context.Background(), b, "the-work"); err != nil {
 		t.Fatalf("SetWork: %v", err)
@@ -610,7 +1203,10 @@ func TestSetWorkInvalidSlug(t *testing.T) {
 	b := makeBook(t, db, "Bad", string(state.ParkCoreNeeded))
 	spy := &readmitSpy{}
 	svc := newService(t, db, "", fakeTokenResolver{err: ErrNoCredential}, &capture{}, spy,
-		func(context.Context, string) error { t.Fatal("verify must not run for a bad slug"); return nil })
+		func(context.Context, string) (string, error) {
+			t.Fatal("verify must not run for a bad slug")
+			return "", nil
+		})
 	if err := svc.SetWork(context.Background(), b, "Not A Slug!"); err != ErrInvalidSlug {
 		t.Fatalf("err = %v, want ErrInvalidSlug", err)
 	}
@@ -623,8 +1219,23 @@ func TestSetWorkNotFoundUpstream(t *testing.T) {
 	db := openDB(t)
 	b := makeBook(t, db, "Missing", string(state.ParkCoreNeeded))
 	svc := newService(t, db, "", fakeTokenResolver{err: ErrNoCredential}, &capture{}, &readmitSpy{},
-		func(context.Context, string) error { return ErrWorkNotFound })
+		func(context.Context, string) (string, error) { return "", ErrWorkNotFound })
 	if err := svc.SetWork(context.Background(), b, "ghost-work"); err != ErrWorkNotFound {
 		t.Fatalf("err = %v, want ErrWorkNotFound", err)
+	}
+}
+
+// TestSetWorkAdoptsSurvivor: a slug a merge retired resolves to its survivor, and the
+// survivor is what gets recorded.
+func TestSetWorkAdoptsSurvivor(t *testing.T) {
+	db := openDB(t)
+	b := makeBook(t, db, "Retired", string(state.ParkCoreNeeded))
+	svc := newService(t, db, "", fakeTokenResolver{err: ErrNoCredential}, &capture{}, &readmitSpy{},
+		func(context.Context, string) (string, error) { return "the-survivor", nil })
+	if err := svc.SetWork(context.Background(), b, "the-retired"); err != nil {
+		t.Fatalf("SetWork: %v", err)
+	}
+	if nb, _ := db.GetBook(context.Background(), b.ID); nb.WorkID != "the-survivor" {
+		t.Fatalf("work_id = %q, want the survivor", nb.WorkID)
 	}
 }

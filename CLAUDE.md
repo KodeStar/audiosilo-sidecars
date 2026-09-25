@@ -216,11 +216,16 @@ Operative caveats surviving from that history:
   pre-M5 `markers_normalizing`/`qa_adjudicating` are safe (those parks wrote
   no sentinel).
 - **audiosilo-meta is pinned at v0.17.0** and the schema drift guard
-  (`internal/pipeline/schema_drift_test.go`) is strict. The contribution paths
-  (PR-mode writes, local export, the poller's slug lookup) still address meta's
-  RETIRED per-record layout through `contrib.LegacyShard`; upstream is
-  range-packed and its CC BY-SA layer lives in KodeStar/audiosilo-meta-community,
-  so they need their own redesign. Background: HISTORY.md (2026-09-25).
+  (`internal/pipeline/schema_drift_test.go`) is strict. Background: HISTORY.md
+  (2026-09-25).
+- **The metadata database is TWO repositories** (since 2026-08-21):
+  `contribution.core_repo` takes add-work proposals, `contribution.community_repo`
+  the sidecars (the core intake refuses them). Contributions go through the
+  repos' intake bots (issue mode) or a local export - never a client-built pack
+  edit (the retired `pr` mode loads as issue). Anything read from upstream
+  storage (a merged PR's new work) goes through meta's `pkg/pack` and ENTRY KEYS,
+  never a file path. A merged work is contributed only once a data release holds
+  it (the release gate). Round trips: `AUDIOSILO_META_DIR` (compose_roundtrip_test).
 - **whisper.cpp binaries ship on their own cadence** (`whisper-binaries.yml`,
   a separate release `toolfetch` consumes; publish first, then bump
   `toolfetch.WhisperCLIReleaseTag`) - never couple them into

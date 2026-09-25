@@ -26,6 +26,20 @@ const ContribNoteIntakePRStale = "intake PR overdue - review the GitHub issue"
 // GitHub drops the requested routing label from a newly created intake issue.
 const ContribNoteLabelsMissingPrefix = "labels missing"
 
+// Intake-verdict notes: the poller records the intake bot's verdict label as the
+// LAST segment of a row's note. needs-human and invalid are actionable on a
+// submitted row; a duplicate row is already_covered (upstream already, not an error).
+const (
+	ContribNoteIntakeVerdictPrefix = "intake verdict: "
+	ContribNoteIntakeNeedsHuman    = ContribNoteIntakeVerdictPrefix + "needs a maintainer"
+	ContribNoteIntakeInvalid       = ContribNoteIntakeVerdictPrefix + "invalid"
+	ContribNoteIntakeDuplicate     = ContribNoteIntakeVerdictPrefix + "already in the database"
+)
+
+// ContribNoteCoreSlugUnresolvedPrefix heads the note on a merged core row whose PR
+// did not add exactly one work; nothing is guessed, a human sets the work.
+const ContribNoteCoreSlugUnresolvedPrefix = "work slug not learned from the merged PR"
+
 // Contribution mode values (how the artifact was contributed). Mirrors
 // config.ContributionConfig.Mode.
 const (
@@ -48,7 +62,7 @@ const (
 )
 
 // Contribution is one tracked contribution row: the state of one artifact (kind) for
-// one book. Number/URL identify the created issue (issue mode) or PR (pr mode);
+// one book. Number/URL identify the created issue (issue mode) or PR (the retired pr mode);
 // PRNumber/PRURL track the intake bot PR an issue-mode contribution produces.
 type Contribution struct {
 	ID        int64
@@ -64,15 +78,18 @@ type Contribution struct {
 	Note      string
 	CreatedAt string
 	UpdatedAt string
+	// IssueSeenAt is the intake issue's updated_at when its verdict comments were
+	// last read (see TouchContribution).
+	IssueSeenAt string
 }
 
 const contribCols = `id, book_id, kind, mode, repo, number, url, pr_number, pr_url,
-	status, note, created_at, updated_at`
+	status, note, created_at, updated_at, issue_seen_at`
 
 func scanContribution(sc interface{ Scan(...any) error }) (Contribution, error) {
 	var c Contribution
 	if err := sc.Scan(&c.ID, &c.BookID, &c.Kind, &c.Mode, &c.Repo, &c.Number, &c.URL,
-		&c.PRNumber, &c.PRURL, &c.Status, &c.Note, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		&c.PRNumber, &c.PRURL, &c.Status, &c.Note, &c.CreatedAt, &c.UpdatedAt, &c.IssueSeenAt); err != nil {
 		return Contribution{}, err
 	}
 	return c, nil
@@ -181,7 +198,7 @@ func (db *DB) ListOpenContributions(ctx context.Context) ([]Contribution, error)
 // of the list as soon as its work_id is set (so an already-resolved book is not
 // re-processed every tick), independent of the book's park state.
 func (db *DB) ListBooksWithUnresolvedMergedCore(ctx context.Context) ([]Book, error) {
-	rows, err := db.sql.QueryContext(ctx,
+	return db.queryBooks(ctx,
 		`SELECT `+bookCols+` FROM books b
 		 WHERE (b.work_id IS NULL OR b.work_id = '')
 		   AND EXISTS (
@@ -190,19 +207,25 @@ func (db *DB) ListBooksWithUnresolvedMergedCore(ctx context.Context) ([]Book, er
 		   )
 		 ORDER BY b.id`,
 		ContribKindCore, ContribStatusMerged)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []Book
-	for rows.Next() {
-		b, err := scanBook(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, b)
-	}
-	return out, rows.Err()
+}
+
+// parkCodeCorePending mirrors state.ParkCorePending (drift-tested, like the kinds).
+const parkCodeCorePending = "core_pending"
+
+// ListBooksAwaitingRelease returns the books parked core_pending with a work_id and
+// a merged core row: the release gate's work list (the poller re-admits each once a
+// data release holds the work).
+func (db *DB) ListBooksAwaitingRelease(ctx context.Context) ([]Book, error) {
+	return db.queryBooks(ctx,
+		`SELECT `+bookCols+` FROM books b
+		 WHERE b.work_id IS NOT NULL AND b.work_id != ''
+		   AND b.status = ? AND b.park_code = ?
+		   AND EXISTS (
+		     SELECT 1 FROM contributions c
+		     WHERE c.book_id = b.id AND c.kind = ? AND c.status = ?
+		   )
+		 ORDER BY b.id`,
+		statusNeedsAttention, parkCodeCorePending, ContribKindCore, ContribStatusMerged)
 }
 
 // SetContributionStatus advances a contribution row's lifecycle: the poller uses it to
@@ -212,6 +235,15 @@ func (db *DB) SetContributionStatus(ctx context.Context, id int64, status string
 	res, err := db.sql.ExecContext(ctx,
 		`UPDATE contributions SET status=?, pr_number=?, pr_url=?, note=?, updated_at=? WHERE id=?`,
 		status, prNumber, prURL, note, timestamp(nowFn()), id)
+	return checkAffected(res, err)
+}
+
+// TouchContribution records that the poller re-checked a row waiting on an intake
+// verdict: it bumps updated_at (which spaces the next check) and stores the issue's
+// updated_at as of that check (which decides whether its comments are re-read).
+func (db *DB) TouchContribution(ctx context.Context, id int64, issueSeenAt string) error {
+	res, err := db.sql.ExecContext(ctx, `UPDATE contributions SET updated_at=?, issue_seen_at=? WHERE id=?`,
+		timestamp(nowFn()), issueSeenAt, id)
 	return checkAffected(res, err)
 }
 
@@ -290,9 +322,14 @@ func LandedCoverage(rows []Contribution) (hasCharacters, hasRecaps bool) {
 // machine-recognized actionable note. Informational audit notes stay neutral.
 func ContributionNeedsAttention(rows []Contribution) bool {
 	for _, row := range rows {
-		if row.Status == ContribStatusSubmitted &&
-			(strings.Contains(row.Note, ContribNoteIntakePRStale) || strings.Contains(row.Note, ContribNoteLabelsMissingPrefix)) {
-			return true
+		if row.Status != ContribStatusSubmitted {
+			continue
+		}
+		for _, marker := range []string{ContribNoteIntakePRStale, ContribNoteLabelsMissingPrefix,
+			ContribNoteIntakeNeedsHuman, ContribNoteIntakeInvalid} {
+			if strings.Contains(row.Note, marker) {
+				return true
+			}
 		}
 	}
 	return false

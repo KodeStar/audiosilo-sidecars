@@ -19,8 +19,13 @@ import (
 // meta slug. The API maps it to 400.
 var ErrInvalidSlug = errors.New("contrib: invalid work id")
 
+// ReleaseWaitMsg parks a book whose add-work PR merged but whose work no published
+// data release holds yet (the community intake would refuse its sidecars); the
+// poller re-admits it once the work is live.
+const ReleaseWaitMsg = "the work proposal merged - waiting for the next data release to publish it; the book resumes automatically"
+
 // ErrWorkNotFound signals that a work id does not exist upstream. The injected
-// VerifyWork translates metaops.ErrWorkNotFound into this package-local sentinel
+// ResolveWork translates metaops.ErrWorkNotFound into this package-local sentinel
 // (so contrib need not import metaops), and SetWork/the API surface it as a 400.
 var ErrWorkNotFound = errors.New("contrib: work not found upstream")
 
@@ -42,8 +47,11 @@ type ContribUpdate struct {
 type ServiceDeps struct {
 	// DB is the scheduling/state store (books + contribution rows).
 	DB *store.DB
-	// Repo is the upstream metadata repo ("owner/name") issues/PRs target.
-	Repo string
+	// CoreRepo is the metadata database's CC0 core repository ("owner/name"), where
+	// SubmitCore opens add-work issues. (Sidecars go to the community repository;
+	// the pipeline's contributing stage opens those, and the poller follows every
+	// row at the repository it records.)
+	CoreRepo string
 	// BaseURL is the GitHub REST base (empty defaults to api.github.com); tests
 	// point it at an httptest server.
 	BaseURL string
@@ -56,11 +64,13 @@ type ServiceDeps struct {
 	// Readmit re-admits a parked book to the scheduler (scheduler.Retry): used when
 	// a core PR merges (poller) or the work is set manually (SetWork).
 	Readmit func(ctx context.Context, id int64) error
-	// VerifyWork checks a work id exists upstream. It returns nil when the work
-	// exists OR the metadata service is disabled (accept the slug shape alone),
-	// ErrWorkNotFound when the work is missing, and any other error for a transport
-	// failure (a transient 502). nil skips verification entirely.
-	VerifyWork func(ctx context.Context, workID string) error
+	// ResolveWork checks a work id is LIVE in the published catalogue and returns
+	// the slug it is live under: the id itself, or - for a slug a merge retired -
+	// the survivor the catalogue redirects it to. It returns (workID, nil) when the
+	// metadata service is disabled (accept the slug shape alone), ErrWorkNotFound
+	// when no published release holds the work, and any other error for a
+	// transport failure (a transient 502). nil skips verification entirely.
+	ResolveWork func(ctx context.Context, workID string) (string, error)
 	// CorePendingMsg is the park message stamped when a core proposal is submitted
 	// (the pipeline owns the canonical string; the server injects it here so contrib
 	// does not import pipeline).
@@ -150,8 +160,12 @@ func (s *Service) SubmitCore(ctx context.Context, book store.Book, p CoreProposa
 
 	// Idempotent reuse: a core row that already carries a created issue is authoritative -
 	// never open a second. Just ensure the park is flipped to core_pending (a prior submit
-	// may have crashed between recording the row and flipping the park).
-	if existing, ok := s.existingCoreRow(ctx, book.ID); ok && existing.URL != "" {
+	// may have crashed between recording the row and flipping the park). Only an
+	// IN-FLIGHT row is reused: a settled one (already_covered - the bot answered
+	// duplicate - or closed) is followed by nothing, so reusing it would park the book
+	// core_pending with no poll or release gate ever moving it again.
+	existing, hasExisting := s.existingCoreRow(ctx, book.ID)
+	if hasExisting && existing.URL != "" && coreRowInFlight(existing) {
 		if err := s.ensureCorePending(ctx, fresh); err != nil {
 			return store.Contribution{}, err
 		}
@@ -171,7 +185,7 @@ func (s *Service) SubmitCore(ctx context.Context, book store.Book, p CoreProposa
 	}
 
 	title, body, labels := WorkIssue(p)
-	issue, err := cli.CreateIssue(ctx, s.deps.Repo, title, body, labels)
+	issue, err := cli.CreateIssue(ctx, s.deps.CoreRepo, title, body, labels)
 	if err != nil {
 		return store.Contribution{}, err
 	}
@@ -183,13 +197,21 @@ func (s *Service) SubmitCore(ctx context.Context, book store.Book, p CoreProposa
 		BookID: book.ID,
 		Kind:   store.ContribKindCore,
 		Mode:   store.ContribModeIssue,
-		Repo:   s.deps.Repo,
+		Repo:   s.deps.CoreRepo,
 		Number: issue.Number,
 		URL:    issue.URL,
 		Status: store.ContribStatusSubmitted,
 	})
 	if err != nil {
 		return store.Contribution{}, fmt.Errorf("contrib: record core row: %w", err)
+	}
+	// The upsert keeps a replaced row's intake-PR pointer: clear it, or the poller
+	// would follow the settled row's old PR instead of the new issue.
+	if hasExisting && (row.PRNumber != 0 || row.PRURL != "") {
+		if err := s.deps.DB.SetContributionStatus(ctx, row.ID, row.Status, 0, "", row.Note); err != nil {
+			return store.Contribution{}, fmt.Errorf("contrib: reset core row: %w", err)
+		}
+		row.PRNumber, row.PRURL = 0, ""
 	}
 
 	// Flip the park core_needed -> core_pending (state stays contributing, status
@@ -206,6 +228,16 @@ func (s *Service) SubmitCore(ctx context.Context, book store.Book, p CoreProposa
 // (core_needed) nor already carries a recorded core issue - so there is nothing to
 // submit and opening one would be spurious. The API maps it to 409.
 var ErrNotAwaitingCore = errors.New("contrib: book is not awaiting a work proposal")
+
+// coreRowInFlight reports whether a core row is still followed by the poller
+// (submitted / pr_open) or the release gate (merged).
+func coreRowInFlight(r store.Contribution) bool {
+	switch r.Status {
+	case store.ContribStatusSubmitted, store.ContribStatusPROpen, store.ContribStatusMerged:
+		return true
+	}
+	return false
+}
 
 // existingCoreRow reads the book's kind=core contribution row, if any.
 func (s *Service) existingCoreRow(ctx context.Context, bookID int64) (store.Contribution, bool) {
@@ -232,24 +264,29 @@ func (s *Service) ensureCorePending(ctx context.Context, book store.Book) error 
 
 // SetWork records a manually-supplied work slug on a book and re-admits it if it
 // was parked awaiting a work (core_needed/core_pending). The slug shape is checked
-// locally; existence is checked via the injected VerifyWork (a disabled metadata
-// service accepts the shape alone). It returns ErrInvalidSlug (bad shape) or
-// ErrWorkNotFound (missing upstream) for the API to map to 400, or a wrapped
-// transport error (502).
+// locally; existence is checked via the injected ResolveWork (a disabled metadata
+// service accepts the shape alone), and a retired slug is recorded as the survivor
+// it resolves to. It returns ErrInvalidSlug (bad shape) or ErrWorkNotFound
+// (missing upstream) for the API to map to 400, or a wrapped transport error (502).
 func (s *Service) SetWork(ctx context.Context, book store.Book, workID string) error {
 	workID = strings.TrimSpace(workID)
 	if !model.ValidSlug(workID) {
 		return ErrInvalidSlug
 	}
-	if s.deps.VerifyWork != nil {
-		if err := s.deps.VerifyWork(ctx, workID); err != nil {
+	live := workID
+	if s.deps.ResolveWork != nil {
+		var err error
+		if live, err = s.deps.ResolveWork(ctx, workID); err != nil {
 			if errors.Is(err, ErrWorkNotFound) {
 				return ErrWorkNotFound
 			}
 			return fmt.Errorf("contrib: verify work: %w", err)
 		}
+		if live == "" {
+			live = workID
+		}
 	}
-	if err := s.deps.DB.SetBookWorkID(ctx, book.ID, workID); err != nil {
+	if _, err := AdoptLiveWork(ctx, s.deps.DB, book.ID, book.WorkID, live); err != nil {
 		return fmt.Errorf("contrib: set work id: %w", err)
 	}
 	if awaitingWork(book) && s.deps.Readmit != nil {

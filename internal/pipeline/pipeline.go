@@ -133,16 +133,18 @@ type Config struct {
 
 	// Contribution (M7) drives the contributing stage. Meta resolves a book's work
 	// slug and reads sidecar coverage (nil = metadata disabled); TokenSource resolves a
-	// GitHub credential for issue/pr modes (nil = no credential); ContribMode is
-	// issue|pr|local; ContribRepo is the upstream owner/name; ContribBaseURL overrides
-	// the GitHub REST base for tests (empty = api.github.com); ExportRoot is where local
-	// mode writes the repo-layout export.
-	Meta           MetaCoverage
-	TokenSource    TokenResolver
-	ContribMode    string
-	ContribRepo    string
-	ContribBaseURL string
-	ExportRoot     string
+	// GitHub credential for issue mode (nil = no credential); ContribMode is
+	// issue|local; ContribCommunityRepo is the owner/name of the metadata
+	// database's COMMUNITY repository, which takes the characters/recaps sidecars
+	// (add-work proposals go to the core repository through contrib.Service, not
+	// through this stage); ContribBaseURL overrides the GitHub REST base for tests
+	// (empty = api.github.com); ExportRoot is where local mode writes its export.
+	Meta                 MetaCoverage
+	TokenSource          TokenResolver
+	ContribMode          string
+	ContribCommunityRepo string
+	ContribBaseURL       string
+	ExportRoot           string
 }
 
 // Executor is the composite stage executor. ffmpeg/ffprobe are the resolved tool
@@ -187,12 +189,12 @@ type Executor struct {
 	fallback              scheduler.Executor
 
 	// Contribution-stage deps (M7); see Config.
-	meta           MetaCoverage
-	tokenSource    TokenResolver
-	contribMode    string
-	contribRepo    string
-	contribBaseURL string
-	exportRoot     string
+	meta                 MetaCoverage
+	tokenSource          TokenResolver
+	contribMode          string
+	contribCommunityRepo string
+	contribBaseURL       string
+	exportRoot           string
 
 	// redetectASR re-selects an ASR backend when the frozen one is unavailable. It is
 	// a field so a test can inject a scripted result; NewExecutor sets it to
@@ -252,12 +254,12 @@ func NewExecutor(cfg Config) *Executor {
 		log:                   log,
 		fallback:              cfg.Fallback,
 
-		meta:           cfg.Meta,
-		tokenSource:    cfg.TokenSource,
-		contribMode:    cfg.ContribMode,
-		contribRepo:    cfg.ContribRepo,
-		contribBaseURL: cfg.ContribBaseURL,
-		exportRoot:     cfg.ExportRoot,
+		meta:                 cfg.Meta,
+		tokenSource:          cfg.TokenSource,
+		contribMode:          cfg.ContribMode,
+		contribCommunityRepo: cfg.ContribCommunityRepo,
+		contribBaseURL:       cfg.ContribBaseURL,
+		exportRoot:           cfg.ExportRoot,
 	}
 	e.redetectASR = e.defaultRedetectASR
 	e.redetectAgent = e.defaultRedetectAgent

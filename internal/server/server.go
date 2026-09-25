@@ -70,6 +70,11 @@ func Run(ctx context.Context, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	// Deprecated settings Load honoured (e.g. the pre-split contribution.repo) are
+	// reported once per start; saving the settings rewrites the file without them.
+	for _, d := range cfg.Deprecations() {
+		fmt.Fprintf(opts.Out, "[warn] deprecated setting: %s\n", d)
+	}
 	if opts.Listen != "" {
 		cfg.Listen = opts.Listen
 		if err := cfg.Validate(); err != nil {
@@ -247,12 +252,15 @@ func Run(ctx context.Context, opts Options) error {
 		// token`), and publishes per the configured mode. ContribBaseURL is the GitHub
 		// REST base (config.contribution.api_base_url, default api.github.com; overridable
 		// for tests and GitHub Enterprise); ExportRoot receives local-mode exports.
-		Meta:           metaClient,
-		TokenSource:    tokenSource,
-		ContribMode:    cfg.Contribution.Mode,
-		ContribRepo:    cfg.Contribution.Repo,
-		ContribBaseURL: cfg.Contribution.APIBaseURL,
-		ExportRoot:     filepath.Join(opts.DataDir, "export"),
+		// The stage contributes the characters/recaps sidecars, which belong in the
+		// COMMUNITY repository; add-work proposals go to the core repository through
+		// the contribution service below.
+		Meta:                 metaClient,
+		TokenSource:          tokenSource,
+		ContribMode:          cfg.Contribution.Mode,
+		ContribCommunityRepo: cfg.Contribution.CommunityRepo,
+		ContribBaseURL:       cfg.Contribution.APIBaseURL,
+		ExportRoot:           filepath.Join(opts.DataDir, "export"),
 	})
 	sched := scheduler.New(db, hub, exec, agentCapacity.QueueConcurrency, workRoot, cfg.Contribution.AutoPurge)
 	schedCtx, cancelSched := context.WithCancel(runCtx)
@@ -318,26 +326,30 @@ func Run(ctx context.Context, opts Options) error {
 
 	// Contribution service (M7): the core add-work submit endpoint and the intake
 	// poller share it. It reaches the scheduler (re-admit) and the event hub (SSE)
-	// through injected function seams so contrib imports neither. VerifyWork maps the
+	// through injected function seams so contrib imports neither. ResolveWork maps the
 	// metadata client's errors to contrib's local sentinels (a disabled service accepts
-	// the slug shape alone). The poller runs under schedCtx so it stops with the
-	// scheduler; it works tokenless (public reads).
+	// the slug shape alone) and hands back the LIVE slug (a retired one resolves to its
+	// survivor) - it is also the poller's release gate. The poller runs under schedCtx
+	// so it stops with the scheduler; it works tokenless (public reads).
 	contribSvc := contrib.NewService(contrib.ServiceDeps{
-		DB:      db,
-		Repo:    cfg.Contribution.Repo,
-		BaseURL: cfg.Contribution.APIBaseURL, // GitHub REST base (default api.github.com)
-		Tokens:  tokenSource,
-		Publish: func(u contrib.ContribUpdate) { _ = hub.PublishBook("contrib.update", u.BookID, u) },
-		Readmit: sched.Retry,
-		VerifyWork: func(ctx context.Context, workID string) error {
-			_, err := metaClient.CoverageForWork(ctx, workID)
+		DB:       db,
+		CoreRepo: cfg.Contribution.CoreRepo,
+		BaseURL:  cfg.Contribution.APIBaseURL, // GitHub REST base (default api.github.com)
+		Tokens:   tokenSource,
+		Publish:  func(u contrib.ContribUpdate) { _ = hub.PublishBook("contrib.update", u.BookID, u) },
+		Readmit:  sched.Retry,
+		ResolveWork: func(ctx context.Context, workID string) (string, error) {
+			// Fresh: this decides which slug is live (adoption, the release gate).
+			cov, err := metaClient.FreshCoverageForWork(ctx, workID)
 			switch {
-			case err == nil, errors.Is(err, metaops.ErrDisabled):
-				return nil
+			case err == nil:
+				return cov.WorkID, nil
+			case errors.Is(err, metaops.ErrDisabled):
+				return workID, nil
 			case errors.Is(err, metaops.ErrWorkNotFound):
-				return contrib.ErrWorkNotFound
+				return "", contrib.ErrWorkNotFound
 			default:
-				return err
+				return "", err
 			}
 		},
 		CorePendingMsg: pipeline.CorePendingMsg,

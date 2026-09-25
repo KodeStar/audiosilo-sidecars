@@ -7,11 +7,10 @@
 import type { ContributionConfig, ContributionUpdate } from '@/api/types';
 import { parseIntOrNaN } from '@/lib/formNumbers';
 
-// The three publish modes for the contributing stage.
+// The publish modes for the contributing stage (the direct-PR mode is retired).
 export const CONTRIBUTION_MODES: { value: string; label: string }[] = [
   { value: 'issue', label: 'Issue (intake bot composes the PR)' },
-  { value: 'pr', label: 'Pull request (direct)' },
-  { value: 'local', label: 'Local export only' },
+  { value: 'local', label: 'Local export only (one sidecar file per kind)' },
 ];
 
 // ContributionFormState is the editable form model. pollMinutes is a raw input
@@ -19,16 +18,43 @@ export const CONTRIBUTION_MODES: { value: string; label: string }[] = [
 // validation functions parse it.
 export interface ContributionFormState {
   mode: string;
-  repo: string;
+  coreRepo: string;
+  communityRepo: string;
   autoPurge: boolean;
   pollMinutes: string;
 }
+
+// REPO_FIELDS are the two halves of the split metadata database, rendered and
+// validated from this one list.
+export const REPO_FIELDS: {
+  key: 'communityRepo' | 'coreRepo';
+  id: string;
+  label: string;
+  example: string;
+  hint: string;
+}[] = [
+  {
+    key: 'communityRepo',
+    id: 'contrib-community-repo',
+    label: 'Community repository',
+    example: 'KodeStar/audiosilo-meta-community',
+    hint: 'Receives the characters and recaps sidecars (the CC BY-SA layer).',
+  },
+  {
+    key: 'coreRepo',
+    id: 'contrib-core-repo',
+    label: 'Core repository',
+    example: 'KodeStar/audiosilo-meta',
+    hint: 'Receives add-work proposals, for a book whose work is not on AudioSilo Meta yet.',
+  },
+];
 
 // contributionConfigToForm seeds the form from the loaded settings.
 export function contributionConfigToForm(cfg: ContributionConfig): ContributionFormState {
   return {
     mode: cfg.mode,
-    repo: cfg.repo,
+    coreRepo: cfg.core_repo,
+    communityRepo: cfg.community_repo,
     autoPurge: cfg.auto_purge,
     pollMinutes: String(cfg.poll_minutes),
   };
@@ -39,7 +65,8 @@ export function contributionConfigToForm(cfg: ContributionConfig): ContributionF
 export function contributionFormToUpdate(form: ContributionFormState): ContributionUpdate {
   return {
     mode: form.mode,
-    repo: form.repo.trim(),
+    core_repo: form.coreRepo.trim(),
+    community_repo: form.communityRepo.trim(),
     auto_purge: form.autoPurge,
     poll_minutes: parseIntOrNaN(form.pollMinutes),
   };
@@ -50,10 +77,11 @@ export function contributionFormToUpdate(form: ContributionFormState): Contribut
 // owner/name shape, mode enum, poll interval) and its 400 message wins on any
 // disagreement.
 export function validateContributionForm(form: ContributionFormState): string | null {
-  const repo = form.repo.trim();
   // owner/name: a single slash, no spaces, non-empty halves.
-  if (!/^[^/\s]+\/[^/\s]+$/.test(repo)) {
-    return 'Repository must be in owner/name form (e.g. KodeStar/audiosilo-meta).';
+  for (const f of REPO_FIELDS) {
+    if (!/^[^/\s]+\/[^/\s]+$/.test(form[f.key].trim())) {
+      return `${f.label} must be in owner/name form (e.g. ${f.example}).`;
+    }
   }
   const p = parseIntOrNaN(form.pollMinutes);
   if (!Number.isInteger(p) || p < 1) {

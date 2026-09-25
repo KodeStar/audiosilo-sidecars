@@ -385,7 +385,12 @@ func (db *DB) GetBook(ctx context.Context, id int64) (Book, error) {
 
 // ListBooks returns all books ordered by id.
 func (db *DB) ListBooks(ctx context.Context) ([]Book, error) {
-	rows, err := db.sql.QueryContext(ctx, `SELECT `+bookCols+` FROM books ORDER BY id`)
+	return db.queryBooks(ctx, `SELECT `+bookCols+` FROM books ORDER BY id`)
+}
+
+// queryBooks runs a SELECT of bookCols and scans every row.
+func (db *DB) queryBooks(ctx context.Context, query string, args ...any) ([]Book, error) {
+	rows, err := db.sql.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -429,23 +434,10 @@ func (db *DB) ListBookTracking(ctx context.Context) (map[string]BookTracking, er
 // filters these by park_code (only the transient agent codes auto-readmit); a book that
 // predates migration 0008 has retry_at=” and is excluded here, so it never auto-readmits.
 func (db *DB) ListBooksDueForRetry(ctx context.Context, now string) ([]Book, error) {
-	rows, err := db.sql.QueryContext(ctx,
+	return db.queryBooks(ctx,
 		`SELECT `+bookCols+` FROM books
 		 WHERE status=? AND retry_at != '' AND retry_at <= ? ORDER BY id`,
 		statusNeedsAttention, now)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []Book
-	for rows.Next() {
-		b, err := scanBook(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, b)
-	}
-	return out, rows.Err()
 }
 
 // SetBookState updates a book's state, status, error, and typed park code together
