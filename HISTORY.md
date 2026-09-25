@@ -604,19 +604,30 @@ Milestones from the workspace plan; each is shippable.
   #2366 made its `data/` tree a nested module, so a meta tag's module zip is a
   few MiB again and the pin moved from v0.8.0 to **v0.17.0**, the first tag
   carrying that change. Taking it forces meta's Go floor (`go 1.26.0`) here:
-  go.mod, the Dockerfile's `golang:1.26` build stage, README and CLAUDE (CI
-  reads `go-version-file: go.mod`). What broke against the new pkg/*: (1)
-  `model.Shard` is gone - upstream's tree is range-packed, so a path no longer
-  names a record. The contribution paths that spell per-record paths keep
-  their behaviour through `contrib.LegacyShard`, a verbatim copy; they target
-  a layout upstream retired (and a repo the sidecar layer left on 2026-08-21),
-  which is a separate redesign, recorded in CLAUDE.md. (2) `extract.NGram` now
-  identifies a bare sidecar by EVERY schema-required key and refuses one
-  missing any - which would have failed the validating stage, whose contract
-  is that only IO fails it. `ngramGate` reports a missing key (or a non-object
-  file) as an ERROR finding and skips the n-gram check until the fixer repairs
-  the record; `sidecarRequiredKeys` is pinned to the schemas' `required` by
-  the drift test. One test fixture gained the keys. The drift guard is STRICT
-  again: `stalePinLicenseContent` and
+  go.mod, the Dockerfile's `golang:1.26` build stage, README and CLAUDE. CI
+  and release setup-go now read a one-line `.go-version` (`1.26`) with
+  `check-latest: true`, as audiosilo-meta does: `go-version-file: go.mod` took
+  the exact `1.26.0` floor and built every release on it, missing each later
+  1.26.x stdlib fix. What broke against the new pkg/*: (1) `model.Shard` is
+  gone - upstream's tree is range-packed, so a path no longer names a record.
+  The contribution paths that spell per-record paths keep their behaviour
+  through `contrib.LegacyShard`, a verbatim copy; they target a layout
+  upstream retired (and a repo the sidecar layer left on 2026-08-21), which is
+  a separate redesign, recorded in CLAUDE.md. (2) `extract.NGram` now
+  hard-fails on a sidecar its schema rejects - a missing required key, or
+  (unlike v0.8.0) a null or wrong-typed field such as `"ending": null`, which
+  the typed decode and the structural rules both accept - and that would have
+  failed the validating stage, whose contract is that only IO fails it.
+  `ngramGate` validates each sidecar against meta's embedded characters/recaps
+  schema (compiled once from each file's own `$id`,
+  santhosh-tekuri/jsonschema/v6, now a direct dependency) and skips the scan
+  only for a file NGram would REFUSE - not valid JSON, a missing top-level
+  required key, or a wrong JSON type (null included) - with one ERROR finding
+  naming the first such violation, chosen deterministically. Any other
+  violation (a cap, an enum, an empty list) is still scanned, so a verbatim
+  run in an over-cap description is reported in the same round rather than a
+  fix attempt later; a valid recaps.json is likewise still scanned beside a
+  broken characters.json. One test fixture now builds complete records. The
+  drift guard is STRICT again: `stalePinLicenseContent` and
   `TestSidecarLicenseIsTheCommunityLayerValue` are gone, since the upstream
   enum is now CC-BY-SA-4.0 and plain equality holds. Gate: full Go gate green.

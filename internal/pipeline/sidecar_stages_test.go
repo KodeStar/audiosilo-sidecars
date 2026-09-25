@@ -277,18 +277,90 @@ func TestValidateFlagsEmDash(t *testing.T) {
 	}
 }
 
-// TestValidateReportsAnIncompleteRecordInsteadOfFailing: extract.NGram refuses a
-// sidecar missing a schema-required key, and the stage's contract is that only IO
-// fails it. So a record without its sources is an ERROR finding the fixer can act on
-// (and the n-gram check waits for the repaired record), never a stage error.
-func TestValidateReportsAnIncompleteRecordInsteadOfFailing(t *testing.T) {
+// TestValidateSkipsNgramForSchemaInvalidSidecars: extract.NGram hard-fails on a
+// record its schema rejects, and the stage's contract is that only IO fails it. So
+// each schema-invalid file is ONE error finding (and is not scanned), never a stage
+// error - while a valid sibling is still scanned.
+func TestValidateSkipsNgramForSchemaInvalidSidecars(t *testing.T) {
+	const stolen = "the ancient tower stood alone against the crimson sky"
+	cases := []struct {
+		name   string
+		file   string
+		mutate func(obj map[string]any)
+		want   string
+	}{
+		{"null ending", recapsFileName, func(o map[string]any) { o["ending"] = nil }, "recaps.json satisfies the recaps schema"},
+		{"null characters", charactersFileName, func(o map[string]any) { o["characters"] = nil }, "characters.json satisfies the characters schema"},
+		{"wrong-typed field", recapsFileName, func(o map[string]any) { o["in_short"] = 42 }, "recaps.json satisfies the recaps schema"},
+		{"missing key", charactersFileName, func(o map[string]any) { delete(o, "sources") }, "characters.json satisfies the characters schema"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			work := t.TempDir()
+			seedSidecarManifest(t, work)
+			// Plant a verbatim run in BOTH files, so whichever one stays valid proves it
+			// was still scanned.
+			chars := baseChars("book")
+			chars.Characters[0].Description = "In this book, " + stolen + " throughout."
+			recs := baseRecaps("book")
+			recs.Recaps[0].Text = "Then " + stolen + " once more."
+			seedWorkSidecars(t, work, chars, recs)
+			seedTranscriptsText(t, work, "before it "+stolen+" after it", "unrelated text here")
+
+			path := filepath.Join(work, sidecarsDir, tc.file)
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var obj map[string]any
+			if err := json.Unmarshal(raw, &obj); err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(obj)
+			writeJSON(t, path, obj)
+
+			exe := NewExecutor(Config{DataDir: t.TempDir(), Fallback: scheduler.NewStubExecutor(0, 0)})
+			if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Validating, scheduler.StageReport{}); err != nil {
+				t.Fatalf("validating failed the stage over a repairable record: %v", err)
+			}
+			rep := readValidationReport(t, work)
+			gate := 0
+			for _, e := range rep.Errors {
+				if strings.Contains(e, "n-gram check skipped") {
+					gate++
+				}
+			}
+			if gate != 1 || !containsSub(rep.Errors, tc.want) {
+				t.Errorf("errors %v: want exactly one gate finding containing %q", rep.Errors, tc.want)
+			}
+			valid := charactersFileName
+			if tc.file == charactersFileName {
+				valid = recapsFileName
+			}
+			if !containsSub(rep.Errors, "in "+valid+" vs") {
+				t.Errorf("errors %v: the valid %s was not n-gram scanned", rep.Errors, valid)
+			}
+			if containsSub(rep.Errors, "in "+tc.file+" vs") {
+				t.Errorf("errors %v: the schema-invalid %s was n-gram scanned", rep.Errors, tc.file)
+			}
+		})
+	}
+}
+
+// TestValidateScansThroughViolationsNgramAccepts: a schema violation extract.NGram
+// reads through (an over-cap description, an empty aliases list, an empty role) must
+// not skip the scan, or a verbatim run in that file surfaces a whole fix round late.
+func TestValidateScansThroughViolationsNgramAccepts(t *testing.T) {
+	const stolen = "the ancient tower stood alone against the crimson sky"
 	work := t.TempDir()
 	seedSidecarManifest(t, work)
-	seedWorkSidecars(t, work, baseChars("book"), baseRecaps("book"))
-	seedTranscriptsText(t, work, "unrelated one", "unrelated two")
-	// Rewrite characters.json without its sources key.
-	charsPath := filepath.Join(work, sidecarsDir, charactersFileName)
-	raw, err := os.ReadFile(charsPath)
+	chars := baseChars("book")
+	chars.Characters[0].Description = "In this book, " + stolen + " throughout. " + strings.Repeat("a", capDescription)
+	seedWorkSidecars(t, work, chars, baseRecaps("book"))
+	seedTranscriptsText(t, work, "before it "+stolen+" after it", "unrelated text here")
+
+	path := filepath.Join(work, sidecarsDir, charactersFileName)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,30 +368,66 @@ func TestValidateReportsAnIncompleteRecordInsteadOfFailing(t *testing.T) {
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		t.Fatal(err)
 	}
-	delete(obj, "sources")
-	writeJSON(t, charsPath, obj)
+	c0 := obj["characters"].([]any)[0].(map[string]any)
+	c0["aliases"] = []any{}
+	c0["role"] = ""
+	writeJSON(t, path, obj)
 
-	exe := NewExecutor(Config{DataDir: t.TempDir(), Fallback: scheduler.NewStubExecutor(0, 0)})
-	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Validating, scheduler.StageReport{}); err != nil {
-		t.Fatalf("validating failed the stage over a repairable record: %v", err)
-	}
-	rep := readValidationReport(t, work)
-	if rep.Clean || !containsSub(rep.Errors, `missing required key "sources"`) {
-		t.Errorf("report = %+v, want a missing-required-key error", rep)
-	}
-}
-
-// TestNgramGateAcceptsCompleteRecords: the gate stands aside for records carrying
-// every required key, so the n-gram check runs on them.
-func TestNgramGateAcceptsCompleteRecords(t *testing.T) {
-	work := t.TempDir()
-	seedWorkSidecars(t, work, baseChars("book"), baseRecaps("book"))
-	got, err := ngramGate(filepath.Join(work, sidecarsDir, charactersFileName), filepath.Join(work, sidecarsDir, recapsFileName))
+	schemas, err := sidecarSchemas()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 0 {
-		t.Errorf("gate findings = %v, want none for complete records", got)
+	raw, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, refused := schemaViolation(schemas["characters"], raw); v == "" || refused {
+		t.Fatalf("schemaViolation = %q, refused=%v; want a violation NGram does not refuse", v, refused)
+	}
+
+	exe := NewExecutor(Config{DataDir: t.TempDir(), Fallback: scheduler.NewStubExecutor(0, 0)})
+	if _, err := exe.Execute(context.Background(), store.Book{ID: 1, Title: "Book", WorkDir: work}, state.Validating, scheduler.StageReport{}); err != nil {
+		t.Fatalf("validating: %v", err)
+	}
+	rep := readValidationReport(t, work)
+	if containsSub(rep.Errors, "n-gram check skipped") {
+		t.Errorf("errors %v: the scan was skipped over a violation NGram accepts", rep.Errors)
+	}
+	if !containsSub(rep.Errors, "near-verbatim overlap") || !containsSub(rep.Errors, "in "+charactersFileName+" vs") {
+		t.Errorf("errors %v: the overlap in characters.json was not reported in this round", rep.Errors)
+	}
+}
+
+// TestSchemaViolationIsDeterministic: the validator walks an object's properties in
+// map order, so with several violations its own first leaf varies run to run. The
+// finding must name the same violation every time (and count the rest).
+func TestSchemaViolationIsDeterministic(t *testing.T) {
+	schemas, err := sidecarSchemas()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(baseRecaps("book"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatal(err)
+	}
+	obj["in_short"] = 42
+	obj["ending"] = nil
+	obj["license"] = "CC0-1.0"
+	if raw, err = json.Marshal(obj); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := schemaViolation(schemas["recaps"], raw)
+	if !strings.HasPrefix(first, "/ending: ") || !strings.HasSuffix(first, "(and 2 more)") {
+		t.Fatalf("violation = %q, want the smallest location first and a count of the rest", first)
+	}
+	for range 50 {
+		if got, _ := schemaViolation(schemas["recaps"], raw); got != first {
+			t.Fatalf("violation changed between runs: %q then %q", first, got)
+		}
 	}
 }
 

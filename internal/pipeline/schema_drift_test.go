@@ -9,7 +9,7 @@ import (
 )
 
 // TestSidecarConstantsMatchUpstreamSchema is a drift guard: the caps, enums, QID
-// pattern, share-alike license and required keys in sidecars.go are HAND-COPIED from the
+// pattern and share-alike license in sidecars.go are HAND-COPIED from the
 // audiosilo-meta characters/recaps schemas (there is no codegen). This test loads the
 // authoritative schemas straight from the pinned meta module's embedded FS
 // (meta.SchemaFS) and asserts the local constants still equal the upstream contract, so
@@ -53,31 +53,6 @@ func TestSidecarConstantsMatchUpstreamSchema(t *testing.T) {
 	}
 	if v, _ := enum[0].(string); v != sidecarLicenseContent {
 		t.Errorf("license_content enum[0] = %q, local sidecarLicenseContent = %q", v, sidecarLicenseContent)
-	}
-
-	// The top-level required keys (schema `required` <-> sidecarRequiredKeys, the set
-	// the validating stage checks before handing a record to extract.NGram).
-	assertRequired(t, "characters", characters, sidecarRequiredKeys("characters"))
-	assertRequired(t, "recaps", recaps, sidecarRequiredKeys("recaps"))
-}
-
-func assertRequired(t *testing.T, locus string, schema map[string]any, local []string) {
-	t.Helper()
-	raw, ok := schema["required"].([]any)
-	if !ok {
-		t.Fatalf("%s: required missing in schema", locus)
-	}
-	schemaSet := map[string]bool{}
-	for _, v := range raw {
-		s, _ := v.(string)
-		schemaSet[s] = true
-	}
-	localSet := map[string]bool{}
-	for _, k := range local {
-		localSet[k] = true
-	}
-	if !reflect.DeepEqual(schemaSet, localSet) {
-		t.Errorf("%s required = %v, local sidecarRequiredKeys = %v", locus, schemaSet, localSet)
 	}
 }
 

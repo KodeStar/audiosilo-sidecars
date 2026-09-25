@@ -6,6 +6,7 @@ require (
 	github.com/dlclark/regexp2 v1.12.0
 	github.com/kodestar/audiosilo-meta v0.17.0
 	github.com/kodestar/audiosilo-server v1.12.1-0.20260813222639-6a1c4142a8ad
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	github.com/ulikunitz/xz v0.5.15
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/crypto v0.54.0
@@ -22,7 +23,6 @@ require (
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
-	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	modernc.org/libc v1.75.7 // indirect

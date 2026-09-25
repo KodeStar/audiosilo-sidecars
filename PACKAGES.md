@@ -322,10 +322,8 @@ internal/
             + validated outputs via the shared runAgent driver, usage recorded onto the
             open stage_run after every invocation), while retranscribing/correcting/
             validating are MECHANICAL (ASR+repair / spelling engine / canonicalize+ngram).
-            validating's ngramGate runs first: extract.NGram REFUSES a record missing a
-            schema-required key (sidecarRequiredKeys, drift-guarded), so an incomplete
-            record is an ERROR finding and the n-gram check waits for the fixed record -
-            only IO may fail the stage.
+            validating skips the n-gram scan only for a sidecar NGram would refuse
+            (ngramGate).
             M7 made contributing real (contrib_stage.go: slug reconcile -> skip-if-
             covered -> submit per contribution.mode, resume-idempotent via the
             contributions rows; export.go composes the download zip + core-proposal

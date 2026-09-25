@@ -28,7 +28,11 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # .go-version holds the bare minor; check-latest resolves it to the newest
+          # patch. go.mod's exact `go 1.26.0` floor would pin every build to 1.26.0
+          # and miss each later stdlib security fix.
+          go-version-file: .go-version
+          check-latest: true
 
       - name: Build
         run: go build ./...
