@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -295,13 +296,7 @@ func readingSeries(refs []SeriesRef) *SeriesRef {
 	if len(refs) == 0 {
 		return nil
 	}
-	i := 0
-	for j := range refs {
-		if refs[j].OrderingOf == "" {
-			i = j
-			break
-		}
-	}
+	i := max(slices.IndexFunc(refs, func(r SeriesRef) bool { return r.OrderingOf == "" }), 0)
 	return cloneSeriesRef(&refs[i])
 }
 
@@ -692,7 +687,8 @@ func (c *Client) searchMatch(ctx context.Context, id BookIdentity) (Coverage, bo
 		}
 		// The card's series arrives already chosen: metaserve's card applies
 		// readingSeries' rule server-side (non-variants first), so a ref carrying
-		// ordering_of here is a variant-only work and is kept as is.
+		// ordering_of here is a variant-only work and is kept as is (fetchWorkSearch
+		// decodes the field for exactly that).
 		v = searchVal{
 			matched: true, workID: cards[idx].ID, workTitle: cards[idx].Title,
 			series: cloneSeriesRef(cards[idx].Series),
@@ -781,11 +777,10 @@ func (c *Client) fetchWorkSearch(ctx context.Context, query string, limit int) (
 			Narrators []struct {
 				Name string `json:"name"`
 			} `json:"narrators"`
-			Series *struct {
-				Name     string `json:"name"`
-				Position string `json:"position"`
-			} `json:"series"`
-			CoverURL *string `json:"cover_url"`
+			// The card's whole series ref, ordering_of included, so a variant-only
+			// work's card keeps the marker readingSeries reads on works/{id}.
+			Series   *SeriesRef `json:"series"`
+			CoverURL *string    `json:"cover_url"`
 		} `json:"results"`
 	}
 	found, ok := c.getJSON(ctx, "/api/v1/search?"+q.Encode(), &res)
@@ -809,9 +804,7 @@ func (c *Client) fetchWorkSearch(ctx context.Context, query string, limit int) (
 					w.Narrators = append(w.Narrators, n.Name)
 				}
 			}
-			if r.Series != nil {
-				w.Series = &SeriesRef{Name: r.Series.Name, Position: r.Series.Position}
-			}
+			w.Series = r.Series
 			if r.CoverURL != nil {
 				w.CoverURL = *r.CoverURL
 			}

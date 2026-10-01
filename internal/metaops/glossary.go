@@ -121,7 +121,12 @@ func (c *Client) SeriesGlossary(ctx context.Context, workID string) (Glossary, e
 	// book 1's misheard "Floss" (for "Flos") is never questioned. Series listings
 	// come back in position order, so the position of this work in the list is the
 	// cut - no position parsing needed.
-	if i := slices.Index(siblings, workID); i >= 0 {
+	//
+	// The listing names the work by its LIVE slug, so a workID a merge retired is
+	// cut (and skipped) under the survivor works/{id} answered with - else the
+	// index misses and every later volume is consulted.
+	self := liveWorkID(workID, work.id)
+	if i := slices.Index(siblings, self); i >= 0 {
 		siblings = siblings[:i]
 	}
 
@@ -137,7 +142,7 @@ func (c *Client) SeriesGlossary(ctx context.Context, workID string) (Glossary, e
 	// for the full TTL - including across a Retry.
 	degraded := false
 	for _, sib := range siblings {
-		if sib == workID || sib == "" {
+		if sib == workID || sib == self || sib == "" {
 			continue
 		}
 		if len(consulted) >= maxGlossarySiblings || fetched >= maxGlossaryFetches {

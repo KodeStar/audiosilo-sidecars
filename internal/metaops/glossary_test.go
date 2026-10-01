@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -316,6 +317,41 @@ func TestSeriesGlossaryVariantOnlyWorkCutsOnItsVariant(t *testing.T) {
 	}
 	if !slices.Equal(g.Works, []string{"w-book4"}) {
 		t.Errorf("consulted works = %v, want only the variant's earlier volume", g.Works)
+	}
+}
+
+// TestSeriesGlossaryCutsARetiredSlugAtItsSurvivor: a work id a merge retired is
+// answered (301) under the survivor, and the series listing names the survivor, so
+// the cut is taken there - not skipped, which would consult every later volume.
+func TestSeriesGlossaryCutsARetiredSlugAtItsSurvivor(t *testing.T) {
+	s := wanderingInn()
+	s.work["w-book5"] = workRow{title: "The Last Light", seriesName: "The Wandering Inn", seriesPos: "5",
+		chars: []string{"Toren", "Flos", "Teriarch"}}
+	s.work["w-book6"] = workRow{title: "The General of Izril", seriesName: "The Wandering Inn",
+		seriesPos: "6", chars: []string{"Tyrion"}}
+	if s.requests == nil {
+		s.requests = map[string]int{}
+	}
+	inner := s.handler()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/works/old-book5" {
+			http.Redirect(w, r, "/api/v1/works/w-book5", http.StatusMovedPermanently)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.URL)
+
+	g, err := c.SeriesGlossary(context.Background(), "old-book5")
+	if err != nil {
+		t.Fatalf("SeriesGlossary: %v", err)
+	}
+	if !slices.Equal(g.Works, []string{"w-book4"}) {
+		t.Errorf("consulted works = %v, want only the volume before the survivor", g.Works)
+	}
+	if slices.Contains(g.Names, "Tyrion") || slices.Contains(g.Names, "Teriarch") {
+		t.Errorf("names = %v, want neither the book's own nor a later volume's", g.Names)
 	}
 }
 
