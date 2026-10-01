@@ -275,11 +275,7 @@ func TestSeriesGlossaryConsultsOnlyEarlierVolumes(t *testing.T) {
 	}
 }
 
-// TestSeriesGlossaryCutsInThePrimaryOrder: a work in both a primary series and its
-// chronological variant is cut in the PRIMARY order, whichever ref metaserve lists
-// first. In the variant below book 6 is a prequel listed FIRST, so a cut there
-// would consult nothing - and in a family where the variant lists it later, it
-// would consult volumes written after it.
+// TestSeriesGlossaryCutsInThePrimaryOrder: a primary membership beats its variant.
 func TestSeriesGlossaryCutsInThePrimaryOrder(t *testing.T) {
 	s := wanderingInn()
 	s.work["w-book6"] = workRow{title: "The General of Izril", memberships: []SeriesRef{

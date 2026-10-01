@@ -112,9 +112,8 @@ func (c *Client) SeriesGlossary(ctx context.Context, workID string) (Glossary, e
 		return Glossary{}, nil
 	}
 
-	// work.series is readingSeries' choice, so the cut below is taken in the
-	// family's primary order whenever the work is in it - a chronological variant
-	// would count a later-written prequel as "earlier".
+	// work.series is readingSeries' choice, so the cut is taken in the order the
+	// book is read in.
 	//
 	// Only volumes EARLIER in the series are consulted. A later volume's canonical
 	// can suppress the very proposal this feature exists to make: if book 9

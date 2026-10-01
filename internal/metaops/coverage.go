@@ -288,29 +288,21 @@ type SeriesRef struct {
 }
 
 // readingSeries picks the ONE series a book is read in out of its works/{id}
-// memberships: the first that is not a variant reading order, else the first
-// membership. Everything downstream of workDetail (the local store's series and
-// position, the predecessor search, the glossary's earlier-volumes cut) reads
-// this one choice, so it is made here and nowhere else.
-//
-// The choice is made from the metadata rather than from metaserve's response
-// order. metaserve v7 does list memberships primary-first, but that is ordering
-// in somebody else's SQL, and a chronological variant read as THE series hands
-// the glossary a different set of "earlier" volumes - a prequel written later is
-// volume 1 there, so the cut lets a later-written book's names settle the
-// spellings of an earlier one. A work only a variant lists keeps that variant: it
-// is the only order that places it at all. A response with no ordering fields
-// (pre-v7) resolves to the first membership, exactly as before.
+// memberships: the first that is not a variant reading order (`ordering_of`
+// empty), else the first - a variant-only work keeps its variant. A book is read
+// in its primary order, and metaserve's response order is not part of its contract.
 func readingSeries(refs []SeriesRef) *SeriesRef {
 	if len(refs) == 0 {
 		return nil
 	}
-	for i := range refs {
-		if refs[i].OrderingOf == "" {
-			return cloneSeriesRef(&refs[i])
+	i := 0
+	for j := range refs {
+		if refs[j].OrderingOf == "" {
+			i = j
+			break
 		}
 	}
-	return cloneSeriesRef(&refs[0])
+	return cloneSeriesRef(&refs[i])
 }
 
 // WorkSearchResult is one work hit from the /meta/search proxy, flattened to the
@@ -698,6 +690,9 @@ func (c *Client) searchMatch(ctx context.Context, id BookIdentity) (Coverage, bo
 		if contradictsVolume(cards[idx], claim, digitRuns(step.query) < digitRuns(step.matchTitle)) {
 			continue
 		}
+		// The card's series arrives already chosen: metaserve's card applies
+		// readingSeries' rule server-side (non-variants first), so a ref carrying
+		// ordering_of here is a variant-only work and is kept as is.
 		v = searchVal{
 			matched: true, workID: cards[idx].ID, workTitle: cards[idx].Title,
 			series: cloneSeriesRef(cards[idx].Series),
