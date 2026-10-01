@@ -275,6 +275,54 @@ func TestSeriesGlossaryConsultsOnlyEarlierVolumes(t *testing.T) {
 	}
 }
 
+// TestSeriesGlossaryCutsInThePrimaryOrder: a work in both a primary series and its
+// chronological variant is cut in the PRIMARY order, whichever ref metaserve lists
+// first. In the variant below book 6 is a prequel listed FIRST, so a cut there
+// would consult nothing - and in a family where the variant lists it later, it
+// would consult volumes written after it.
+func TestSeriesGlossaryCutsInThePrimaryOrder(t *testing.T) {
+	s := wanderingInn()
+	s.work["w-book6"] = workRow{title: "The General of Izril", memberships: []SeriesRef{
+		{ID: "s-chrono", Name: "The Wandering Inn (Chronological)", Position: "1", OrderingOf: "s"},
+		{ID: "s", Name: "The Wandering Inn", Position: "6"},
+	}}
+	s.seriesWorks["s-chrono"] = []string{"w-book6", "w-book4", "w-book5"}
+	c, _ := newMeta(t, s)
+
+	g, err := c.SeriesGlossary(context.Background(), "w-book6")
+	if err != nil {
+		t.Fatalf("SeriesGlossary: %v", err)
+	}
+	if g.SeriesName != "The Wandering Inn" {
+		t.Errorf("series name = %q, want the primary", g.SeriesName)
+	}
+	if !slices.Equal(g.Works, []string{"w-book4", "w-book5"}) {
+		t.Errorf("consulted works = %v, want the primary's earlier volumes", g.Works)
+	}
+}
+
+// TestSeriesGlossaryVariantOnlyWorkCutsOnItsVariant: a work only a reading-order
+// variant lists has no primary position, so the variant is the order it is cut in.
+func TestSeriesGlossaryVariantOnlyWorkCutsOnItsVariant(t *testing.T) {
+	s := wanderingInn()
+	s.work["w-book6"] = workRow{title: "The General of Izril", memberships: []SeriesRef{
+		{ID: "s-chrono", Name: "The Wandering Inn (Chronological)", Position: "2", OrderingOf: "s"},
+	}}
+	s.seriesWorks["s-chrono"] = []string{"w-book4", "w-book6", "w-book5"}
+	c, _ := newMeta(t, s)
+
+	g, err := c.SeriesGlossary(context.Background(), "w-book6")
+	if err != nil {
+		t.Fatalf("SeriesGlossary: %v", err)
+	}
+	if g.SeriesName != "The Wandering Inn (Chronological)" {
+		t.Errorf("series name = %q, want the variant", g.SeriesName)
+	}
+	if !slices.Equal(g.Works, []string{"w-book4"}) {
+		t.Errorf("consulted works = %v, want only the variant's earlier volume", g.Works)
+	}
+}
+
 func TestUsableGlossaryName(t *testing.T) {
 	cases := []struct {
 		name string

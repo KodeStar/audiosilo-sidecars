@@ -274,10 +274,43 @@ type searchVal struct {
 // SeriesRef is a work's series membership in a search result. ID is the series
 // slug, which SeriesGlossary follows to reach the sibling volumes; some upstream
 // payloads omit it, so a consumer must tolerate "".
+//
+// OrderingOf is set only on a VARIANT reading order (a chronological or
+// recommended listing of another series) and names that family's primary series.
+// metaserve sends it from artifact schema_version 7; an older metaserve omits it,
+// so "" means "the series itself, or not known to be a variant" and every ref of a
+// pre-v7 response reads as a primary.
 type SeriesRef struct {
-	ID       string `json:"id,omitempty"`
-	Name     string `json:"name"`
-	Position string `json:"position"`
+	ID         string `json:"id,omitempty"`
+	Name       string `json:"name"`
+	Position   string `json:"position"`
+	OrderingOf string `json:"ordering_of,omitempty"`
+}
+
+// readingSeries picks the ONE series a book is read in out of its works/{id}
+// memberships: the first that is not a variant reading order, else the first
+// membership. Everything downstream of workDetail (the local store's series and
+// position, the predecessor search, the glossary's earlier-volumes cut) reads
+// this one choice, so it is made here and nowhere else.
+//
+// The choice is made from the metadata rather than from metaserve's response
+// order. metaserve v7 does list memberships primary-first, but that is ordering
+// in somebody else's SQL, and a chronological variant read as THE series hands
+// the glossary a different set of "earlier" volumes - a prequel written later is
+// volume 1 there, so the cut lets a later-written book's names settle the
+// spellings of an earlier one. A work only a variant lists keeps that variant: it
+// is the only order that places it at all. A response with no ordering fields
+// (pre-v7) resolves to the first membership, exactly as before.
+func readingSeries(refs []SeriesRef) *SeriesRef {
+	if len(refs) == 0 {
+		return nil
+	}
+	for i := range refs {
+		if refs[i].OrderingOf == "" {
+			return cloneSeriesRef(&refs[i])
+		}
+	}
+	return cloneSeriesRef(&refs[0])
 }
 
 // WorkSearchResult is one work hit from the /meta/search proxy, flattened to the
@@ -587,9 +620,7 @@ func (c *Client) workDetail(ctx context.Context, workID string) (v workVal, foun
 		return workVal{}, false, true
 	}
 	v = workVal{id: res.ID, title: res.Title, hasChars: len(res.Characters) > 0, hasRecap: len(res.Recaps) > 0}
-	if len(res.Series) > 0 {
-		v.series = cloneSeriesRef(&res.Series[0])
-	}
+	v.series = readingSeries(res.Series)
 	for _, ch := range res.Characters {
 		v.charNames = append(v.charNames, ch.Name)
 		v.charNames = append(v.charNames, ch.Aliases...)

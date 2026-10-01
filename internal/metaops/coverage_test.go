@@ -17,10 +17,12 @@ import (
 // workRow is a fake work's title + sidecar presence. chars, when set, lists the
 // work's character names for the series-glossary tests; when it is empty and c is
 // true the work reports one placeholder character, which is all the coverage tests
-// need.
+// need. memberships, when set, is the work's whole series[] array as sent (several
+// refs, ordering_of included) and replaces the one-ref seriesName/seriesPos form.
 type workRow struct {
 	title                 string
 	seriesName, seriesPos string
+	memberships           []SeriesRef
 	c, r                  bool
 	chars                 []string
 }
@@ -110,7 +112,15 @@ func (s *metaServer) handler() http.Handler {
 			return
 		}
 		body := `{"id":"` + id + `","title":"` + wk.title + `"`
-		if wk.seriesName != "" {
+		switch {
+		case len(wk.memberships) > 0:
+			raw, err := json.Marshal(wk.memberships)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			body += `,"series":` + string(raw)
+		case wk.seriesName != "":
 			body += `,"series":[{"id":"s","name":"` + wk.seriesName + `","position":"` + wk.seriesPos + `"}]`
 		}
 		switch {
@@ -1006,5 +1016,44 @@ func TestFreshCoverageForWorkSeesARetirementTheCacheHides(t *testing.T) {
 	got, err := c.FreshCoverageForWork(ctx, "old-slug")
 	if err != nil || got.WorkID != "new-slug" {
 		t.Fatalf("fresh read = %+v, %v, want the survivor new-slug", got, err)
+	}
+}
+
+// TestWorkDetailReadsTheSeriesTheBookIsReadIn pins readingSeries' choice through
+// the works/{id} read, which is what Coverage.Series (and from there the local
+// store's series, position and predecessor search) is built from.
+func TestWorkDetailReadsTheSeriesTheBookIsReadIn(t *testing.T) {
+	primary := SeriesRef{ID: "narnia", Name: "The Chronicles of Narnia", Position: "6"}
+	chrono := SeriesRef{ID: "narnia-chrono", Name: "The Chronicles of Narnia (Chronological)",
+		Position: "1", OrderingOf: "narnia"}
+	cases := []struct {
+		name        string
+		memberships []SeriesRef
+		want        SeriesRef
+	}{
+		// The response order is not trusted: a primary listed after its variant is
+		// still the series the book is read in.
+		{"primary listed second", []SeriesRef{chrono, primary}, primary},
+		{"primary listed first", []SeriesRef{primary, chrono}, primary},
+		// A work only the variant lists keeps it - it is the only order placing it.
+		{"variant only", []SeriesRef{chrono}, chrono},
+		// A pre-v7 metaserve sends no ordering fields: the first ref, as before.
+		{"pre-v7 response", []SeriesRef{
+			{ID: "a", Name: "Alpha", Position: "2"},
+			{ID: "b", Name: "Beta", Position: "1"},
+		}, SeriesRef{ID: "a", Name: "Alpha", Position: "2"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &metaServer{
+				lookup: map[string]string{"B-ASIN": "w1"},
+				work:   map[string]workRow{"w1": {title: "Work", memberships: tc.memberships}},
+			}
+			c, _ := newMeta(t, s)
+			got, _ := c.CoverageFor(context.Background(), BookIdentity{ASIN: "B-ASIN"})
+			if got.Series == nil || *got.Series != tc.want {
+				t.Fatalf("series = %+v, want %+v", got.Series, tc.want)
+			}
+		})
 	}
 }

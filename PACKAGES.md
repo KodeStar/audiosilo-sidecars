@@ -725,7 +725,19 @@ internal/
             missing young gnoll child") since those are prose, not spellings. Every
             no-data path (disabled client, no series, outage, uncontributed
             siblings) returns an empty glossary and a NIL error - a metadata outage
-            must never park a book. Coverage resolves
+            must never park a book. "Its series" is ONE choice, readingSeries in
+            coverage.go, made where workDetail decodes works/{id}.series[] and read
+            by everything downstream (Coverage.Series -> the local store's series/
+            position and findSeriesPredecessor, and the glossary's earlier-volumes
+            cut): the first membership whose `ordering_of` is empty, else the first
+            membership. `ordering_of` (metaserve artifact schema_version 7) marks a
+            VARIANT reading order (chronological/recommended) and names its family's
+            primary; the choice reads it rather than trusting metaserve's
+            primary-first response order, because a cut taken in a chronological
+            variant consults a later-written prequel as "earlier". A work only a
+            variant lists keeps the variant (the only order placing it), and a
+            pre-v7 response, carrying no ordering fields, resolves to the first ref
+            exactly as before. Coverage resolves
             asin -> isbn -> a fuzzy title-search fallback scored by
             audiosilo-server's pure-stdlib pkg/match (Coverage carries matched_by
             "asin"|"isbn"|"search"|"manual" + work_title provenance). The search
