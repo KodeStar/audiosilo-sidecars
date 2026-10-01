@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -274,10 +275,29 @@ type searchVal struct {
 // SeriesRef is a work's series membership in a search result. ID is the series
 // slug, which SeriesGlossary follows to reach the sibling volumes; some upstream
 // payloads omit it, so a consumer must tolerate "".
+//
+// OrderingOf is set only on a VARIANT reading order (a chronological or
+// recommended listing of another series) and names that family's primary series.
+// metaserve sends it from artifact schema_version 7; an older metaserve omits it,
+// so "" means "the series itself, or not known to be a variant" and every ref of a
+// pre-v7 response reads as a primary.
 type SeriesRef struct {
-	ID       string `json:"id,omitempty"`
-	Name     string `json:"name"`
-	Position string `json:"position"`
+	ID         string `json:"id,omitempty"`
+	Name       string `json:"name"`
+	Position   string `json:"position"`
+	OrderingOf string `json:"ordering_of,omitempty"`
+}
+
+// readingSeries picks the ONE series a book is read in out of its works/{id}
+// memberships: the first that is not a variant reading order (`ordering_of`
+// empty), else the first - a variant-only work keeps its variant. A book is read
+// in its primary order, and metaserve's response order is not part of its contract.
+func readingSeries(refs []SeriesRef) *SeriesRef {
+	if len(refs) == 0 {
+		return nil
+	}
+	i := max(slices.IndexFunc(refs, func(r SeriesRef) bool { return r.OrderingOf == "" }), 0)
+	return cloneSeriesRef(&refs[i])
 }
 
 // WorkSearchResult is one work hit from the /meta/search proxy, flattened to the
@@ -587,9 +607,7 @@ func (c *Client) workDetail(ctx context.Context, workID string) (v workVal, foun
 		return workVal{}, false, true
 	}
 	v = workVal{id: res.ID, title: res.Title, hasChars: len(res.Characters) > 0, hasRecap: len(res.Recaps) > 0}
-	if len(res.Series) > 0 {
-		v.series = cloneSeriesRef(&res.Series[0])
-	}
+	v.series = readingSeries(res.Series)
 	for _, ch := range res.Characters {
 		v.charNames = append(v.charNames, ch.Name)
 		v.charNames = append(v.charNames, ch.Aliases...)
@@ -667,6 +685,10 @@ func (c *Client) searchMatch(ctx context.Context, id BookIdentity) (Coverage, bo
 		if contradictsVolume(cards[idx], claim, digitRuns(step.query) < digitRuns(step.matchTitle)) {
 			continue
 		}
+		// The card's series arrives already chosen: metaserve's card applies
+		// readingSeries' rule server-side (non-variants first), so a ref carrying
+		// ordering_of here is a variant-only work and is kept as is (fetchWorkSearch
+		// decodes the field for exactly that).
 		v = searchVal{
 			matched: true, workID: cards[idx].ID, workTitle: cards[idx].Title,
 			series: cloneSeriesRef(cards[idx].Series),
@@ -755,11 +777,10 @@ func (c *Client) fetchWorkSearch(ctx context.Context, query string, limit int) (
 			Narrators []struct {
 				Name string `json:"name"`
 			} `json:"narrators"`
-			Series *struct {
-				Name     string `json:"name"`
-				Position string `json:"position"`
-			} `json:"series"`
-			CoverURL *string `json:"cover_url"`
+			// The card's whole series ref, ordering_of included, so a variant-only
+			// work's card keeps the marker readingSeries reads on works/{id}.
+			Series   *SeriesRef `json:"series"`
+			CoverURL *string    `json:"cover_url"`
 		} `json:"results"`
 	}
 	found, ok := c.getJSON(ctx, "/api/v1/search?"+q.Encode(), &res)
@@ -783,9 +804,7 @@ func (c *Client) fetchWorkSearch(ctx context.Context, query string, limit int) (
 					w.Narrators = append(w.Narrators, n.Name)
 				}
 			}
-			if r.Series != nil {
-				w.Series = &SeriesRef{Name: r.Series.Name, Position: r.Series.Position}
-			}
+			w.Series = r.Series
 			if r.CoverURL != nil {
 				w.CoverURL = *r.CoverURL
 			}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -272,6 +273,85 @@ func TestSeriesGlossaryConsultsOnlyEarlierVolumes(t *testing.T) {
 	}
 	if !slices.Contains(g.Names, "Toren") {
 		t.Errorf("earlier volumes must still be consulted: %v", g.Names)
+	}
+}
+
+// TestSeriesGlossaryCutsInThePrimaryOrder: a primary membership beats its variant.
+func TestSeriesGlossaryCutsInThePrimaryOrder(t *testing.T) {
+	s := wanderingInn()
+	s.work["w-book6"] = workRow{title: "The General of Izril", memberships: []SeriesRef{
+		{ID: "s-chrono", Name: "The Wandering Inn (Chronological)", Position: "1", OrderingOf: "s"},
+		{ID: "s", Name: "The Wandering Inn", Position: "6"},
+	}}
+	s.seriesWorks["s-chrono"] = []string{"w-book6", "w-book4", "w-book5"}
+	c, _ := newMeta(t, s)
+
+	g, err := c.SeriesGlossary(context.Background(), "w-book6")
+	if err != nil {
+		t.Fatalf("SeriesGlossary: %v", err)
+	}
+	if g.SeriesName != "The Wandering Inn" {
+		t.Errorf("series name = %q, want the primary", g.SeriesName)
+	}
+	if !slices.Equal(g.Works, []string{"w-book4", "w-book5"}) {
+		t.Errorf("consulted works = %v, want the primary's earlier volumes", g.Works)
+	}
+}
+
+// TestSeriesGlossaryVariantOnlyWorkCutsOnItsVariant: a work only a reading-order
+// variant lists has no primary position, so the variant is the order it is cut in.
+func TestSeriesGlossaryVariantOnlyWorkCutsOnItsVariant(t *testing.T) {
+	s := wanderingInn()
+	s.work["w-book6"] = workRow{title: "The General of Izril", memberships: []SeriesRef{
+		{ID: "s-chrono", Name: "The Wandering Inn (Chronological)", Position: "2", OrderingOf: "s"},
+	}}
+	s.seriesWorks["s-chrono"] = []string{"w-book4", "w-book6", "w-book5"}
+	c, _ := newMeta(t, s)
+
+	g, err := c.SeriesGlossary(context.Background(), "w-book6")
+	if err != nil {
+		t.Fatalf("SeriesGlossary: %v", err)
+	}
+	if g.SeriesName != "The Wandering Inn (Chronological)" {
+		t.Errorf("series name = %q, want the variant", g.SeriesName)
+	}
+	if !slices.Equal(g.Works, []string{"w-book4"}) {
+		t.Errorf("consulted works = %v, want only the variant's earlier volume", g.Works)
+	}
+}
+
+// TestSeriesGlossaryCutsARetiredSlugAtItsSurvivor: a work id a merge retired is
+// answered (301) under the survivor, and the series listing names the survivor, so
+// the cut is taken there - not skipped, which would consult every later volume.
+func TestSeriesGlossaryCutsARetiredSlugAtItsSurvivor(t *testing.T) {
+	s := wanderingInn()
+	s.work["w-book5"] = workRow{title: "The Last Light", seriesName: "The Wandering Inn", seriesPos: "5",
+		chars: []string{"Toren", "Flos", "Teriarch"}}
+	s.work["w-book6"] = workRow{title: "The General of Izril", seriesName: "The Wandering Inn",
+		seriesPos: "6", chars: []string{"Tyrion"}}
+	if s.requests == nil {
+		s.requests = map[string]int{}
+	}
+	inner := s.handler()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/works/old-book5" {
+			http.Redirect(w, r, "/api/v1/works/w-book5", http.StatusMovedPermanently)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.URL)
+
+	g, err := c.SeriesGlossary(context.Background(), "old-book5")
+	if err != nil {
+		t.Fatalf("SeriesGlossary: %v", err)
+	}
+	if !slices.Equal(g.Works, []string{"w-book4"}) {
+		t.Errorf("consulted works = %v, want only the volume before the survivor", g.Works)
+	}
+	if slices.Contains(g.Names, "Tyrion") || slices.Contains(g.Names, "Teriarch") {
+		t.Errorf("names = %v, want neither the book's own nor a later volume's", g.Names)
 	}
 }
 

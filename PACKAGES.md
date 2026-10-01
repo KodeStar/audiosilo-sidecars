@@ -725,7 +725,11 @@ internal/
             missing young gnoll child") since those are prose, not spellings. Every
             no-data path (disabled client, no series, outage, uncontributed
             siblings) returns an empty glossary and a NIL error - a metadata outage
-            must never park a book. Coverage resolves
+            must never park a book. "Its series" for works/{id} is readingSeries'
+            choice in coverage.go (the first membership with no `ordering_of`, else
+            the first), read by Coverage.Series, the predecessor search and the
+            glossary cut; a search card's series arrives already chosen by metaserve
+            under the same rule. Coverage resolves
             asin -> isbn -> a fuzzy title-search fallback scored by
             audiosilo-server's pure-stdlib pkg/match (Coverage carries matched_by
             "asin"|"isbn"|"search"|"manual" + work_title provenance). The search

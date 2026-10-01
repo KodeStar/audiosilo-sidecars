@@ -131,7 +131,10 @@ internal/
   scheduler/  wake-on-event dispatch over three lanes + _done sentinels + crash reconcile
   supervisor/ health-tick babysitter: bounded, capped automatic recovery
   metaops/    meta.audiosilo.app client: coverage/lookup + search ladder, scan jobs,
-              series glossary, library sightings (injected recorder -> the New view)
+              series glossary, library sightings (injected recorder -> the New view);
+              works/{id}'s series is readingSeries' choice (the primary reading
+              order by `ordering_of`); a search card's arrives chosen by metaserve
+              under the same rule
   events/     SSE hub (replay, heartbeats, durable sink)
   api/        transport-only HTTP handlers
   web/        go:embed of the SPA (build-tag selected) + SPA-fallback static serving
