@@ -692,6 +692,171 @@ func TestArtifactStatusIgnoresOpenStageDespiteStaleBookSnapshot(t *testing.T) {
 	}
 }
 
+func TestIncidentsAreConfirmedAgainstAFreshSnapshot(t *testing.T) {
+	// check's batch reads predate its own per-book filesystem work, so they can show a
+	// stage whose completion sentinel the scheduler has already removed for a legitimate
+	// rerun. Acting on that stale view would interrupt a healthy loop and consume the
+	// automatic-recovery cap, so every incident is re-classified from a fresh read.
+	for _, tc := range []struct {
+		name                      string
+		transition, startRerun    bool
+		paused                    bool
+		wantApplied, wantRecorded int
+	}{
+		// No transition: a genuinely missing prerequisite still earns its recovery.
+		{name: "unchanged", wantApplied: 1, wantRecorded: 1},
+		// auditing -> fixing with the old fixing sentinel gone: the expected absence.
+		{name: "queued", transition: true},
+		{name: "running", transition: true, startRerun: true},
+		// Classify protects every incident of a paused book: contained, never actioned.
+		{name: "paused", paused: true, wantApplied: 0, wantRecorded: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := supervisorDB(t)
+			book, err := db.CreateBook(ctx, store.NewBook{SourcePath: "/book", WorkDir: t.TempDir(), Title: "Book", State: "auditing"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			runID, err := db.StartStageRun(ctx, book.ID, "fixing", 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.FinishStageRun(ctx, runID, true, json.RawMessage(`{}`)); err != nil {
+				t.Fatal(err)
+			}
+			if tc.paused {
+				if err := db.SetBookStatus(ctx, book.ID, string(state.StatusPaused), "", ""); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg := config.Default().Supervisor
+			cfg.AutomaticActions = true
+			applied := 0
+			s := New(db, cfg, pricing.Table{Version: "test"}, nil, Hooks{
+				Runtime: func([]store.Book) Runtime {
+					// Runs after check's batch reads and before the per-book pass, so the
+					// transition lands exactly in the window the confirmation guards.
+					if tc.transition {
+						if err := db.SetBookPipelineState(ctx, book.ID, "fixing"); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if tc.startRerun {
+						if _, err := db.StartStageRun(ctx, book.ID, "fixing", 2); err != nil {
+							t.Fatal(err)
+						}
+					}
+					return Runtime{ActiveBooks: map[int64]bool{book.ID: true}}
+				},
+				Apply: func(context.Context, Action, Incident) (string, error) {
+					applied++
+					return "applied", nil
+				},
+			})
+			s.check(ctx, "test")
+			recorded, err := db.RecentSupervisorRuns(ctx, "", 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if applied != tc.wantApplied || len(recorded) != tc.wantRecorded {
+				t.Fatalf("actions=%d, recorded incidents=%d; want %d and %d",
+					applied, len(recorded), tc.wantApplied, tc.wantRecorded)
+			}
+		})
+	}
+}
+
+// The confirmation's fresh run read is arbitrarily newer than the tick's single runtime
+// occupancy sample, so a book the scheduler dispatches DURING the pass shows an open run
+// against a sample taken before its worker existed. Treating that as a missing worker would
+// terminate_requeue the stage that had only just started; the genuine incident the book was
+// confirmed for must still be acted on.
+func TestConfirmationDoesNotTerminateAStageDispatchedMidPass(t *testing.T) {
+	ctx := context.Background()
+	db := supervisorDB(t)
+	book, err := db.CreateBook(ctx, store.NewBook{SourcePath: "/book", WorkDir: t.TempDir(), Title: "Book", State: "auditing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A completed earlier stage whose sentinel is absent: the genuine artifact incident
+	// that puts this book on the confirmation path in the first place.
+	runID, err := db.StartStageRun(ctx, book.ID, "fixing", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishStageRun(ctx, runID, true, json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default().Supervisor
+	cfg.AutomaticActions = true
+	var applied []Action
+	s := New(db, cfg, pricing.Table{Version: "test"}, nil, Hooks{
+		Runtime: func([]store.Book) Runtime {
+			// The scheduler admits the book just after the occupancy sample is stamped: it
+			// registers the worker in-flight and THEN opens the run row, so the sample
+			// legitimately reports no active book for a run that is perfectly healthy.
+			if _, err := db.StartStageRun(ctx, book.ID, "auditing", 1); err != nil {
+				t.Fatal(err)
+			}
+			return Runtime{ActiveBooks: map[int64]bool{}}
+		},
+		Apply: func(_ context.Context, a Action, _ Incident) (string, error) {
+			applied = append(applied, a)
+			return "applied", nil
+		},
+	})
+	s.check(ctx, "test")
+	for _, a := range applied {
+		if a == ActionTerminateRequeue {
+			t.Fatalf("a stage dispatched mid-pass was terminated as an orphan; actions=%v", applied)
+		}
+	}
+	if len(applied) != 1 || applied[0] != ActionSupersedeRerun {
+		t.Fatalf("the genuine artifact incident must still be acted on; actions=%v", applied)
+	}
+}
+
+func TestCheckSkipsABookDeletedMidPass(t *testing.T) {
+	// The confirmation re-reads the book, so a book deleted between the batch read and
+	// that re-read must be skipped - not turned into a failed tick that abandons every
+	// remaining book and reddens the supervisor's last_error.
+	ctx := context.Background()
+	db := supervisorDB(t)
+	doomed, err := db.CreateBook(ctx, store.NewBook{SourcePath: "/gone", WorkDir: t.TempDir(), Title: "Gone", State: "auditing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := db.StartStageRun(ctx, doomed.ID, "fixing", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishStageRun(ctx, runID, true, json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default().Supervisor
+	cfg.AutomaticActions = true
+	deleted := false
+	s := New(db, cfg, pricing.Table{Version: "test"}, nil, Hooks{
+		Runtime: func([]store.Book) Runtime {
+			// Fires after check's batch read and before the per-book pass. Status()
+			// invokes this hook too, so the delete must happen exactly once.
+			if !deleted {
+				deleted = true
+				if err := db.DeleteBook(ctx, doomed.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return Runtime{ActiveBooks: map[int64]bool{}}
+		},
+		Apply: func(context.Context, Action, Incident) (string, error) { return "applied", nil },
+	})
+	s.check(ctx, "test")
+	if lastErr := s.Status().LastError; lastErr != "" {
+		t.Fatalf("deleted book failed the tick: %s", lastErr)
+	}
+}
+
 func TestArtifactStatusStillChecksCompletedEarlierStagesDuringRerun(t *testing.T) {
 	// Skipping current-stage history must not suppress validation of genuinely
 	// completed prerequisites. With no files present, validating remains invalid.

@@ -78,10 +78,16 @@ type ArtifactStatus struct {
 }
 
 type Snapshot struct {
-	Now                time.Time
-	Book               store.Book
-	Runs               []store.StageRun
+	Now  time.Time
+	Book store.Book
+	Runs []store.StageRun
+	// RuntimeActive and RuntimeAt are one sample of the scheduler's occupancy and the
+	// moment it was taken. Runs can be re-read after that sample (the monitor confirms
+	// every incident against a fresh read of one book), so a run admitted AFTER
+	// RuntimeAt is not evidence of a missing worker. A zero RuntimeAt disables that
+	// guard for a hand-assembled Snapshot.
 	RuntimeActive      bool
+	RuntimeAt          time.Time
 	ProcessAlive       *bool
 	Artifacts          []ArtifactStatus
 	AgentActive        int

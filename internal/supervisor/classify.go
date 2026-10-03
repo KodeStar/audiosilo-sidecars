@@ -138,13 +138,18 @@ func Classify(s Snapshot, p Policy) []Incident {
 	}
 	if open != nil {
 		base := Incident{BookID: s.Book.ID, BatchID: s.Book.BatchID, Stage: open.Stage, StageRunID: open.ID}
-		if !s.RuntimeActive {
+		// admittedAfterRuntimeSample keeps the open-run-versus-no-worker comparison
+		// honest when the two reads are not simultaneous (they are not: the monitor
+		// samples occupancy once per tick, then re-reads a book's runs when it confirms
+		// an incident). The explicit s.RuntimeActive on the second branch preserves the
+		// original else: the liveness check only ever applied to a book with a worker.
+		if !s.RuntimeActive && !admittedAfterRuntimeSample(s.RuntimeAt, *open) {
 			i := base
 			i.Kind = IncidentMissingProcess
 			i.Diagnosis = "database stage is running but the scheduler has no worker"
 			i.Evidence = []string{fmt.Sprintf("stage run %d is open", open.ID)}
 			incidents = append(incidents, i)
-		} else if s.ProcessAlive != nil && !*s.ProcessAlive && processReferenceAge(s.Now, *open) >= processExitGrace {
+		} else if s.RuntimeActive && s.ProcessAlive != nil && !*s.ProcessAlive && processReferenceAge(s.Now, *open) >= processExitGrace {
 			i := base
 			i.Kind = IncidentMissingProcess
 			i.Diagnosis = "recorded invocation process has disappeared"
@@ -254,6 +259,27 @@ func Classify(s Snapshot, p Policy) []Incident {
 		}
 	}
 	return dedupeIncidents(incidents)
+}
+
+// admittedAfterRuntimeSample reports whether an open run was admitted AFTER the runtime
+// occupancy sample it would be judged against. The scheduler inserts a book's in-flight
+// entry BEFORE it opens the run row, so a sample taken earlier simply cannot show that
+// worker: the absence is an artefact of the two reads' order, not an orphaned run. Without
+// this, confirming an incident from a freshly-read run list - which is arbitrarily newer
+// than the tick's one occupancy sample - would terminate_requeue a stage that had only just
+// started. A genuinely orphaned run stays detectable: the next tick's sample postdates it.
+// A zero RuntimeAt (a hand-assembled Snapshot) disables the guard.
+//
+// The boundary is inclusive (NOT strictly after): the wall clock behind both stamps has
+// only microsecond granularity here, so a run opened immediately after the sample routinely
+// carries the identical timestamp. Only a run stamped strictly EARLIER is provably one the
+// sample could have seen.
+func admittedAfterRuntimeSample(runtimeAt time.Time, open store.StageRun) bool {
+	if runtimeAt.IsZero() {
+		return false
+	}
+	started := parseTime(open.StartedAt)
+	return !started.IsZero() && !started.Before(runtimeAt)
 }
 
 // processReferenceAge measures from the freshest durable evidence that the open run was
