@@ -171,86 +171,145 @@ func (s *Service) check(ctx context.Context, trigger string) {
 		s.setCheck(err)
 		return
 	}
-	runtime := Runtime{ActiveBooks: map[int64]bool{}}
+	// runtimeAt is stamped BEFORE the hook samples the scheduler, so every run the sample
+	// could possibly have observed as in-flight started before it. Classification uses that
+	// to tell a run admitted after the sample from a genuinely orphaned one.
+	pass := passReads{runtime: Runtime{ActiveBooks: map[int64]bool{}}, runtimeAt: time.Now().UTC(),
+		invocationsByRun: invocationsByRun, progressByBook: progressByBook}
 	if s.hooks.Runtime != nil {
-		runtime = s.hooks.Runtime(books)
-		if runtime.ActiveBooks == nil {
-			runtime.ActiveBooks = map[int64]bool{}
+		pass.runtime = s.hooks.Runtime(books)
+		if pass.runtime.ActiveBooks == nil {
+			pass.runtime.ActiveBooks = map[int64]bool{}
 		}
 	}
 	for _, book := range books {
 		if ctx.Err() != nil {
 			return
 		}
-		runs := runsByBook[book.ID]
-		eligibleCount := 0
-		if len(runtime.EligibleAgentIDs) > 0 && book.ID == runtime.EligibleAgentIDs[0] {
-			eligibleCount = runtime.EligibleAgentBooks
+		if _, ok := primaryIncident(Classify(s.buildSnapshot(book, runsByBook[book.ID], pass), s.policy)); !ok {
+			continue
 		}
-		remaining := 0
-		for _, progress := range progressByBook[book.ID] {
-			if progress.Stage == book.State {
-				remaining = max(0, progress.Total-progress.Done)
-				break
-			}
+		// The batch reads above predate this pass's own per-book filesystem work, so a
+		// book reached late can be judged on data older than the pass itself: a loop
+		// transition deliberately removes the next stage's completion sentinel, and a
+		// finishing run releases its worker. The batch classification is therefore only
+		// a cheap filter - every incident is confirmed against a freshly-read snapshot
+		// of this one book before any recovery is recorded. Re-classifying (rather than
+		// rechecking one field) keeps that freshness true for every incident kind and
+		// leaves the protection rules owned solely by Classify.
+		snap, runs, err := s.freshSnapshot(ctx, book.ID, pass)
+		if errors.Is(err, store.ErrNotFound) {
+			continue // deleted mid-pass; there is nothing left to recover
 		}
-		snap := Snapshot{Now: time.Now().UTC(), Book: book, Runs: runs, RuntimeActive: runtime.ActiveBooks[book.ID],
-			Artifacts: s.artifactStatuses(book, runs), AgentActive: runtime.AgentActive, AgentCapacity: runtime.AgentCapacity, EligibleAgentBooks: eligibleCount,
-			AgentInvocations: runtime.AgentInvocations, InvocationCapacity: runtime.InvocationCapacity, BookInvocations: runtime.InvocationsByBook[book.ID],
-			MaxAgentsPerBook: runtime.MaxAgentsPerBook, RemainingWorkUnits: remaining}
-		for i := range runs {
-			if runs[i].FinishedAt != "" {
-				continue
-			}
-			children := invocationsByRun[runs[i].ID]
-			if len(children) > 0 {
-				oldestHeartbeat := children[0].HeartbeatAt
-				for _, child := range children[1:] {
-					if child.HeartbeatAt < oldestHeartbeat {
-						oldestHeartbeat = child.HeartbeatAt
-					}
-				}
-				// A fresh sibling must not hide a stale child behind the compatible
-				// parent roll-up. Classification therefore uses the oldest active
-				// invocation heartbeat for this fanned-out run.
-				runs[i].HeartbeatAt = oldestHeartbeat
-				alive := true
-				checked := false
-				for _, child := range children {
-					// PID zero is the short interval after durable admission and before
-					// cmd.Start. Staleness catches a child that never starts; it is not
-					// evidence that a process disappeared.
-					if child.ProcessID <= 0 {
-						continue
-					}
-					checked = true
-					if !processAlive(child.ProcessID) {
-						alive = false
-						break
-					}
-				}
-				if checked {
-					snap.ProcessAlive = &alive
-				}
-				break
-			}
-			// Legacy/pre-migration active process fallback.
-			if runs[i].ProcessActive && runs[i].ProcessID > 0 {
-				alive := processAlive(runs[i].ProcessID)
-				snap.ProcessAlive = &alive
-				break
-			}
+		if err != nil {
+			s.setCheck(err)
+			return
 		}
-		if incident, ok := primaryIncident(Classify(snap, s.policy)); ok {
-			if err := s.handleIncident(ctx, trigger, incident, runs, runtime); err != nil {
-				s.setCheck(err)
-				return
-			}
+		incident, ok := primaryIncident(Classify(snap, s.policy))
+		if !ok {
+			continue
+		}
+		if err := s.handleIncident(ctx, trigger, incident, runs, pass.runtime); err != nil {
+			s.setCheck(err)
+			return
 		}
 	}
 	s.mu.Lock()
 	s.lastCheck, s.lastErr = time.Now().UTC(), ""
 	s.mu.Unlock()
+}
+
+// passReads is one tick's shared batch-read context: the single runtime occupancy sample
+// (with the moment it was stamped), the active fanned-out invocations and the per-book
+// progress rows. Only a book and its stage runs are re-read per incident; everything here
+// stays as of the tick's prologue, which is why runtimeAt travels with it.
+type passReads struct {
+	runtime          Runtime
+	runtimeAt        time.Time
+	invocationsByRun map[int64][]store.AgentInvocation
+	progressByBook   map[int64][]store.Progress
+}
+
+// buildSnapshot assembles one book's classification input: its stage-run history, the
+// artifact/sentinel statuses (filesystem I/O), the runtime occupancy figures and the
+// fanned-out invocation roll-up. The batch pass and the per-incident confirmation share
+// it so both classify from identically-assembled data.
+func (s *Service) buildSnapshot(book store.Book, runs []store.StageRun, pass passReads) Snapshot {
+	eligibleCount := 0
+	if len(pass.runtime.EligibleAgentIDs) > 0 && book.ID == pass.runtime.EligibleAgentIDs[0] {
+		eligibleCount = pass.runtime.EligibleAgentBooks
+	}
+	remaining := 0
+	for _, progress := range pass.progressByBook[book.ID] {
+		if progress.Stage == book.State {
+			remaining = max(0, progress.Total-progress.Done)
+			break
+		}
+	}
+	snap := Snapshot{Now: time.Now().UTC(), Book: book, Runs: runs, RuntimeActive: pass.runtime.ActiveBooks[book.ID], RuntimeAt: pass.runtimeAt,
+		Artifacts: s.artifactStatuses(book, runs), AgentActive: pass.runtime.AgentActive, AgentCapacity: pass.runtime.AgentCapacity, EligibleAgentBooks: eligibleCount,
+		AgentInvocations: pass.runtime.AgentInvocations, InvocationCapacity: pass.runtime.InvocationCapacity, BookInvocations: pass.runtime.InvocationsByBook[book.ID],
+		MaxAgentsPerBook: pass.runtime.MaxAgentsPerBook, RemainingWorkUnits: remaining}
+	for i := range runs {
+		if runs[i].FinishedAt != "" {
+			continue
+		}
+		children := pass.invocationsByRun[runs[i].ID]
+		if len(children) > 0 {
+			oldestHeartbeat := children[0].HeartbeatAt
+			for _, child := range children[1:] {
+				if child.HeartbeatAt < oldestHeartbeat {
+					oldestHeartbeat = child.HeartbeatAt
+				}
+			}
+			// A fresh sibling must not hide a stale child behind the compatible
+			// parent roll-up. Classification therefore uses the oldest active
+			// invocation heartbeat for this fanned-out run.
+			runs[i].HeartbeatAt = oldestHeartbeat
+			alive := true
+			checked := false
+			for _, child := range children {
+				// PID zero is the short interval after durable admission and before
+				// cmd.Start. Staleness catches a child that never starts; it is not
+				// evidence that a process disappeared.
+				if child.ProcessID <= 0 {
+					continue
+				}
+				checked = true
+				if !processAlive(child.ProcessID) {
+					alive = false
+					break
+				}
+			}
+			if checked {
+				snap.ProcessAlive = &alive
+			}
+			break
+		}
+		// Legacy/pre-migration active process fallback.
+		if runs[i].ProcessActive && runs[i].ProcessID > 0 {
+			alive := processAlive(runs[i].ProcessID)
+			snap.ProcessAlive = &alive
+			break
+		}
+	}
+	return snap
+}
+
+// freshSnapshot re-reads one book and its stage runs and rebuilds its snapshot. It
+// returns the runs it classified so the acting layer decides on the same data, with the
+// invocation heartbeat roll-up buildSnapshot applies. A store.ErrNotFound means the book
+// was deleted mid-pass and is the caller's signal to skip it rather than fail the tick.
+func (s *Service) freshSnapshot(ctx context.Context, bookID int64, pass passReads) (Snapshot, []store.StageRun, error) {
+	book, err := s.db.GetBook(ctx, bookID)
+	if err != nil {
+		return Snapshot{}, nil, err
+	}
+	runs, err := s.db.ListStageRuns(ctx, bookID)
+	if err != nil {
+		return Snapshot{}, nil, err
+	}
+	return s.buildSnapshot(book, runs, pass), runs, nil
 }
 
 func primaryIncident(incidents []Incident) (Incident, bool) {

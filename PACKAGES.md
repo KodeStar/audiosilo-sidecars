@@ -713,7 +713,22 @@ internal/
             stage; and collectArtifactStatuses trusts an OPEN stage run over the
             stale book snapshot (the scheduler can advance the state between the
             two reads), so an intentionally absent sentinel for an in-flight rerun
-            is not reported broken.
+            is not reported broken. The batch ListBooks/StageRunsAll reads predate
+            the pass's own per-book filesystem work, so that classification is only a
+            CHEAP FILTER: every incident is confirmed by re-reading just that book
+            (GetBook + ListStageRuns), rebuilding its snapshot through the shared
+            buildSnapshot, and re-CLASSIFYING before any recovery is recorded. One
+            invariant for every incident kind, so protection rules stay owned solely
+            by Classify and the acting layer holds no per-kind freshness patch; a
+            book deleted mid-pass is skipped, never a failed tick. That re-read makes
+            a book's runs NEWER than the tick's single runtime occupancy sample, so
+            passReads carries the moment that sample was stamped and Classify ignores
+            an open run admitted no earlier than it (admittedAfterRuntimeSample, an
+            INCLUSIVE boundary - the wall clock is microsecond-granular): the
+            scheduler registers a worker in-flight BEFORE it opens the run row, so a
+            book dispatched mid-pass would otherwise be terminate_requeued as an
+            orphan. The occupancy/invocation/progress figures themselves stay as of
+            the prologue by design; they are what the sample timestamp qualifies.
   metaops/  meta.audiosilo.app client (coverage/lookup, capped 1h TTL caches,
             graceful degrade) + async folder-scan job manager over audiosilo-meta
             pkg/scan + the library_roots PathAllowed check. glossary.go adds

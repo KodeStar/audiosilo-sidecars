@@ -88,6 +88,21 @@ and detailed typed parks at their caps; the supervisor must not interrupt an act
 repair. Existing in-invocation transient retry logic remains the cheapest first line
 of recovery.
 
+Each tick reads every book once, then spends per-book time inspecting artifacts on
+disk, so a book reached late can be judged on data older than the tick itself. Before
+any recovery is recorded, the monitor therefore re-reads that one book and classifies
+it again. A normal loop transition removes its next stage's old completion sentinel,
+and a finishing run releases its worker; neither may become a recovery action or
+consume the automatic-recovery cap. A book deleted mid-tick is skipped, and the
+remaining books are still examined.
+
+Worker occupancy, by contrast, is sampled once per tick, so that re-read leaves a
+book's stage runs newer than the occupancy figures. A book the scheduler starts
+mid-tick therefore shows a running stage against a sample taken before its worker
+existed; the monitor records when it sampled and does not call such a stage orphaned,
+so a healthy book that had only just started is never terminated and requeued. A
+genuinely orphaned stage is caught by the next tick.
+
 ## Configuration
 
 All settings are restart-to-apply. Older configuration files inherit defaults because

@@ -42,6 +42,33 @@ func TestClassifyRecordedProcessDisappeared(t *testing.T) {
 	}
 }
 
+// The scheduler registers a book in-flight BEFORE it opens the run row, so an occupancy
+// sample taken earlier simply cannot show that worker. The monitor confirms incidents from a
+// freshly-read run list, which is newer than the tick's one sample, so without this guard a
+// stage that had only just started would be classified an orphan and terminate_requeued.
+// A run admitted BEFORE the sample is still a genuine orphan.
+func TestClassifyMissingProcessIgnoresARunAdmittedAfterTheRuntimeSample(t *testing.T) {
+	now := time.Now().UTC()
+	sample := now.Add(-time.Second)
+	policy := Policy{StaleAfter: time.Hour, NoProgressAfter: time.Hour, MaxStageDuration: time.Hour, MaxErrorRepeats: 2}
+	admitted := func(at time.Time) Snapshot {
+		stamp := at.Format(time.RFC3339Nano)
+		return Snapshot{Now: now, Book: store.Book{ID: 1, BatchID: "b"}, RuntimeActive: false, RuntimeAt: sample,
+			Runs: []store.StageRun{{ID: 4, Stage: "fixing", StartedAt: stamp, HeartbeatAt: stamp, ProgressAt: stamp}}}
+	}
+	if got := kinds(Classify(admitted(sample.Add(time.Millisecond)), policy)); got[IncidentMissingProcess] {
+		t.Errorf("run admitted after the occupancy sample classified as an orphan: %#v", got)
+	}
+	// The wall clock behind both stamps is only microsecond-granular, so the common real
+	// case is an identical timestamp; it must be read as "not provably earlier".
+	if got := kinds(Classify(admitted(sample), policy)); got[IncidentMissingProcess] {
+		t.Errorf("run admitted in the sample's own tick classified as an orphan: %#v", got)
+	}
+	if got := kinds(Classify(admitted(sample.Add(-time.Minute)), policy)); !got[IncidentMissingProcess] {
+		t.Errorf("run admitted before the occupancy sample must still be an orphan: %#v", got)
+	}
+}
+
 // The grace is measured from a heartbeat that a live agent stage refreshes only once a
 // cadence, so the reference at child exit is routinely most of a cadence old. This pins
 // that a reference just INSIDE the window is still protected - a grace shorter than the
