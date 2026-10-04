@@ -1,0 +1,82 @@
+version: 2
+
+# Keep the four dependency surfaces this repo actually has fresh, without
+# turning the pull request list into a dependency feed. Minor and patch updates
+# are GROUPED into one pull request per ecosystem per week - they are the bulk of
+# the traffic and are reviewed as one bump either way - while a major update
+# still arrives on its own, because that is the one that needs reading.
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    # The workspace's own modules are pinned deliberately and moved by hand:
+    # audiosilo-meta at a release the strict schema drift guard
+    # (internal/pipeline/schema_drift_test.go) is written against, and
+    # audiosilo-server at a pseudo-version of a chosen commit.
+    ignore:
+      - dependency-name: github.com/kodestar/audiosilo-meta
+      - dependency-name: github.com/kodestar/audiosilo-server
+
+  # The embedded web UI.
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+    groups:
+      web-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # The workflows reference actions by major tag (actions/checkout@v4), so for
+  # most of them the only update is the next major, which arrives on its own.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # The Dockerfile's base images (node:24-slim, golang:1.26,
+  # nvidia/cuda:12.6.3-runtime-ubuntu22.04; debian:stable-slim is unversioned).
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      base-images-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    # Node majors (the web build stage): only the EVEN ones become LTS, so the
+    # odd majors are ignored and an even one still arrives as a pull request.
+    # Dependabot takes version patterns, not a parity rule; extend the list
+    # before Node 31 ships.
+    #
+    # golang: the image's MINOR is the Go language version - a Go bump is three
+    # edits (go.mod's `go` line, .go-version, this tag) done by hand in one
+    # change, never an image-only pull request.
+    #
+    # nvidia/cuda: the CUDA image matches the whisper CUDA build
+    # (whisper-binaries.yml, CUDA 12.6 on ubuntu22.04), which ships on its own
+    # cadence; the two move together by hand.
+    ignore:
+      - dependency-name: node
+        versions: ["25.x", "27.x", "29.x"]
+      - dependency-name: golang
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+      - dependency-name: nvidia/cuda
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
