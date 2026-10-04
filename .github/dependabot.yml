@@ -34,8 +34,8 @@ updates:
           - minor
           - patch
 
-  # The workflows reference actions by major tag (actions/checkout@v4), so for
-  # most of them the only update is the next major, which arrives on its own.
+  # The workflows reference actions by major tag (actions/checkout@v4), so the
+  # only update for them is the next major, which arrives on its own.
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -58,9 +58,12 @@ updates:
           - minor
           - patch
     # Node majors (the web build stage): only the EVEN ones become LTS, so the
-    # odd majors are ignored and an even one still arrives as a pull request.
-    # Dependabot takes version patterns, not a parity rule; extend the list
-    # before Node 31 ships.
+    # odd majors are ignored and an even one still arrives as a pull request -
+    # to be merged together with ci.yml's and release.yml's setup-node
+    # `node-version`, which dependabot does not move. Dependabot takes version
+    # ranges, not a parity rule, and a docker range is Bundler syntax
+    # ("~> 25.0" is every 25.x; a bare "25.x" would match no tag); extend the
+    # list before Node 31 ships.
     #
     # golang: the image's MINOR is the Go language version - a Go bump is three
     # edits (go.mod's `go` line, .go-version, this tag) done by hand in one
@@ -71,7 +74,7 @@ updates:
     # cadence; the two move together by hand.
     ignore:
       - dependency-name: node
-        versions: ["25.x", "27.x", "29.x"]
+        versions: ["~> 25.0", "~> 27.0", "~> 29.0"]
       - dependency-name: golang
         update-types:
           - version-update:semver-major
