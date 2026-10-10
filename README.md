@@ -1,5 +1,11 @@
 # AudioSilo Sidecars
 
+> **Use of AI:** AudioSilo is developed by me (a human), with assistance from AI, primarily Claude Code, to help me write, clean up, document, and review the code. That doesn't mean the app is generated on autopilot or "vibe coded". Nothing goes out until I've read it, tested it, and decided it belongs. AI is what lets one person keep up this pace, and I think it's important to disclose that.
+
+![The AudioSilo Sidecars library view](.github/assets/screenshot.webp)
+
+[Website](https://audiosilo.app) · [Metadata](https://audiosilo.app/metadata#contribute) · [Docs](https://docs.audiosilo.app) · [Discord](https://discord.gg/nFFqRbkRn6) · [Sponsor](https://github.com/sponsors/KodeStar)
+
 A standalone contributor tool for [meta.audiosilo.app](https://meta.audiosilo.app):
 point it at an audiobook folder and it produces the community **character sheets**
 and **"story so far" recaps** (the spoiler-gated CC BY-SA sidecars) for that book,
