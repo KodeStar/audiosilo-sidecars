@@ -1,5 +1,7 @@
 # CLAUDE.md - AudioSilo Sidecars
 
+**Archived (November 2026), do not extend:** replaced by the AudioSilo Bridge (KodeStar/audiosilo-bridge, public, AGPL-3.0), where this engine now lives; make no changes here.
+
 Guidance for working in this repository. Keep this file updated as the codebase
 evolves. This is the seventh repo in the AudioSilo workspace (`~/dev/audiosilo`) -
 read the workspace [CLAUDE.md](../CLAUDE.md) first, plus

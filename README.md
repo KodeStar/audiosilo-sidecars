@@ -1,5 +1,19 @@
 # AudioSilo Sidecars
 
+> [!IMPORTANT]
+> **Archived (November 2026).** This repository is no longer maintained: no new
+> features or fixes. It is replaced by the
+> [AudioSilo Bridge](https://docs.audiosilo.app/users/admin/bridge)
+> ([source](https://github.com/KodeStar/audiosilo-bridge)), the optional companion
+> container that writes to a server's libraries and runs the heavy jobs.
+> Generating character and recap sidecars now runs in the Bridge (this engine moved
+> there with its history): see
+> [Generating characters and recaps](https://docs.audiosilo.app/users/admin/generating-characters-and-recaps).
+> The existing [GitHub releases](https://github.com/KodeStar/audiosilo-sidecars/releases)
+> and `ghcr.io/kodestar/audiosilo-sidecars` images (including the `-cuda` image) stay
+> downloadable but get no updates. The rest of this README describes the tool as it
+> was.
+
 > **Use of AI:** AudioSilo is developed by me (a human), with assistance from AI, primarily Claude Code, to help me write, clean up, document, and review the code. That doesn't mean the app is generated on autopilot or "vibe coded". Nothing goes out until I've read it, tested it, and decided it belongs. AI is what lets one person keep up this pace, and I think it's important to disclose that.
 
 ![The AudioSilo Sidecars library view](.github/assets/screenshot.webp)
@@ -23,9 +37,9 @@ or API key).
 > community repository (KodeStar/audiosilo-meta-community), add-work proposals
 > to the core one (KodeStar/audiosilo-meta), as prefilled intake issues or a
 > keep-local export of the sidecar files - with live boards,
-> ETAs, and per-stage cost tracking in the web UI. Packaging is in place -
-> tagged (`v*`) releases publish native binaries (GitHub Releases) and container
-> images (GHCR, plus a `-cuda` GPU variant); see **Install** below. See
+> ETAs, and per-stage cost tracking in the web UI. Tagged (`v*`) releases
+> published native binaries (GitHub Releases) and container images (GHCR, plus a
+> `-cuda` GPU variant); see **Install** below. See
 > [CLAUDE.md](CLAUDE.md) for the roadmap.
 
 This is the seventh repository in the AudioSilo workspace. Code is licensed
@@ -34,7 +48,8 @@ the content license of the metadata database.
 
 ## Install
 
-Tagged (`v*`) releases publish two things:
+Tagged (`v*`) releases published two things. They stay downloadable, but there
+will be no new releases or image updates:
 
 - **Native binaries** on the [GitHub Releases](https://github.com/KodeStar/audiosilo-sidecars/releases)
   page - one self-contained archive per OS/arch (Linux, macOS, Windows; amd64 and
